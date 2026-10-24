@@ -37,3 +37,4 @@ import LeanSudo.I18n
 import LeanSudo.I18n.Load
 import LeanSudo.I18n.Render
 import LeanSudo.Nsswitch
+import LeanSudo.Sys.Lookup

@@ -46,8 +46,8 @@ Absent catalogs preserve the original English bytes.
 | `LeanSudo/Policy/Eval.lean` | `evaluate : Sudoers → Settings → Request → Judgement`, matching |
 | `LeanSudo/Policy/List.lean` | `sudo -l` rendering |
 | `LeanSudo/Policy/Proofs.lean` | policy theorems |
-| `LeanSudo/Cli.lean` | `parseArgs : String (progname) → List String → Except String Options` |
-| `LeanSudo/Env.lean` | `buildEnv` (command environment) + proofs |
+| `LeanSudo/Cli.lean` | `parseArgs (argv0 : String) (args : List String) (env : List (String × String) := []) : ParseResult` (`warnings`, `result : Except Diagnostic Options`; getopt-style diagnostics carry the full argv[0]) |
+| `LeanSudo/Env.lean` | `buildEnv` (command environment, sudo's env.c order: rebuild, then explicitly permitted `VAR=value`/`--preserve-env`, then PAM `env_merge`) + proofs |
 | `LeanSudo/Prompt.lean` | `%u %U %h %H %p %%` prompt expansion |
 | `LeanSudo/I18n.lean`, `LeanSudo/I18n/Render.lean` | pure GNU MO parsing, catalog fallback theorem, plural expressions, printf substitution and diagnostic presentation |
 | `LeanSudo/I18n/Load.lean` | root-owned catalog/locale loading; message-locale precedence, Ubuntu langpack fallback, separate `sudoers_locale` log catalog |

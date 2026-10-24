@@ -11,10 +11,63 @@ def pathParts (path : String) : Option (List String × String) := do
     | [] => none
     | name :: dirs => some ((dirs.reverse).filter (· != ""), if name == "" then "." else name)
 
+
+private def unescapeWord : List Char → List Char
+  | '\\' :: c :: cs => c :: unescapeWord cs
+  | c :: cs => c :: unescapeWord cs
+  | [] => []
+
+private def quotedWord (quote : Char) : List Char → Bool → List Char →
+    Option (List Char × List Char)
+  | [], _, _ => none
+  | c :: cs, escaped, acc =>
+    if c == quote && !escaped then some (acc.reverse, cs)
+    else quotedWord quote cs (c == '\\') (c :: acc)
+
+private def bareWord : List Char → List Char → List Char × List Char
+  | [], acc => (acc.reverse, [])
+  | '\\' :: c :: cs, acc => bareWord cs (c :: '\\' :: acc)
+  | c :: cs, acc =>
+    if c == ' ' || c == '\t' then (acc.reverse, cs)
+    else bareWord cs (c :: acc)
+
+private def splitEditor : Nat → List Char → List String
+  | 0, _ => []
+  | fuel + 1, chars =>
+    match chars.dropWhile (fun c => c == ' ' || c == '\t') with
+    | [] => []
+    | c :: cs =>
+      let (word, rest) := if c == '\'' || c == '"' then
+        match quotedWord c cs false [] with
+        | some result => result
+        | none => bareWord (c :: cs) []
+        else bareWord (c :: cs) []
+      String.ofList (unescapeWord word) :: splitEditor fuel rest
+
+/-- sudoers wordsplit: quotes delimit only at word start; backslashes quote the
+next character, with no shell expansion. Unmatched quotes remain literal. -/
+def editorWords (source : String) : List String :=
+  splitEditor (source.length + 1) source.toList
+
+/-- Preserve the last suffix for editor syntax detection, including dotfiles. -/
+def tempName (name : String) : String :=
+  match (name.splitOn ".").reverse with
+  | suffix :: rest@(_ :: _) => String.intercalate "." rest.reverse ++ "XXXXXXXX." ++ suffix
+  | _ => name ++ ".XXXXXXXX"
+
+/-- sudo_edit compares size and nanosecond mtime, not contents. -/
+def fileChanged (before after : Array Nat) (elapsed : Bool) : Bool :=
+  !elapsed || before[3]! != after[3]! || before[4]! != after[4]! || before[5]! != after[5]!
 /-- The editor cannot inject additional sudoedit file operands via `--`. -/
 def editorArgsSafe (words : List String) : Bool :=
-  !words.isEmpty && words.all Sys.Exec.cSafe && !words.contains "--"
+  !words.isEmpty && words.all Sys.Exec.cSafe && !(words.drop 1).contains "--"
 
+
+theorem editorWords_no_file_separator (source : String)
+    (h : editorArgsSafe (editorWords source) = true) :
+    "--" ∉ (editorWords source).drop 1 := by
+  simp [editorArgsSafe, Bool.and_eq_true] at h
+  simpa using h.2
 /-- Ordered candidate selection from filesystem resolution results. -/
 def selectEditor : List (List String × Option String) → Option (String × List String)
   | [] => none

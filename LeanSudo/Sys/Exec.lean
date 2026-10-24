@@ -13,6 +13,11 @@ the child never runs the command in that case.
 The parent relays signals and job-control stops to the command (see `c/exec.c`),
 optionally through a pty (`usePty`, only when one of fds 0–2 is a terminal), and
 returns the command's status.
+Non-pty job control hands the foreground terminal to a separately grouped command
+stopped by SIGTTIN/SIGTTOU, or suspends sudo until the invoking shell resumes it.
+Foreground restoration refuses to steal a terminal from another job.
+User-generated SIGWINCH is relayed without a pty; with a pty, size changes update
+the terminal and explicitly signal the command's process group, as sudo does.
 
 Before anything reaches C, this module checks the arguments and fails closed:
 ids must fit in `uid_t`/`gid_t` and must not be `(uid_t)-1` (which `setresuid`

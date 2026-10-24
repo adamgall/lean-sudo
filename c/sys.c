@@ -1,5 +1,6 @@
 /* System lookup oracles: no policy decisions live in this translation unit. */
 #include <lean/lean.h>
+#include "locale_scope.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <glob.h>
@@ -140,9 +141,9 @@ static int regex_check(const char *pattern) {
   return 0;
 }
 
-/* sudoers.c switches to sudoers_locale around lookup, not the invoking
- * user's locale. Use a thread-local locale scope so PAM/libc messages retain
- * the user locale. Cache the default C object for all ordinary lookups. */
+/* Shared sudoers locale for matching and audit timestamp/path formatting.
+ * Thread-local scopes leave PAM/libc diagnostics in the invoking user locale.
+ * Cache the default C object for ordinary operations. */
 static pthread_once_t match_locale_once = PTHREAD_ONCE_INIT;
 static locale_t match_c_locale;
 
@@ -150,7 +151,7 @@ static void match_locale_init(void) {
   match_c_locale = newlocale(LC_ALL_MASK, "C", (locale_t)0);
 }
 
-static locale_t match_locale_enter(const char *name, locale_t *previous) {
+locale_t leansudo_locale_enter(const char *name, locale_t *previous) {
   pthread_once(&match_locale_once, match_locale_init);
   if (!match_c_locale) return (locale_t)0;
   locale_t locale = match_c_locale;
@@ -171,7 +172,7 @@ static locale_t match_locale_enter(const char *name, locale_t *previous) {
   return locale;
 }
 
-static void match_locale_leave(locale_t locale, locale_t previous) {
+void leansudo_locale_leave(locale_t locale, locale_t previous) {
   (void)uselocale(previous);
   if (locale != match_c_locale) freelocale(locale);
 }
@@ -197,19 +198,19 @@ LEAN_EXPORT lean_obj_res leansudo_sys_regex(b_lean_obj_arg pattern, b_lean_obj_a
     }
   }
   locale_t previous;
-  locale_t locale = match_locale_enter(lean_string_cstr(locale_name), &previous);
+  locale_t locale = leansudo_locale_enter(lean_string_cstr(locale_name), &previous);
   if (!locale) return failure("unable to initialize matching locale");
   int err = regex_check(expr);
   if (!err) err = regcomp(&re, expr, flags);
   if (err) {
     char msg[256];
     regerror(err, &re, msg, sizeof msg);
-    match_locale_leave(locale, previous);
+    leansudo_locale_leave(locale, previous);
     return failure(msg);
   }
   err = regexec(&re, lean_string_cstr(text), 0, NULL, 0);
   regfree(&re);
-  match_locale_leave(locale, previous);
+  leansudo_locale_leave(locale, previous);
   if (err != 0 && err != REG_NOMATCH) return failure("unable to match regular expression");
   return lean_io_result_mk_ok(lean_box(err == 0));
 }
@@ -217,7 +218,7 @@ LEAN_EXPORT lean_obj_res leansudo_sys_glob(b_lean_obj_arg pattern,
     b_lean_obj_arg locale_name, lean_obj_arg world) {
   (void)world;
   locale_t previous;
-  locale_t locale = match_locale_enter(lean_string_cstr(locale_name), &previous);
+  locale_t locale = leansudo_locale_enter(lean_string_cstr(locale_name), &previous);
   if (!locale) return failure("unable to initialize matching locale");
   glob_t g = {0};
   int err = glob(lean_string_cstr(pattern), GLOB_NOSORT, NULL, &g);
@@ -231,7 +232,7 @@ LEAN_EXPORT lean_obj_res leansudo_sys_glob(b_lean_obj_arg pattern,
     }
   }
   globfree(&g);
-  match_locale_leave(locale, previous);
+  leansudo_locale_leave(locale, previous);
   if (err != 0 && err != GLOB_NOMATCH) return failure("unable to expand command glob");
   return lean_io_result_mk_ok(out);
 }
@@ -240,13 +241,14 @@ LEAN_EXPORT lean_obj_res leansudo_sys_hostname(b_lean_obj_arg host, lean_obj_arg
   struct addrinfo hints = {0}, *res;
   hints.ai_flags = AI_CANONNAME;
   hints.ai_family = AF_UNSPEC;
-  lean_object *out = lean_box(0);
-  if (getaddrinfo(lean_string_cstr(host), NULL, &hints, &res) == 0) {
-    if (res->ai_canonname) {
-      out = lean_alloc_ctor(1, 1, 0);
-      lean_ctor_set(out, 0, lean_mk_string(res->ai_canonname));
-    }
+  int status = getaddrinfo(lean_string_cstr(host), NULL, &hints, &res);
+  lean_object *out = lean_alloc_ctor(status == 0 ? 1 : 0, 1, 0);
+  if (status == 0) {
+    lean_ctor_set(out, 0, lean_mk_string(res->ai_canonname ?
+        res->ai_canonname : lean_string_cstr(host)));
     freeaddrinfo(res);
+  } else {
+    lean_ctor_set(out, 0, lean_mk_string(gai_strerror(status)));
   }
   return lean_io_result_mk_ok(out);
 }

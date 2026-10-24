@@ -9,15 +9,16 @@ A pure model of sudoers' `rebuild_env` / `validate_env_vars` / `insert_env_vars`
 
 Two modes:
 * **reset** (`env_reset`, or `-i`): start empty, keep only `env_check` variables with
-  safe values and `env_keep` (and `PATH`) variables, then set `HOME`, `LOGNAME`, `USER`,
-  `MAIL`, `SHELL`, `TERM`, `PATH`.
+  safe values and `env_keep` variables (including `PATH` in the default list),
+  then supply defaults for `HOME`, `LOGNAME`, `USER`, `MAIL`, `SHELL`, `TERM`, `PATH`.
 * **copy** (`!env_reset`, or `-E` with SETENV permission): copy the user's environment
   minus `env_delete` matches and `env_check` matches with unsafe values.
 
-Bash function exports (values starting with `()`) and malformed names are always
-dropped. `PATH` is forced to `secure_path` unless the invoking user belongs to
-`exempt_group`; `SUDO_COMMAND`, `SUDO_USER`, `SUDO_UID`, and the real invoking
-`SUDO_GID` cannot be overridden. The list never has duplicate keys.
+Malformed names are dropped. User entries follow the name/value patterns and bash
+function rules of `env.c`. `secure_path` (unless exempt) and the invoking identity
+are installed during rebuilding, then authorized explicit assignments overwrite
+them. Trusted PAM entries merge last, overwriting entries not kept by policy.
+The list never has duplicate keys.
 
 Proofs are in `LeanSudo.EnvProofs`.
 -/
@@ -39,7 +40,8 @@ structure EnvInput where
   preserve : PreserveEnv
   /-- SETENV tag / `setenv` default / command matched by `ALL` -/
   setenvAllowed : Bool
-  /-- `sudo VAR=value cmd` -/
+  /-- Ordered `VAR=value` assignments and snapshots of set `--preserve-env=list`
+  variables, resolved by the CLI at their position among the arguments. -/
   cmdlineVars : EnvList
   /-- `-i` -/
   loginShell : Bool
@@ -84,23 +86,55 @@ def addDefaults (e : EnvList) : EnvList → EnvList
 
 /-! ## Variable classification -/
 
-/-- sudo's env list patterns: exact name, or a prefix when the pattern ends in `*`. -/
-def patMatchL : List Char → List Char → Bool
-  | ['*'], _ => true
-  | [], [] => true
-  | p :: ps, c :: cs => p == c && patMatchL ps cs
-  | _, _ => false
+/-- `env_pattern.c` uses the first occurrence of the character after `*`, without
+backtracking. A wildcard cannot cross the name/value separator unless its next
+literal is `=`. The result records whether a value character was matched
+explicitly (a final `*` alone does not make a full match). -/
+def envPatternL : List Char → List Char → Bool → Bool → Option Bool
+  | [], cs, inValue, full =>
+    if cs.isEmpty || (!inValue && cs.head? == some '=') then some full else none
+  | ['*'], _, _, full => some full
+  | '*' :: '*' :: ps, cs, inValue, full => envPatternL ('*' :: ps) cs inValue full
+  | '*' :: p :: ps, cs, inValue, full =>
+    let rest := cs.dropWhile fun c => c != p && (inValue || p == '=' || c != '=')
+    match rest with
+    | c :: cs =>
+      if p == c then envPatternL ps cs (inValue || p == '=') (full || inValue) else none
+    | [] => none
+  | p :: ps, c :: cs, inValue, full =>
+    if p == c then envPatternL ps cs (inValue || p == '=') (full || inValue) else none
+  | _, _, _, _ => none
 
-def patMatch (pat key : String) : Bool := patMatchL pat.toList key.toList
+def patMatchL (pat value : List Char) : Bool :=
+  (envPatternL pat value false false).isSome
 
-def matchesAny (pats : List String) (key : String) : Bool := pats.any (fun p => patMatch p key)
+def patMatch (pat value : String) : Bool := patMatchL pat.toList value.toList
+
+/-- Linux sudo treats LOGNAME and USER as the same name-only entry, even for
+value-qualified patterns: `USER=alice` matches neither identity variable. -/
+def entryPattern (pat k v : String) : Option Bool :=
+  if k == "LOGNAME" || k == "USER" then
+    (envPatternL pat.toList "LOGNAME".toList false false).orElse fun _ =>
+      envPatternL pat.toList "USER".toList false false
+  else envPatternL pat.toList (k ++ "=" ++ v).toList false false
+
+def matchesAny (pats : List String) (k v : String) : Bool :=
+  pats.any fun p => (entryPattern p k v).isSome
+
+/-- The first matching pattern supplies `full_match`, as in `matches_env_list`. -/
+def matchFull : List String → String → String → Bool
+  | [], _, _ => false
+  | p :: ps, k, v =>
+    match entryPattern p k v with
+    | some full => full
+    | none => matchFull ps k v
 
 def validName (k : String) : Bool := !k.toList.isEmpty && !k.toList.contains '='
 
-/-- Exported bash function (`NAME=() { ...; }`). -/
+/-- Function prefix rejected by `env_should_keep` unless the value is matched. -/
 def isBashFn (v : String) : Bool :=
   match v.toList with
-  | '(' :: ')' :: _ => true
+  | '(' :: ')' :: ' ' :: _ => true
   | _ => false
 
 def entryOk (k v : String) : Bool := validName k && !isBashFn v
@@ -129,15 +163,22 @@ def tzSafe (v : String) : Bool :=
 def checkSafe (k v : String) : Bool :=
   if k == "TZ" then tzSafe v else !(v.toList.contains '%' || v.toList.contains '/')
 
-/-- Kept in reset mode (sudo's `env_should_keep`; `PATH` is in sudo's built-in
-`env_keep`, and `-s` keeps `SHELL`). -/
+/-- Whitelist classification before the function-export full-match check. -/
+def keepResetPolicy (i : EnvInput) (k v : String) : Bool :=
+  if matchesAny i.settings.envCheck k v then checkSafe k v
+  else matchesAny i.settings.envKeep k v || (i.shellMode && k == "SHELL")
+
+/-- `env_should_keep`: `env_check` wins over `env_keep`; function exports require
+a pattern matching the value, not just the name. `-s` implicitly keeps SHELL. -/
 def keepReset (i : EnvInput) (k v : String) : Bool :=
-  if matchesAny i.settings.envCheck k then checkSafe k v
-  else matchesAny i.settings.envKeep k || k == "PATH" || (i.shellMode && k == "SHELL")
+  keepResetPolicy i k v &&
+    (!isBashFn v || (if matchesAny i.settings.envCheck k v then
+      matchFull i.settings.envCheck k v
+    else if i.shellMode && k == "SHELL" then false else matchFull i.settings.envKeep k v))
 
 /-- Removed in copy mode (sudo's `env_should_delete`). -/
 def deleteCopy (i : EnvInput) (k v : String) : Bool :=
-  matchesAny i.settings.envDelete k || (matchesAny i.settings.envCheck k && !checkSafe k v)
+  matchesAny i.settings.envDelete k v || (matchesAny i.settings.envCheck k v && !checkSafe k v)
 
 /-- `-E` / `--preserve-env` without a list. -/
 def wantsPreserveAll (i : EnvInput) : Bool :=
@@ -151,28 +192,22 @@ def resetMode (i : EnvInput) : Bool :=
 
 /-- A user variable survives the initial filtering. -/
 def userPass (i : EnvInput) (reset : Bool) (k v : String) : Bool :=
-  entryOk k v && (if reset then keepReset i k v else !deleteCopy i k v)
+  validName k && (if reset then keepReset i k v else !deleteCopy i k v)
 
-/-- A PAM variable is merged (only when its name is not already set). -/
-def pamPass (i : EnvInput) (k v : String) : Bool :=
-  entryOk k v && !matchesAny i.settings.envDelete k && k != "SUDO_TTY"
+/-- PAM is a trusted source, not user input: no env_delete or function filtering. -/
+def pamPass (_i : EnvInput) (k _v : String) : Bool := validName k
 
 /-- A `VAR=value` / `--preserve-env=VAR` variable may be set (sudo's
-`validate_env_vars`; with SETENV anything but a bash function is allowed). -/
+`validate_env_vars`; SETENV bypasses the environment policy checks). -/
 def extraAllowed (i : EnvInput) (reset : Bool) (k v : String) : Bool :=
-  entryOk k v &&
+  validName k &&
     (i.setenvAllowed ||
       (!((effectiveSecurePath i).isSome && k == "PATH") &&
         (if reset then keepReset i k v else !deleteCopy i k v)))
 
-/-- `--preserve-env=a,b` behaves like `a=$a b=$b` on the command line (sudo's
-`parse_env_list`); unset variables are skipped. -/
-def preserveExtra (i : EnvInput) : EnvList :=
-  match i.preserve with
-  | .vars vs => vs.filterMap fun n => (i.userEnv.find? (fun kv => kv.1 == n)).map fun kv => (n, kv.2)
-  | _ => []
-
-def extraVars (i : EnvInput) : EnvList := i.cmdlineVars ++ preserveExtra i
+/-- Both forms of explicit assignment were materialized in encounter order by
+the CLI; `preserve.vars` is metadata, not a second insertion pass. -/
+def extraVars (i : EnvInput) : EnvList := i.cmdlineVars
 
 /-! ## Construction -/
 
@@ -231,6 +266,15 @@ def sudoVars (i : EnvInput) (e : EnvList) : EnvList :=
 
 def pamVars (i : EnvInput) : EnvList := i.pamEnv.filter fun kv => pamPass i kv.1 kv.2
 
+/-- `env_merge` tests the incoming PAM value, not the existing binding. -/
+def pamOverwrite (i : EnvInput) (k v : String) : Bool :=
+  if resetMode i then !keepReset i k v else deleteCopy i k v
+
+def mergePam (i : EnvInput) (e : EnvList) : EnvList → EnvList
+  | [] => e
+  | (k, v) :: rest =>
+    mergePam i (if pamOverwrite i k v then setVar e k v else setDefault e k v) rest
+
 /-- Administrator-supplied files do not overwrite existing environment entries. -/
 def fileVars (i : EnvInput) : EnvList :=
   ((i.restrictedEnvFile.filter fun kv => userPass i (resetMode i) kv.1 kv.2) ++
@@ -240,10 +284,11 @@ def assemble (i : EnvInput) (reset : Bool) (extra : EnvList) : EnvList :=
   let e0 := baseEnv i reset
   let e1 := if reset then defaultsReset i e0 else defaultsCopy i e0
   let e2 := commonDefaults i e1
-  let e3 := setAll e2 extra
-  let e4 := applySecurePath i e3
-  let e5 := sudoVars i e4
-  addDefaults (addDefaults e5 (pamVars i)) (fileVars i)
+  let e3 := applySecurePath i e2
+  let e4 := sudoVars i e3
+  let e5 := addDefaults e4 (fileVars i)
+  let e6 := setAll e5 extra
+  mergePam i e6 (pamVars i)
 
 def preserveDeniedMsg : String := "sorry, you are not allowed to preserve the environment"
 

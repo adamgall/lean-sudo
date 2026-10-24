@@ -8,19 +8,29 @@ namespace Tests.Cli
 
 open LeanSudo LeanSudo.Cli
 
-def P (args : List String) : Except String Options := parseArgs "sudo" args
+def P (args : List String) (env : List (String × String) := []) : ParseResult :=
+  parseArgs "sudo" args env
 
-def okOf : Except String Options → Option Options
+def okOf (r : ParseResult) : Option Options := match r.result with
   | .ok o => some o
   | .error _ => none
 
-def errOf : Except String Options → Option String
+def errOf (r : ParseResult) : Option String := match r.result with
   | .ok _ => none
-  | .error e => some e
+  | .error e => some e.message
 
 /-- error message without the trailing usage text -/
-def msgOf (r : Except String Options) : Option String :=
+def msgOf (r : ParseResult) : Option String :=
   (errOf r).map fun e => (e.splitOn "\n").head!
+
+/-- The runtime emits warnings before branching on the result. -/
+def stderrOf (argv0 : String) (args : List String)
+    (env : List (String × String) := []) : String :=
+  let parsed := parseArgs argv0 args env
+  String.join (parsed.warnings.map fun warning => formatError argv0 { message := warning }) ++
+    match parsed.result with
+    | .ok _ => ""
+    | .error e => formatError argv0 e
 
 def usageS : String := usageFor "sudo"
 
@@ -55,8 +65,8 @@ def usageS : String := usageFor "sudo"
 #guard okOf (P ["--preserve-groups", "--askpass", "--bell", "--no-update", "ls"]) ==
   some { preserveGroups := true, askpass := true, bell := true, noUpdate := true, command := ["ls"] }
 #guard okOf (P ["--preserve-env", "ls"]) == some { preserveEnv := .all, command := ["ls"] }
-#guard okOf (P ["--preserve-env=A,B", "--preserve-env=C", "ls"]) ==
-  some { preserveEnv := .vars ["A", "B", "C"], command := ["ls"] }
+#guard okOf (P ["--preserve-env=A,B", "--preserve-env=C", "ls"] [("A", "a"), ("B", "b"), ("C", "c")]) ==
+  some { preserveEnv := .vars ["A", "B", "C"], envVars := [("A", "a"), ("B", "b"), ("C", "c")], command := ["ls"] }
 #guard okOf (P ["-E", "--preserve-env=A", "ls"]) == some { preserveEnv := .all, command := ["ls"] }
 #guard okOf (P ["--preserve-env=", "ls"]) == some { command := ["ls"] }
 #guard msgOf (P ["--preserve-env=A=b", "ls"]) == some "invalid environment variable name: A=b"
@@ -118,7 +128,7 @@ def usageS : String := usageFor "sudo"
 #guard errOf (P ["-e"]) == some usageS
 #guard okOf (P ["-e", "/etc/hosts"]) == some { mode := .edit, command := ["/etc/hosts"] }
 #guard errOf (P ["-e", "-E", "f"]) == some usageS
-#guard msgOf (P ["-e", "--preserve-env=A", "f"]) == some "you may not specify environment variables in edit mode"
+#guard msgOf (P ["-e", "--preserve-env=A", "f"] [("A", "a")]) == some "you may not specify environment variables in edit mode"
 #guard msgOf (P ["-e", "A=b", "f"]) == some "you may not specify environment variables in edit mode"
 #guard errOf (P ["-e", "-i", "f"]) == some usageS
 #guard errOf (P ["-e", "-s", "f"]) == some usageS
@@ -132,7 +142,13 @@ def usageS : String := usageFor "sudo"
 #guard okOf (P ["-r", "role", "ls"]) == some { role := some "role", command := ["ls"] }
 #guard okOf (P ["-t", "type", "ls"]) == some { type := some "type", command := ["ls"] }
 #guard okOf (P ["-R", "/", "ls"]) == some { chroot := some "/", command := ["ls"] }
-#guard okOf (P ["-T", "5", "ls"]) == some { timeout := some 5, command := ["ls"] }
+#guard okOf (P ["-T", "5", "ls"]) == some { timeout := some 5, timeoutText := some "5", command := ["ls"] }
+#guard okOf (P ["-T", "nonsense", "ls"]) ==
+  some { timeoutText := some "nonsense", command := ["ls"] }
+#guard (okOf (P ["-T", "", "ls"])).bind timeoutError == some ": invalid timeout value"
+#guard (okOf (P ["-T", "nonsense", "ls"])).bind timeoutError ==
+  some "nonsense: invalid timeout value"
+#guard errOf (P ["-T", "nonsense", "-T", "5", "ls"]) == some usageS
 #guard okOf (P ["--chroot=/", "ls"]) == some { chroot := some "/", command := ["ls"] }
 #guard msgOf (P ["-C", "2", "ls"]) == some "the argument to -C must be a number greater than or equal to 3"
 #guard msgOf (P ["-C", "x", "ls"]) == some "the argument to -C must be a number greater than or equal to 3"
@@ -158,14 +174,79 @@ def usageS : String := usageFor "sudo"
 #guard basename "sudo" == "sudo"
 
 /-! ### Messages -/
-#guard formatError "sudo" "you may not specify both the -i and -s options\nusage: x\n" ==
+#guard formatError "sudo" { message := "you may not specify both the -i and -s options\nusage: x\n" } ==
   "sudo: you may not specify both the -i and -s options\nusage: x\n"
-#guard formatError "sudo" usageS == usageS
-#guard formatError "sudo" "the -h (--host) option is not supported" ==
+#guard formatError "sudo" { message := usageS } == usageS
+#guard formatError "sudo" { message := "the -h (--host) option is not supported" } ==
   "sudo: the -h (--host) option is not supported\n"
 #guard usageText == "usage: sudo -h | -K | -k | -V\nusage: sudo -v [-ABkNnS] [-g group] [-h host] [-p prompt] [-u user]\nusage: sudo -l [-ABkNnS] [-g group] [-h host] [-p prompt] [-U user]\n            [-u user] [command [arg ...]]\nusage: sudo [-ABbEHkNnPS] [-r role] [-t type] [-C num] [-D directory]\n            [-g group] [-h host] [-p prompt] [-R directory] [-T timeout]\n            [-u user] [VAR=value] [-i | -s] [command [arg ...]]\nusage: sudo -e [-ABkNnS] [-r role] [-t type] [-C num] [-D directory]\n            [-g group] [-h host] [-p prompt] [-R directory] [-T timeout]\n            [-u user] file ...\n"
 #guard helpText == "sudo - execute a command as another user\n\nusage: sudo -h | -K | -k | -V\nusage: sudo -v [-ABkNnS] [-g group] [-h host] [-p prompt] [-u user]\nusage: sudo -l [-ABkNnS] [-g group] [-h host] [-p prompt] [-U user]\n            [-u user] [command [arg ...]]\nusage: sudo [-ABbEHkNnPS] [-r role] [-t type] [-C num] [-D directory]\n            [-g group] [-h host] [-p prompt] [-R directory] [-T timeout]\n            [-u user] [VAR=value] [-i | -s] [command [arg ...]]\nusage: sudo -e [-ABkNnS] [-r role] [-t type] [-C num] [-D directory]\n            [-g group] [-h host] [-p prompt] [-R directory] [-T timeout]\n            [-u user] file ...\n\nOptions:\n  -A, --askpass                 use a helper program for password prompting\n  -b, --background              run command in the background\n  -B, --bell                    ring bell when prompting\n  -C, --close-from=num          close all file descriptors >= num\n  -D, --chdir=directory         change the working directory before running\n                                command\n  -E, --preserve-env            preserve user environment when running command\n      --preserve-env=list       preserve specific environment variables\n  -e, --edit                    edit files instead of running a command\n  -g, --group=group             run command as the specified group name or ID\n  -H, --set-home                set HOME variable to target user's home dir\n  -h, --help                    display help message and exit\n  -h, --host=host               run command on host (if supported by plugin)\n  -i, --login                   run login shell as the target user; a command\n                                may also be specified\n  -K, --remove-timestamp        remove timestamp file completely\n  -k, --reset-timestamp         invalidate timestamp file\n  -l, --list                    list user's privileges or check a specific\n                                command; use twice for longer format\n  -n, --non-interactive         non-interactive mode, no prompts are used\n  -P, --preserve-groups         preserve group vector instead of setting to\n                                target's\n  -p, --prompt=prompt           use the specified password prompt\n  -R, --chroot=directory        change the root directory before running command\n  -r, --role=role               create SELinux security context with specified\n                                role\n  -S, --stdin                   read password from standard input\n  -s, --shell                   run shell as the target user; a command may\n                                also be specified\n  -t, --type=type               create SELinux security context with specified\n                                type\n  -T, --command-timeout=timeout terminate command after the specified time limit\n  -U, --other-user=user         in list mode, display privileges for user\n  -u, --user=user               run command (or edit file) as specified user\n                                name or ID\n  -V, --version                 display version information and exit\n  -v, --validate                update user's timestamp without running a\n                                command\n  --                            stop processing command line arguments\n"
 #guard helpFor "sudoedit" == "sudoedit - edit files as another user\n\nusage: sudoedit -h | -V\nusage: sudoedit [-ABkNnS] [-r role] [-t type] [-C num] [-D directory]\n                [-g group] [-h host] [-p prompt] [-R directory] [-T timeout]\n                [-u user] file ...\n\nOptions:\n  -A, --askpass                 use a helper program for password prompting\n  -B, --bell                    ring bell when prompting\n  -C, --close-from=num          close all file descriptors >= num\n  -D, --chdir=directory         change the working directory before running\n                                command\n  -g, --group=group             run command as the specified group name or ID\n  -h, --help                    display help message and exit\n  -h, --host=host               run command on host (if supported by plugin)\n  -k, --reset-timestamp         invalidate timestamp file\n  -n, --non-interactive         non-interactive mode, no prompts are used\n  -p, --prompt=prompt           use the specified password prompt\n  -R, --chroot=directory        change the root directory before running command\n  -r, --role=role               create SELinux security context with specified\n                                role\n  -S, --stdin                   read password from standard input\n  -t, --type=type               create SELinux security context with specified\n                                type\n  -T, --command-timeout=timeout terminate command after the specified time limit\n  -u, --user=user               run command (or edit file) as specified user\n                                name or ID\n  -V, --version                 display version information and exit\n  --                            stop processing command line arguments\n"
+
+/-! ### Parse-time diagnostics (sudo 1.9.17p2 `parse_args.c`) -/
+#guard stderrOf "/usr/bin/sudo" ["-z"] ==
+  "/usr/bin/sudo: invalid option -- 'z'\n" ++ usageS
+#guard stderrOf "/usr/bin/sudo" ["-u"] ==
+  "/usr/bin/sudo: option requires an argument -- 'u'\n" ++ usageS
+#guard stderrOf "/usr/bin/sudo" ["--unknown"] ==
+  "/usr/bin/sudo: unrecognized option '--unknown'\n" ++ usageS
+#guard stderrOf "/usr/bin/sudo" ["--user"] ==
+  "/usr/bin/sudo: option '--user' requires an argument\n" ++ usageS
+#guard stderrOf "/usr/bin/sudo" ["--login=yes"] ==
+  "/usr/bin/sudo: option '--login' doesn't allow an argument\n" ++ usageS
+#guard stderrOf "/usr/bin/sudo" ["--pre"] ==
+  "/usr/bin/sudo: option '--pre' is ambiguous; possibilities: '--preserve-env' '--preserve-groups'\n" ++ usageS
+#guard stderrOf "/usr/bin/sudo" ["-i", "-s"] ==
+  "sudo: you may not specify both the -i and -s options\n" ++ usageS
+#guard stderrOf "/usr/bin/sudoedit" ["-i", "f"] ==
+  "/usr/bin/sudoedit: invalid option -- 'i'\n" ++ usageFor "sudoedit"
+#guard stderrOf "/tmp/other-name" ["-i", "-s"] ==
+  "sudo: you may not specify both the -i and -s options\n" ++ usageS
+#guard stderrOf "/usr/bin/sudo" ["-R", "/", "-V"] == "sudo: " ++ chrootWarning ++ "\n"
+#guard okOf (P ["-R", "/", "-V"]) == some { mode := .version, chroot := some "/" }
+#guard stderrOf "/usr/bin/sudo" ["-R", "/", "-z"] ==
+  "sudo: " ++ chrootWarning ++ "\n/usr/bin/sudo: invalid option -- 'z'\n" ++ usageS
+#guard stderrOf "/usr/bin/sudo" ["-R", "/", "-i", "-s"] ==
+  "sudo: " ++ chrootWarning ++ "\nsudo: you may not specify both the -i and -s options\n" ++ usageS
+#guard stderrOf "/usr/bin/sudo" ["-R", "/", "-R", "/"] ==
+  "sudo: " ++ chrootWarning ++ "\n" ++ usageS
+#guard stderrOf "/usr/bin/sudo" ["-R", ""] == usageS
+#guard (P ["-z", "-R", "/"]).warnings == []
+#guard (P ["id", "-R", "/"]).warnings == []
+#guard (P ["--", "-R", "/"]).warnings == []
+#guard (P ["-nR/", "-Az"]).warnings == [chrootWarning]
+#guard (P ["--chroot=/", "--version"]).warnings == [chrootWarning]
+#guard (P ["-R"]).warnings == []
+
+/-! ### Only set preserve-list names enter the edit-mode environment -/
+#guard okOf (P ["-e", "--preserve-env=UNSET", "f"]) ==
+  some { mode := .edit, command := ["f"] }
+#guard okOf (P ["--preserve-env=UNSET", "-e", "f"]) ==
+  some { mode := .edit, command := ["f"] }
+#guard okOf (P ["--preserve-env=UNSET,SET,,UNSET", "id"] [("SET", "")]) ==
+  some { preserveEnv := .vars ["SET"], envVars := [("SET", "")], command := ["id"] }
+#guard msgOf (P ["-e", "--preserve-env=SET", "f"] [("SET", "")]) ==
+  some "you may not specify environment variables in edit mode"
+#guard msgOf (P ["--preserve-env=UNSET,SET", "-e", "f"] [("SET", "value")]) ==
+  some "you may not specify environment variables in edit mode"
+#guard msgOf (P ["-e", "--preserve-env=UNSET=bad", "f"]) ==
+  some "invalid environment variable name: UNSET=bad"
+#guard msgOf (P ["-e", "UNSET=value", "--preserve-env=UNSET", "f"]) ==
+  some "you may not specify environment variables in edit mode"
+
+/-! Named-preservation snapshots share `env_add` with assignments, not a second
+post-parse list. Later entries win regardless of which syntax produced them. -/
+#guard (okOf (P ["--preserve-env=PATH", "PATH=/explicit", "id"] [("PATH", "/caller")])).map
+    (·.envVars) == some [("PATH", "/caller"), ("PATH", "/explicit")]
+#guard (okOf (P ["PATH=/explicit", "--preserve-env=PATH", "id"] [("PATH", "/caller")])).map
+    (·.envVars) == some [("PATH", "/explicit"), ("PATH", "/caller")]
+#guard (okOf (P ["--preserve-env=PATH", "PATH=/explicit", "--preserve-env=PATH", "id"]
+    [("PATH", "/caller")])).map (·.envVars) ==
+  some [("PATH", "/caller"), ("PATH", "/explicit"), ("PATH", "/caller")]
+#guard okOf (P ["-E", "--preserve-env=PATH", "id"] [("PATH", "/caller")]) ==
+  some { preserveEnv := .all, envVars := [("PATH", "/caller")], command := ["id"] }
+#guard (okOf (P ["PATH=/explicit", "--preserve-env=UNSET", "id"])).map (·.envVars) ==
+  some [("PATH", "/explicit")]
 
 /-! ### Shell mode -/
 #guard shellCommand "/bin/bash" false [] == { path := "/bin/bash", argv := ["/bin/bash"] }
@@ -185,7 +266,7 @@ def usageS : String := usageFor "sudo"
 example : WellEscaped (shellEscape ["rm", "-rf", "/; reboot"]).toList := shellEscape_wellEscaped _
 
 /-! ### Theorems instantiated -/
-example (o : Options) (h : parseArgs "sudo" ["--", "-i", "x"] = .ok o) : o.command = ["-i", "x"] :=
+example (o : Options) (h : (parseArgs "sudo" ["--", "-i", "x"]).result = .ok o) : o.command = ["-i", "x"] :=
   parseArgs_dashdash h
 
 /-! ### Prompt -/

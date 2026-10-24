@@ -6,18 +6,25 @@ package «lean-sudo» where
   moreLinkArgs := #["-ldl", "-lutil"]
 
 /-- C shim translation units (each owned by one Lean `LeanSudo.Sys.*` module). -/
-def shimSources : Array String := #["core", "exec", "ts", "visudo", "edit", "sys", "iolog"]
+def shimSources : Array String := #["core", "exec", "ts", "visudo", "edit", "sys", "iolog", "lookup"]
 
 def shimCFlags : Array String :=
   #["-fPIC", "-O2", "-Wall", "-Wextra", "-Werror", "-D_GNU_SOURCE",
     "-fstack-protector-strong", "-D_FORTIFY_SOURCE=2"]
+
+/-- Headers shared by shim translation units; every object is rebuilt when one changes. -/
+def shimHeaders : Array String := #["locale_scope.h"]
 
 extern_lib leansudoshim pkg := do
   let leanInc := (← getLeanIncludeDir).toString
   let objs ← shimSources.mapM fun src => do
     let oFile := pkg.buildDir / "c" / s!"{src}.o"
     let srcJob ← inputTextFile <| pkg.dir / "c" / s!"{src}.c"
-    buildO oFile srcJob #["-I", leanInc] shimCFlags "cc" getLeanTrace
+    let depTrace : JobM BuildTrace := do
+      let hs ← shimHeaders.mapM fun (h : String) =>
+        BuildTrace.compute (TextFilePath.mk (pkg.dir / "c" / h))
+      return hs.foldl BuildTrace.mix (← getLeanTrace)
+    buildO oFile srcJob #["-I", leanInc] shimCFlags "cc" depTrace
   buildStaticLib (pkg.staticLibDir / nameToStaticLib "leansudoshim") objs
 
 @[default_target]

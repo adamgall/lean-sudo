@@ -395,7 +395,8 @@ def installFile (o : Options) (f : EditFile) (mainFile : Bool) : IO Unit := do
   else
     removeQuietly f.tmp
     if mainFile && f.created then removeQuietly f.path
-    else if useOwner || usePerms then setOwnerMode f.path uid gid mode
+    else if useOwner || usePerms then
+      correctLockedMetadata f.path uid.toUInt32 gid.toUInt32 mode.toUInt32 useOwner usePerms
 
 partial def checkEdits (o : Options) (host : String) (session : IO.Ref (Array EditFile))
     (known : IO.Ref (Array String)) (editor : String × String × List String)
@@ -474,13 +475,25 @@ def editMode (o : Options) (path : String) : IO UInt32 := do
         let f ← editFile f false editor
         files.modify fun fs => fs.set! (fs.size - 1) f
     let known ← IO.mkRef current.files
+    let mut exitCode : UInt32 := 0
+    let mut retained : Array String := #[]
     match ← checkEdits o host files known editor mode with
     | none => pure ()
     | some checked =>
       files.set checked
-      for i in [:checked.size] do installFile o checked[i]! (i == 0)
-    for f in ← files.get do removeQuietly f.tmp
-    return 0
+      for i in [:checked.size] do
+        let f := checked[i]!
+        try
+          installFile o f (i == 0)
+        catch e =>
+          exitCode := 1
+          eprint s!"visudo: {e}"
+          if (← stat f.tmp).isSome then
+            eprint s!"visudo: contents of edit session left in {f.tmp}"
+            retained := retained.push f.tmp
+    for f in ← files.get do
+      unless retained.contains f.tmp do removeQuietly f.tmp
+    return exitCode
   catch e =>
     eprint s!"visudo: {e}"
     for f in ← files.get do removeQuietly f.tmp

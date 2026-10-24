@@ -11,6 +11,7 @@
  *    object whose data is a plain C struct (it owns C copies of the config strings).
  */
 #include <lean/lean.h>
+#include "locale_scope.h"
 
 #include <dirent.h>
 #include <dlfcn.h>
@@ -723,25 +724,38 @@ LEAN_EXPORT lean_obj_res lean_sudo_admin_flag(b_lean_obj_arg path,
     return io_ok(lean_box(0));
 }
 
-LEAN_EXPORT lean_obj_res lean_sudo_log_time(uint8_t year) {
+LEAN_EXPORT lean_obj_res lean_sudo_log_time(uint8_t year, b_lean_obj_arg locale_name) {
+    const char *name = cstr_arg(locale_name);
+    if (!name) return io_err(NUL_ARG_ERROR);
+    locale_t previous;
+    locale_t locale = leansudo_locale_enter(name, &previous);
+    if (!locale) return io_err("unable to initialize logging locale");
     time_t now = time(NULL);
     struct tm tm;
     char buf[64];
-    if (!localtime_r(&now, &tm) ||
-        !strftime(buf, sizeof(buf), year ? "%b %e %H:%M:%S %Y" : "%b %e %H:%M:%S", &tm))
-        return io_err("unable to format log timestamp");
+    bool ok = localtime_r(&now, &tm) &&
+        strftime(buf, sizeof(buf), year ? "%b %e %H:%M:%S %Y" : "%b %e %H:%M:%S", &tm);
+    leansudo_locale_leave(locale, previous);
+    if (!ok) return io_err("unable to format log timestamp");
     return io_ok(lean_mk_string(buf));
 }
 
-LEAN_EXPORT lean_obj_res lean_sudo_event_time(uint8_t year) {
+LEAN_EXPORT lean_obj_res lean_sudo_event_time(uint8_t year, b_lean_obj_arg locale_name) {
     struct timespec ts;
     struct tm tm;
     char iso[64] = "", local[64] = "";
     if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return io_errno(errno);
-    if (gmtime_r(&ts.tv_sec, &tm))
-        strftime(iso, sizeof(iso), "%Y%m%d%H%M%SZ", &tm);
-    if (localtime_r(&ts.tv_sec, &tm))
+    const char *name = cstr_arg(locale_name);
+    if (!name) return io_err(NUL_ARG_ERROR);
+    locale_t previous;
+    locale_t locale = leansudo_locale_enter(name, &previous);
+    if (!locale) return io_err("unable to initialize logging locale");
+    bool ok = gmtime_r(&ts.tv_sec, &tm) &&
+        strftime(iso, sizeof(iso), "%Y%m%d%H%M%SZ", &tm) &&
+        localtime_r(&ts.tv_sec, &tm) &&
         strftime(local, sizeof(local), year ? "%b %e %H:%M:%S %Y" : "%b %e %H:%M:%S", &tm);
+    leansudo_locale_leave(locale, previous);
+    if (!ok) return io_err("unable to format event timestamp");
     lean_object *v = lean_alloc_ctor(0, 4, 0);
     lean_ctor_set(v, 0, mk_nat((uint64_t)ts.tv_sec));
     lean_ctor_set(v, 1, mk_nat((uint64_t)ts.tv_nsec));

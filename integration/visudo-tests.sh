@@ -17,6 +17,9 @@ WORK=$(mktemp -d /tmp/visudo-it.XXXXXX)
 chmod 0755 "$WORK"
 REFERENCE=/usr/sbin/visudo.ws
 CMD_TIMEOUT=40
+IS_REF=0
+[[ $VISUDO == "$REFERENCE" ]] && IS_REF=1
+SUDO=${VISUDO_SUDO_BINARY:-/usr/bin/sudo.ws}
 
 [[ -f $VISUDO ]] || { echo "Bail out! $VISUDO does not exist"; exit 2; }
 chmod 0755 "$VISUDO"
@@ -685,7 +688,14 @@ for flag in '' -s -q -sq; do
         unused) printf 'Cmnd_Alias C = /bin/ls\nroot ALL = ALL\n' >"$WORK/scratch/s";;
       esac
       vrun -cf "$WORK/scratch/s" ${flag:+"$flag"}
-      compare_reference -cf "$WORK/scratch/s" ${flag:+"$flag"}
+      # Documented lockout-prevention deviation: lean-sudo enforces the runtime's
+      # alias validation even without -s. Its diagnostic matches reference -s.
+      if [[ $IS_REF == 0 && $kind != unused ]]; then
+        expect_rc 1
+        compare_reference -csf "$WORK/scratch/s" ${flag:+"$flag"}
+      else
+        compare_reference -cf "$WORK/scratch/s" ${flag:+"$flag"}
+      fi
       end
     }
   done
@@ -849,7 +859,21 @@ for kind in unknown-default invalid-default duplicate unused-undefined unused-cy
       esac
       printf '%b' "$text" >"$WORK/scratch/s"
       vrun -cf "$WORK/scratch/s" ${flag:+"$flag"}
-      compare_reference -cf "$WORK/scratch/s" ${flag:+"$flag"}
+      # Upstream ignores invalid unreferenced aliases; lean-sudo's runtime
+      # validates them, so its visudo must refuse them in every mode.
+      if [[ $IS_REF == 0 && $kind == unused-* ]]; then
+        expect_rc 1
+        expect_out_empty
+        if [[ $flag == -q ]]; then
+          expect_err_empty
+        elif [[ $kind == unused-undefined ]]; then
+          expect_err_has 'User_Alias "MISSING" referenced but not defined'
+        else
+          expect_err_has 'cycle in User_Alias'
+        fi
+      else
+        compare_reference -cf "$WORK/scratch/s" ${flag:+"$flag"}
+      fi
       end
     }
   done
@@ -971,6 +995,81 @@ begin edit-dash-is-literal-filename && {
   expect_last_line "$WORK/scratch/-" 'root ALL=ALL'
   expect_stat "$WORK/scratch/-" '640 root root'
   expect_no_tmp "$WORK/scratch/-.tmp"
+  end
+}
+
+begin edit-refused-undefined-alias-keeps-sudo-working && {
+  # Reference needs -s to refuse this policy; lean-sudo must always refuse it
+  # because its runtime rejects undefined aliases before evaluating any command.
+  chown root:root "$SUDO"
+  chmod 4755 "$SUDO"
+  "$SUDO" -n /usr/bin/true || fail "sudo failed before editing"
+  XENV=(EDITOR="$ED/append" LINE='bob UNDEFINED_HOST = /usr/bin/id')
+  answer $'x\n'
+  if [[ $IS_REF == 1 ]]; then vrun -s; else vrun; fi
+  expect_rc 0
+  expect_out_has 'What now?'
+  expect_err_has 'Host_Alias "UNDEFINED_HOST" referenced but not defined'
+  expect_unchanged
+  expect_no_tmp
+  "$SUDO" -n /usr/bin/true || fail "sudo failed after rejected edit"
+  end
+}
+
+begin edit-unchanged-symlink-include-keeps-later-edits && {
+  printf 'root ALL=ALL\n' >"$WORK/scratch/target"
+  chown bob:bob "$WORK/scratch/target"
+  chmod 0600 "$WORK/scratch/target"
+  ln -s "$WORK/scratch/target" "$WORK/scratch/a"
+  printf 'root ALL=ALL\n' >"$WORK/scratch/b"
+  chmod 0440 "$WORK/scratch/b"
+  printf '@include %s\n@include %s\n' "$WORK/scratch/a" "$WORK/scratch/b" >>/etc/sudoers
+  cat >"$ED/symlink-session" <<'EOF'
+#!/bin/sh
+for a; do f=$a; done
+case "$f" in
+  */a.tmp) ;;
+  *) printf '# edited\n' >>"$f";;
+esac
+EOF
+  chmod 0755 "$ED/symlink-session"
+  XENV=(EDITOR="$ED/symlink-session")
+  vrun
+  expect_rc 0
+  expect_last_line /etc/sudoers '# edited'
+  expect_last_line "$WORK/scratch/b" '# edited'
+  [[ -L $WORK/scratch/a ]] || fail "unchanged include symlink replaced"
+  expect_stat "$WORK/scratch/target" '440 root root'
+  expect_no_tmp
+  expect_no_tmp "$WORK/scratch/a.tmp"
+  expect_no_tmp "$WORK/scratch/b.tmp"
+  "$VISUDO" -c >/dev/null 2>&1 || fail "installed policy does not validate"
+  end
+}
+
+begin edit-install-error-continues-with-later-files && {
+  printf 'root ALL=ALL\n' >"$WORK/scratch/a"
+  printf 'root ALL=ALL\n' >"$WORK/scratch/b"
+  chmod 0440 "$WORK/scratch/a" "$WORK/scratch/b"
+  printf '@include %s\n@include %s\n' "$WORK/scratch/a" "$WORK/scratch/b" >>/etc/sudoers
+  cat >"$ED/install-error" <<'EOF'
+#!/bin/sh
+for a; do f=$a; done
+printf '# edited\n' >>"$f"
+case "$f" in
+  */b.tmp) rm "$FAIL_TARGET"; mkdir "$FAIL_TARGET";;
+esac
+EOF
+  chmod 0755 "$ED/install-error"
+  XENV=(EDITOR="$ED/install-error" FAIL_TARGET="$WORK/scratch/a")
+  vrun
+  expect_rc 1
+  expect_last_line /etc/sudoers '# edited'
+  expect_last_line "$WORK/scratch/b" '# edited'
+  expect_last_line "$WORK/scratch/a.tmp" '# edited'
+  expect_err_has "contents of edit session left in $WORK/scratch/a.tmp"
+  expect_no_tmp
+  expect_no_tmp "$WORK/scratch/b.tmp"
   end
 }
 

@@ -185,11 +185,11 @@ def createAdminFlag (path : String) (uid gid : Nat) (groups : List Nat) : IO Uni
   let some g := toId? gid | throw (IO.userError "invalid admin flag gid")
   adminFlagRaw path u g groups.toArray
 
-@[extern "lean_sudo_log_time"] opaque logTime (year : Bool) : IO String
+@[extern "lean_sudo_log_time"] opaque logTime (year : Bool) (locale : @& String) : IO String
 @[extern "lean_sudo_append_log"] opaque appendLog (path text : @& String) : IO Unit
 /-- Locked seek-and-append for sudo's pretty JSON object, not JSON lines. -/
 @[extern "lean_sudo_append_json"] opaque appendJson (path member : @& String) : IO Unit
-@[extern "lean_sudo_event_time"] opaque eventTime (year : Bool) : IO EventLog.Time
+@[extern "lean_sudo_event_time"] opaque eventTime (year : Bool) (locale : @& String) : IO EventLog.Time
 @[extern "lean_sudo_event_uuid"] opaque eventUuid : IO String
 @[extern "lean_sudo_terminal_size"] opaque terminalSize : IO (Nat × Nat)
 @[extern "lean_sudo_signal_name"] opaque signalName (signal : UInt32) : IO String

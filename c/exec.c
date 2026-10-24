@@ -1,4 +1,20 @@
 /*
+ * Job-control and tty-size handling follows sudo's suspend_parent.c and
+ * ttysize.c. Copyright (c) 2009-2023 Todd C. Miller <Todd.Miller@sudo.ws>.
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+/*
  * c/exec.c — command execution for lean-sudo (owned by LeanSudo/Sys/Exec.lean).
  *
  * Responsibilities: fork, privilege drop (with verification), execve, signal relay,
@@ -321,12 +337,6 @@ static int sigstate_install(struct sigstate *s, int pty) {
   sa.sa_flags = SA_SIGINFO | SA_RESTART;
   sigfillset(&sa.sa_mask);
   for (size_t i = 0; i < N_RELAY_SIGS; i++) {
-    /* In non-pty mode the command shares our terminal, so SIGWINCH reaches it
-     * directly; we only need it to resize the pty. */
-    if (!pty && k_relay_sigs[i] == SIGWINCH) {
-      sigaction(SIGWINCH, NULL, &s->old[i]);
-      continue;
-    }
     sigaction(k_relay_sigs[i], &sa, &s->old[i]);
   }
   struct sigaction ign;
@@ -383,7 +393,7 @@ static int user_sent(const struct sigrec *r) { return r->code <= 0 && r->pid > 0
 static int is_forwarded(int signo) {
   switch (signo) {
   case SIGINT: case SIGQUIT: case SIGTSTP: case SIGTERM: case SIGHUP:
-  case SIGALRM: case SIGUSR1: case SIGUSR2: case SIGPIPE:
+  case SIGALRM: case SIGUSR1: case SIGUSR2: case SIGPIPE: case SIGWINCH:
     return 1;
   default:
     return 0;
@@ -406,7 +416,8 @@ static int should_forward(const struct sigrec *r, pid_t cmd_pid, int pty) {
     if (pty && r->sid != -1 && r->sid == cmd_pid)
       return 0;
   }
-  if (r->signo == SIGINT || r->signo == SIGQUIT || r->signo == SIGTSTP) {
+  if (r->signo == SIGINT || r->signo == SIGQUIT || r->signo == SIGTSTP ||
+      (!pty && r->signo == SIGWINCH)) {
     if (!from_user)
       return 0;
     if (r->pgrp != -1 && r->pgrp == getpgrp())
@@ -819,46 +830,72 @@ static void stop_self(int sig, int whole_pgrp) {
   if (whole_pgrp)
     killpg(getpgrp(), sig);
   else
-    kill(getpid(), sig);
+    /* Lean may execute us on a worker thread. A process-directed kill can
+     * reach another thread after we restore the handler; raise targets this
+     * thread, so the stop has happened before the disposition is restored. */
+    raise(sig);
   if (changed)
     sigaction(sig, &old, NULL);
 }
 
-/* tcsetpgrp from a possibly-background process without being stopped by SIGTTOU. */
-static void tcsetpgrp_nostop(int fd, pid_t pgrp) {
-  sigset_t set, old;
-  sigemptyset(&set);
-  sigaddset(&set, SIGTTOU);
-  sigprocmask(SIG_BLOCK, &set, &old);
-  (void)tcsetpgrp(fd, pgrp);
-  sigprocmask(SIG_SETMASK, &old, NULL);
+/* Like sudo's tcsetpgrp_nobg: do not steal the tty if sudo lost the foreground
+ * between tcgetpgrp and tcsetpgrp. Catch SIGTTOU instead of blocking it. */
+static volatile sig_atomic_t got_sigttou;
+static void record_sigttou(int sig) {
+  (void)sig;
+  got_sigttou = 1;
+}
+
+static int tcsetpgrp_nobg(int fd, pid_t pgrp) {
+  struct sigaction sa, old;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_handler = record_sigttou;
+  sigemptyset(&sa.sa_mask);
+  got_sigttou = 0;
+  if (sigaction(SIGTTOU, &sa, &old) != 0) return -1;
+  int ret;
+  do {
+    ret = tcsetpgrp(fd, pgrp);
+  } while (ret != 0 && errno == EINTR && !got_sigttou);
+  int saved_errno = errno;
+  sigaction(SIGTTOU, &old, NULL);
+  errno = saved_errno;
+  return ret;
 }
 
 /* ------------------------------------------------------------------------- */
 /* Non-pty mode (cf. sudo exec_nopty.c).                                      */
 /* ------------------------------------------------------------------------- */
 
-/* Child stopped (e.g. ^Z reached its and our pgrp, or it got SIGSTOP/SIGTTIN):
- * stop ourselves with the same signal, then resume the command. */
+/* sudo_suspend_parent(): a separate command pgrp stopped on terminal I/O
+ * should get the foreground if sudo owns it; otherwise suspend sudo itself. */
 static void nopty_child_stopped(pid_t child, int sig) {
-  /* If the command put itself into the terminal's foreground (a job-control shell),
-   * remember that so it can be restored on resume; most shells reset it themselves. */
   int ttyfd = open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
-  pid_t saved = -1;
-  if (ttyfd >= 0) {
-    saved = tcgetpgrp(ttyfd);
-    if (saved == getpgrp())
-      saved = -1;
+  pid_t saved = ttyfd >= 0 ? tcgetpgrp(ttyfd) : -1;
+  if (ttyfd >= 0 && saved == -1) {
+    close(ttyfd);
+    ttyfd = -1;
   }
-  if (ls_iolog_suspend(sig)) { kill(child, SIGKILL); return; }
+  if ((sig == SIGTTIN || sig == SIGTTOU) && saved == getpgrp()) {
+    pid_t command_pgrp = getpgid(child);
+    if (command_pgrp > 0 && command_pgrp != getpgrp() &&
+        tcsetpgrp_nobg(ttyfd, command_pgrp) == 0) {
+      killpg(command_pgrp, SIGCONT);
+      close(ttyfd);
+      return;
+    }
+  }
+  if (ls_iolog_suspend(sig)) {
+    if (ttyfd >= 0) close(ttyfd);
+    kill(child, SIGKILL);
+    return;
+  }
   stop_self(sig, 0);
-  if (ls_iolog_suspend(SIGCONT)) { kill(child, SIGKILL); return; }
+  if (ls_iolog_suspend(SIGCONT)) kill(child, SIGKILL);
   if (ttyfd >= 0) {
-    if (saved != -1)
-      tcsetpgrp_nostop(ttyfd, saved);
+    if (saved != getpgrp()) (void)tcsetpgrp_nobg(ttyfd, saved);
     close(ttyfd);
   }
-  kill(child, SIGCONT);
 }
 
 /* Returns 1 with *status when the child terminated, 0 to keep waiting, -1 on error. */
@@ -959,6 +996,7 @@ struct pty_ctx {
   int fg;      /* we are in the user's terminal foreground pgrp */
   int raw;     /* user terminal is currently in raw mode (by us) */
   struct termios orig;
+  int rows, cols; /* sudo_get_ttysize fallback until the first resize event */
 };
 
 static int bc_send(int sock, int type, int val) {
@@ -994,6 +1032,21 @@ static void close_pty_ctx(struct pty_ctx *p) {
   p->ttyfd = p->master = p->slave = -1;
 }
 
+static int tty_dimension(const char *name, int fallback) {
+  const unsigned char *s = (const unsigned char *)getenv(name);
+  if (s == NULL) return fallback;
+  while (*s == ' ' || (*s >= '\t' && *s <= '\r')) s++;
+  if (*s == '+') s++;
+  if (*s < '0' || *s > '9') return fallback;
+  unsigned n = 0;
+  while (*s >= '0' && *s <= '9') {
+    unsigned digit = *s++ - '0';
+    if (n > ((unsigned)INT32_MAX - digit) / 10) return fallback;
+    n = n * 10 + digit;
+  }
+  return *s == '\0' && n != 0 ? (int)n : fallback;
+}
+
 /* Allocate the pty and mirror the user's terminal settings onto it. On failure
  * returns -1 with errno set and nothing left open. */
 static int pty_setup(struct pty_ctx *p) {
@@ -1013,6 +1066,8 @@ static int pty_setup(struct pty_ctx *p) {
   struct winsize ws;
   memset(&ws, 0, sizeof ws);
   (void)ioctl(p->ttyfd, TIOCGWINSZ, &ws);
+  p->rows = ws.ws_row && ws.ws_col ? ws.ws_row : tty_dimension("LINES", 24);
+  p->cols = ws.ws_row && ws.ws_col ? ws.ws_col : tty_dimension("COLUMNS", 80);
   struct termios t = p->orig;
   if (openpty(&p->master, &p->slave, NULL, &t, &ws) != 0)
     goto fail;
@@ -1377,9 +1432,15 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
         break; /* the monitor reports through the backchannel */
       case SIGWINCH: {
         struct winsize ws;
-        if (ioctl(p->ttyfd, TIOCGWINSZ, &ws) == 0) {
+        if (ioctl(p->ttyfd, TIOCGWINSZ, &ws) == 0 &&
+            (ws.ws_row != p->rows || ws.ws_col != p->cols)) {
           if (ls_iolog_winsize(ws.ws_row, ws.ws_col)) return -1;
           (void)ioctl(p->master, TIOCSWINSZ, &ws);
+          /* TIOCSWINSZ alone may not signal (e.g. an initially zero-sized
+           * terminal). sudo explicitly signals the command pgrp as well. */
+          bc_send(L->sock, MSG_SIGNAL, SIGWINCH);
+          p->rows = ws.ws_row;
+          p->cols = ws.ws_col;
         }
         break;
       }

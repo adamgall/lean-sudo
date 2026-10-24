@@ -7,8 +7,13 @@ import LeanSudo.Sudoers.Parser
 Command-line parsing, diagnostics rendering and the semantic checks run on a parsed
 (include-resolved) policy.
 
-Alias checks follow visudo: undefined references and cycles warn by default and
-become errors with `-s`. Defaults use the runtime's complete typed option table.
+visudo must not install a policy that lean-sudo's runtime rejects: doing so could
+lock every administrator out. Therefore `Policy.validate` is authoritative in both
+strict and non-strict modes. Undefined aliases and cycles, including unreferenced
+definitions and Defaults bindings, are fatal even where sudo.ws merely warns.
+Duplicate aliases are fatal in both implementations. Defaults use the runtime's
+complete typed option table. The explicit `Q` override remains a dangerous,
+user-requested escape hatch, as in upstream visudo.
 -/
 
 namespace LeanSudo.Visudo
@@ -227,6 +232,21 @@ def scanAliases (es : List Located) : AliasScan :=
           scanAlias defs (defs.length + 1) [] kind name loc state) state) state
     | _ => state) {}
 
+/-- Also visit definitions and Defaults bindings that upstream's user-specification
+walk does not reach, because the runtime validates the entire policy. -/
+def runtimeAliasErrors (es : List Located) : List String :=
+  let defs := aliasDefs es
+  let state := defs.foldl (fun state (kind, name, loc) =>
+    scanAlias defs (defs.length + 1) [] kind name loc state) (scanAliases es)
+  let state := es.foldl (fun state loc =>
+    match loc.entry with
+    | .defaults _ _ =>
+      (refsByKind (entryRefs loc.entry)).foldl (fun state (kind, names) =>
+        names.foldl (fun state name =>
+          scanAlias defs (defs.length + 1) [] kind name loc state) state) state
+    | _ => state) state
+  state.errors
+
 /-- Share the runtime's authoritative sudo 1.9.17p2 option table. -/
 def sudoOptionNames : List String := defaultOptionNames
 
@@ -258,10 +278,16 @@ def defaultsWarnings (es : List Located) : List String :=
     | (l, .warn m) => some s!"Warning: {locPos l}: {m}"
     | _ => none
 
-/-- Undefined references and cycles are fatal only in strict mode. -/
-def semanticErrors (es : List Located) (strict : Bool := false) : List String :=
-  duplicateErrors es ++ defaultsErrors es ++
-    (if strict then (scanAliases es).errors else [])
+/-- No runtime-invalid policy is accepted, regardless of `-s`. Keep source-located
+sudo-style diagnostics, with an authoritative fallback for future validation rules. -/
+def semanticErrors (es : List Located) (_strict : Bool := false) : List String :=
+  let errors := duplicateErrors es ++ defaultsErrors es
+  match validate (es.map (·.entry)) with
+  | .ok () => errors
+  | .error message =>
+    let errors := errors ++ runtimeAliasErrors es
+    if !errors.isEmpty then errors
+    else [s!"{es.head?.map locPos |>.getD "visudo"}: {message}"]
 
 /-- `Warning: file:line: unused <kind> "<name>"` for aliases nothing refers to. -/
 def unusedWarnings (es : List Located) : List String :=
@@ -269,11 +295,9 @@ def unusedWarnings (es : List Located) : List String :=
   ((aliasDefs es).mergeSort (fun a b => a.2.1 ≤ b.2.1)).filterMap fun (k, n, l) =>
     if used.contains (k, n) then none else some s!"Warning: {locPos l}: unused {k} \"{n}\""
 
-/-- Alias warnings do not prevent installation unless strict checking is requested. -/
-def semanticWarnings (es : List Located) (strict : Bool := false) : List String :=
-  defaultsWarnings es ++
-    (if strict then [] else (scanAliases es).errors) ++
-    unusedWarnings es
+/-- Unused aliases remain warnings; runtime-invalid aliases are errors above. -/
+def semanticWarnings (es : List Located) (_strict : Bool := false) : List String :=
+  defaultsWarnings es ++ unusedWarnings es
 
 /-! ## Edit mode helpers -/
 

@@ -54,4 +54,10 @@ def setOwnerMode (path : String) (uid gid mode : Nat) : IO Unit :=
     setOwnerModeRaw path uid.toUInt32 gid.toUInt32 mode.toUInt32
   else throw (IO.userError s!"invalid owner {uid}:{gid} or mode {mode}")
 
+/-- Correct an unchanged original through its held lock descriptor, following no
+new path opens and changing only metadata that differs from the requested values. -/
+@[extern "leansudo_visudo_correct_locked_metadata"]
+opaque correctLockedMetadata (path : @& String) (uid gid mode : UInt32)
+    (owner perms : Bool) : IO Unit
+
 end LeanSudo.Visudo

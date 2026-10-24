@@ -10,10 +10,12 @@ A pure re-implementation of sudo 1.9's `parse_args.c` on top of a GNU
 operand, unique-prefix long options, `--`), including sudo's interleaving of
 `VAR=value` operands with options.
 
-Error convention: `parseArgs` returns `.error e` where `e` is exactly what sudo would
-write to stderr *after* the leading `sudo: ` of its first line. Pure usage errors
-(where sudo prints only the usage text) start with `usage:`. Use `formatError` to get
-the complete stderr text.
+`parseArgs` preserves warnings produced during option scanning even when a later
+option or validation fails. Callers must emit `ParseResult.warnings` before handling
+`ParseResult.result` (including help/version). `formatError` uses the full `argv[0]`
+for getopt diagnostics and sudo's program identity for its own diagnostics. Named
+environment preservation only retains names present in the supplied environment,
+as in sudo 1.9.17p2 `src/parse_args.c` (`parse_env_list` and case `'R'`).
 -/
 
 namespace LeanSudo.Cli
@@ -27,7 +29,7 @@ inductive PreserveEnv where
   | none
   /-- `-E` / `--preserve-env` without a list -/
   | all
-  /-- `--preserve-env=a,b` (accumulated over all occurrences) -/
+  /-- Set-name metadata for `--preserve-env=a,b`; values are ordered in `envVars`. -/
   | vars (vs : List String)
   deriving Repr, DecidableEq, Inhabited
 
@@ -70,7 +72,8 @@ structure Options where
   askpass : Bool := false
   /-- `-N`: do not update the timestamp -/
   noUpdate : Bool := false
-  /-- `NAME=value` operands given before the command, in order -/
+  /-- `NAME=value` operands and set `--preserve-env=list` snapshots, in encounter
+  order before the command (sudo's `env_add`). Later entries override earlier ones. -/
   envVars : List (String × String) := []
   /-- operands after option processing (the command and its arguments, or the files
   for `-e`/`sudoedit`, or the command to check for `-l`) -/
@@ -80,14 +83,25 @@ structure Options where
   type : Option String := none
   chroot : Option String := none
   timeout : Option Nat := none
+  /-- Raw plugin setting: timeout validation errors belong to sudoers initialization. -/
+  timeoutText : Option String := none
   impliedShell : Bool := false
   deriving Repr, DecidableEq, Inhabited
+
+/-- The front end accepts the setting; sudoers reports an invalid timeout on open. -/
+def timeoutError (o : Options) : Option String :=
+  o.timeoutText.bind fun text =>
+    if o.timeout.isSome then none else some s!"{text}: invalid timeout value"
 
 /-! ## Usage, help and version text -/
 
 /-- `basename` of `argv[0]` (sudo's `getprogname()`). -/
 def basename (path : String) : String :=
   String.ofList ((path.toList.reverse.takeWhile (· != '/')).reverse)
+
+/-- Only sudoedit changes the front-end identity, regardless of the executable name. -/
+def programName (argv0 : String) : String :=
+  if basename argv0 == "sudoedit" then "sudoedit" else "sudo"
 
 private def sudoUsage : List (List String) :=
   [ ["-h | -K | -k | -V"],
@@ -316,10 +330,28 @@ def versionFor (root : Bool) (s : Settings := {}) (interfaces : List String := [
     "\nLocal IP address and netmask pairs:\n" ++ String.join (interfaces.map ("\t" ++ · ++ "\n"))) ++
   "\nSudoers I/O plugin version 1.9.17p2\nSudoers audit plugin version 1.9.17p2\n"
 
-/-- Complete stderr text for a `parseArgs` error. -/
-def formatError (progname : String) (e : String) : String :=
-  let body := if "usage:".toList.isPrefixOf e.toList then e else progname ++ ": " ++ e
+/-- Origin matters: libc's getopt uses `argv[0]`, not sudo's program identity. -/
+structure Diagnostic where
+  message : String
+  getopt : Bool := false
+  deriving Repr, DecidableEq
+
+/-- Complete stderr text for a parser diagnostic, excluding earlier warnings. -/
+def formatError (argv0 : String) (e : Diagnostic) : String :=
+  let name := if e.getopt then argv0 else programName argv0
+  let body := if "usage:".toList.isPrefixOf e.message.toList then e.message
+    else name ++ ": " ++ e.message
   if body.toList.getLast? == some '\n' then body else body ++ "\n"
+
+/-- Warnings precede both the final error and successful help/version output. -/
+structure ParseResult where
+  warnings : List String
+  result : Except Diagnostic Options
+
+/-- Scanner failures retain warnings already emitted by earlier options. -/
+structure ParseFailure where
+  diagnostic : Diagnostic
+  warnings : List String
 
 /-! ## Option scanner -/
 
@@ -376,6 +408,9 @@ def isEnvar (s : String) : Bool := isEnvarL s.toList
 structure Raw where
   progname : String
   sudoedit : Bool
+  /-- Caller environment used by `parse_env_list`; an empty value is still set. -/
+  env : List (String × String) := []
+  warnings : List String := []
   mode : Option Mode := none
   lcount : Nat := 0
   /-- `-k` or `-K` seen (`ARG_IGNORE_TICKET`) -/
@@ -389,6 +424,7 @@ structure Raw where
   nonInteractive : Bool := false
   preserveGroups : Bool := false
   shell : Bool := false
+  /-- Ordered explicit assignments and named-preservation snapshots. -/
   envVars : List (String × String) := []
   user : Option String := none
   group : Option String := none
@@ -404,10 +440,17 @@ structure Raw where
   type : Option String := none
   chroot : Option String := none
   timeout : Option Nat := none
+  timeoutText : Option String := none
 
-def Raw.init (progname : String) : Raw :=
+def Raw.init (argv0 : String) (env : List (String × String) := []) : Raw :=
+  let progname := programName argv0
   let se := progname == "sudoedit"
-  { progname, sudoedit := se, mode := if se then some .edit else none }
+  { progname, sudoedit := se, env, mode := if se then some .edit else none }
+
+def Raw.failure (r : Raw) (message : String) (getopt : Bool := false) : ParseFailure :=
+  { diagnostic := { message, getopt }, warnings := r.warnings }
+
+def chrootWarning : String := "the -R option will be removed in a future version of sudo"
 
 /-- `msg` followed by the usage text (sudo's `sudo_warnx(msg); usage()`). -/
 def usageErr (r : Raw) (msg : String) : String := msg ++ "\n" ++ usageFor r.progname
@@ -434,11 +477,11 @@ def parseCloseFrom (s : String) : Option Nat :=
   else none
 
 /-- Apply one recognised option (`key` as in sudo's `switch (ch)`). -/
-def applyOpt (r : Raw) (key : Char) (arg : Option String) : Except String Raw :=
-  let usage : Except String Raw := .error (usageFor r.progname)
-  let excl : Except String Raw := .error (usageErr r exclMsg)
-  let exclTicket : Except String Raw := .error (usageErr r exclTicketMsg)
-  let nonEmpty (k : String → Except String Raw) : Except String Raw :=
+def applyOpt (r : Raw) (key : Char) (arg : Option String) : Except ParseFailure Raw :=
+  let usage : Except ParseFailure Raw := .error (r.failure (usageFor r.progname))
+  let excl : Except ParseFailure Raw := .error (r.failure (usageErr r exclMsg))
+  let exclTicket : Except ParseFailure Raw := .error (r.failure (usageErr r exclTicketMsg))
+  let nonEmpty (k : String → Except ParseFailure Raw) : Except ParseFailure Raw :=
     match arg with
     | some a => if a.isEmpty then usage else k a
     | none => usage
@@ -448,7 +491,7 @@ def applyOpt (r : Raw) (key : Char) (arg : Option String) : Except String Raw :=
   | 'B' => .ok { r with bell := true }
   | 'C' =>
     match arg.bind parseCloseFrom with
-    | none => .error (usageErr r "the argument to -C must be a number greater than or equal to 3")
+    | none => .error (r.failure (usageErr r "the argument to -C must be a number greater than or equal to 3"))
     | some n => if r.closeFrom.isSome then usage else .ok { r with closeFrom := some n }
   | 'D' => nonEmpty fun a => if r.chdir.isSome then usage else .ok { r with chdir := some a }
   | 'E' =>
@@ -457,8 +500,12 @@ def applyOpt (r : Raw) (key : Char) (arg : Option String) : Except String Raw :=
     | some l =>
       let names := splitCommas l
       match names.find? (fun n => n.toList.contains '=') with
-      | some bad => .error (usageErr r s!"invalid environment variable name: {bad}")
-      | none => .ok { r with preserveVars := r.preserveVars ++ names }
+      | some bad => .error (r.failure (usageErr r s!"invalid environment variable name: {bad}"))
+      | none =>
+        let present := names.filterMap (fun name => r.env.find? (fun entry => entry.1 == name))
+        let preserveVars := r.preserveVars ++ present.map Prod.fst
+        let envVars := r.envVars ++ present
+        .ok { r with preserveVars, envVars }
   | 'e' =>
     if r.mode.isSome && r.mode != some .edit then excl else .ok { r with mode := some .edit }
   | 'g' => nonEmpty fun a => if r.group.isSome then usage else .ok { r with group := some a }
@@ -486,13 +533,14 @@ def applyOpt (r : Raw) (key : Char) (arg : Option String) : Except String Raw :=
     match arg with
     | some a => if r.prompt.isSome then usage else .ok { r with prompt := some a }
     | none => usage
-  | 'R' => nonEmpty fun a => if r.chroot.isSome then usage else .ok { r with chroot := some a }
+  | 'R' => nonEmpty fun a => if r.chroot.isSome then usage
+    else .ok { r with chroot := some a, warnings := r.warnings ++ [chrootWarning] }
   | 'r' => nonEmpty fun a => if r.role.isSome then usage else .ok { r with role := some a }
   | 't' => nonEmpty fun a => if r.type.isSome then usage else .ok { r with type := some a }
-  | 'T' => nonEmpty fun a =>
-    match Sudoers.Parser.parseTimeout a with
-    | some n => if r.timeout.isSome then usage else .ok { r with timeout := some n }
-    | none => .error s!"{a}: invalid timeout value"
+  | 'T' => match arg with
+    | none => usage
+    | some text => if r.timeoutText.isSome then usage
+      else .ok { r with timeoutText := some text, timeout := Sudoers.Parser.parseTimeout text }
   | 'S' => .ok { r with stdin := true }
   | 's' => .ok { r with shell := true }
   | 'U' => nonEmpty fun a => if r.otherUser.isSome then usage else .ok { r with otherUser := some a }
@@ -509,11 +557,11 @@ def applyOpt (r : Raw) (key : Char) (arg : Option String) : Except String Raw :=
 `next` is the following command-line argument, `alone` whether the whole argument
 was exactly `-h`. Returns the new state and whether `next` was consumed. -/
 def shortCluster (r : Raw) (next : Option String) (alone : Bool) :
-    List Char → Except String (Raw × Bool)
+    List Char → Except ParseFailure (Raw × Bool)
   | [] => .ok (r, false)
   | c :: cs =>
     match shortSpec r.sudoedit c with
-    | none => .error (usageErr r s!"invalid option -- '{c}'")
+    | none => .error (r.failure (usageErr r s!"invalid option -- '{c}'") true)
     | some .no => do
       let r' ← applyOpt r c none
       shortCluster r' next alone cs
@@ -521,7 +569,7 @@ def shortCluster (r : Raw) (next : Option String) (alone : Bool) :
       if cs.isEmpty then
         match next with
         | some a => do return (← applyOpt r c (some a), true)
-        | none => .error (usageErr r s!"option requires an argument -- '{c}'")
+        | none => .error (r.failure (usageErr r s!"option requires an argument -- '{c}'") true)
       else do return (← applyOpt r c (some (String.ofList cs)), false)
     | some .opt =>
       -- only `-h` has an optional argument; it must be attached (`-hhost`), except
@@ -536,7 +584,7 @@ def shortCluster (r : Raw) (next : Option String) (alone : Bool) :
       else do return (← applyOpt r c (some (String.ofList cs)), false)
 
 /-- Process `--name[=value]` (`body` = the characters after `--`). -/
-def longOpt (r : Raw) (next : Option String) (body : List Char) : Except String (Raw × Bool) :=
+def longOpt (r : Raw) (next : Option String) (body : List Char) : Except ParseFailure (Raw × Bool) :=
   let name := body.takeWhile (· != '=')
   let hasArg := body.contains '='
   let value := String.ofList ((body.dropWhile (· != '=')).drop 1)
@@ -547,25 +595,25 @@ def longOpt (r : Raw) (next : Option String) (body : List Char) : Except String 
     | none => visible.filter (fun o => name.isPrefixOf o.name.toList)
   let full := "--" ++ String.ofList body
   match cands with
-  | [] => .error (usageErr r s!"unrecognized option '{full}'")
+  | [] => .error (r.failure (usageErr r s!"unrecognized option '{full}'") true)
   | [o] =>
     match o.spec with
     | .no =>
-      if hasArg then .error (usageErr r s!"option '--{o.name}' doesn't allow an argument")
+      if hasArg then .error (r.failure (usageErr r s!"option '--{o.name}' doesn't allow an argument") true)
       else do return (← applyOpt r o.key none, false)
     | .opt => do return (← applyOpt r o.key (if hasArg then some value else none), false)
     | .req =>
       if hasArg then do return (← applyOpt r o.key (some value), false)
       else match next with
         | some a => do return (← applyOpt r o.key (some a), true)
-        | none => .error (usageErr r s!"option '--{o.name}' requires an argument")
+        | none => .error (r.failure (usageErr r s!"option '--{o.name}' requires an argument") true)
   | os =>
-    .error (usageErr r (s!"option '{full}' is ambiguous; possibilities:" ++
-      String.join (os.map fun o => s!" '--{o.name}'")))
+    .error (r.failure (usageErr r (s!"option '{full}' is ambiguous; possibilities:" ++
+      String.join (os.map fun o => s!" '--{o.name}'"))) true)
 
 /-- getopt_long loop with sudo's `VAR=value` interleaving. Returns the final state and
 the operands. -/
-def scan : List String → Raw → Except String (Raw × List String)
+def scan : List String → Raw → Except ParseFailure (Raw × List String)
   | [], r => .ok (r, [])
   | a :: rest, r =>
     match a.toList with
@@ -652,20 +700,24 @@ def Raw.build (r : Raw) (ops : List String) : Options :=
     noUpdate := r.noUpdate
     envVars := r.envVars
     command := ops
-    host := r.host, role := r.role, type := r.type, chroot := r.chroot, timeout := r.timeout
+    host := r.host, role := r.role, type := r.type, chroot := r.chroot, timeout := r.timeout,
+    timeoutText := r.timeoutText
     impliedShell := m == .run && ops.isEmpty && !(r.shell || r.login) }
 
-def finish (r : Raw) (ops : List String) : Except String Options :=
+def finish (r : Raw) (ops : List String) : Except Diagnostic Options :=
   match r.check ops with
-  | some e => .error e
+  | some e => .error { message := e }
   | none => .ok (r.build ops)
 
-/-- Parse sudo's command line. `progname` is the basename of `argv[0]`, `args` are
-`argv[1..]`. -/
-def parseArgs (progname : String) (args : List String) : Except String Options :=
-  match scan args (Raw.init progname) with
-  | .error e => .error e
-  | .ok (r, ops) => finish r ops
+/-- Parse `argv[1..]` using the original `argv[0]` and caller environment.
+Warnings are produced only when their option is reached and accepted, never by a
+second scan of the argument vector. The empty environment default is for pure
+callers; the runtime supplies its captured environment. -/
+def parseArgs (argv0 : String) (args : List String)
+    (env : List (String × String) := []) : ParseResult :=
+  match scan args (Raw.init argv0 env) with
+  | .error e => { warnings := e.warnings, result := .error e.diagnostic }
+  | .ok (r, ops) => { warnings := r.warnings, result := finish r ops }
 
 /-! ## Shell mode (`-s` / `-i`) -/
 
@@ -709,9 +761,5 @@ def userShell (envShell : Option String) (passwdShell : String) : String :=
   match envShell with
   | some s => if s.isEmpty then (if passwdShell.isEmpty then "/bin/sh" else passwdShell) else s
   | none => if passwdShell.isEmpty then "/bin/sh" else passwdShell
-
-/-- Only sudoedit changes the front-end identity, regardless of the executable name. -/
-def programName (argv0 : String) : String :=
-  if basename argv0 == "sudoedit" then "sudoedit" else "sudo"
 
 end LeanSudo.Cli

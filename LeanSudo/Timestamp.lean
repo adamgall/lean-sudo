@@ -33,9 +33,9 @@ structure Record where
   disabled : Bool
   deriving DecidableEq, Repr, Inhabited
 
-/-- Scope of the current invocation. Like sudo, a `tty` timestamp without a
-controlling terminal falls back to the parent process; `kernel` (in-kernel tty
-tickets) is treated as `tty`. -/
+/-- Linux has no kernel tty tickets. Authentication uses sudo's
+`ts_init_key_nonglobal`: `kernel` shares the tty scope, falling back to the
+parent process only without a controlling terminal. -/
 def scopeFor (t : TimestampType) (ttyDev : Option Nat) (sid sidStart ppid ppidStart : Nat) :
     Scope :=
   match t with
@@ -45,6 +45,20 @@ def scopeFor (t : TimestampType) (ttyDev : Option Nat) (sid sidStart ppid ppidSt
     | none => .ppid ppid ppidStart
   | .ppid => .ppid ppid ppidStart
   | .global => .global
+
+theorem kernel_scope_tty (ttyDev : Nat) (sid sidStart ppid ppidStart : Nat) :
+    scopeFor .kernel (some ttyDev) sid sidStart ppid ppidStart = .tty ttyDev sid sidStart := rfl
+
+theorem kernel_scope_no_tty (sid sidStart ppid ppidStart : Nat) :
+    scopeFor .kernel none sid sidStart ppid ppidStart = .ppid ppid ppidStart := rfl
+
+/-- A kernel-mode ticket on another tty cannot authorize this request. -/
+theorem kernel_scope_terminal_separation (tty₁ tty₂ sid sidStart ppid ppidStart : Nat)
+    (h : tty₁ ≠ tty₂) :
+    scopeFor .kernel (some tty₁) sid sidStart ppid ppidStart ≠
+      scopeFor .kernel (some tty₂) sid sidStart ppid ppidStart := by
+  simpa [scopeFor] using (fun eq => h (Scope.tty.inj eq).1 :
+    Scope.tty tty₁ sid sidStart ≠ .tty tty₂ sid sidStart)
 
 /-- Timeout in seconds (`none` = never expires, `some 0` = never cache) → nanoseconds check. -/
 def fresh (now : Nat) (timeout : Option Nat) (time : Nat) : Bool :=
@@ -73,9 +87,13 @@ def update (now : Nat) (scope : Scope) (authUid : Nat) (rs : List Record) : List
     (rs.filter (fun r => !(decide (r.scope = scope) && decide (r.authUid = authUid)))).take
       (maxRecords - 1)
 
-/-- `sudo -k`: disable every record. -/
+/-- Bulk invalidation disables every record, independently of scope. -/
 def invalidate (rs : List Record) : List Record :=
   rs.map fun r => { r with disabled := true }
+
+/-- `sudo -k` disables all authentication identities in the selected scope. -/
+def invalidateScope (scope : Scope) (rs : List Record) : List Record :=
+  rs.map fun r => if r.scope = scope then { r with disabled := true } else r
 
 /-! ## Encoding
 
@@ -263,10 +281,22 @@ theorem lookup_timeout_zero (now : Nat) (scope : Scope) (authUid : Nat) (rs : Li
     lookup now (some 0) scope authUid rs = false := by
   simp [lookup, valid, fresh]
 
-/-- `sudo -k`: after invalidation no record is accepted. -/
+/-- After bulk invalidation no record is accepted. -/
 theorem lookup_invalidate (now : Nat) (timeout : Option Nat) (scope : Scope) (authUid : Nat)
     (rs : List Record) : lookup now timeout scope authUid (invalidate rs) = false := by
   simp [lookup, invalidate, valid]
+
+theorem lookup_invalidateScope (now : Nat) (timeout : Option Nat) (scope : Scope)
+    (authUid : Nat) (rs : List Record) :
+    lookup now timeout scope authUid (invalidateScope scope rs) = false := by
+  simp only [lookup, invalidateScope, List.any_map]
+  apply List.any_eq_false.mpr
+  intro r _
+  by_cases h : r.scope = scope <;> simp [h, valid]
+
+theorem invalidateScope_other (scope : Scope) (r : Record) (h : r.scope ≠ scope) :
+    invalidateScope scope [r] = [r] := by
+  simp [invalidateScope, h]
 
 theorem lookup_update_self (now t : Nat) (scope : Scope) (authUid : Nat) (rs : List Record)
     (ht : 0 < t) : lookup now (some t) scope authUid (update now scope authUid rs) = true := by

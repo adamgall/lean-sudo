@@ -22,8 +22,9 @@ opaque regexMatches (pattern text : @& String) (locale : @& String := "C") : IO 
 @[extern "leansudo_sys_glob"]
 opaque globPaths (pattern : @& String) (locale : @& String := "C") : IO (List String)
 
+/-- Resolve AI_CANONNAME; resolver failures retain gai_strerror for sudo's warning. -/
 @[extern "leansudo_sys_hostname"]
-opaque canonicalHostname (host : @& String) : IO (Option String)
+opaque canonicalHostname (host : @& String) : IO (Except String String)
 
 /-- Emit USER_CMD; false is a real audit failure. Unsupported/unavailable kernel
 audit is a successful no-op, as in sudo's Linux audit backend. -/

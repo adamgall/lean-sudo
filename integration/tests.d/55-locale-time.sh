@@ -119,3 +119,66 @@ EOF
   expect_out_line é
   end
 }
+
+locale_time_logging() {
+  local policy_locale=$1 caller_locale=$2
+  rm -rf /var/log/locale-time-io /var/log/locale-time.log
+  install -m 0440 /dev/stdin /etc/sudoers.d/locale-time <<EOF
+Defaults:judy sudoers_locale=$policy_locale,log_output,iolog_dir=/var/log/locale-time-io,iolog_file="%{user}/%x",logfile=/var/log/locale-time.log
+judy ALL=(root) NOPASSWD: /usr/bin/true
+EOF
+  XENV=(LC_ALL="$caller_locale")
+  run judy 'sudo -n /usr/bin/true'
+  expect_rc 0
+  local expected_date expected_month
+  # Python uses libc strftime; Rust date's %x differs from libc's German format.
+  expected_date=$(python3 -c 'import locale,sys,time; locale.setlocale(locale.LC_ALL,sys.argv[1]); print(time.strftime("%x"))' "$policy_locale")
+  expected_month=$(python3 -c 'import locale,sys,time; locale.setlocale(locale.LC_ALL,sys.argv[1]); print(time.strftime("%b %e "))' "$policy_locale")
+  if [[ ! -f "/var/log/locale-time-io/judy/$expected_date/log" ]]; then
+    find /var/log/locale-time-io -type f
+    fail "I/O log path does not use the expected locale date $expected_date"
+  fi
+  grep -qF "$expected_month" /var/log/locale-time.log ||
+    fail "logfile timestamp does not use sudoers_locale $policy_locale"
+}
+
+begin locale-time-logging-default-C && {
+  locale_time_logging C de_DE.UTF-8
+  end
+}
+
+begin locale-time-logging-configured-de && {
+  locale_time_logging de_DE.UTF-8 C
+  end
+}
+
+begin locale-time-json-timestamps-default-C && {
+  rm -f /var/log/locale-time.json
+  install -m 0440 /dev/stdin /etc/sudoers.d/locale-time <<'EOF'
+Defaults:judy log_format=json_compact,logfile=/var/log/locale-time.json
+judy ALL=(root) NOPASSWD: /usr/bin/true
+EOF
+  XENV=(LC_ALL=de_DE.UTF-8)
+  run judy 'sudo -n /usr/bin/true'
+  expect_rc 0
+  python3 - <<'PY' || fail 'JSON localtime is not in the sudoers C locale'
+import json, locale, time
+locale.setlocale(locale.LC_TIME, "C")
+count = 0
+def check(value):
+    global count
+    if isinstance(value, dict):
+        if "localtime" in value:
+            assert value["localtime"] == time.strftime("%b %e %H:%M:%S", time.localtime(value["seconds"])), value
+            count += 1
+        for child in value.values():
+            check(child)
+    elif isinstance(value, list):
+        for child in value:
+            check(child)
+for line in open("/var/log/locale-time.json"):
+    check(json.loads(line))
+assert count >= 2, count
+PY
+  end
+}

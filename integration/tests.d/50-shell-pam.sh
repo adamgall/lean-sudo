@@ -231,6 +231,13 @@ EOF
   end
 }
 
+# sudo_auth_approval calls log_auth_failure after an account rejection.
+# Pin the complete reference stderr, including its zero-attempt second line.
+shell_expect_expired_account_stderr() {
+  local expected=$'[sudo] password for judy: sudo: account validation failure, is your account locked?\nsudo: a password is required'
+  [[ $ERR == "$expected" ]] || fail "expired account stderr differs: $ERR"
+}
+
 begin shell_pam_validate_expired_account && {
   install -m 0440 /dev/stdin /etc/sudoers.d/shell-expired <<'EOF'
 Defaults:judy timestamp_type=global
@@ -239,7 +246,7 @@ EOF
   chage -E 0 judy
   run judy "printf 'judypw\n' | sudo -S -v"
   expect_rc 1
-  expect_err_has 'account validation failure, is your account locked?'
+  shell_expect_expired_account_stderr
   chage -E -1 judy
   run judy 'sudo -n /usr/bin/true'
   expect_rc 1
@@ -255,7 +262,7 @@ EOF
   chage -E 0 judy
   run judy "printf 'judypw\n' | sudo -S -l"
   expect_rc 1
-  expect_err_has 'account validation failure, is your account locked?'
+  shell_expect_expired_account_stderr
   chage -E -1 judy
   run judy 'sudo -n /usr/bin/true'
   expect_rc 1
@@ -277,5 +284,21 @@ EOF
   expect_err_has 'Permission denied'
   expect_err_lacks '/nonexistent/noexec.so'
   cp -a "$WORK/shell-sudo.conf" /etc/sudo.conf
+  end
+}
+
+begin shell_pam_run_expired_account && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/shell-expired <<'EOF'
+Defaults:judy timestamp_type=global
+judy ALL=(root) /usr/bin/true
+EOF
+  chage -E 0 judy
+  run judy "printf 'judypw\n' | sudo -S /usr/bin/true"
+  expect_rc 1
+  shell_expect_expired_account_stderr
+  chage -E -1 judy
+  run judy 'sudo -n /usr/bin/true'
+  expect_rc 1
+  expect_err_has 'a password is required'
   end
 }

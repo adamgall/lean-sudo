@@ -103,10 +103,10 @@ def ginaCtx : Context :=
 #guard auth { ctx with opts := { mode := .resetTimestamp } } == .none
 #guard !(decide { ctx with opts := { mode := .removeTimestamp } }).updateTimestamp
 #guard auth { ctx with settings := { ctx.settings with rootpw := true } } ==
-  .required { root with groups := [] }
+  .required root
 #guard auth { ctx with settings := { ctx.settings with targetpw := true } } == .required root
-#guard failure { ctx with target := bob, settings := { ctx.settings with runaspw := true } } ==
-  some "sudo: runaspw requires the default runas user as target\n"
+#guard auth { ctx with target := bob, settings := { ctx.settings with runaspw := true } } == .required root
+#guard auth { ctx with target := bob, runasDefaultUser := some carol, settings := { ctx.settings with runaspw := true, runasDefault := "carol" } } == .required carol
 #guard failure { ctx with opts := { mode := .list, otherUser := some "bob" }, listUser := some bob } ==
   some "User bob is not allowed to run sudo on box.\n"
 
@@ -118,6 +118,10 @@ def cwdCtx : Context :=
 #guard match (decide cwdCtx).action with | .exec p => p.cwd == some "/tmp" | _ => false
 #guard match (decide { ctx with opts := { ctx.opts with login := true } }).action with
   | .exec p => p.cwd == some "/root" && p.pamService == "sudo-i" | _ => false
+#guard match (decide { cwdCtx with opts := { cwdCtx.opts with login := true } }).action with
+  | .exec p => p.cwd == some "/tmp" && !p.cwdOptional | _ => false
+#guard match (decide { ctx with opts := { ctx.opts with login := true }, settings := { ctx.settings with runcwd := some "/tmp" } }).action with
+  | .exec p => p.cwd == some "/tmp" && !p.cwdOptional | _ => false
 #guard match (decide ctx).action with
   | .exec p => p.path == "/usr/bin/id" &&
     p.envInput.command == "/usr/bin/id -u" && p.argv == ["id", "-u"] | _ => false
@@ -224,6 +228,21 @@ def selfAuth : Allowed := { needsAuth := true, setenv := false, cwd := none }
 #guard match (decide { ctx with invokingRealGid := some 4, settings := { ctx.settings with staySetuid := true } }).action with
   | .exec p => p.gid == 4 && p.staySetuid
   | _ => false
+
+#guard authUser { ctx with opts := { mode := .list }, settings := { ctx.settings with rootpw := true } } == alice
+#guard authUser { ctx with opts := { mode := .list }, settings := { ctx.settings with targetpw := true } } == alice
+#guard authUser { ctx with opts := { mode := .list }, settings := { ctx.settings with runaspw := true } } == alice
+def deniedList : Context := { ctx with invoking := bob, opts := { mode := .list }, longHost := "box.example.test" }
+#guard failure deniedList == some "Sorry, user bob may not run sudo on box.\n"
+#guard denialReason deniedList == "command not allowed"
+#guard failure { deniedList with opts := { mode := .validate } } == some "Sorry, user bob may not run sudo on box.\n"
+def deniedOther : Context :=
+  { carolCtx with opts := { mode := .list, otherUser := some "bob" }, listUser := some bob }
+#guard listOtherDenied deniedOther
+#guard failure deniedOther == some "Sorry, user carol is not allowed to execute 'list' as bob on box.\n"
+#guard (decide deniedOther).log.isSome
+#guard (editPlan { editCtx with settings := { editCtx.settings with envEditor := false } } selfAuth).editors.head? ==
+  some ["vim", "-f"]
 
 example (c : Context) (p : ExecPlan) (h : (decide c).action = .exec p) :
     p.uid = c.target.uid := (exec_identity c p h).1

@@ -62,7 +62,23 @@ def warningsOf (t : String) : List String :=
 #guard warningsOf "Cmnd_Alias C = /bin/ls\nroot ALL = ALL\n" == ["Warning: s:1: unused Cmnd_Alias \"C\""]
 #guard warningsOf "Cmnd_Alias C = /bin/ls\nroot ALL = C\n" == []
 
-#guard (parse "s" "bob FOO = /usr/bin/id\n").toOption.map (semanticErrors · false) == some []
+#guard (parse "s" "bob FOO = /usr/bin/id\n").toOption.map (semanticErrors · false) ==
+  some ["s:1: Host_Alias \"FOO\" referenced but not defined"]
+
+/-- Neither mode may accept a policy that would disable the runtime. -/
+def refusesRuntimeInvalid (text : String) : Bool :=
+  match parse "s" text with
+  | .error _ => false
+  | .ok entries =>
+    match LeanSudo.Policy.validate (entries.map (·.entry)) with
+    | .ok () => false
+    | .error _ => [false, true].all fun strict => !(semanticErrors entries strict).isEmpty
+
+#guard ["bob FOO = /usr/bin/id\n",
+  "User_Alias A = MISSING\nroot ALL=ALL\n",
+  "User_Alias A = B\nUser_Alias B = A\nroot ALL=ALL\n",
+  "Defaults:UNKNOWN !authenticate\nroot ALL=ALL\n",
+  "Cmnd_Alias C = /bin/ls\nCmnd_Alias C = /bin/cat\nroot ALL=ALL\n"].all refusesRuntimeInvalid
 
 #guard renderSyntaxError { file := "s", line := 2, col := 5, msg := "" } "a\nfoo bar\n" ==
   "s:2:5: syntax error\nfoo bar\n    ^~~"

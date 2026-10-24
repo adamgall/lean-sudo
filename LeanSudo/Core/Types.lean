@@ -106,6 +106,7 @@ structure Context where
   commandFoundInDot : Bool := false
   targetUnknownUid : Bool := false
   targetUnknownGid : Bool := false
+  runasDefaultUser : Option Principal := none
 
 /-- Whose credentials must be checked before `action` may happen. -/
 inductive AuthReq where
@@ -177,6 +178,9 @@ structure EditPlan where
   checkdir : Bool := true
   /-- Original file operands, exactly as evaluated by sudoers before making paths absolute. -/
   policyFiles : List String := []
+  editorSources : List String := []
+  editorNotFound : String := ""
+  editorPath : String := ""
 
 inductive Action where
   | exec (plan : ExecPlan)

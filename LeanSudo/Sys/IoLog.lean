@@ -3,7 +3,7 @@ import LeanSudo.IoLog
 namespace LeanSudo.Sys.IoLog
 
 @[extern "leansudo_iolog_clock"]
-private opaque clock (formats : @& Array String) : IO (Array String)
+private opaque clock (formats : @& Array String) (locale : @& String) : IO (Array String)
 @[extern "leansudo_iolog_prepare"]
 private opaque prepare (dir user group : @& String) (mode maxseq : UInt32) : IO Nat
 @[extern "leansudo_iolog_start"]
@@ -14,11 +14,12 @@ private opaque abort : IO Unit
 
 /-- Open all log files before allowing execution. Failure is fatal unless the
 policy explicitly opted into ignore_iolog_errors. -/
-def «open» (p : LeanSudo.IoLog.Plan) (m : LeanSudo.IoLog.Metadata) : IO (Option String) := do
+def «open» (p : LeanSudo.IoLog.Plan) (m : LeanSudo.IoLog.Metadata)
+    (locale : String) : IO (Option String) := do
   try
     let keys := (LeanSudo.IoLog.timeKeys p.dir.toList ++
       LeanSudo.IoLog.timeKeys p.file.toList).eraseDups
-    let facts ← clock keys.toArray
+    let facts ← clock keys.toArray locale
     let seconds := (facts[0]!).toNat!
     let nanos := (facts[1]!).toNat!
     let time := keys.zipIdx.map fun (key, n) => (key, facts[n + 4]!)

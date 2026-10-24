@@ -23,9 +23,24 @@ private theorem early_safe (ctx : Context) (act : Action)
 
 private theorem denied_safe (ctx : Context) :
     (∀ p, deniedAction ctx ≠ .exec p) ∧ (∀ p, deniedAction ctx ≠ .edit p) := by
-  unfold deniedAction
-  repeat' split
-  all_goals constructor <;> intro p h <;> cases h
+  constructor <;> intro p h
+  all_goals
+    unfold deniedAction at h
+    repeat' first | contradiction | (rcases branch_of_ite_eq h with h | h)
+
+private theorem policyJudgement_allow (ctx : Context) (a : Allowed)
+    (h : policyJudgement ctx = .allow a) :
+    evaluate ctx.sudoers ctx.settings (request ctx) = .allow a := by
+  unfold policyJudgement at h
+  split at h
+  · cases h
+  · exact h
+
+private theorem authJudgement_policyJudgement (ctx : Context) :
+    authJudgement ctx (policyJudgement ctx) =
+      authJudgement ctx (evaluate ctx.sudoers ctx.settings (request ctx)) := by
+  by_cases hm : ctx.opts.mode = .list <;>
+    simp [authJudgement, policyJudgement, listOtherDenied, hm]
 
 /-- Every executable plan comes from an allowed resolved run with a checked environment. -/
 theorem exec_origin (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .exec p) :
@@ -39,7 +54,7 @@ theorem exec_origin (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .e
   | some act => simp only [he] at h; exact False.elim ((early_safe ctx act he).1 p h)
   | none =>
     simp only [he] at h ⊢
-    cases hj : evaluate ctx.sudoers ctx.settings (request ctx) with
+    cases hj : policyJudgement ctx with
     | deny => simp only [hj, policyDecision] at h; exact False.elim ((denied_safe ctx).1 p h)
     | allow a =>
       simp only [hj, policyDecision] at h
@@ -58,7 +73,7 @@ theorem exec_origin (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .e
             | error e => simp [hb] at h
             | ok env =>
               simp only [hb, Action.exec.injEq] at h
-              refine ⟨a, rc, rfl, hm, rfl, h.symm, ⟨env, hb⟩, rfl, ?_, ?_⟩
+              refine ⟨a, rc, policyJudgement_allow ctx a hj, hm, rfl, h.symm, ⟨env, hb⟩, rfl, ?_, ?_⟩
               · simp [← h, request, hm, runCommand, hc, execPlan]
               · simp [← h, execPlan]
       all_goals repeat' first | split at h | cases h
@@ -74,7 +89,7 @@ theorem edit_origin (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .e
   | some act => simp only [he] at h; exact False.elim ((early_safe ctx act he).2 p h)
   | none =>
     simp only [he] at h ⊢
-    cases hj : evaluate ctx.sudoers ctx.settings (request ctx) with
+    cases hj : policyJudgement ctx with
     | deny => simp only [hj, policyDecision] at h; exact False.elim ((denied_safe ctx).2 p h)
     | allow a =>
       simp only [hj, policyDecision] at h
@@ -90,7 +105,7 @@ theorem edit_origin (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .e
           | error e => simp [hb] at h
           | ok env =>
             simp only [hb, Action.edit.injEq] at h
-            exact ⟨a, rfl, hm, h.symm, ⟨env, hb⟩, rfl⟩
+            exact ⟨a, policyJudgement_allow ctx a hj, hm, h.symm, ⟨env, hb⟩, rfl⟩
       all_goals repeat' first | split at h | cases h
 
 theorem exec_allowed (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .exec p) :
@@ -133,7 +148,7 @@ theorem edit_files_normalized (ctx : Context) (p : EditPlan)
     | none => rfl
     | some bad =>
       simp [earlyAction, hm, hx] at he
-      split at he <;> contradiction
+      repeat first | contradiction | split at he
   simp only [invalidEditFile, List.find?_eq_none] at hb
   simpa [editPlan, normalizedEditFile] using hb
 
@@ -289,7 +304,11 @@ theorem timestamp_update_allowed (ctx : Context) (h : (decide ctx).updateTimesta
   split at h
   · cases h
   · unfold policyDecision at h
-    cases hj : evaluate ctx.sudoers ctx.settings (request ctx) <;> simp_all
+    cases hj : policyJudgement ctx with
+    | deny => simp [hj] at h
+    | allow a =>
+      have ha := policyJudgement_allow ctx a hj
+      simp_all
 
 theorem reset_never_waives_auth (ctx : Context) (j : Judgement)
     (hk : ctx.opts.resetTimestamp = true) (hn : policyNeedsAuth ctx j = true) :
@@ -302,7 +321,7 @@ theorem decide_reset_requires_auth (ctx : Context) (he : earlyAction ctx = none)
     (hn : policyNeedsAuth ctx (authJudgement ctx
       (evaluate ctx.sudoers ctx.settings (request ctx))) = true) :
     (decide ctx).auth = .required (authUser ctx) := by
-  simp only [decide, he, policyDecision]
+  simp only [decide, he, policyDecision, authJudgement_policyJudgement]
   exact reset_never_waives_auth ctx _ hk hn
 
 theorem required_auth_identity (ctx : Context) (u : Principal)
@@ -363,5 +382,34 @@ theorem group_plugin_no_execution (ctx : Context)
     (∀ p, (decide ctx).action ≠ .exec p) ∧
     (∀ p, (decide ctx).action ≠ .edit p) := by
   cases hm : ctx.opts.mode <;> simp [decide, earlyAction, hm, h]
+
+/-- A malformed plugin timeout cannot silently become an unlimited execution. -/
+theorem invalid_timeout_no_execution (ctx : Context)
+    (h : (Cli.timeoutError ctx.opts).isSome = true) :
+    (∀ p, (decide ctx).action ≠ .exec p) ∧
+    (∀ p, (decide ctx).action ≠ .edit p) := by
+  cases hg : ctx.settings.groupPlugin.isSome <;>
+    cases hm : ctx.opts.mode <;> simp [decide, earlyAction, hm, hg, h]
+
+/-- An explicitly configured command directory wins over login-home selection
+and cannot be treated as an optional missing home directory. -/
+theorem configured_cwd_required (ctx : Context) (a : Allowed) (rc : ResolvedCmd)
+    (path resolved : String) (hp : configuredCwd ctx a = some path)
+    (hr : expandHome ctx path = some resolved) :
+    (execPlan ctx a rc).cwd = some resolved ∧ (execPlan ctx a rc).cwdOptional = false := by
+  simp [execPlan, hp, hr]
+
+/-- Denying permission to list another user is never an execution authorization. -/
+theorem list_other_denied_no_execution (ctx : Context) (h : listOtherDenied ctx = true) :
+    (∀ p, (decide ctx).action ≠ .exec p) ∧ (∀ p, (decide ctx).action ≠ .edit p) := by
+  cases he : earlyAction ctx with
+  | some action => simpa [decide, he] using early_safe ctx action he
+  | none => simpa [decide, he, policyJudgement, h, policyDecision] using denied_safe ctx
+
+/-- Editor variables select only the editor, never policy file operands. -/
+theorem editor_variables_preserve_files (ctx : Context) (a : Allowed) (env : EnvList) :
+    (editPlan { ctx with userEnv := env } a).files = (editPlan ctx a).files ∧
+    (editPlan { ctx with userEnv := env } a).policyFiles = (editPlan ctx a).policyFiles :=
+  ⟨rfl, rfl⟩
 
 end LeanSudo.Core

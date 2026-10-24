@@ -21,6 +21,7 @@ def r3 : Record := { scope := .global, authUid := 0, time := 2 ^ 70, disabled :=
 #guard scopeFor .kernel none 1 2 3 4 = .ppid 3 4
 #guard scopeFor .ppid (some 7) 1 2 3 4 = .ppid 3 4
 #guard scopeFor .global (some 7) 1 2 3 4 = .global
+#guard scopeFor .kernel (some 7) 1 2 3 4 = scopeFor .kernel (some 7) 1 2 5 6
 
 /-! ### validity -/
 -- exactly at the timeout boundary: valid; one nanosecond later: expired
@@ -53,6 +54,8 @@ def r3 : Record := { scope := .global, authUid := 0, time := 2 ^ 70, disabled :=
 #guard lookup (501 * sec) (some 900) ttyS 1000 (update (501 * sec) ppidS 1000 [r1])
 #guard !lookup (501 * sec) none ttyS 1000 (invalidate [r1, r2, r3])
 #guard !lookup (2 ^ 70) none .global 0 (invalidate [r1, r2, r3])
+#guard !lookup (501 * sec) none ttyS 1000 (invalidateScope ttyS [r1, r2, r3])
+#guard lookup (501 * sec) none ttyS 1000 (invalidateScope ppidS [r1, r2, r3])
 -- the record count is bounded
 #guard (update 0 .global 0 ((List.range 300).map fun i =>
   { scope := .ppid i 0, authUid := 0, time := 0, disabled := false })).length = maxRecords

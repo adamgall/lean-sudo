@@ -63,4 +63,13 @@ def error (name : String) (op : DefaultsOp) : Option String :=
 #guard (setting "badpass_message" (.assign "Sorry, try again.")).map
   (·.badpassMessageConfigured) == some true
 
+private def invoking : Principal := ⟨"alice", 1000, 1000, [], "/home/alice", "/bin/sh"⟩
+
+#guard (resolveDefaults [] invoking "box" none none
+  (initial := { passpromptOverride := true })).toOption.map
+  (fun (s, _) => s.passpromptOverride) == some true
+#guard (resolveDefaults [.defaults .global [⟨"passprompt_override", .flag false⟩]]
+  invoking "box" none none (initial := { passpromptOverride := true })).toOption.map
+  (fun (s, _) => s.passpromptOverride) == some false
+
 end Tests.Defaults

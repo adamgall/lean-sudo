@@ -283,3 +283,36 @@ EOF
   expect_out_line "gid ($daemon_gid, $daemon_gid, $daemon_gid)"
   end
 }
+
+begin exec-nopty-command-foreground-handoff && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-job-control <<'EOF'
+Defaults !use_pty
+EOF
+  pty root "sudo -n /usr/bin/python3 -c 'import os; os.setpgid(0, 0); print(\"waiting-input\", flush=True); line=input(); print(\"foreground=\" + str(os.tcgetpgrp(0) == os.getpgrp()), flush=True); print(\"read=\" + line)'" \
+    -e waiting-input -s 'continue\r' -e 'read=continue'
+  expect_rc 0
+  expect_out_has foreground=True
+  end
+}
+
+begin exec-nopty-user-winch-relay && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-signals <<'EOF'
+Defaults !use_pty
+EOF
+  cat >/usr/local/bin/exec-winch.py <<'PY'
+import os, signal, subprocess, sys, time
+def received(signum, frame):
+    print("winch-relayed", flush=True)
+    sys.exit(0)
+signal.signal(signal.SIGWINCH, received)
+subprocess.Popen(["/bin/sh", "-c", "sleep 0.2; kill -WINCH %d" % os.getppid()],
+                 start_new_session=True)
+time.sleep(5)
+sys.exit(2)
+PY
+  run root "sudo -n /usr/bin/python3 /usr/local/bin/exec-winch.py"
+  expect_rc 0
+  expect_out_line winch-relayed
+  rm -f /usr/local/bin/exec-winch.py
+  end
+}

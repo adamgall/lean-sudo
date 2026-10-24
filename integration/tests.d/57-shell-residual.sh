@@ -273,3 +273,47 @@ EOF
   shell_residual_audit_record failed || fail 'no authentication USER_CMD failure audit record'
   end
 }
+
+begin shell-residual-kernel-timestamp-shared-parent && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/shell-residual <<'EOF'
+Defaults:alice timestamp_type=kernel
+EOF
+  pty alice 'sudo -v && sudo -n /usr/bin/true && bash -c '\''sudo -n /usr/bin/true; result=$?; echo nested:$result; exit $result'\''; result=$?; exit $result' \
+    -e 'password for alice: ' -s 'alicepw\r'
+  expect_rc 0
+  expect_out_has 'nested:0'
+  end
+}
+
+begin shell-residual-ppid-timestamp-parent-isolation && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/shell-residual <<'EOF'
+Defaults:alice timestamp_type=ppid
+EOF
+  pty alice 'sudo -v && sudo -n /usr/bin/true && bash -c '\''sudo -n /usr/bin/true; result=$?; echo nested:$result; exit $result'\''; result=$?; exit $result' \
+    -e 'password for alice: ' -s 'alicepw\r'
+  expect_rc 1
+  expect_out_has 'nested:1'
+  expect_out_has 'a password is required'
+  end
+}
+
+begin shell-residual-kernel-timestamp-invalidate-key && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/shell-residual <<'EOF'
+Defaults:alice timestamp_type=kernel
+EOF
+  pty alice 'sudo -v && sudo -k && sudo -n /usr/bin/true' \
+    -e 'password for alice: ' -s 'alicepw\r'
+  expect_rc 0
+  end
+}
+
+begin shell-residual-tty-timestamp-invalidate-key && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/shell-residual <<'EOF'
+Defaults:alice timestamp_type=tty
+EOF
+  pty alice 'sudo -v && sudo -k && sudo -n /usr/bin/true' \
+    -e 'password for alice: ' -s 'alicepw\r'
+  expect_rc 1
+  expect_out_has 'a password is required'
+  end
+}

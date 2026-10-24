@@ -139,6 +139,45 @@ LEAN_EXPORT lean_obj_res leansudo_visudo_lock(b_lean_obj_arg path, uint32_t mode
     return lean_io_result_mk_ok(lean_box(created ? 2 : 0));
 }
 
+/* An unchanged original may be a symlink. Use the descriptor we already locked,
+ * not a fresh O_NOFOLLOW open of the pathname, and avoid needless metadata writes. */
+LEAN_EXPORT lean_obj_res leansudo_visudo_correct_locked_metadata(b_lean_obj_arg path,
+        uint32_t uid, uint32_t gid, uint32_t mode, uint8_t owner, uint8_t perms) {
+    const char *p = cstr_arg(path);
+    if (!p) return io_err("invalid path");
+    if (uid == (uint32_t)-1 || gid == (uint32_t)-1 || (mode & ~07777u) != 0)
+        return io_err("invalid owner or mode");
+    int fd = -1;
+    for (struct locked_file *l = locked_files; l; l = l->next) {
+        if (!strcmp(l->path, p)) {
+            fd = l->fd;
+            break;
+        }
+    }
+    struct stat st;
+    if (fd == -1) {
+        /* Different include spellings can refer to the same locked inode. */
+        if (stat(p, &st) != 0) return io_errno_path("unable to stat", p, errno);
+        for (struct locked_file *l = locked_files; l; l = l->next) {
+            if (l->dev == st.st_dev && l->ino == st.st_ino) {
+                fd = l->fd;
+                break;
+            }
+        }
+    }
+    if (fd == -1) return io_err("sudoers file is not locked");
+    if (fstat(fd, &st) != 0) return io_errno_path("unable to stat", p, errno);
+    if (owner && (st.st_uid != (uid_t)uid || st.st_gid != (gid_t)gid)) {
+        if (fchown(fd, (uid_t)uid, (gid_t)gid) != 0)
+            return io_errno_path("unable to set (uid, gid) of", p, errno);
+    }
+    if (perms && (st.st_mode & 0777) != mode) {
+        if (fchmod(fd, (mode_t)mode) != 0)
+            return io_errno_path("unable to change mode of", p, errno);
+    }
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
 struct temporary_file {
     struct temporary_file *next;
     char *path;

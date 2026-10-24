@@ -48,12 +48,19 @@ esac
 
 # --- visudo suite hook ------------------------------------------------------
 entry=()
+visudo_env=()
+sibling_sudo=
 if [[ $visudo == 1 ]]; then
   case $impl in
     reference) bin=/usr/sbin/visudo.ws; label=visudo-reference ;;
     sudo-rs)   usage ;;
     *)         bin=/opt/impl/visudo; label=visudo-$(basename "$host_bin")
-               [[ $label == visudo-visudo ]] && label=custom-visudo ;;
+               [[ $label == visudo-visudo ]] && label=custom-visudo
+               # Tests that run sudo after visudo use the sibling sudo binary, if any.
+               if [[ -f $(dirname "$host_bin")/sudo ]]; then
+                 sibling_sudo=$(dirname "$host_bin")/sudo
+                 visudo_env=(-e VISUDO_SUDO_BINARY=/opt/impl/sudo)
+               fi ;;
   esac
   entry=(--entrypoint /opt/impl/visudo-tests.sh)
 fi
@@ -75,7 +82,7 @@ cid=$(docker create \
   --hostname sudo-it --network none --cap-add SYS_PTRACE \
   -v "$here/out:/out" \
   -e IMPL_LABEL="$label" -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-  "${entry[@]}" "$image" "$bin" "$filter")
+  "${visudo_env[@]}" "${entry[@]}" "$image" "$bin" "$filter")
 trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 
 if [[ -n $host_bin ]]; then
@@ -83,6 +90,7 @@ if [[ -n $host_bin ]]; then
 fi
 if [[ $visudo == 1 ]]; then
   docker cp -q "$here/visudo-tests.sh" "$cid:/opt/impl/visudo-tests.sh"
+  [[ -n $sibling_sudo ]] && docker cp -q "$sibling_sudo" "$cid:/opt/impl/sudo"
 fi
 
 set +e

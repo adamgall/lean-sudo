@@ -1,6 +1,7 @@
 import LeanSudo.Core.Types
 import LeanSudo.Policy.Eval
 import LeanSudo.Policy.List
+import LeanSudo.Sudoedit.Check
 
 /-!
 # Pure decision core
@@ -65,13 +66,27 @@ def request (ctx : Context) : Request :=
       | _ => runCommand ctx }
 
 def authUser (ctx : Context) : Principal :=
-  if ctx.settings.rootpw then
-    { name := "root", uid := 0, gid := 0, groups := [], home := "/root", shell := "/bin/bash" }
-  else if ctx.settings.runaspw || ctx.settings.targetpw then ctx.target else ctx.invoking
+  if ctx.opts.mode == .list then ctx.invoking
+  else if ctx.settings.rootpw then ctx.root
+  else if ctx.settings.runaspw then ctx.runasDefaultUser.getD ctx.root
+  else if ctx.settings.targetpw then ctx.target else ctx.invoking
 
 /-- sudo's user-facing host is the resolved full name, unlike its short matcher key. -/
 def displayHost (ctx : Context) : String :=
   ctx.opts.host.getD (if ctx.longHost.isEmpty then ctx.host else ctx.longHost)
+
+/-- Listing headers and NO_HOST/NO_CHECK diagnostics use runas.shost. -/
+def displayShortHost (ctx : Context) : String :=
+  ((ctx.opts.host.getD ctx.host).splitOn ".").headD ctx.host
+
+def listOtherDenied (ctx : Context) : Bool :=
+  ctx.opts.mode == .list && ctx.opts.otherUser.isSome &&
+    !canListOther ctx.sudoers ctx.settings { request ctx with user := ctx.invoking }
+      (ctx.listUser.getD ctx.invoking) ctx.root
+
+/-- Listing another user is an authorization decision, not a pre-authentication error. -/
+def policyJudgement (ctx : Context) : Judgement :=
+  if listOtherDenied ctx then .deny else evaluate ctx.sudoers ctx.settings (request ctx)
 
 def sameIdentity (ctx : Context) : Bool :=
   ctx.target.uid == ctx.invoking.uid &&
@@ -172,12 +187,12 @@ def commandTimeout (ctx : Context) (a : Allowed) : Nat :=
 def execPlan (ctx : Context) (a : Allowed) (rc : ResolvedCmd) : ExecPlan :=
   { path := executionPath ctx rc, argv := rc.argv0 :: rc.args, envInput := environment ctx a,
     uid := ctx.target.uid, gid := commandGid ctx, groups := targetGroups ctx,
-    cwd := if ctx.opts.login then some ctx.target.home else (configuredCwd ctx a).bind (expandHome ctx),
+    cwd := ((configuredCwd ctx a).bind (expandHome ctx)).or (if ctx.opts.login then some ctx.target.home else none),
     umask := commandUmask ctx,
     usePty := ctx.settings.usePty, background := ctx.opts.background,
     closeFrom := ctx.opts.closeFrom.getD ctx.settings.closefrom.toNat,
     pamService := pamService ctx, pamSession := ctx.settings.pamSession,
-    pamSetcred := ctx.settings.pamSetcred, cwdOptional := ctx.opts.login,
+    pamSetcred := ctx.settings.pamSetcred, cwdOptional := ctx.opts.login && (configuredCwd ctx a).isNone,
     execBackground := ctx.settings.execBackground,
     staySetuid := ctx.settings.staySetuid,
     timeout := commandTimeout ctx a,
@@ -191,21 +206,30 @@ def execPlan (ctx : Context) (a : Allowed) (rc : ResolvedCmd) : ExecPlan :=
     rlimits := ctx.settings.resourceLimits,
     iolog := IoLog.plan ctx.settings { logInput := a.logInput, logOutput := a.logOutput } }
 
-def editorWords (s : String) : List String :=
-  (s.splitOn " ").flatMap (fun w => w.splitOn "\t") |>.filter (· != "")
+def editorWords (s : String) : List String := Sudoedit.editorWords s
 
-def editors (ctx : Context) : List (List String) :=
-  ((if ctx.settings.envEditor then
-    ["SUDO_EDITOR", "VISUAL", "EDITOR"].filterMap (lookup ctx.userEnv) else []) ++
-    ctx.settings.editor.splitOn ":").map editorWords |>.filter (! ·.isEmpty)
+def environmentEditors (ctx : Context) : List String :=
+  (["SUDO_EDITOR", "VISUAL", "EDITOR"].filterMap (lookup ctx.userEnv)).filter (!·.isEmpty)
+
+def editorCandidates (ctx : Context) : List (String × List String) :=
+  (environmentEditors ctx ++ ctx.settings.editor.splitOn ":").filterMap fun source =>
+    let words := editorWords source
+    if words.isEmpty then none else some (source, words)
+
+def editors (ctx : Context) : List (List String) := (editorCandidates ctx).map (·.2)
 
 def editPlan (ctx : Context) (a : Allowed) : EditPlan :=
-  { files := files ctx, policyFiles := ctx.opts.command, editors := editors ctx, editUid := (displayUser ctx).uid,
+  let candidates := editorCandidates ctx
+  { files := files ctx, policyFiles := ctx.opts.command, editors := candidates.map (·.2), editUid := (displayUser ctx).uid,
     editGid := (displayUser ctx).gid, editGroups := (displayUser ctx).groups.map (·.2),
     fileUid := ctx.target.uid, fileGid := targetGid ctx, fileGroups := targetGroups ctx,
     envInput := environment ctx a, umask := commandUmask ctx, pamService := pamService ctx,
     pamSession := ctx.settings.pamSession, pamSetcred := ctx.settings.pamSetcred,
-    follow := a.follow.getD ctx.settings.sudoeditFollow, checkdir := ctx.settings.sudoeditCheckdir }
+    follow := a.follow.getD ctx.settings.sudoeditFollow, checkdir := ctx.settings.sudoeditCheckdir,
+    editorSources := candidates.map (·.1),
+    editorNotFound := (environmentEditors ctx).getLast?.getD ctx.settings.editor,
+    editorPath := (if userIsExempt ctx.settings ctx.invoking then none else ctx.settings.securePath).getD
+      ((lookup ctx.userEnv "PATH").getD stdPath) }
 
 def notFound (ctx : Context) : Action :=
   let command := ctx.opts.command.headD ""
@@ -260,7 +284,7 @@ def allowedAction (ctx : Context) (a : Allowed) : Action :=
   | .list =>
     if ctx.opts.command.isEmpty then
       .print (listPrivileges ctx.sudoers ctx.settings (ctx.listUser.getD ctx.invoking)
-        (displayHost ctx) ctx.canon (ctx.opts.listVerbose > 1) ctx.locatedSudoers
+        (displayShortHost ctx) ctx.canon (ctx.opts.listVerbose > 1) ctx.locatedSudoers
           (some (request ctx)) ctx.listColumns) 0
     else match ctx.command with
       | none => notFound ctx
@@ -280,7 +304,8 @@ def hostMatches (ctx : Context) : Bool :=
     us.entries.any (fun hc => hostListOk al al.fuel ctx.host hc.hosts ctx.settings (some (request ctx)))
 
 def denialReason (ctx : Context) : String :=
-  if !userMatches ctx then "user NOT in sudoers"
+  if ctx.opts.mode == .list || ctx.opts.mode == .validate then "command not allowed"
+  else if !userMatches ctx then "user NOT in sudoers"
   else if !hostMatches ctx then "user NOT authorized on host" else "command not allowed"
 
 def denialMail (ctx : Context) : Bool :=
@@ -292,13 +317,19 @@ def incident (ctx : Context) : String :=
   if denialMail ctx then "This incident has been reported to the administrator.\n" else ""
 
 def deniedAction (ctx : Context) : Action :=
-  if ctx.opts.mode = .list then
-    if ctx.opts.command.isEmpty then .fail (notAllowedMessage (ctx.listUser.getD ctx.invoking).name (displayHost ctx) ++ "\n") 1
-    else .print "" 1
-  else if ctx.opts.mode = .validate then .fail (notAllowedMessage ctx.invoking.name (displayHost ctx) ++ "\n") 1
+  if listOtherDenied ctx then
+    .fail (s!"Sorry, user {ctx.invoking.name} is not allowed to execute '{if ctx.opts.command.isEmpty then "list" else "list " ++ commandText ctx}' as {(ctx.listUser.getD ctx.invoking).name} on {displayHost ctx}.\n" ++
+      (ctx.settings.cmddenialMessage.map (· ++ "\n")).getD "") 1
+  else if ctx.opts.mode = .list then
+    if !ctx.opts.command.isEmpty then .print "" 1
+    else if ctx.opts.otherUser.isSome && (ctx.listUser.getD ctx.invoking).uid != ctx.invoking.uid then
+      .fail (notAllowedMessage (ctx.listUser.getD ctx.invoking).name (displayShortHost ctx) ++ "\n") 1
+    else .fail s!"Sorry, user {ctx.invoking.name} may not run sudo on {displayShortHost ctx}.\n" 1
+  else if ctx.opts.mode = .validate then
+    .fail s!"Sorry, user {ctx.invoking.name} may not run sudo on {displayShortHost ctx}.\n" 1
   else if !userMatches ctx then .fail (s!"{(displayUser ctx).name} is not in the sudoers file.\n" ++ incident ctx) 1
   else if !hostMatches ctx then
-    .fail (s!"{(displayUser ctx).name} is not allowed to run sudo on {displayHost ctx}.\n" ++ incident ctx) 1
+    .fail (s!"{(displayUser ctx).name} is not allowed to run sudo on {displayShortHost ctx}.\n" ++ incident ctx) 1
   else if ctx.command.isNone && ctx.opts.mode = .run && ctx.settings.pathInfo then notFound ctx
   else
     let target := ctx.target.name ++ (ctx.targetGroup.map (fun g => ":" ++ g.name)).getD ""
@@ -321,7 +352,9 @@ def logArgument (arg : String) : String :=
 
 def logCommand (ctx : Context) : String :=
   match (request ctx).command with
-  | .run p _ args => logEscape p true ++ String.join (args.map (" " ++ logArgument ·))
+  | .run p _ args =>
+    let path := if p.startsWith "/" then p else (ctx.command.map (executionPath ctx)).getD p
+    logEscape path true ++ String.join (args.map (" " ++ logArgument ·))
   | .sudoedit fs => "sudoedit" ++ String.join (fs.map (" " ++ logArgument ·))
   | _ => commandText ctx
 
@@ -330,8 +363,7 @@ def logLine (ctx : Context) (reason : Option String) (allowed : Option Allowed :
     logEscape (if t.startsWith "/dev/" then String.ofList (t.toList.drop 5) else t)
   let cwd := (ctx.opts.chdir.or (allowed.bind (·.cwd.join))).or ctx.settings.runcwd
     |>.filter (· != "*")
-  let cwd := if ctx.opts.login then ctx.target.home else
-    (cwd.bind (expandHome ctx)).getD ctx.cwd
+  let cwd := (cwd.bind (expandHome ctx)).getD (if ctx.opts.login then ctx.target.home else ctx.cwd)
   let chroot := ctx.opts.chroot.or ((allowed.bind (·.chroot)).or ctx.settings.runchroot)
   { format := ctx.settings.logFormat, reason,
     priority := (if reason.isSome then ctx.settings.syslogBadpri else ctx.settings.syslogGoodpri).getD "none",
@@ -383,6 +415,8 @@ def earlyAction (ctx : Context) : Option Action :=
   | _ =>
     if ctx.settings.groupPlugin.isSome then
       some (.fail "sudo: group_plugin is not supported\n" 1)
+    else if (Cli.timeoutError ctx.opts).isSome then
+      some (.fail s!"sudo: {(Cli.timeoutError ctx.opts).getD ""}\nsudo: error initializing audit plugin sudoers_audit\n" 1)
     else if ctx.opts.mode = .edit ∧ (invalidEditFile ctx).isSome then
       some (.fail s!"sudoedit: {(invalidEditFile ctx).getD ""}: path is not absolute or contains a NUL byte, refusing\n" 1)
     else if ctx.targetUnknownUid && !ctx.settings.runasAllowUnknownId then
@@ -403,13 +437,9 @@ def earlyAction (ctx : Context) : Option Action :=
     else if ctx.opts.closeFrom.isSome && ctx.opts.closeFrom != some ctx.settings.closefrom.toNat &&
         !ctx.settings.closefromOverride then
       some (.fail "sudo: you are not permitted to use the -C option\n" 1)
-    else if ctx.opts.otherUser.isSome &&
-      !canListOther ctx.sudoers ctx.settings { request ctx with user := ctx.invoking }
-        (ctx.listUser.getD ctx.invoking) ctx.root then
-      some (.fail s!"sudo: user {ctx.invoking.name} is not allowed to list privileges for {(ctx.listUser.getD ctx.invoking).name}\n" 1)
-    else if !ctx.settings.rootpw && ctx.settings.runaspw &&
-      ctx.target.name != ctx.settings.runasDefault then
-      some (.fail "sudo: runaspw requires the default runas user as target\n" 1)
+    else if ctx.opts.mode != .list && !ctx.settings.rootpw && ctx.settings.runaspw &&
+        ctx.runasDefaultUser.isNone && ctx.settings.runasDefault != ctx.root.name then
+      some (.fail s!"sudo: unknown user {ctx.settings.runasDefault}\n" 1)
     else none
 
 /-- sudo checks listing authentication independently of `-l command` authorization. -/
@@ -436,6 +466,6 @@ def policyDecision (ctx : Context) (j : Judgement) : Decision :=
 def decide (ctx : Context) : Decision :=
   match earlyAction ctx with
   | some action => { auth := .none, action, updateTimestamp := false, log := none }
-  | none => policyDecision ctx (evaluate ctx.sudoers ctx.settings (request ctx))
+  | none => policyDecision ctx (policyJudgement ctx)
 
 end LeanSudo.Core

@@ -229,7 +229,20 @@ or wait for a release file; `What now?` answers on stdin) and restores
 The suite has no implementation-specific skips. It checks stock-policy output,
 `-c`, `-q`, `-s`, `-f -`, `-O`/`-P`, help/version and argument handling. Exact
 reference comparisons cover syntax and semantic diagnostics, including source
-columns, undefined/cyclic/unused aliases, and invalid Defaults.
+columns and invalid Defaults; alias cases explicitly encode the safety deviation
+below rather than skipping either implementation.
+
+**Documented lean-sudo deviation:** the runtime rejects undefined aliases, alias
+cycles and duplicate definitions before executing any command. To avoid installing
+a policy that would lock administrators out, visudo treats every `Policy.validate`
+failure as fatal in both strict and non-strict modes, including invalid aliases
+in unused definitions and Defaults bindings. sudo.ws only warns about reachable
+undefined/cyclic aliases without `-s` and ignores invalid unreferenced definitions.
+Check mode exits 1; edit mode enters the usual `What now?` loop, retaining the
+existing policy on `x`/EOF. The explicitly dangerous `Q` override still exists.
+The regression suite checks that sudo continues working after a rejected undefined
+alias edit. For a custom visudo with a sibling sudo binary, the runner supplies
+that runtime as `VISUDO_SUDO_BINARY`; reference runs use `/usr/bin/sudo.ws`.
 
 Edit coverage includes explicit `@include` and `#include` files in order, nested
 session validation before installation, newly added includes, empty includes,
@@ -249,6 +262,11 @@ use mode 0640 (subject to the inherited umask) unless `-P` requests 0440.
 editor selection, arguments and exit/signal status, signal cleanup, zero-length
 main files, stale temporary files, and owner/mode preservation. In edit mode
 `-f -` names a literal file `-`; only check mode treats it as standard input.
+Unchanged originals, including symlinked includes, receive owner/mode corrections
+through their held lock descriptors and only when metadata differs. Every file
+is validated before installation starts. A per-file installation failure is
+reported without aborting later installations; failed temporary copies are
+retained with the upstream-style “contents of edit session left in” diagnostic.
 
 `-x file` / `--export=file` reproduces upstream's compatibility implementation:
 print its two deprecation warnings, then execute

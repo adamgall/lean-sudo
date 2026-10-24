@@ -6,17 +6,16 @@ import LeanSudo.Env
 Headline properties of `buildEnv` (DESIGN.md, verified property 6):
 
 * `buildEnv_nodup`: no duplicate keys.
-* `buildEnv_reset_whitelist`: in reset mode without SETENV-granted extra variables,
-  every variable is set by sudo, comes from PAM, or is whitelisted (`env_keep`, or
-  `env_check` with a safe value).
-* `buildEnv_delete_respected` / `buildEnv_no_LD`: without SETENV, a variable matching
-  `env_delete` (e.g. `LD_*`) only survives if sudo sets it itself or an `env_keep` /
-  `env_check` pattern whitelists it in reset mode.
-* `buildEnv_no_bash_fn`: a bash-function value only appears under a key sudo sets
-  itself from trusted data (`sudoValues`).
-* `buildEnv_securePath`: `PATH = secure_path` and it is the only `PATH`.
-* `buildEnv_sudo_vars`: `SUDO_COMMAND`, `SUDO_USER`, `SUDO_UID`, `SUDO_GID` are present
-  with the invoking user's values (and unique by `buildEnv_unique`).
+* `buildEnv_reset_whitelist`: without SETENV-granted extras, entries are from
+  sudo, trusted files/PAM, or the name/value whitelist (including identity coupling).
+* `buildEnv_delete_respected` / `buildEnv_no_LD`: user-controlled blocked entries
+  require reset-mode whitelisting; trusted PAM and files are separate provenance.
+* `buildEnv_no_bash_fn`: function values have trusted or explicitly authorized
+  provenance. `userPass_unapproved_function` excludes reset-mode functions without
+  a value-qualified match; SETENV and copy-mode policy can authorize functions.
+* `buildEnv_securePath` / `buildEnv_sudo_vars`: rebuilt values are unique and
+  survive unless an authorized explicit assignment or PAM merge replaces them.
+  `BindingSafe` requires every later write to preserve the rebuilt binding.
 -/
 
 namespace LeanSudo
@@ -85,6 +84,62 @@ theorem mem_addDefaults_of_mem {e l : EnvList} {kv : String × String} (h : kv �
     obtain ⟨k, v⟩ := x
     exact ih (mem_setDefault_of_mem h)
 
+/-- Explicit assignments preserve a binding when any replacement agrees with it. -/
+theorem mem_setAll_of_compatible {e l : EnvList} {k v : String}
+    (h : (k, v) ∈ e) (hl : ∀ kv ∈ l, kv.1 = k → kv.2 = v) :
+    (k, v) ∈ setAll e l := by
+  induction l generalizing e with
+  | nil => exact h
+  | cons x rest ih =>
+    obtain ⟨k', v'⟩ := x
+    apply ih
+    · by_cases hk : k = k'
+      · subst k'
+        have hv := hl (k, v') (by simp) rfl
+        dsimp only at hv
+        subst v'
+        exact mem_setVar_self _ _ _
+      · exact mem_setVar_of_ne h hk
+    · intro kv hm
+      exact hl kv (List.mem_cons_of_mem _ hm)
+
+theorem mem_mergePam {i : EnvInput} {e l : EnvList} {kv : String × String}
+    (h : kv ∈ mergePam i e l) : kv ∈ e ∨ kv ∈ l := by
+  induction l generalizing e with
+  | nil => exact Or.inl h
+  | cons x rest ih =>
+    obtain ⟨k, v⟩ := x
+    rcases ih h with h' | h'
+    · split at h'
+      · rcases mem_setVar.1 h' with ⟨he, _⟩ | rfl
+        · exact Or.inl he
+        · exact Or.inr (by simp)
+      · rcases mem_setDefault h' with he | rfl
+        · exact Or.inl he
+        · exact Or.inr (by simp)
+    · exact Or.inr (List.mem_cons_of_mem _ h')
+
+theorem mem_mergePam_of_compatible {i : EnvInput} {e l : EnvList} {k v : String}
+    (h : (k, v) ∈ e)
+    (hl : ∀ kv ∈ l, kv.1 = k → pamOverwrite i kv.1 kv.2 = false ∨ kv.2 = v) :
+    (k, v) ∈ mergePam i e l := by
+  induction l generalizing e with
+  | nil => exact h
+  | cons x rest ih =>
+    obtain ⟨k', v'⟩ := x
+    apply ih
+    · split
+      · rename_i hw
+        by_cases hk : k = k'
+        · subst k'
+          rcases hl (k, v') (by simp) rfl with hn | hv
+          · simp [hn] at hw
+          · dsimp only at hv; subst v'; exact mem_setVar_self _ _ _
+        · exact mem_setVar_of_ne h hk
+      · exact mem_setDefault_of_mem h
+    · intro kv hm
+      exact hl kv (List.mem_cons_of_mem _ hm)
+
 theorem lookup_mem {e : EnvList} {k v : String} (h : lookup e k = some v) : (k, v) ∈ e := by
   unfold lookup at h
   cases hf : e.find? (fun kv => kv.1 == k) with
@@ -139,6 +194,17 @@ theorem nodup_addDefaults {e : EnvList} (l : EnvList) (h : NodupKeys e) :
   induction l generalizing e with
   | nil => exact h
   | cons x rest ih => obtain ⟨k, v⟩ := x; exact ih (nodup_setDefault k v h)
+
+theorem nodup_mergePam {i : EnvInput} {e : EnvList} (l : EnvList) (h : NodupKeys e) :
+    NodupKeys (mergePam i e l) := by
+  induction l generalizing e with
+  | nil => exact h
+  | cons x rest ih =>
+    obtain ⟨k, v⟩ := x
+    apply ih
+    split
+    · exact nodup_setVar k v h
+    · exact nodup_setDefault k v h
 
 theorem nodup_unique {e : EnvList} (h : NodupKeys e) {k v₁ v₂ : String}
     (h₁ : (k, v₁) ∈ e) (h₂ : (k, v₂) ∈ e) : v₁ = v₂ := by
@@ -214,7 +280,7 @@ def Origin (i : EnvInput) (reset : Bool) (extra : EnvList) (kv : String × Strin
   (kv.1 = "PS1" ∧ ("SUDO_PS1", kv.2) ∈ i.userEnv ∧ entryOk "SUDO_PS1" kv.2 = true) ∨
   -- a command-line / --preserve-env=list variable
   kv ∈ extra ∨
-  -- a PAM variable that passed the filter
+  -- a trusted PAM variable with a well-formed name (not user-filtered)
   (kv ∈ i.pamEnv ∧ pamPass i kv.1 kv.2 = true) ∨
   -- set by sudo
   kv ∈ sudoValues i
@@ -314,17 +380,16 @@ theorem mem_assemble_origin {i : EnvInput} {reset : Bool} {extra : EnvList} {kv 
     · exact inv_defaultsReset i reset extra
     · exact inv_defaultsCopy i reset extra
   have h2 := inv_commonDefaults i reset extra h1
-  have h3 := inv_setAll (l := extra) h2 (fun kv hm => Or.inr (Or.inr (Or.inr (Or.inl hm))))
-  have h4 : Inv (Origin i reset extra) (applySecurePath i (setAll (commonDefaults i
-      (if reset then defaultsReset i (baseEnv i reset) else defaultsCopy i (baseEnv i reset))) extra)) := by
+  have h4 : Inv (Origin i reset extra) (applySecurePath i (commonDefaults i
+      (if reset then defaultsReset i (baseEnv i reset) else defaultsCopy i (baseEnv i reset)))) := by
     unfold applySecurePath
     split
     · rename_i p hp
-      exact inv_setVar h3 (sv _ (by simp [sudoValues, hp]))
-    · exact h3
+      exact inv_setVar h2 (sv _ (by simp [sudoValues, hp]))
+    · exact h2
   have hh := inv_setVar h4 (sv ("SUDO_HOME", i.invoking.home) (by simp [sudoValues]))
-  let eh := setVar (applySecurePath i (setAll (commonDefaults i
-    (if reset then defaultsReset i (baseEnv i reset) else defaultsCopy i (baseEnv i reset))) extra))
+  let eh := setVar (applySecurePath i (commonDefaults i
+    (if reset then defaultsReset i (baseEnv i reset) else defaultsCopy i (baseEnv i reset))))
       "SUDO_HOME" i.invoking.home
   have ht : Inv (Origin i reset extra)
       (match i.ttyName with
@@ -338,12 +403,13 @@ theorem mem_assemble_origin {i : EnvInput} {reset : Bool} {extra : EnvList} {kv 
     (sv ("SUDO_USER", i.invoking.name) (by simp [sudoValues])))
     (sv ("SUDO_UID", toString i.invoking.uid) (by simp [sudoValues])))
     (sv ("SUDO_GID", toString (i.invokingRealGid.getD i.invoking.gid)) (by simp [sudoValues]))
-  have h6 := inv_addDefaults (l := pamVars i) h5 (fun kv hm => by
-    have := List.mem_filter.1 hm
-    exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inl this)))))
-  rcases mem_addDefaults h with hm | hm
-  · exact Or.inl (h6 kv hm)
-  · exact Or.inr hm
+  rcases mem_mergePam h with he | hp
+  · rcases mem_setAll he with he | hx
+    · rcases mem_addDefaults he with he | hf
+      · exact Or.inl (h5 kv he)
+      · exact Or.inr hf
+    · exact Or.inl (Or.inr (Or.inr (Or.inr (Or.inl hx))))
+  · exact Or.inl (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl (List.mem_filter.1 hp))))))
 
 theorem nodup_assemble (i : EnvInput) (reset : Bool) (extra : EnvList) :
     NodupKeys (assemble i reset extra) := by
@@ -367,6 +433,7 @@ theorem nodup_assemble (i : EnvInput) (reset : Bool) (extra : EnvList) :
   repeat first
     | exact h1
     | apply nodup_addDefaults
+    | apply nodup_mergePam
     | apply nodup_setVar
     | apply nodup_setDefault
     | apply nodup_setAll
@@ -434,36 +501,36 @@ theorem sudoValues_key {i : EnvInput} {kv : String × String} (h : kv ∈ sudoVa
       simp
     · simp at h
 
-/-- (b) In reset mode, when no extra variables were granted through SETENV, every
-variable is set by sudo, is a filtered PAM variable, or is whitelisted: it matches
-`env_check` and has a safe value, or it matches no `env_check` pattern but an
-`env_keep` pattern. -/
+/-- Whitelisting uses complete name/value patterns and LOGNAME/USER coupling.
+Trusted PAM and files are explicit exceptions, not user-controlled whitelist entries. -/
 theorem buildEnv_reset_whitelist {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out)
     (hr : resetMode i = true) (hx : i.setenvAllowed = false ∨ extraVars i = [])
     {kv : String × String} (hm : kv ∈ out) :
     kv ∈ fileVars i ∨ kv.1 ∈ sudoKeys ∨ (kv ∈ i.pamEnv ∧ pamPass i kv.1 kv.2 = true) ∨
-    ((∃ p ∈ i.settings.envCheck, patMatch p kv.1 = true) ∧ checkSafe kv.1 kv.2 = true) ∨
-    ((∀ p ∈ i.settings.envCheck, patMatch p kv.1 = false) ∧
-      ∃ p ∈ i.settings.envKeep, patMatch p kv.1 = true) := by
+    (matchesAny i.settings.envCheck kv.1 kv.2 = true ∧ checkSafe kv.1 kv.2 = true) ∨
+    (matchesAny i.settings.envCheck kv.1 kv.2 = false ∧
+      matchesAny i.settings.envKeep kv.1 kv.2 = true) := by
   rcases buildEnv_origin h hm with hor | hf
   case inr => exact Or.inl hf
   right
   obtain ⟨_, hallowed, _⟩ := buildEnv_ok h
   have hkeep : ∀ k v, keepReset i k v = true → k ∈ sudoKeys ∨
-      ((∃ p ∈ i.settings.envCheck, patMatch p k = true) ∧ checkSafe k v = true) ∨
-      ((∀ p ∈ i.settings.envCheck, patMatch p k = false) ∧
-        ∃ p ∈ i.settings.envKeep, patMatch p k = true) := by
+      (matchesAny i.settings.envCheck k v = true ∧ checkSafe k v = true) ∨
+      (matchesAny i.settings.envCheck k v = false ∧
+        matchesAny i.settings.envKeep k v = true) := by
     intro k v hk
-    unfold keepReset matchesAny at hk
+    unfold keepReset at hk
+    simp only [Bool.and_eq_true] at hk
+    obtain ⟨hk, _⟩ := hk
+    unfold keepResetPolicy at hk
     split at hk
     · rename_i hc
-      exact Or.inr (Or.inl ⟨List.any_eq_true.1 hc, hk⟩)
+      exact Or.inr (Or.inl ⟨hc, hk⟩)
     · rename_i hc
-      simp only [Bool.not_eq_true, List.any_eq_false] at hc
-      simp only [Bool.or_eq_true, List.any_eq_true, beq_iff_eq, Bool.and_eq_true] at hk
-      rcases hk with (hk | hk) | ⟨_, hk⟩
-      · exact Or.inr (Or.inr ⟨fun p hp => by simpa using hc p hp, hk⟩)
-      · exact Or.inl (by simp [hk, sudoKeys])
+      have hc : matchesAny i.settings.envCheck k v = false := by simpa using hc
+      simp only [Bool.or_eq_true, beq_iff_eq, Bool.and_eq_true] at hk
+      rcases hk with hk | ⟨_, hk⟩
+      · exact Or.inr (Or.inr ⟨hc, hk⟩)
       · exact Or.inl (by simp [hk, sudoKeys])
   rcases hor with ⟨_, hu⟩ | ⟨hk, -⟩ | ⟨hk, -⟩ | hx' | hp | hs
   · simp only [userPass, hr, ↓reduceIte, Bool.and_eq_true] at hu
@@ -482,12 +549,14 @@ theorem buildEnv_reset_whitelist {i : EnvInput} {out : EnvList} (h : buildEnv i 
   · exact Or.inr (Or.inl hp)
   · exact Or.inl (sudoValues_key hs)
 
-/-- (c) Without SETENV, a variable whose name matches `env_delete` survives only if sudo
-sets it itself, or in reset mode when it is explicitly whitelisted. -/
+/-- User-controlled blocked entries require reset-mode whitelisting. Trusted
+PAM and administrator files are not subject to the user's env_delete filter. -/
 theorem buildEnv_delete_respected {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out)
     (hs : i.setenvAllowed = false) {kv : String × String} (hm : kv ∈ out)
-    (hd : matchesAny i.settings.envDelete kv.1 = true) :
-    kv ∈ fileVars i ∨ kv.1 ∈ sudoKeys ∨ (resetMode i = true ∧ keepReset i kv.1 kv.2 = true) := by
+    (hd : matchesAny i.settings.envDelete kv.1 kv.2 = true) :
+    kv ∈ fileVars i ∨ kv.1 ∈ sudoKeys ∨
+    (kv ∈ i.pamEnv ∧ pamPass i kv.1 kv.2 = true) ∨
+    (resetMode i = true ∧ keepReset i kv.1 kv.2 = true) := by
   rcases buildEnv_origin h hm with hor | hf
   case inr => exact Or.inl hf
   right
@@ -497,7 +566,7 @@ theorem buildEnv_delete_respected {i : EnvInput} {out : EnvList} (h : buildEnv i
     cases hr : resetMode i
     · simp [hr, deleteCopy, hd] at hu
     · simp only [hr, ↓reduceIte, Bool.and_eq_true] at hu
-      exact Or.inr ⟨rfl, hu.2⟩
+      exact Or.inr (Or.inr ⟨rfl, hu.2⟩)
   · left; simp at hk; rcases hk with hk | hk <;> simp [hk, sudoKeys]
   · left; simp [hk, sudoKeys]
   · have := hallowed kv hx'
@@ -505,104 +574,144 @@ theorem buildEnv_delete_respected {i : EnvInput} {out : EnvList} (h : buildEnv i
     cases hr : resetMode i
     · simp [hr, hs, deleteCopy, hd] at this
     · simp only [hr, hs, ↓reduceIte, Bool.false_or, Bool.and_eq_true] at this
-      exact Or.inr ⟨rfl, this.2.2⟩
-  · simp [pamPass, hd] at hp
+      exact Or.inr (Or.inr ⟨rfl, this.2.2⟩)
+  · exact Or.inr (Or.inl hp)
   · exact Or.inl (sudoValues_key hsv)
 
 theorem patMatch_LD_sudoKeys {k : String} (hk : k ∈ sudoKeys) : patMatch "LD_*" k = false := by
   simp only [sudoKeys, List.mem_cons, List.not_mem_nil, or_false] at hk
   rcases hk with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide
 
-/-- (c) `LD_*`: when `env_delete` contains `LD_*` (sudo's default) and the user has no
-SETENV permission, an `LD_` variable is present only in reset mode and only if an
-`env_keep` pattern, or an `env_check` pattern with a safe value, names it. -/
-theorem buildEnv_no_LD {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out)
-    (hdel : "LD_*" ∈ i.settings.envDelete) (hs : i.setenvAllowed = false)
-    {k v : String} (hm : (k, v) ∈ out) (hld : patMatch "LD_*" k = true) :
-    (k, v) ∈ fileVars i ∨ resetMode i = true ∧
-    ((∃ p ∈ i.settings.envCheck, patMatch p k = true) ∧ checkSafe k v = true ∨
-     ∃ p ∈ i.settings.envKeep, patMatch p k = true) := by
-  have hd : matchesAny i.settings.envDelete k = true := List.any_eq_true.2 ⟨_, hdel, hld⟩
-  rcases buildEnv_delete_respected h hs hm hd with hf | hk | ⟨hr, hkeep⟩
-  · exact Or.inl hf
-  · rw [patMatch_LD_sudoKeys hk] at hld; cases hld
-  · right
-    refine ⟨hr, ?_⟩
-    unfold keepReset matchesAny at hkeep
-    split at hkeep
-    · exact Or.inl ⟨List.any_eq_true.1 (by assumption), hkeep⟩
-    · simp only [Bool.or_eq_true, List.any_eq_true, beq_iff_eq, Bool.and_eq_true] at hkeep
-      rcases hkeep with (hk | rfl) | ⟨_, rfl⟩
-      · exact Or.inr hk
-      · cases hld
-      · cases hld
-
 /-- `patMatch "LD_*" k` is exactly "`k` starts with `LD_`". -/
 theorem patMatch_LD_iff (k : String) :
     patMatch "LD_*" k = true ↔ ∃ r, k.toList = 'L' :: 'D' :: '_' :: r := by
-  unfold patMatch
+  unfold patMatch patMatchL
   have : "LD_*".toList = ['L', 'D', '_', '*'] := by decide
   rw [this]
   match k.toList with
-  | [] => simp [patMatchL]
-  | [_] => simp [patMatchL]
-  | [_, _] => simp [patMatchL]
+  | [] => simp [envPatternL]
+  | [_] => simp [envPatternL]
+  | [_, _] => simp [envPatternL]
   | a :: b :: c :: r =>
-    simp [patMatchL]
-    constructor
-    · rintro ⟨rfl, rfl, rfl⟩; simp
-    · rintro ⟨rfl, rfl, rfl⟩; simp
+    simp [envPatternL] <;>
+      (by_cases ha : a = 'L' <;> by_cases hb : b = 'D' <;> by_cases hc : c = '_' <;>
+        simp_all [eq_comm])
 
-/-- (c) Bash function exports never come from the user's environment, the command line
-or PAM: a value starting with `()` can only be one sudo set from trusted data. -/
+/-- Blocked LD entries cannot come from unapproved user input. Trusted PAM and
+files remain distinguished from the whitelist exception. -/
+theorem buildEnv_no_LD {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out)
+    (hdel : "LD_*" ∈ i.settings.envDelete) (hs : i.setenvAllowed = false)
+    {k v : String} (hm : (k, v) ∈ out) (hld : patMatch "LD_*" k = true) :
+    (k, v) ∈ fileVars i ∨ ((k, v) ∈ i.pamEnv ∧ pamPass i k v = true) ∨
+    resetMode i = true ∧
+    ((matchesAny i.settings.envCheck k v = true ∧ checkSafe k v = true) ∨
+      matchesAny i.settings.envKeep k v = true) := by
+  have hn : k ≠ "LOGNAME" := by intro he; subst k; cases hld
+  have hu : k ≠ "USER" := by intro he; subst k; cases hld
+  obtain ⟨r, hr⟩ := (patMatch_LD_iff k).1 hld
+  have hp : (entryPattern "LD_*" k v).isSome = true := by
+    simp [entryPattern, hn, hu, String.toList_append, hr, envPatternL]
+  have hd : matchesAny i.settings.envDelete k v = true :=
+    List.any_eq_true.2 ⟨_, hdel, hp⟩
+  rcases buildEnv_delete_respected h hs hm hd with hf | hk | hpam | ⟨hreset, hkeep⟩
+  · exact Or.inl hf
+  · rw [patMatch_LD_sudoKeys hk] at hld; cases hld
+  · exact Or.inr (Or.inl hpam)
+  · right; right
+    refine ⟨hreset, ?_⟩
+    unfold keepReset at hkeep
+    simp only [Bool.and_eq_true] at hkeep
+    obtain ⟨hkeep, _⟩ := hkeep
+    unfold keepResetPolicy at hkeep
+    split at hkeep
+    · exact Or.inl ⟨by assumption, hkeep⟩
+    · simp only [Bool.or_eq_true, beq_iff_eq, Bool.and_eq_true] at hkeep
+      rcases hkeep with hk | ⟨_, rfl⟩
+      · exact Or.inr hk
+      · cases hld
+
+/-- An invoking function without a value-qualified pattern cannot pass reset
+filtering. SETENV bypass and trusted PAM do not weaken this user-filter theorem. -/
+theorem userPass_unapproved_function {i : EnvInput} {k v : String}
+    (hf : isBashFn v = true)
+    (hc : matchFull i.settings.envCheck k v = false)
+    (hk : matchFull i.settings.envKeep k v = false) :
+    userPass i true k v = false := by
+  simp [userPass, keepReset, hf, hc, hk]
+
+/-- Functions in output have trusted provenance or come from input accepted by
+the actual user/explicit-assignment policy. The source key is retained for the
+LOGNAME/USER coupling case; no arbitrary user entry is a trusted PAM exception. -/
 theorem buildEnv_no_bash_fn {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out)
     {kv : String × String} (hm : kv ∈ out) (hf : isBashFn kv.2 = true) :
-    kv ∈ sudoValues i := by
+    kv ∈ sudoValues i ∨ (kv ∈ i.pamEnv ∧ pamPass i kv.1 kv.2 = true) ∨
+    kv ∈ fileVars i ∨
+    (∃ k, (k, kv.2) ∈ i.userEnv ∧ userPass i (resetMode i) k kv.2 = true) ∨
+    (kv ∈ extraVars i ∧ extraAllowed i (resetMode i) kv.1 kv.2 = true) := by
   obtain ⟨_, hallowed, _⟩ := buildEnv_ok h
   rcases buildEnv_origin h hm with hor | hfile
-  case inr =>
-    simp only [fileVars, List.mem_filter, List.mem_append] at hfile
-    rcases hfile.1 with hfile | hfile
-    · simp [userPass, entryOk, hf] at hfile
-    · simp [entryOk, hf] at hfile
-  rcases hor with ⟨_, hu⟩ | ⟨_, k', _, hu⟩ | ⟨_, _, he⟩ | hx' | hp | hsv
-  · simp [userPass, entryOk, hf] at hu
-  · simp [userPass, entryOk, hf] at hu
+  case inr => exact Or.inr (Or.inr (Or.inl hfile))
+  rcases hor with ⟨hm, hu⟩ | ⟨_, k', hm, hu⟩ | ⟨_, _, he⟩ | hx | hp | hsv
+  · exact Or.inr (Or.inr (Or.inr (Or.inl ⟨kv.1, hm, hu⟩)))
+  · exact Or.inr (Or.inr (Or.inr (Or.inl ⟨k', hm, hu⟩)))
   · simp [entryOk, hf] at he
-  · have := hallowed kv hx'
-    simp [extraAllowed, entryOk, hf] at this
-  · simp [pamPass, entryOk, hf] at hp
-  · exact hsv
+  · exact Or.inr (Or.inr (Or.inr (Or.inr ⟨hx, hallowed kv hx⟩)))
+  · exact Or.inr (Or.inl hp)
+  · exact Or.inl hsv
 
-/-- (d) An effective `secure_path` (non-exempt user) is the one and only `PATH`. -/
+/-- Later assignments either leave a binding alone or write its same value.
+PAM's decision uses the incoming value; even an env_check unsafe PAM value may
+overwrite a previously safe value. -/
+def BindingSafe (i : EnvInput) (k v : String) : Prop :=
+  (∀ kv ∈ extraVars i, kv.1 = k → kv.2 = v) ∧
+  (∀ kv ∈ pamVars i, kv.1 = k → pamOverwrite i kv.1 kv.2 = false ∨ kv.2 = v)
+
+theorem mem_assemble_of_bindingSafe {i : EnvInput} {k v : String}
+    (hs : BindingSafe i k v)
+    (hm : (k, v) ∈ sudoVars i (applySecurePath i (commonDefaults i
+      (if resetMode i then defaultsReset i (baseEnv i (resetMode i))
+       else defaultsCopy i (baseEnv i (resetMode i)))))) :
+    (k, v) ∈ assemble i (resetMode i) (extraVars i) := by
+  exact mem_mergePam_of_compatible
+    (mem_setAll_of_compatible (mem_addDefaults_of_mem hm) hs.1) hs.2
+
+/-- An effective secure_path survives compatible later writes, remaining unique.
+SETENV-approved PATH and non-kept PAM PATH may replace it. -/
 theorem buildEnv_securePath {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out)
-    {p : String} (hp : effectiveSecurePath i = some p) :
+    {p : String} (hp : effectiveSecurePath i = some p) (hs : BindingSafe i "PATH" p) :
     ("PATH", p) ∈ out ∧ ∀ v, ("PATH", v) ∈ out → v = p := by
   have hmem : ("PATH", p) ∈ out := by
     obtain ⟨rfl, -, -⟩ := buildEnv_ok h
-    unfold assemble sudoVars applySecurePath
+    apply mem_assemble_of_bindingSafe hs
+    unfold sudoVars applySecurePath
     simp only [hp]
-    apply mem_addDefaults_of_mem
-    apply mem_addDefaults_of_mem
-    cases ht : i.ttyName <;>
-      simp only [ht, mem_setVar, List.mem_filter, Prod.fst] <;>
+    cases i.ttyName <;>
+      simp only [mem_setVar, List.mem_filter] <;>
       simp
   exact ⟨hmem, fun v hv => buildEnv_unique h hv hmem⟩
 
-/-- (e) `SUDO_COMMAND`, `SUDO_USER`, `SUDO_UID` and `SUDO_GID` carry the command and the
-invoking user's name, uid and gid (and, by `buildEnv_unique`, no other value). -/
-theorem buildEnv_sudo_vars {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out) :
+/-- Rebuilt identity values (including the real invoking gid) survive compatible
+explicit/PAM writes; output uniqueness still holds with authorized overrides. -/
+theorem buildEnv_sudo_vars {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out)
+    (hc : BindingSafe i "SUDO_COMMAND" i.command)
+    (hu : BindingSafe i "SUDO_USER" i.invoking.name)
+    (hi : BindingSafe i "SUDO_UID" (toString i.invoking.uid))
+    (hg : BindingSafe i "SUDO_GID" (toString (i.invokingRealGid.getD i.invoking.gid))) :
     ("SUDO_COMMAND", i.command) ∈ out ∧ ("SUDO_USER", i.invoking.name) ∈ out ∧
-    ("SUDO_UID", toString i.invoking.uid) ∈ out ∧ ("SUDO_GID", toString (i.invokingRealGid.getD i.invoking.gid)) ∈ out := by
+    ("SUDO_UID", toString i.invoking.uid) ∈ out ∧
+    ("SUDO_GID", toString (i.invokingRealGid.getD i.invoking.gid)) ∈ out := by
   obtain ⟨rfl, -, -⟩ := buildEnv_ok h
-  unfold assemble sudoVars
-  simp only
-  refine ⟨?_, ?_, ?_, ?_⟩ <;> apply mem_addDefaults_of_mem <;> apply mem_addDefaults_of_mem
-  · refine mem_setVar_of_ne (mem_setVar_of_ne (mem_setVar_of_ne (mem_setVar_self _ _ _) ?_) ?_) ?_ <;>
+  refine ⟨mem_assemble_of_bindingSafe hc ?_, mem_assemble_of_bindingSafe hu ?_,
+    mem_assemble_of_bindingSafe hi ?_, mem_assemble_of_bindingSafe hg ?_⟩
+  · unfold sudoVars
+    refine mem_setVar_of_ne (mem_setVar_of_ne (mem_setVar_of_ne (mem_setVar_self _ _ _) ?_) ?_) ?_ <;>
       (dsimp only; decide)
-  · refine mem_setVar_of_ne (mem_setVar_of_ne (mem_setVar_self _ _ _) ?_) ?_ <;> (dsimp only; decide)
-  · exact mem_setVar_of_ne (mem_setVar_self _ _ _) (by dsimp only; decide)
-  · exact mem_setVar_self _ _ _
+  · unfold sudoVars
+    refine mem_setVar_of_ne (mem_setVar_of_ne (mem_setVar_self _ _ _) ?_) ?_ <;> (dsimp only; decide)
+  · unfold sudoVars
+    exact mem_setVar_of_ne (mem_setVar_self _ _ _) (by dsimp only; decide)
+  · unfold sudoVars
+    exact mem_setVar_self _ _ _
 
 
 /-- Restricted files use user filtering; unrestricted entries come only from the

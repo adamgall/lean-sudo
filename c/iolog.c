@@ -1,5 +1,6 @@
 /* sudo-compatible on-disk I/O logs. Policy and metadata rendering live in Lean. */
 #include <lean/lean.h>
+#include "locale_scope.h"
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -195,11 +196,14 @@ int ls_iolog_close(int exit_code, int signal_number) {
 LEAN_EXPORT lean_obj_res leansudo_iolog_abort(lean_obj_arg world) {
   (void)world; reset(); return lean_io_result_mk_ok(lean_box(0));
 }
-LEAN_EXPORT lean_obj_res leansudo_iolog_clock(b_lean_obj_arg formats, lean_obj_arg world) {
+LEAN_EXPORT lean_obj_res leansudo_iolog_clock(b_lean_obj_arg formats, b_lean_obj_arg locale_name, lean_obj_arg world) {
   (void)world;
   struct timespec now;
   struct tm tm;
   if (clock_gettime(CLOCK_REALTIME, &now) || !localtime_r(&now.tv_sec, &tm)) return failure("I/O log clock");
+  locale_t previous;
+  locale_t locale = leansudo_locale_enter(lean_string_cstr(locale_name), &previous);
+  if (!locale) return failure("unable to initialize I/O logging locale");
   size_t count = lean_array_size(formats);
   lean_object *a = lean_mk_empty_array_with_capacity(lean_unsigned_to_nat(count + 4));
   char buf[256]; snprintf(buf, sizeof buf, "%lld", (long long)now.tv_sec);
@@ -216,6 +220,7 @@ LEAN_EXPORT lean_obj_res leansudo_iolog_clock(b_lean_obj_arg formats, lean_obj_a
     if (!strftime(buf, sizeof buf, format, &tm)) snprintf(buf, sizeof buf, "%s", format);
     a = lean_array_push(a, lean_mk_string(buf));
   }
+  leansudo_locale_leave(locale, previous);
   return lean_io_result_mk_ok(a);
 }
 LEAN_EXPORT lean_obj_res leansudo_iolog_prepare(b_lean_obj_arg dir, b_lean_obj_arg user,

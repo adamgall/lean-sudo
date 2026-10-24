@@ -16,6 +16,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <time.h>
 
 static lean_obj_res error(int e) {
     return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(strerror(e))));
@@ -45,11 +46,11 @@ bad:
 }
 struct reply { int err; int value; char name[PATH_MAX]; };
 /* op: 0 directory, 1 read regular (ENOENT is optional), 2 write regular,
- * 3 W_OK directory, 4 mkstemp, 5 unlink, 6 executable regular (follows links),
+ * 3 W_OK directory, 4 mkstemps, 5 unlink, 6 executable regular (follows links),
  * 7 directory following links, 8 read regular following links, 9 write following links.
  * SCM_RIGHTS transfers opened descriptors, never numeric child-local handles. */
 static int worker(uint32_t op, int dir, const char *path, uid_t uid, gid_t gid,
-                  b_lean_obj_arg gs, mode_t mask, struct reply *out) {
+                  b_lean_obj_arg gs, mode_t mask, uint32_t suffixlen, struct reply *out) {
     size_t n = lean_array_size(gs);
     if (uid == (uid_t)-1 || gid == (gid_t)-1 || n > INT_MAX || mask > 0777) { errno = EINVAL; return -1; }
     gid_t *groups = calloc(n + 1, sizeof(gid_t));
@@ -99,7 +100,8 @@ static int worker(uint32_t op, int dir, const char *path, uid_t uid, gid_t gid,
                 if (strlen(path) >= sizeof result.name) result.err = ENAMETOOLONG;
                 else {
                     strcpy(result.name, path);
-                    fd = mkostemp(result.name, O_CLOEXEC);
+                    if (suffixlen > INT_MAX) { result.err = EINVAL; break; }
+                    fd = mkostemps(result.name, suffixlen, O_CLOEXEC);
                     if (fd < 0) result.err = errno;
                 }
                 break;
@@ -153,13 +155,13 @@ static int worker(uint32_t op, int dir, const char *path, uid_t uid, gid_t gid,
     return fd;
 }
 LEAN_EXPORT lean_obj_res leansudo_edit_op(uint32_t op, uint32_t dir, b_lean_obj_arg path,
-        uint32_t uid, uint32_t gid, b_lean_obj_arg groups, uint32_t mask) {
+        uint32_t uid, uint32_t gid, b_lean_obj_arg groups, uint32_t mask, uint32_t suffixlen) {
     const char *p = string_arg(path);
     if (!p || (dir != UINT32_MAX && dir > INT_MAX)) return error(EINVAL);
     struct reply r;
     memset(&r, 0, sizeof r);
     errno = 0;
-    int fd = worker(op, dir == UINT32_MAX ? AT_FDCWD : (int)dir, p, uid, gid, groups, mask, &r);
+    int fd = worker(op, dir == UINT32_MAX ? AT_FDCWD : (int)dir, p, uid, gid, groups, mask, suffixlen, &r);
     if (fd < 0 && errno) return error(errno);
     lean_object *result = lean_alloc_ctor(0, 1, 4);
     lean_ctor_set(result, 0, lean_mk_string(r.name));
@@ -178,6 +180,21 @@ LEAN_EXPORT lean_obj_res leansudo_edit_stat(uint32_t fd) {
     lean_object *a = lean_mk_empty_array();
     for (size_t i = 0; i < sizeof values / sizeof values[0]; ++i) a = lean_array_push(a, lean_uint64_to_nat(values[i]));
     return lean_io_result_mk_ok(a);
+}
+/* Preserve the original timestamp (epoch for a new file). The caller restats
+ * the temp afterwards to account for filesystem timestamp resolution. */
+LEAN_EXPORT lean_obj_res leansudo_edit_times(uint32_t fd, uint64_t sec, uint64_t nsec) {
+    if (fd > INT_MAX || nsec >= 1000000000) return error(EINVAL);
+    struct timespec times[2] = {
+        { (time_t)sec, (long)nsec }, { (time_t)sec, (long)nsec }
+    };
+    if (futimens((int)fd, times)) return error(errno);
+    return lean_io_result_mk_ok(lean_box(0));
+}
+LEAN_EXPORT lean_obj_res leansudo_edit_clock(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts)) return error(errno);
+    return lean_io_result_mk_ok(lean_box_uint64((uint64_t)ts.tv_sec * 1000000000 + ts.tv_nsec));
 }
 LEAN_EXPORT lean_obj_res leansudo_edit_read(uint32_t fd) {
     struct stat st;

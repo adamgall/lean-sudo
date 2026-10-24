@@ -486,10 +486,12 @@ def applicableDefaults (s : Sudoers) (user : Principal) (host : String) (runas :
     (defaultsOf s).flatMap fun (sc, ss) =>
       if scopePhase sc == phase && scopeMatches al st user host runas cmd canon facts sc then ss else []
 
-/-- Resolve all options, rejecting invalid values and retaining unknown-option warnings. -/
+/-- Resolve all options, rejecting invalid values and retaining unknown-option warnings.
+`initial` supplies front-end defaults (such as `-p` implying passprompt_override);
+explicit sudoers settings still override that seed. -/
 def resolveDefaults (s : Sudoers) (user : Principal) (host : String) (runas : Option Principal)
     (cmd : Option Command) (canon : String → String := id) (facts : Option Request := none)
-    : Except String (Settings × List String) := do
+    (initial : Settings := {}) : Except String (Settings × List String) := do
   let al := aliasesOf s
   let ds := defaultsOf s
   [0, 1, 2].foldlM (fun acc phase =>
@@ -498,7 +500,7 @@ def resolveDefaults (s : Sudoers) (user : Principal) (host : String) (runas : Op
         if scopePhase sc != phase || !scopeMatches al acc.1 user host runas cmd canon facts sc then
           return acc
         let (st, warnings) ← applySettings acc.1 (ss.filter fun d => earlyDefaults.contains d.name == early)
-        return (st, acc.2 ++ warnings)) acc) acc) ({}, [])
+        return (st, acc.2 ++ warnings)) acc) acc) (initial, [])
 
 /-- Clearing an unknown option cannot mutate any setting. -/
 theorem applySetting_unknown (st : Settings) (d : DefaultsSetting)
