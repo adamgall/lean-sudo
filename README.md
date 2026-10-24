@@ -108,13 +108,15 @@ flowchart LR
 
 In total there are 182 hand-written theorems across the code base, plus 700 compile-time
 regression checks (`#guard`) that run on every build. `scripts/AxiomAudit.lean` checks
-mechanically that every theorem in the library (681 including generated lemmas) rests
-only on Lean's three standard axioms (`propext`, `Quot.sound`, `Classical.choice`); a
-`sorry` or `native_decide` anywhere would make it fail:
+mechanically that every declaration defined in a `LeanSudo` module (definitions,
+theorems and instances, including private and generated ones) rests only on Lean's
+three standard axioms (`propext`, `Quot.sound`, `Classical.choice`). A `sorry`, `admit`
+or `native_decide` in the library would make it fail; it is backed by a source grep for
+those words and for `implemented_by`.
 
 ```console
 $ lake env lean scripts/AxiomAudit.lean
-681 theorems checked; axioms used ⊆ propext, Quot.sound, Classical.choice
+4218 declarations (1327 theorems) checked; axioms used ⊆ propext, Quot.sound, Classical.choice
 ```
 
 A proof is only as good as its statement, so the statements are written to be read:
