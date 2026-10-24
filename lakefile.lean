@@ -45,3 +45,7 @@ lean_exe «smoke-exec» where
 lean_exe «smoke-ts» where
   srcDir := "test"
   root := `Smoke.Ts
+
+@[default_target]
+lean_exe visudo where
+  root := `Visudo
