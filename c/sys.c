@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <glob.h>
 #include <ifaddrs.h>
+#include <limits.h>
 #include <linux/audit.h>
 #include <linux/netlink.h>
 #include <net/if.h>
@@ -65,10 +66,99 @@ LEAN_EXPORT lean_obj_res leansudo_sys_netgroup(b_lean_obj_arg group, b_lean_obj_
   (void)world;
   return lean_io_result_mk_ok(lean_box(innetgr(lean_string_cstr(group), optional(host), optional(user), optional(domain)) != 0));
 }
+
+/*
+ * Repetition validation adapted from sudo lib/util/regex.c (1.9.17p2).
+ * Copyright (c) 2023 Todd C. Miller <Todd.Miller@sudo.ws>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+static int regex_number(const char *str, const char **end) {
+  int n = 0;
+  char c;
+  while ((c = *str++) != 0) {
+    if (c == '\\' && str[0] >= '0' && str[0] <= '9')
+      c = *str++;
+    else if (c < '0' || c > '9')
+      break;
+    int digit = c - '0';
+    if (n > INT_MAX / 10 || (n == INT_MAX / 10 && digit > INT_MAX % 10)) {
+      n = -1;
+      break;
+    }
+    n = n * 10 + digit;
+  }
+  *end = str - 1;
+  return n;
+}
+
+static int regex_repetition(char c) {
+  return c == '?' || c == '*' || c == '+' || c == '{';
+}
+
+static int regex_check(const char *pattern) {
+  const char *p = pattern;
+  int upper = 0;
+  char c, prev = 0;
+  while ((c = *p++) != 0) {
+    if (c == '\\' && *p) {
+      p++;
+      prev = 0;
+      continue;
+    }
+    if (c == '?' || c == '*' || c == '+') {
+      if (regex_repetition(prev)) return REG_BADRPT;
+    } else if (c == '{') {
+      const char *end;
+      int lower = regex_number(p, &end);
+      if (end[0] == '\\' && end[1] == ',') end++;
+      if (*end == ',') upper = regex_number(end + 1, &end);
+      p = end;
+      if (*p == '}') {
+        if (lower < 0 || lower > 255 || upper < 0 || upper > 255) return REG_BADBR;
+        if (regex_repetition(prev)) return REG_BADRPT;
+        p++;
+      } else {
+        prev = 0;
+        continue;
+      }
+    }
+    prev = c;
+  }
+  return 0;
+}
+
 LEAN_EXPORT lean_obj_res leansudo_sys_regex(b_lean_obj_arg pattern, b_lean_obj_arg text, lean_obj_arg world) {
   (void)world;
-  regex_t re;
-  int err = regcomp(&re, lean_string_cstr(pattern), REG_EXTENDED | REG_NOSUB);
+  regex_t re = {0};
+  const char *expr = lean_string_cstr(pattern);
+  size_t len = strlen(expr);
+  if (len > 1024) return failure("regular expression too large");
+  int flags = REG_EXTENDED | REG_NOSUB;
+  const char *prefix = expr[0] == '^' ? expr + 1 : expr;
+  char adjusted[1025];
+  if (strncmp(prefix, "(?i)", 4) == 0) {
+    flags |= REG_ICASE;
+    if (expr[0] == '^') {
+      memcpy(adjusted, expr + 4, len - 3);
+      adjusted[0] = '^';
+      expr = adjusted;
+    } else {
+      expr += 4;
+    }
+  }
+  int err = regex_check(expr);
+  if (!err) err = regcomp(&re, expr, flags);
   if (err) {
     char msg[256];
     regerror(err, &re, msg, sizeof msg);

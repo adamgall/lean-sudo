@@ -31,7 +31,7 @@ def spec (runas : Option RunasSpec) (c : Member CmndAtom) (tags : Tags := {})
 
 def rule (users : List (Member UserAtom)) (hosts : List (Member HostAtom)) (cmnds : List CmndSpec) :
     Entry :=
-  .userSpec ⟨users, [⟨hosts, cmnds⟩]⟩
+  .userSpec { users, entries := [⟨hosts, cmnds⟩] }
 
 def allAll : Option RunasSpec := some ⟨some [pos .all], some [pos .all]⟩
 def asRoot : Option RunasSpec := some ⟨some [pos (.name "root")], none⟩

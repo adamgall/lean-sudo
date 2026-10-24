@@ -194,6 +194,8 @@ structure LogLine where
   /-- e.g. `alice : TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/id` or
   `carol : command not allowed ; TTY=… ; PWD=… ; USER=root ; COMMAND=…` -/
   msg : String
+  format : String := "sudo"
+  reason : Option String := none
   deriving Repr, BEq, DecidableEq, Inhabited
 
 structure Decision where

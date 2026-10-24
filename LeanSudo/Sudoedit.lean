@@ -2,6 +2,7 @@ import LeanSudo.Core.Types
 import LeanSudo.Sys.Core
 import LeanSudo.Sys.Edit
 import LeanSudo.Sudoedit.Check
+import LeanSudo.I18n.Load
 
 /-!
 # sudoedit (`sudo -e`)
@@ -18,7 +19,8 @@ The original inode is retained, so owner/mode and existing hard links survive.
 -/
 namespace LeanSudo.Sudoedit
 
-private def warn (s : String) : IO Unit := Sys.writeStderr s!"sudoedit: {s}\n"
+private def warn (s : String) : IO Unit := do
+  Sys.writeStderr ("sudoedit: " ++ (← I18n.translate s false) ++ "\n")
 
 private def fileError (path : String) (e : IO.Error) : IO.Error :=
   let text := e.toString

@@ -774,7 +774,19 @@ static int waitpid_retry(pid_t pid, int *status, int flags) {
   }
 }
 
+static bool last_dumped_core;
+
+LEAN_EXPORT lean_obj_res leansudo_exec_dumped_core(lean_obj_arg world) {
+  (void)world;
+  return lean_io_result_mk_ok(lean_box(last_dumped_core));
+}
+
 static uint32_t encode_status(int status) {
+#ifdef WCOREDUMP
+  last_dumped_core = WIFSIGNALED(status) && WCOREDUMP(status);
+#else
+  last_dumped_core = false;
+#endif
   if (WIFSIGNALED(status))
     return 0x10000u | (uint32_t)WTERMSIG(status);
   return (uint32_t)WEXITSTATUS(status);
@@ -1585,6 +1597,7 @@ LEAN_EXPORT lean_obj_res leansudo_exec_run(b_lean_obj_arg path, b_lean_obj_arg a
                                            uint32_t execfd, uint8_t exec_background,
                                            lean_obj_arg world) {
   (void)world;
+  last_dumped_core = false;
   struct exec_req r;
   memset(&r, 0, sizeof r);
   r.path = lean_string_cstr(path);

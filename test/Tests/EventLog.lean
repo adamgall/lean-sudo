@@ -99,4 +99,43 @@ private def acceptedBody : String :=
 #guard formatFile "Jun 26 18:00:06" "" "millert" acceptedBody false 80 ==
   "Jun 26 18:00:06 : millert : TTY=ttypm ; PWD=/usr/src/local/millert/hg/sudo/build\n    ; USER=root ; TSID=0004KT ; COMMAND=/bin/rm /root/.bash_profile\n"
 
+#guard jsonQuote "\"\\/\x08\x0c\n\r\t\x01\x1f\x7fé" ==
+  "\"\\\"\\\\/\\b\\f\\n\\r\\t\\u0001\\u001f\\u007fé\""
+
+private def clock : Time := { seconds := 1, nanoseconds := 2, iso8601 := "19700101000001Z", localtime := "Jan  1 00:00:01" }
+private def accepted : Event := {
+  kind := .accept, uuid := "id", serverTime := clock, eventTime := some clock,
+  details := some {
+    submituser := "alice", command := some "/bin/echo",
+    runuser := some "root", runuid := some 0, runargv := some ["/bin/echo", "a\n\"b"],
+    submitenv := some [] } }
+
+#guard formatJsonLine accepted ==
+  "{\"accept\":{\"uuid\":\"id\",\"server_time\":{\"seconds\":1,\"nanoseconds\":2,\"iso8601\":\"19700101000001Z\",\"localtime\":\"Jan  1 00:00:01\"},\"submit_time\":{\"seconds\":1,\"nanoseconds\":2,\"iso8601\":\"19700101000001Z\",\"localtime\":\"Jan  1 00:00:01\"},\"submituser\":\"alice\",\"command\":\"/bin/echo\",\"runuser\":\"root\",\"runuid\":0,\"columns\":80,\"lines\":24,\"runargv\":[\"/bin/echo\",\"a\\n\\\"b\"],\"submitenv\":[]}}\n"
+#guard formatJsonSyslog accepted ==
+  "@cee:{\"sudo\":{" ++ formatJsonMember accepted true ++ "}}"
+#guard formatJsonMember {
+    kind := .alert, reason := some "failure", error := some "error",
+    serverTime := {}, eventTime := some {} } false ==
+  "\n    \"alert\": {\n        \"reason\": \"failure: error\",\n        \"server_time\": {\n            \"seconds\": 0,\n            \"nanoseconds\": 0\n        },\n        \"alert_time\": {\n            \"seconds\": 0,\n            \"nanoseconds\": 0\n        }\n    }"
+#guard (Event.fields { accepted with kind := .reject, reason := some "command not allowed" }).map (·.1) ==
+  ["uuid", "reason", "server_time", "submit_time", "submituser", "command", "runuser",
+   "runuid", "columns", "lines", "runargv", "submitenv"]
+#guard (Event.fields { accepted with
+    kind := .exit, exitValue := 143, signal := some "TERM",
+    runTime := some { seconds := 3 } }).map (·.1) ==
+  ["uuid", "server_time", "exit_time", "run_time", "signal", "dumped_core", "exit_value",
+   "run_time", "signal", "dumped_core", "exit_value"]
+#guard formatJsonLine { kind := .exit, serverTime := {}, exitValue := 1 } ==
+  "{\"exit\":{\"server_time\":{\"seconds\":0,\"nanoseconds\":0},\"exit_value\":1,\"exit_value\":1}}\n"
+#guard (Details.fields { submituser := "a", rungid := some 5 }).map (·.1) ==
+  ["submituser", "columns", "lines"]
+#guard (Details.fields {
+    submituser := "a", rungroup := some "g", rungid := some 5,
+    runuid := some 6, runchroot := some "/", runcwd := some "/tmp", source := some "p:1:2",
+    ttyname := some "/dev/pts/1", submithost := some "h", submitcwd := some "/home/a",
+    runenv := some [], runargv := some [], submitenv := some [] }).map (·.1) ==
+  ["submituser", "rungroup", "runchroot", "runcwd", "source", "ttyname", "submithost",
+   "submitcwd", "rungid", "runuid", "columns", "lines", "runargv", "runenv", "submitenv"]
+
 end Tests.EventLog

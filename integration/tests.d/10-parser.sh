@@ -104,3 +104,58 @@ EOF
   expect_rc 0
   end
 }
+
+begin parser-regex-path-and-argument-boundaries && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/parser <<'EOF'
+nick ALL = ^/tmp/a\$, ^/tmp/a\\$b$, ^/tmp/a\#b$
+ivan ALL = NOPASSWD: /usr/bin/echo ^a\$b$, /usr/bin/echo ^(?i)HELLO$
+EOF
+  run root '/usr/sbin/visudo.ws -csf /etc/sudoers.d/parser'
+  expect_rc 0
+  run root "sudo -ll -U nick >'$WORK/regex-actual' && /usr/bin/sudo.ws -ll -U nick >'$WORK/regex-reference' && diff -u '$WORK/regex-reference' '$WORK/regex-actual'"
+  expect_rc 0
+  run ivan "sudo -n /usr/bin/echo 'a\$b'"
+  expect_rc 0
+  expect_out_line 'a$b'
+  run ivan 'sudo -n /usr/bin/echo hello'
+  expect_rc 0
+  expect_out_line hello
+  end
+}
+
+begin parser-regex-dollar-token-errors && {
+  for rule in \
+    'ivan ALL = NOPASSWD: ^/bin/[$]$' \
+    'ivan ALL = NOPASSWD: ^/bin/a$tail$' \
+    'ivan ALL = NOPASSWD: /usr/bin/true ^(a$|b)$' \
+    'ivan ALL = NOPASSWD: /usr/bin/true ^[$]$' \
+    'ivan ALL = NOPASSWD: /usr/bin/true ^a\\$b$' \
+    'ivan ALL = NOPASSWD: /usr/bin/true ^a\$'
+  do
+    printf '%s\n' "$rule" >/etc/sudoers.d/parser || fail "unable to write regex fixture"
+    chmod 0440 /etc/sudoers.d/parser
+    run root '/usr/sbin/visudo.ws -cf /etc/sudoers.d/parser'
+    expect_rc 1
+    run ivan 'sudo -n /usr/bin/true'
+    expect_rc 1
+    expect_out_empty
+  done
+  end
+}
+
+begin parser-regex-invalid-ere-refuses-runtime && {
+  for rule in \
+    'ivan ALL = NOPASSWD: ^/usr/bin/(true$|false)$' \
+    'ivan ALL = NOPASSWD: /usr/bin/true ^(a$' \
+    'ivan ALL = NOPASSWD: /usr/bin/true ^a++$'
+  do
+    printf '%s\n' "$rule" >/etc/sudoers.d/parser || fail "unable to write regex fixture"
+    chmod 0440 /etc/sudoers.d/parser
+    run root '/usr/sbin/visudo.ws -cf /etc/sudoers.d/parser'
+    expect_rc 0
+    run ivan 'sudo -n /usr/bin/true a'
+    expect_rc 1
+    expect_out_empty
+  done
+  end
+}

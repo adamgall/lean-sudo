@@ -190,6 +190,8 @@ structure HostCmnds where
 structure UserSpec where
   users : List (Member UserAtom)
   entries : List HostCmnds
+  /-- Terminator line/column recorded by sudo's parser for event log source. -/
+  source : Option (Nat × Nat) := none
   deriving Repr, BEq, DecidableEq, Inhabited
 
 inductive DefaultsScope where

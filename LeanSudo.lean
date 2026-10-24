@@ -33,3 +33,6 @@ import LeanSudo.Sys.Edit
 import LeanSudo.Sys.Extra
 import LeanSudo.Sys.IoLog
 import LeanSudo.Util.Sha2
+import LeanSudo.I18n
+import LeanSudo.I18n.Load
+import LeanSudo.I18n.Render

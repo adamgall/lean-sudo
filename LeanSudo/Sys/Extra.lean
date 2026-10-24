@@ -11,7 +11,8 @@ opaque interfaceAddresses : IO (Array (String × String))
 @[extern "leansudo_sys_netgroup"]
 opaque inNetgroup (group : @& String) (host user domain : @& Option String) : IO Bool
 
-/-- POSIX extended regex; malformed expressions raise an error, not a non-match. -/
+/-- Sudo's POSIX extended regex dialect: `(?i)` prefix, 1024-byte maximum,
+repetition validation and bounds ≤255. Invalid expressions raise an error. -/
 @[extern "leansudo_sys_regex"]
 opaque regexMatches (pattern text : @& String) : IO Bool
 

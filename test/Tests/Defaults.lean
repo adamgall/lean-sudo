@@ -56,5 +56,11 @@ def error (name : String) (op : DefaultsOp) : Option String :=
 #guard ({} : Settings).syslogMaxlen == 960
 #guard (setting "syslog_goodpri" (.assign "none")).map (·.syslogGoodpri) == some none
 #guard (applySetting {} ⟨"maxseq", .assign "not-a-number"⟩ false).toOption.isSome
+#guard !({} : Settings).passpromptConfigured
+#guard !({} : Settings).badpassMessageConfigured
+#guard (setting "passprompt" (.assign "[sudo] password for %p: ")).map
+  (·.passpromptConfigured) == some true
+#guard (setting "badpass_message" (.assign "Sorry, try again.")).map
+  (·.badpassMessageConfigured) == some true
 
 end Tests.Defaults

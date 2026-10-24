@@ -3,6 +3,8 @@ import LeanSudo.Visudo.Sys
 import LeanSudo.Sudoers.Load
 import LeanSudo.Sys.Core
 import LeanSudo.Sys.Exec
+import LeanSudo.Sys.Extra
+import LeanSudo.I18n.Load
 
 /-!
 # `visudo` entry point
@@ -38,6 +40,7 @@ structure LoadState where
   entries : Array Located := #[]
   errors : Array String := #[]
   warnings : Array String := #[]
+  strict : Bool := false
 
 abbrev LoadM := StateT LoadState IO
 
@@ -49,6 +52,35 @@ def readSudoers (path : String) : IO (Except String String) := do
   | .ok (_, text) => pure (.ok text)
   | .error e => pure (.error (toString e))
 
+/-- Only visudo -s validates path ERE tokens. Upstream's GOTREGEX action
+checks the final `$` token rather than the accumulated argument expression, so
+argument ERE validity remains a runtime check even in strict mode. -/
+def commandRegexes : CmndAtom → List String
+  | .commandRegex re _ => [re]
+  | .digest _ c => commandRegexes c
+  | _ => []
+
+def checkRegexes (loc : Located) (text : String) : LoadM Unit := do
+  for re in (Sudoers.Parser.cmndAtoms loc.entry).flatMap commandRegexes do
+    try
+      let _ ← Sys.regexMatches re ""
+    catch e =>
+      let lines := text.splitOn "\n"
+      let mut line := loc.line
+      let mut col := 1
+      for (ln, index) in (lines.drop (loc.line - 1)).zipIdx do
+        match ln.splitOn re with
+        | beforeToken :: _ :: _ =>
+          line := loc.line + index
+          col := beforeToken.length + 1
+          break
+        | _ => pure ()
+      let ln := lines[line - 1]?.getD ""
+      let pad := String.ofList ((ln.toList.take (col - 1)).map fun c =>
+        if c == '\t' then '\t' else ' ')
+      let underline := String.ofList (List.replicate (re.length - 1) '~')
+      addError s!"{loc.file}:{line}:{col}: {e}\n{ln}\n{pad}^{underline}"
+
 mutual
 partial def loadText (host : String) (depth : Nat) (path text : String) : LoadM Unit := do
   modify fun s => { s with files := s.files.push path }
@@ -56,6 +88,7 @@ partial def loadText (host : String) (depth : Nat) (path text : String) : LoadM 
   | .error e => addError (renderSyntaxError e text)
   | .ok es =>
     for l in es do
+      if (← get).strict then checkRegexes l text
       match l.entry with
       | .include raw => includeFile host (depth + 1) (resolveIncludePath path host raw)
       | .includeDir raw => includeDir host (depth + 1) (resolveIncludePath path host raw)
@@ -98,8 +131,8 @@ structure Analysis where
   errors : List String
   warnings : List String
 
-def analyze (host path text : String) : IO Analysis := do
-  let ((), s) ← (loadText host 0 path text).run {}
+def analyze (host path text : String) (strict : Bool) : IO Analysis := do
+  let ((), s) ← (loadText host 0 path text).run { strict }
   let entries := s.entries.toList
   let sem := if s.errors.isEmpty then semanticErrors entries else []
   let unused := if s.errors.isEmpty && sem.isEmpty then semanticWarnings entries else []
@@ -111,7 +144,7 @@ def shortHost : IO String := do
   | h :: _ => pure h
   | [] => pure ""
 
-def eprint (s : String) : IO Unit := IO.eprintln s
+def eprint (s : String) : IO Unit := do IO.eprintln (← I18n.translate s)
 
 /-! ## Check mode -/
 
@@ -139,7 +172,7 @@ def checkMode (o : Options) (path : String) : IO UInt32 := do
     match ← readSudoers path with
     | .ok t => pure (path, t)
     | .error e => say s!"visudo: {e}"; return 1
-  let a ← analyze (← shortHost) name text
+  let a ← analyze (← shortHost) name text o.strict
   a.warnings.forM say
   unless a.errors.isEmpty do
     a.errors.forM say
@@ -151,7 +184,7 @@ def checkMode (o : Options) (path : String) : IO UInt32 := do
     let probs ← if name == "stdin" && f == name then pure []
       else ownerPermProblems f enforceOwner enforcePerms
     if probs.isEmpty then
-      unless o.quiet do IO.println s!"{f}: parsed OK"
+      unless o.quiet do IO.println (← I18n.translate s!"{f}: parsed OK")
     else
       ok := false
       probs.forM say
@@ -227,14 +260,14 @@ def editorSettings (host : String) (a : Analysis) : IO Settings := do
 
 partial def whatNow : IO Char := do
   let out ← IO.getStdout
-  out.putStr "What now? "
+  out.putStr (← I18n.gettext "What now? ")
   out.flush
   let line ← (← IO.getStdin).getLine
   if line.isEmpty then return 'x'
   match whatNowChoice line with
   | some c => return c
   | none =>
-    out.putStr whatNowHelp
+    out.putStr (← I18n.translate whatNowHelp)
     whatNow
 
 def removeQuietly (p : String) : IO Unit :=
@@ -269,7 +302,7 @@ partial def editLoop (o : Options) (host path tmp initial : String) (orig : Opti
     unless o.quiet do eprint s!"visudo: {tmp} unchanged"
     removeQuietly tmp
     return 0
-  let a ← analyze host path text
+  let a ← analyze host path text o.strict
   unless o.quiet do a.warnings.forM eprint
   unless a.errors.isEmpty do
     a.errors.forM eprint
@@ -315,7 +348,7 @@ def editMode (o : Options) (path : String) : IO UInt32 := do
         return 1
       pure (none, "")
   let host ← shortHost
-  let current ← analyze host path text
+  let current ← analyze host path text o.strict
   unless o.quiet do
     current.warnings.forM eprint
     current.errors.forM eprint
@@ -338,17 +371,18 @@ def editMode (o : Options) (path : String) : IO UInt32 := do
 end VisudoMain
 
 def main (args : List String) : IO UInt32 := do
+  I18n.initializeLocale
   match parseArgs args with
   | .error e =>
-    unless e.isEmpty do IO.eprintln s!"visudo: {e}"
-    IO.eprintln usageLine
+    unless e.isEmpty do VisudoMain.eprint s!"visudo: {e}"
+    VisudoMain.eprint usageLine
     return 1
   | .ok o =>
     if o.help then
-      IO.print helpText
+      IO.print (← I18n.translate helpText)
       return 0
     if o.version then
-      IO.print versionText
+      IO.print (← I18n.translate versionText)
       return 0
     let path := o.file.getD mainSudoersPath
     if o.check then VisudoMain.checkMode o path else VisudoMain.editMode o path

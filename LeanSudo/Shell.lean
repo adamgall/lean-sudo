@@ -13,12 +13,14 @@ import LeanSudo.Util.Sha2
 import LeanSudo.Insults
 import LeanSudo.EventLog
 import LeanSudo.Sys.IoLog
+import LeanSudo.I18n.Load
 
 /-! Linux IO boundary: collect facts, execute the verified decision, and bracket PAM
 resources. Policy decisions belong to `Core.decide`, not this module. -/
 namespace LeanSudo.Shell
 
-private def warn (msg : String) : IO Unit := Sys.writeStderr ("sudo: " ++ msg ++ "\n")
+private def warn (msg : String) : IO Unit := do
+  Sys.writeStderr ("sudo: " ++ (← I18n.translate msg) ++ "\n")
 
 private def fromExcept (x : Except String α) : IO α :=
   match x with
@@ -298,7 +300,75 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
     previousUser
     mailerAvailable := ← match settings.mailerpath with | some p => executable p | none => pure false }
 
-private def logLine (ctx : Core.Context) (line : Core.LogLine) : IO Unit := do
+private def jsonDetails (ctx : Core.Context) (accepted : Bool) : IO EventLog.Details := do
+  let r := Core.request ctx
+  let al := Policy.aliasesOf ctx.sudoers
+  let candidates := ctx.locatedSudoers.flatMap fun l =>
+    match l.entry with
+    | .userSpec us => (Policy.usCandidates al al.fuel ctx.settings r us).map ((l.file, us.source), ·)
+    | _ => []
+  let chosen := candidates.getLast?
+  let allowed := chosen.filter (·.2.allow) |>.map (Policy.allowedOf ctx.settings ·.2)
+  let cwd := (ctx.opts.chdir.or (allowed.bind (·.cwd.join))).or ctx.settings.runcwd
+    |>.filter (· != "*")
+  let cwd := if ctx.opts.login then ctx.target.home else
+    (cwd.bind (Core.expandHome ctx)).getD ctx.cwd
+  let command := match r.command with
+    | .run p _ _ => p | .sudoedit _ => "sudoedit" | _ => Core.commandText ctx
+  let argv := match r.command with
+    | .run _ _ _ => ctx.command.map (fun c => c.argv0 :: c.args) |>.getD ctx.opts.command
+    | .sudoedit fs => "sudoedit" :: fs | _ => []
+  let runenv := if accepted then allowed.bind fun a =>
+      (buildEnv (Core.environment ctx a)).toOption.map (fun env => env.map fun (k, v) => k ++ "=" ++ v)
+    else none
+  let (columns, lines) ← Sys.terminalSize
+  return {
+    submituser := (Core.displayUser ctx).name, command := some command,
+    runuser := some ctx.target.name, rungroup := ctx.targetGroup.map (·.name),
+    runchroot := ctx.opts.chroot.or ((allowed.bind (·.chroot)).or ctx.settings.runchroot),
+    runcwd := some cwd, source := chosen.bind fun ((file, pos), _) =>
+      pos.map fun (line, col) => s!"{file}:{line}:{col}",
+    ttyname := ctx.ttyName, submithost := some ctx.longHost, submitcwd := some ctx.cwd,
+    -- sudoers_to_eventlog records the passwd primary gid, even with explicit -g.
+    rungid := some ctx.target.gid, runuid := some ctx.target.uid, columns, lines,
+    runargv := some argv, runenv,
+    submitenv := some (ctx.userEnv.map fun (k, v) => k ++ "=" ++ v) }
+
+private def logJson (ctx : Core.Context) (priority : String) (event : EventLog.Event) : IO Unit := do
+  if priority != "none" then
+    if let some facility := ctx.settings.syslog then
+      Sys.syslogBytes facility priority (EventLog.formatJsonSyslog event).toUTF8 ctx.settings.syslogPid
+  if let some path := ctx.settings.logfile then
+    try
+      if ctx.settings.logFormat == "json_compact" then
+        Sys.appendLog path (EventLog.formatJsonLine event)
+      else Sys.appendJson path (EventLog.formatJsonMember event false)
+    catch e =>
+      if ctx.settings.ignoreLogfileErrors then warn e.toString else throw e
+
+private def localizedLog (ctx : Core.Context) (line : Core.LogLine) : IO Core.LogLine := do
+  let some reason := line.reason | return line
+  let translated ← I18n.translateLog ctx.settings.sudoersLocale reason
+  if translated == reason then return line
+  let initial := Core.logEscape (Core.displayUser ctx).name ++ " : "
+  let original := initial ++ Core.logEscape reason ++ " ; "
+  let msg := if line.msg.startsWith original then
+      initial ++ Core.logEscape translated ++ " ; " ++ (line.msg.drop original.length).toString
+    else line.msg
+  return { line with reason := some translated, msg }
+
+private def logLine (ctx : Core.Context) (line : Core.LogLine)
+    (iologPath : Option String := none) : IO (Option EventLog.Event) := do
+  let line ← localizedLog ctx line
+  if line.format != "sudo" then
+    let eventTime ← Sys.eventTime ctx.settings.logYear
+    let event : EventLog.Event := {
+      kind := if line.reason.isSome then .reject else .accept,
+      uuid := ← Sys.eventUuid, reason := line.reason,
+      serverTime := ← Sys.eventTime ctx.settings.logYear, eventTime := some eventTime,
+      details := some (← jsonDetails ctx line.reason.isNone), iologPath }
+    logJson ctx line.priority event
+    return some event
   let name := (ctx.previousUser.getD ctx.invoking).name
   let body := EventLog.messageBody name line.msg
   if line.priority != "none" then
@@ -311,11 +381,13 @@ private def logLine (ctx : Core.Context) (line : Core.LogLine) : IO Unit := do
         ctx.longHost name body ctx.settings.logHost ctx.settings.loglinelen)
     catch e =>
       if ctx.settings.ignoreLogfileErrors then warn e.toString else throw e
+  return none
 
 private def mail (ctx : Core.Context) (line : Core.LogLine) : IO Unit := do
   if !ctx.mailerAvailable then return
   let some path := ctx.settings.mailerpath | return
   let some recipient := ctx.settings.mailto | return
+  let line ← localizedLog ctx line
   let name := (ctx.previousUser.getD ctx.invoking).name
   let sender := ctx.settings.mailfrom.getD name
   let subject := (ctx.settings.mailsub.replace "%h" ctx.longHost).replace "%u" name
@@ -339,13 +411,14 @@ private def lecture (ctx : Core.Context) : IO String := do
       let (_, text) ← Sys.readFileFollow file
       return text
     catch _ => pure ()
-  return "\nWe trust you have received the usual lecture from the local System\n" ++
+  let security ← if ctx.settings.pwfeedback then pure "" else
+    I18n.gettext "For security reasons, the password you type will not be visible.\n\n"
+  return (← I18n.gettext ("\nWe trust you have received the usual lecture from the local System\n" ++
     "Administrator. It usually boils down to these three things:\n\n" ++
     "    #1) Respect the privacy of others.\n" ++
     "    #2) Think before you type.\n" ++
-    "    #3) With great power comes great responsibility.\n\n" ++
-    (if ctx.settings.pwfeedback then "" else
-      "For security reasons, the password you type will not be visible.\n\n")
+    "    #3) With great power comes great responsibility.\n\n")) ++
+    security
 
 private def authenticate (ctx : Core.Context) (h : Sys.PamHandle) : IO (Option String) := do
   for attempt in List.range ctx.settings.passwdTries do
@@ -361,12 +434,16 @@ private def authenticate (ctx : Core.Context) (h : Sys.PamHandle) : IO (Option S
       return some err
     if attempt + 1 < ctx.settings.passwdTries then
       let seed ← Sys.bootTimeNanos
-      let message := if ctx.settings.insults then
-        Insults.select seed else ctx.settings.badpassMessage
+      let message ← if ctx.settings.insults then
+        I18n.gettext (Insults.select seed)
+        else if ctx.settings.badpassMessageConfigured then pure ctx.settings.badpassMessage
+        else I18n.gettext ctx.settings.badpassMessage
       Sys.writeStderr (message ++ "\n")
   let n := ctx.settings.passwdTries
   let message := s!"{n} incorrect password attempt{if n == 1 then "" else "s"}"
-  warn (Core.authFailureMessage ctx n)
+  if ctx.settings.authfailMessage.isSome then
+    Sys.writeStderr ("sudo: " ++ Core.authFailureMessage ctx n ++ "\n")
+  else warn (Core.authFailureMessage ctx n)
   return some message
 
 private def checkPam (h : Sys.PamHandle) (operation : String) (result : IO Int) : IO Unit := do
@@ -418,26 +495,53 @@ private def session (ctx : Core.Context) (h : Sys.PamHandle) (setcred openSessio
   finally
     if credentials then cleanup (checkPam h "unable to delete credentials" (Sys.pamSetcred h false))
 
+private def logExit (ctx : Core.Context) (event : Option EventLog.Event)
+    (started : Nat) (status : Sys.ExitStatus) : IO Unit := do
+  if !ctx.settings.logExitStatus then return
+  let some accepted := event | return
+  let elapsed := (← Sys.bootTimeNanos) - started
+  let time ← Sys.eventTime ctx.settings.logYear
+  let signal ← match status with
+    | .signaled n => pure (some (← Sys.signalName n.toUInt32))
+    | .exited _ => pure none
+  let event : EventLog.Event := {
+    kind := .exit, uuid := accepted.uuid, serverTime := ← Sys.eventTime ctx.settings.logYear,
+    eventTime := some time, iologPath := accepted.iologPath,
+    runTime := some { seconds := elapsed / 1000000000, nanoseconds := elapsed % 1000000000 },
+    signal, dumpedCore := ← Sys.lastDumpedCore,
+    exitValue := match status with | .exited n => n | .signaled n => 128 + n }
+  logJson ctx (ctx.settings.syslogGoodpri.getD "none") event
+
 private def executeAction (ctx : Core.Context) (decision : Core.Decision)
     (h : Option Sys.PamHandle) : IO Sys.ExitStatus := do
-  if let some line := decision.log then logLine ctx line
+  let started ← if ctx.settings.logExitStatus then Sys.bootTimeNanos else pure 0
+  let iologPath ← match decision.action with
+    | .exec plan => do
+      let some iolog := plan.iolog | pure none
+      let group := (ctx.invoking.groups.find? (·.2 == ctx.invoking.gid)).map (·.1) |>.getD ""
+      let runasGroup := (← Sys.getgrgid plan.gid).map (·.name) |>.getD ("#" ++ toString plan.gid)
+      Sys.IoLog.open iolog {
+        user := ctx.invoking.name, group, runasUser := ctx.target.name, runasGroup
+        hostname := ctx.longHost, command := plan.path, cwd := ctx.cwd
+        tty := ctx.ttyName.getD "unknown", argv := plan.argv.toArray }
+    | _ => pure none
+  let event ← match decision.log with
+    | some line => logLine ctx line iologPath
+    | none => do
+      if ctx.settings.logFormat == "sudo" || !ctx.settings.logExitStatus then pure none
+      else pure (some {
+        kind := .accept, uuid := ← Sys.eventUuid,
+        serverTime := ← Sys.eventTime ctx.settings.logYear, iologPath : EventLog.Event })
   if decision.mail then mail ctx (decision.log.getD (Core.logLine ctx none))
   if let some path := decision.adminFlag then
     cleanup (Sys.createAdminFlag path ctx.invoking.uid ctx.invoking.gid (ctx.invoking.groups.map (·.2)))
   match decision.action with
   | .exec plan =>
     let some h := h | throw (IO.userError "missing PAM transaction")
-    session ctx h plan.pamSetcred plan.pamSession do
+    let status ← session ctx h plan.pamSetcred plan.pamSession do
       if !(← Sys.auditCommand (Core.commandText ctx) (ctx.ttyName.getD "unknown") true) &&
           !ctx.settings.ignoreAuditErrors then
         throw (IO.userError "unable to send audit message")
-      if let some iolog := plan.iolog then
-        let group := (ctx.invoking.groups.find? (·.2 == ctx.invoking.gid)).map (·.1) |>.getD ""
-        let runasGroup := (← Sys.getgrgid plan.gid).map (·.name) |>.getD ("#" ++ toString plan.gid)
-        Sys.IoLog.open iolog {
-          user := ctx.invoking.name, group, runasUser := ctx.target.name, runasGroup
-          hostname := ctx.longHost, command := plan.path, cwd := ctx.cwd
-          tty := ctx.ttyName.getD "unknown", argv := plan.argv.toArray }
       Sys.runCommand {
         path := plan.path, argv := plan.argv.toArray
         env := ← environment plan.envInput h, uid := plan.uid, gid := plan.gid
@@ -446,15 +550,19 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
         cwdOptional := plan.cwdOptional, timeout := plan.timeout, noexecFile := plan.noexecFile
         apparmorProfile := plan.apparmorProfile, rlimits := plan.rlimits.toArray,
         utmpUser := plan.utmpUser, execFd := plan.execFd, execBackground := plan.execBackground }
+    logExit ctx event started status
+    return status
   | .edit plan =>
     let some h := h | throw (IO.userError "missing PAM transaction")
-    session ctx h plan.pamSetcred plan.pamSession do
+    let status ← session ctx h plan.pamSetcred plan.pamSession do
       Sudoedit.run plan (← environment plan.envInput h)
+    logExit ctx event started status
+    return status
   | .print text code =>
-    (← IO.getStdout).putStr text
+    (← IO.getStdout).putStr (← I18n.translate text)
     return .exited code.toNat
   | .fail text code =>
-    Sys.writeStderr text
+    Sys.writeStderr (← I18n.translate text)
     return .exited code.toNat
   | .validate => return .exited 0
   | .resetTimestamp =>
@@ -488,7 +596,9 @@ private def execute (ctx : Core.Context) (decision : Core.Decision)
   let service := if useAskpass && ctx.settings.pamAskpassService.isSome then
       ctx.settings.pamAskpassService.getD ctx.settings.pamService
     else if ctx.opts.login then ctx.settings.pamLoginService else ctx.settings.pamService
-  let promptFormat := (ctx.opts.prompt.or (ctx.userEnv.lookup "SUDO_PROMPT")).getD ctx.settings.passprompt
+  let promptFormat ← match ctx.opts.prompt.or (ctx.userEnv.lookup "SUDO_PROMPT") with
+    | some configured => pure configured
+    | none => if ctx.settings.passpromptConfigured then pure ctx.settings.passprompt else I18n.gettext ctx.settings.passprompt
   let prompt := expandPrompt promptFormat ctx.invoking.name ctx.target.name ctx.longHost authUser.name
   let h ← Sys.pamStart service authUser.name {
     useStdin := ctx.opts.stdin, nonInteractive := ctx.opts.nonInteractive,
@@ -510,7 +620,7 @@ private def execute (ctx : Core.Context) (decision : Core.Decision)
           ctx.settings.timestampTimeout ctx.tsScope authUser.uid records
         let failure ← if !needsAuth || cached then pure none else authenticate ctx h
         if let some reason := failure then
-          logLine ctx (Core.logLine ctx (some reason))
+          let _ ← logLine ctx (Core.logLine ctx (some reason))
           if ctx.settings.mailBadpass || ctx.settings.mailAlways then
             mail ctx (Core.logLine ctx (some reason))
           return (none, false)
@@ -535,6 +645,7 @@ lets us reject invalid UTF-8 before decoded Lean arguments reach policy. -/
 def run (args : List String) : IO UInt32 := do
   try
     Sys.initializeProcess false
+    I18n.initializeLocale
     let conf ← if (← Sys.stat "/etc/sudo.conf").isSome then do
         let (_, text) ← Sys.readFileFollow "/etc/sudo.conf"
         fromExcept (SudoConf.parse text)
@@ -563,18 +674,18 @@ def run (args : List String) : IO UInt32 := do
     let opts ← match Cli.parseArgs progname args with
       | .ok opts => pure opts
       | .error err =>
-        Sys.writeStderr (Cli.formatError progname err)
+        Sys.writeStderr (← I18n.translate (Cli.formatError progname err) false)
         return 1
     if opts.mode == .help then
-      (← IO.getStdout).putStr (Cli.helpFor progname)
+      (← IO.getStdout).putStr (Cli.helpFor progname (← I18n.catalogs).sudo)
       return 0
     if opts.mode == .version then
       if (← Sys.getuid) == 0 then
         let ctx ← context progname opts conf
         let interfaces := (← Sys.interfaceAddresses).toList.map (fun (a, m) => a ++ "/" ++ m)
-        (← IO.getStdout).putStr (Cli.versionFor true ctx.settings interfaces (← Sys.architecture))
+        (← IO.getStdout).putStr (← I18n.translate (Cli.versionFor true ctx.settings interfaces (← Sys.architecture)))
       else
-        (← IO.getStdout).putStr Cli.versionText
+        (← IO.getStdout).putStr (← I18n.translate Cli.versionText)
       return 0
     if !valid || args.any (fun a => a.contains '\ufffd') then
       warn "non-UTF-8 command-line arguments are not supported"

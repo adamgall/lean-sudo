@@ -110,8 +110,11 @@ structure Settings where
   requiretty : Bool := false
   visiblepw : Bool := false
   passprompt : String := "[sudo] password for %p: "
+  /-- Explicit sudoers text is not translated as a compiled-in message. -/
+  passpromptConfigured : Bool := false
   passpromptOverride : Bool := false
   badpassMessage : String := "Sorry, try again."
+  badpassMessageConfigured : Bool := false
   pwfeedback : Bool := false
   runasDefault : String := "root"
   umask : Nat := 0o022

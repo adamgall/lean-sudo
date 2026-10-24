@@ -172,6 +172,13 @@ def AuthExemption (ctx : Context) (a : Allowed) : Prop :=
       (ctx.opts.group.isNone = true ∨ ∃ g, ctx.targetGroup = some g ∧
         ctx.invoking.groups.any (fun x => x.2 == g.gid) = true))
 
+/-- Disabling authentication also suppresses password prompts for denied commands;
+the independent authorization decision remains a denial. -/
+theorem denied_authentication_disabled (ctx : Context)
+    (h : ctx.settings.authenticate = false) :
+    authentication ctx .deny = .none := by
+  simp [authentication, policyNeedsAuth, h]
+
 private theorem authentication_none (ctx : Context) (a : Allowed)
     (h : authentication ctx (.allow a) = .none) : AuthExemption ctx a := by
   simp only [authentication, policyNeedsAuth] at h

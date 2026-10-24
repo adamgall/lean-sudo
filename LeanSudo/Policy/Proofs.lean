@@ -80,7 +80,7 @@ theorem notbob_alias_no_candidates (st : Settings) (r : Request) (entries : List
     usCandidates
       { user := [("NOTBOB", [⟨false, .all⟩, ⟨true, .name "bob"⟩])] } 1 st
       { r with user := ⟨"bob", 1001, 1001, [], "/home/bob", "/bin/sh"⟩ }
-      ⟨[⟨false, .alias "NOTBOB"⟩], entries⟩ = [] := by
+      ⟨[⟨false, .alias "NOTBOB"⟩], entries, none⟩ = [] := by
   apply usCandidates_of_userListOk_false
   simp [userListOk, userListResult, matchList, atomMatches, UserAtom.aliasName,
     lookupAlias, userBase, nameEq]
@@ -288,10 +288,10 @@ theorem evaluate_append_negated (s : Sudoers) (st : Settings) (r : Request)
     (hra : runasOk (aliasesOf s) (aliasesOf s).fuel st r cs.runas = true)
     (htime : inTimeWindow r.now cs r.utcOffset = true)
     (hcm : cmndMemberResult (aliasesOf s) (aliasesOf s).fuel r.canon r.command cs.cmnd (some r) = some false) :
-    evaluate (s ++ [.userSpec ⟨users, [⟨hosts, [cs]⟩]⟩]) st r = .deny := by
+    evaluate (s ++ [.userSpec ⟨users, [⟨hosts, [cs]⟩], none⟩]) st r = .deny := by
   have happ : specApplies (aliasesOf s) (aliasesOf s).fuel st r cs = true := by
     simp [specApplies_run hrun, hra, hcm, htime]
-  have hlast : (candidates (s ++ [.userSpec ⟨users, [⟨hosts, [cs]⟩]⟩]) st r).getLast? =
+  have hlast : (candidates (s ++ [.userSpec ⟨users, [⟨hosts, [cs]⟩], none⟩]) st r).getLast? =
       some ⟨cs, false, cmndUsesDigest (aliasesOf s) r (aliasesOf s).fuel cs.cmnd.atom⟩ := by
     rw [candidates_append_userSpec]
     simp [usCandidates, hcCandidates, hu, hh, happ, candidateOf, specAllow, hrun, hcm]
@@ -339,7 +339,7 @@ def denyAllRule (user : String) : Entry :=
   let cs : CmndSpec :=
     { runas := some ⟨some [⟨false, .all⟩], some [⟨false, .all⟩]⟩
       options := {}, tags := {}, cmnd := ⟨true, .all⟩ }
-  .userSpec ⟨[⟨false, .name user⟩], [⟨[⟨false, .all⟩], [cs]⟩]⟩
+  .userSpec ⟨[⟨false, .name user⟩], [⟨[⟨false, .all⟩], [cs]⟩], none⟩
 
 /-- Concrete instance: `<user> ALL = (ALL : ALL) !ALL` appended at the end of any policy
 denies every command (and sudoedit) the invoking user could ask for. -/

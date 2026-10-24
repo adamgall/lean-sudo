@@ -204,6 +204,9 @@ disable core dumps for the privileged process (restored only in the exec child).
 @[extern "leansudo_exec_initialize"]
 opaque initializeProcess (disableCoredump : Bool := true) : IO Unit
 
+/-- Core-dump bit from the command's most recent wait status (not its monitor). -/
+@[extern "leansudo_exec_dumped_core"] opaque lastDumpedCore : IO Bool
+
 /-- fork, drop privileges in the child in the order setgroups → setresgid → setresuid,
 verify the drop with getres[ug]id (abort if it did not take), chdir, umask, close fds,
 execve. The parent relays signals, waits, and returns the child's status. A failed

@@ -451,7 +451,46 @@ def readCmdWord (isPath : Bool) : P String := do
         acc := c.c :: acc
   return String.ofList acc.reverse
 
-/-- Regex tokens retain escapes, whitespace and sudoers punctuation until `$`. -/
+/-- Length of the competing WORD token, before copy_string unescaping. Flex
+chooses it over REGEX whenever it consumes more input (e.g. `^/bin/[$]$`). -/
+def wordTokenLength : List PChar → Nat
+  | c :: d :: rest =>
+    if c.c == '\\' && d.c != '\t' && d.c != '\n' then 2 + wordTokenLength rest
+    else if isWordChar c.c then 1 + wordTokenLength (d :: rest) else 0
+  | [c] => if isWordChar c.c then 1 else 0
+  | [] => 0
+
+/-- INITIAL's REGEX token uses flex longest-match, not ERE bracket/group parsing.
+Its body admits a bare backslash or `\#`/`\$`. Consequently a `\$` may either
+belong to the body or provide the terminal dollar; keep the latest such candidate
+until an unescapable dollar or lexical boundary fixes the token's end. -/
+def readPathRegex : P String := do
+  expect '^'
+  let mut acc := ['^']
+  let mut best : Option (List Char × List PChar) := none
+  let finish (candidate : Option (List Char × List PChar)) : P String :=
+    match candidate with
+    | some (chars, rest) => do set rest; return String.ofList chars.reverse
+    | none => err "unterminated regular expression"
+  for _ in [0:(← fuel)] do
+    match (← get) with
+    | [] => return (← finish best)
+    | c :: cs =>
+      if c.c == '\n' || c.c == '\r' || c.c == '#' then return (← finish best)
+      if c.c == '\\' then
+        if let d :: ds := cs then
+          if d.c == '#' || d.c == '$' then
+            set ds
+            acc := d.c :: '\\' :: acc
+            if d.c == '$' then best := some (acc, ds)
+            continue
+      set cs
+      acc := c.c :: acc
+      if c.c == '$' then return String.ofList acc.reverse
+  finish best
+
+/-- GOTREGEX argument tokens end at the first unescaped `$`, including within
+ERE brackets and groups. Every backslash pair is retained verbatim. -/
 def readRegex : P String := do
   expect '^'
   let mut acc := ['^']
@@ -459,13 +498,13 @@ def readRegex : P String := do
     match (← get) with
     | [] => err "unterminated regular expression"
     | c :: cs =>
-      if c.c == '\n' || c.c == '#' then err "unterminated regular expression"
+      if c.c == '\n' || c.c == '\r' || c.c == '#' then err "unterminated regular expression"
       if c.c == '\\' then
         if isCont cs then ws
         else
           match cs with
           | d :: ds =>
-            if d.c == '\n' then err "unterminated regular expression"
+            if d.c == '\n' || d.c == '\r' then err "unterminated regular expression"
             set ds
             acc := d.c :: '\\' :: acc
           | [] => err "unterminated regular expression"
@@ -569,7 +608,11 @@ def plainCmndAtom (allowArgs : Bool) : P CmndAtom := do
     if (p.splitOn "/").getLast? == some "sudoedit" then return .sudoedit args
     return .command p args
   | some '^' =>
-    let re ← readRegex
+    let start ← get
+    let pos ← curPos
+    let re ← readPathRegex
+    if wordTokenLength start > re.length then
+      errAt pos "expected a fully-qualified path name"
     return .commandRegex re (← if allowArgs then cmndArgs else pure .any)
   | p =>
     let pos ← curPos
@@ -812,7 +855,21 @@ def hostCmnds : P HostCmnds := do
   let cmnds ← cmndSpecList
   return { hosts, cmnds }
 
+/-- The event source column is byte-counted by sudo's lexer. Parser diagnostics
+retain character columns; only the consumed final physical line needs conversion. -/
+private def sourcePosition (stop : Nat × Nat) (extra : Nat) : List PChar → Nat × Nat
+  | [] => (stop.1, stop.2 + extra)
+  | c :: cs =>
+    if c.line > stop.1 || (c.line == stop.1 && c.col >= stop.2) then
+      (stop.1, stop.2 + extra)
+    else
+      let n := c.c.toNat
+      let extra := if c.line != stop.1 then extra else
+        extra + (if n < 0x80 then 0 else if n < 0x800 then 1 else if n < 0x10000 then 2 else 3)
+      sourcePosition stop extra cs
+
 def userSpec : P UserSpec := do
+  let before ← get
   let users ← list1 (member userAtom)
   ws
   let mut entries := [← hostCmnds]
@@ -822,7 +879,7 @@ def userSpec : P UserSpec := do
       advance
       ws
       entries := (← hostCmnds) :: entries
-    else return { users, entries := entries.reverse }
+    else return { users, entries := entries.reverse, source := some (sourcePosition (← curPos) 0 before) }
   err "user specification too long"
 
 /-! ## Aliases and Defaults -/

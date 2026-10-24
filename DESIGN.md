@@ -23,6 +23,16 @@ getpw*/getgr*  ├─► IO shell (Main.lean) ──► pure core (LeanSudo.Core
   against system libpam, and there are no PAM headers on the build host — the shim
   declares the stable PAM ABI itself).
 
+Gettext catalogs are optional. The shell activates only installed locales and loads
+`sudo` / `sudoers` catalogs from `/usr/share/locale`, then Ubuntu's
+`/usr/share/locale-langpack`, with `LANGUAGE` overriding the selected message locale
+except in C. Every resolved catalog path and ancestor must be root-owned and not
+group/world-writable. Translation occurs only at user-output boundaries: pure
+decisions and audit/log data remain independent of the caller's locale. Log reasons
+use the separate `sudoers_locale` (C by default). Explicit `passprompt` and
+`badpass_message` values are literal; only compiled-in defaults are translated.
+Absent catalogs preserve the original English bytes.
+
 ## Module map
 
 | Module | Contents |
@@ -39,8 +49,11 @@ getpw*/getgr*  ├─► IO shell (Main.lean) ──► pure core (LeanSudo.Core
 | `LeanSudo/Cli.lean` | `parseArgs : String (progname) → List String → Except String Options` |
 | `LeanSudo/Env.lean` | `buildEnv` (command environment) + proofs |
 | `LeanSudo/Prompt.lean` | `%u %U %h %H %p %%` prompt expansion |
+| `LeanSudo/I18n.lean`, `LeanSudo/I18n/Render.lean` | pure GNU MO parsing, catalog fallback theorem, plural expressions, printf substitution and diagnostic presentation |
+| `LeanSudo/I18n/Load.lean` | root-owned catalog/locale loading; message-locale precedence, Ubuntu langpack fallback, separate `sudoers_locale` log catalog |
 | `LeanSudo/Timestamp.lean` | pure timestamp records, (de)serialisation, validity + proofs |
 | `LeanSudo/IoLog.lean` | pure I/O stream plans (`plan_enabled`), sudo path escapes, base-36 sequence paths, legacy/JSON metadata and timing records |
+| `LeanSudo/EventLog.lean` | pure sudo text wrapping and ordered JSON accept/reject/alert/exit formatting; `@cee:` syslog records, pretty logfile members and compact JSON lines |
 | `LeanSudo/Sys/Core.lean` + `c/core.c` | users/groups/host/tty/stat/realpath/secure read/environ/syslog |
 | `LeanSudo/Sys/Pam.lean` (+ `c/core.c`) | PAM handle + conversation (tty / `-S` stdin / `-n`) |
 | `LeanSudo/Sys/Exec.lean` + `c/exec.c` | privilege drop, fork/execve/wait, signal relay, pty |

@@ -1,5 +1,6 @@
 import LeanSudo.Policy.Types
 import LeanSudo.Sudoers.Parser
+import LeanSudo.I18n
 
 /-!
 # Command-line parsing (`sudo` / `sudoedit`)
@@ -118,26 +119,27 @@ def usageFor (progname : String) : String :=
 def usageText : String := usageFor "sudo"
 
 /-- Word wrapping as done by sudo's `sudo_lbuf_println` (80 columns, continuation
-lines indented by `indent`). `fuel` bounds the number of output lines. -/
-private def wrapAux (indent : Nat) : Nat → Nat → List Char → List Char
+lines indented by `indent`). sudo counts bytes, not Unicode display columns.
+Breaks are at ASCII spaces, so UTF-8 characters are never split. -/
+private def wrapAux (indent : Nat) : Nat → Nat → List UInt8 → List UInt8
   | 0, _, _ => []
   | fuel + 1, avail, cs =>
-    if cs.length ≤ avail then cs ++ ['\n'] else
+    if cs.length ≤ avail then cs ++ [10] else
       -- last space strictly before position `avail`, else first space after it
       let firstPart := cs.take avail
       let brk : Option Nat :=
-        match (firstPart.reverse.findIdx? (· == ' ')) with
+        match (firstPart.reverse.findIdx? (· == 32)) with
         | some j => some (avail - 1 - j)
-        | none => ((cs.drop avail).findIdx? (· == ' ')).map (· + avail)
+        | none => ((cs.drop avail).findIdx? (· == 32)).map (· + avail)
       match brk with
-      | none => cs ++ ['\n']
+      | none => cs ++ [10]
       | some n =>
-        let rest := (cs.drop n).dropWhile (fun c => c == ' ' || c == '\t')
-        if rest.isEmpty then cs.take n ++ ['\n'] else
-        cs.take n ++ ['\n'] ++ List.replicate indent ' ' ++ wrapAux indent fuel (80 - indent) rest
+        let rest := (cs.drop n).dropWhile (fun c => c == 32 || c == 9)
+        if rest.isEmpty then cs.take n ++ [10] else
+        cs.take n ++ [10] ++ List.replicate indent 32 ++ wrapAux indent fuel (80 - indent) rest
 
 private def wrapLine (s : String) : String :=
-  String.ofList (wrapAux 32 (s.length + 1) 80 s.toList)
+  String.fromUTF8! ⟨(wrapAux 32 (s.utf8ByteSize + 1) 80 s.toUTF8.data.toList).toArray⟩
 
 private def helpEntries (sudoedit : Bool) : List String :=
   let both (l : String) := [l]
@@ -174,12 +176,14 @@ private def helpEntries (sudoedit : Bool) : List String :=
   both     "  --                            stop processing command line arguments"
 
 /-- Output of `sudo -h` (to stdout, exit status 0). -/
-def helpFor (progname : String) : String :=
+def helpFor (progname : String) (catalog : I18n.Catalog := {}) : String :=
   let sudoedit := progname == "sudoedit"
-  let header := if sudoedit then s!"{progname} - edit files as another user\n\n"
-    else s!"{progname} - execute a command as another user\n\n"
-  header ++ usageFor progname ++ "\nOptions:\n" ++
-    String.join ((helpEntries sudoedit).map wrapLine)
+  let header := if sudoedit then "%s - edit files as another user\n\n"
+    else "%s - execute a command as another user\n\n"
+  I18n.format (I18n.lookup catalog header) [progname] ++ usageFor progname ++
+    I18n.lookup catalog "\nOptions:\n" ++
+    String.join ((helpEntries sudoedit).map fun line =>
+      wrapLine ((line.take 32).toString ++ I18n.lookup catalog (line.drop 32).toString))
 
 def helpText : String := helpFor "sudo"
 

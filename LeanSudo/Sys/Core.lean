@@ -1,4 +1,5 @@
 import LeanSudo.Policy.Types
+import LeanSudo.EventLog
 
 /-!
 # `LeanSudo.Sys.Core` — thin FFI bindings to `c/core.c`
@@ -180,6 +181,12 @@ def createAdminFlag (path : String) (uid gid : Nat) (groups : List Nat) : IO Uni
 
 @[extern "lean_sudo_log_time"] opaque logTime (year : Bool) : IO String
 @[extern "lean_sudo_append_log"] opaque appendLog (path text : @& String) : IO Unit
+/-- Locked seek-and-append for sudo's pretty JSON object, not JSON lines. -/
+@[extern "lean_sudo_append_json"] opaque appendJson (path member : @& String) : IO Unit
+@[extern "lean_sudo_event_time"] opaque eventTime (year : Bool) : IO EventLog.Time
+@[extern "lean_sudo_event_uuid"] opaque eventUuid : IO String
+@[extern "lean_sudo_terminal_size"] opaque terminalSize : IO (Nat × Nat)
+@[extern "lean_sudo_signal_name"] opaque signalName (signal : UInt32) : IO String
 @[extern "lean_sudo_send_mail"] opaque sendMail (path : @& String)
     (args : @& Array String) (body : @& String) : IO Unit
 

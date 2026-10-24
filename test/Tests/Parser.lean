@@ -9,8 +9,9 @@ open LeanSudo.Sudoers
 def entriesOf (t : String) : Option (List Entry) :=
   match parse "t" t with
   | .ok ls => some (ls.map fun l => match l.entry with
-      | .userSpec s => .userSpec { s with entries := s.entries.map fun h =>
-          { h with cmnds := h.cmnds.map fun c => { c with runasExplicit := false, optionsExplicit := [] } } }
+      | .userSpec s => .userSpec { s with source := none, entries := s.entries.map fun h =>
+          { h with cmnds := h.cmnds.map fun c =>
+            { c with runasExplicit := false, optionsExplicit := [] } } }
       | e => e)
   | .error _ => none
 
@@ -18,6 +19,11 @@ def linesOf (t : String) : Option (List Nat) :=
   match parse "t" t with
   | .ok ls => some (ls.map (·.line))
   | .error _ => none
+
+#guard match parse "t" "a ALL = /bin/id   # comment\n" with
+  | .ok [{ entry := .userSpec s, .. }] =>
+    s.source == some (1, 19)
+  | _ => false
 
 def errOf (t : String) : Option ParseError :=
   match parse "t" t with
@@ -390,5 +396,31 @@ def digestRule (algo text : String) : String := "a ALL = " ++ algo ++ ":" ++ tex
 
 #guard (commandsOf "a ALL=CWD=/tmp /a, /b, CWD=/tmp ROLE=r /c").map (·.optionsExplicit) ==
   [["CWD"], [], ["CWD", "ROLE"]]
+
+-- Lexer boundaries are not ERE-aware: unescaped dollars terminate even inside
+-- groups/classes. visudo -s validates path tokens; longer WORD tokens win.
+#guard (commandsOf "a ALL=^/bin/(a$|b)$").map (·.cmnd.atom) ==
+  [.commandRegex "^/bin/(a$" (.pattern "|b)$")]
+#guard fails "a ALL=^/bin/[$]$"
+#guard fails "a ALL=^/bin/a$tail$"
+#guard fails "a ALL=/bin/a ^(a$|b)$"
+#guard fails "a ALL=/bin/a ^[$]$"
+#guard (commandsOf "a ALL=/bin/a ^a\\$b$").map (·.cmnd.atom) ==
+  [.command "/bin/a" (.regex "^a\\$b$")]
+#guard fails "a ALL=/bin/a ^a\\$"
+#guard (commandsOf "a ALL=^/bin/a\\$").map (·.cmnd.atom) ==
+  [.commandRegex "^/bin/a\\$" .any]
+#guard (commandsOf "a ALL=^/bin/a\\\\$b$").map (·.cmnd.atom) ==
+  [.commandRegex "^/bin/a\\\\$b$" .any]
+#guard fails "a ALL=/bin/a ^a\\\\$b$"
+#guard (commandsOf "a ALL=^/bin/a\\$ x").map (·.cmnd.atom) ==
+  [.commandRegex "^/bin/a\\$" (.pattern "x")]
+#guard (commandsOf "a ALL=^/bin/a\\#b$").map (·.cmnd.atom) ==
+  [.commandRegex "^/bin/a\\#b$" .any]
+#guard fails "a ALL=^/bin/a\r$"
+#guard fails "a ALL=/bin/a ^a\r$"
+#guard fails "a ALL=^/bin/a\\\n$"
+#guard (commandsOf "a ALL=/bin/a ^a\\\n  b$").map (·.cmnd.atom) ==
+  [.command "/bin/a" (.regex "^ab$")]
 
 end Tests.Parser

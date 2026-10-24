@@ -52,6 +52,9 @@ def catCtx : Context :=
 #guard auth catCtx == .required carol
 #guard failure catCtx == some "Sorry, user carol is not allowed to execute '/usr/bin/cat /etc/shadow' as root on box.\n"
 #guard !(decide catCtx).updateTimestamp
+#guard auth { catCtx with settings := { catCtx.settings with authenticate := false } } == .none
+#guard failure { catCtx with settings := { catCtx.settings with authenticate := false } } == failure catCtx
+#guard execution { catCtx with settings := { catCtx.settings with authenticate := false } } == none
 #guard failure { ctx with opts := { ctx.opts with chdir := some "/tmp" } } ==
   some "sudo: you are not permitted to use the -D option with /usr/bin/id\n"
 #guard failure { carolCtx with opts := { ctx.opts with preserveEnv := .all } } ==

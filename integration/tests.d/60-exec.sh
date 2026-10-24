@@ -194,3 +194,25 @@ EOF
   expect_out_has resumed-foreground=True
   end
 }
+
+begin exec-nopty-timeout-signals-only-command && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-timeout <<'EOF'
+Defaults !use_pty
+root ALL = TIMEOUT=2 NOPASSWD: /bin/sh
+EOF
+  marker="$WORK/timeout-descendant"
+  # sudo 1.9.17p2 exec_nopty.c calls terminate_command(pid, false):
+  # only the command receives HUP/TERM/KILL, not its background descendants.
+  run root "sudo -n /bin/sh -c '/bin/sleep 30 & echo \$! >\"$marker\"; wait'"
+  expect_rc_not 0
+  sleep_pid=$(cat "$marker" 2>/dev/null)
+  if [[ $sleep_pid =~ ^[0-9]+$ ]] && [[ -r /proc/$sleep_pid/stat ]]; then
+    state=$(ps -o stat= -p "$sleep_pid")
+    [[ -n $state && $state != Z* ]] || fail 'non-pty timeout killed the background descendant'
+    kill "$sleep_pid" 2>/dev/null || :
+  else
+    fail 'background descendant did not survive non-pty command timeout'
+  fi
+  rm -f "$marker"
+  end
+}

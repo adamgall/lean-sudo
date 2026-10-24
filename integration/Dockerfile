@@ -10,7 +10,10 @@ ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       sudo sudo-rs python3 procps util-linux passwd login libpam-modules libpam-runtime \
+      locales language-pack-de-base language-pack-fr-base \
  && rm -rf /var/lib/apt/lists/*
+RUN localedef -i de_DE -f UTF-8 de_DE.UTF-8 \
+ && localedef -i fr_FR -f UTF-8 fr_FR.UTF-8
 
 # Test users. alice is in the stock `%sudo` rule; the others get rules from
 # /etc/sudoers.d (fixtures below). bob has no sudo rights at all.

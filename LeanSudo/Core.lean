@@ -75,7 +75,7 @@ def sameIdentity (ctx : Context) : Bool :=
 
 def policyNeedsAuth (ctx : Context) (j : Judgement) : Bool :=
   ctx.invoking.uid != 0 && match j with
-    | .deny => true
+    | .deny => ctx.settings.authenticate
     | .allow a => a.needsAuth && !sameIdentity ctx
 
 def tsValid (ctx : Context) : Bool :=
@@ -203,7 +203,6 @@ def enforcementError (ctx : Context) (a : Allowed) : Option String :=
   else if ctx.settings.fdexec != "never" && (a.usesDigest || ctx.settings.fdexec == "always") &&
       ctx.execFd.isNone then some "unable to execute command: missing command descriptor"
   else if !ctx.settings.logServers.isEmpty then some "unable to connect to log server"
-  else if ctx.settings.logFormat != "sudo" then some "unsupported log format"
   else if (ctx.opts.chroot.or (a.chroot.or ctx.settings.runchroot)).isSome then
     some (if ctx.opts.chroot.isSome then
       s!"you are not permitted to use the -R option with {(ctx.command.map (·.path)).getD "sudoedit"}"
@@ -311,7 +310,8 @@ def logLine (ctx : Context) (reason : Option String) (allowed : Option Allowed :
   let cwd := if ctx.opts.login then ctx.target.home else
     (cwd.bind (expandHome ctx)).getD ctx.cwd
   let chroot := ctx.opts.chroot.or ((allowed.bind (·.chroot)).or ctx.settings.runchroot)
-  { priority := (if reason.isSome then ctx.settings.syslogBadpri else ctx.settings.syslogGoodpri).getD "none",
+  { format := ctx.settings.logFormat, reason,
+    priority := (if reason.isSome then ctx.settings.syslogBadpri else ctx.settings.syslogGoodpri).getD "none",
     msg := logEscape (displayUser ctx).name ++ " : " ++ (reason.map (fun s => logEscape s ++ " ; ")).getD "" ++
       (tty.map (fun t => s!"TTY={t} ; ")).getD "" ++
       (chroot.map (fun p => s!"CHROOT={logEscape p} ; ")).getD "" ++
@@ -320,6 +320,10 @@ def logLine (ctx : Context) (reason : Option String) (allowed : Option Allowed :
       (if ctx.opts.envVars.isEmpty then "" else
         "ENV=" ++ logEscape (String.intercalate " " (ctx.opts.envVars.map fun (k,v) => k ++ "=" ++ v)) ++ " ; ") ++
       "COMMAND=" ++ logCommand ctx }
+
+/-- Event output follows the resolved sudoers format, including JSON. -/
+theorem logLine_format (ctx : Context) (reason : Option String) (allowed : Option Allowed) :
+    (logLine ctx reason allowed).format = ctx.settings.logFormat := rfl
 
 def authFailureLog (ctx : Context) (attempts : Nat) (noninteractive : Bool) : LogLine :=
   logLine ctx (some (if noninteractive then "a password is required"

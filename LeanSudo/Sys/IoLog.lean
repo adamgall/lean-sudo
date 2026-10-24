@@ -14,7 +14,7 @@ private opaque abort : IO Unit
 
 /-- Open all log files before allowing execution. Failure is fatal unless the
 policy explicitly opted into ignore_iolog_errors. -/
-def «open» (p : LeanSudo.IoLog.Plan) (m : LeanSudo.IoLog.Metadata) : IO Unit := do
+def «open» (p : LeanSudo.IoLog.Plan) (m : LeanSudo.IoLog.Metadata) : IO (Option String) := do
   try
     let keys := (LeanSudo.IoLog.timeKeys p.dir.toList ++
       LeanSudo.IoLog.timeKeys p.file.toList).eraseDups
@@ -35,8 +35,10 @@ def «open» (p : LeanSudo.IoLog.Plan) (m : LeanSudo.IoLog.Metadata) : IO Unit :
     let flags := (streams.zipIdx.foldl (fun (n : Nat) (b, i) => if b then n + 2 ^ i else n) 0).toUInt32
     start path (LeanSudo.IoLog.legacyLog m seconds) (LeanSudo.IoLog.jsonLog m seconds nanos)
       flags p.passpromptRegex
+    return some path
   catch e =>
     abort
     if !p.ignoreErrors then throw e
+    return none
 
 end LeanSudo.Sys.IoLog

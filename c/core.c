@@ -36,6 +36,7 @@
 #include <sys/prctl.h>
 #include <sys/ioctl.h>
 #include <sys/utsname.h>
+#include <sys/random.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -679,6 +680,101 @@ LEAN_EXPORT lean_obj_res lean_sudo_log_time(uint8_t year) {
         !strftime(buf, sizeof(buf), year ? "%b %e %H:%M:%S %Y" : "%b %e %H:%M:%S", &tm))
         return io_err("unable to format log timestamp");
     return io_ok(lean_mk_string(buf));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_event_time(uint8_t year) {
+    struct timespec ts;
+    struct tm tm;
+    char iso[64] = "", local[64] = "";
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return io_errno(errno);
+    if (gmtime_r(&ts.tv_sec, &tm))
+        strftime(iso, sizeof(iso), "%Y%m%d%H%M%SZ", &tm);
+    if (localtime_r(&ts.tv_sec, &tm))
+        strftime(local, sizeof(local), year ? "%b %e %H:%M:%S %Y" : "%b %e %H:%M:%S", &tm);
+    lean_object *v = lean_alloc_ctor(0, 4, 0);
+    lean_ctor_set(v, 0, mk_nat((uint64_t)ts.tv_sec));
+    lean_ctor_set(v, 1, mk_nat((uint64_t)ts.tv_nsec));
+    lean_ctor_set(v, 2, lean_mk_string(iso));
+    lean_ctor_set(v, 3, lean_mk_string(local));
+    return io_ok(v);
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_event_uuid(void) {
+    unsigned char bytes[16];
+    size_t done = 0;
+    while (done < sizeof(bytes)) {
+        ssize_t n = getrandom(bytes + done, sizeof(bytes) - done, 0);
+        if (n < 0) { if (errno == EINTR) continue; return io_errno(errno); }
+        if (n == 0) return io_err("unable to generate event UUID");
+        done += (size_t)n;
+    }
+    bytes[7] = (bytes[7] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    /* sudo_uuid_to_string uses a 10-4-4-4-10 layout. */
+    char uuid[37], *p = uuid;
+    const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(bytes); i++) {
+        if (i == 5 || i == 7 || i == 9 || i == 11) *p++ = '-';
+        *p++ = hex[bytes[i] >> 4]; *p++ = hex[bytes[i] & 15];
+    }
+    *p = '\0';
+    return io_ok(lean_mk_string(uuid));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_terminal_size(void) {
+    struct winsize ws = {0};
+    int fd = open("/dev/tty", O_RDONLY | O_NOCTTY | O_CLOEXEC | O_NONBLOCK);
+    if (fd >= 0) { (void)ioctl(fd, TIOCGWINSZ, &ws); close(fd); }
+    return io_ok(mk_pair(mk_nat(ws.ws_col ? ws.ws_col : 80),
+        mk_nat(ws.ws_row ? ws.ws_row : 24)));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_signal_name(uint32_t sig) {
+    const char *name = NULL;
+    switch (sig) {
+#define SIGNAL_NAME(s) case SIG##s: name = #s; break
+    SIGNAL_NAME(HUP); SIGNAL_NAME(INT); SIGNAL_NAME(QUIT); SIGNAL_NAME(ILL);
+    SIGNAL_NAME(TRAP); SIGNAL_NAME(ABRT); SIGNAL_NAME(BUS); SIGNAL_NAME(FPE);
+    SIGNAL_NAME(KILL); SIGNAL_NAME(USR1); SIGNAL_NAME(SEGV); SIGNAL_NAME(USR2);
+    SIGNAL_NAME(PIPE); SIGNAL_NAME(ALRM); SIGNAL_NAME(TERM); SIGNAL_NAME(STKFLT);
+    SIGNAL_NAME(CHLD); SIGNAL_NAME(CONT); SIGNAL_NAME(STOP); SIGNAL_NAME(TSTP);
+    SIGNAL_NAME(TTIN); SIGNAL_NAME(TTOU); SIGNAL_NAME(URG); SIGNAL_NAME(XCPU);
+    SIGNAL_NAME(XFSZ); SIGNAL_NAME(VTALRM); SIGNAL_NAME(PROF); SIGNAL_NAME(WINCH);
+    SIGNAL_NAME(IO); SIGNAL_NAME(PWR); SIGNAL_NAME(SYS);
+#undef SIGNAL_NAME
+    }
+    if (name) return io_ok(lean_mk_string(name));
+    char buf[32];
+    if (sig == (uint32_t)SIGRTMIN) snprintf(buf, sizeof(buf), "RTMIN");
+    else if (sig == (uint32_t)SIGRTMAX) snprintf(buf, sizeof(buf), "RTMAX");
+    else if (sig > (uint32_t)SIGRTMIN && sig < (uint32_t)SIGRTMAX)
+        snprintf(buf, sizeof(buf), "RTMIN+%u", sig - (uint32_t)SIGRTMIN);
+    else snprintf(buf, sizeof(buf), "%u", sig);
+    return io_ok(lean_mk_string(buf));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_append_json(b_lean_obj_arg path, b_lean_obj_arg member) {
+    const char *p = cstr_arg(path), *s = cstr_arg(member);
+    if (!p || !s) return io_err(NUL_ARG_ERROR);
+    int fd = open(p, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600);
+    if (fd < 0) return io_errno_path("unable to open log file", p, errno);
+    struct stat st;
+    if (flock(fd, LOCK_EX) != 0 || fstat(fd, &st) != 0 ||
+        !S_ISREG(st.st_mode) || st.st_uid != 0 || (st.st_mode & 022)) {
+        close(fd); return io_err("unsafe or inaccessible log file");
+    }
+    int rc;
+    if (st.st_size == 0) {
+        rc = write_all(fd, "{", 1);
+    } else {
+        rc = lseek(fd, -3, SEEK_END) < 0 ? -1 : write_all(fd, ",", 1);
+    }
+    if (rc == 0) rc = write_all(fd, s, strlen(s));
+    if (rc == 0) rc = write_all(fd, "\n}\n", 3);
+    int saved = errno;
+    close(fd);
+    if (rc != 0) return io_errno(saved);
+    return io_ok(lean_box(0));
 }
 
 LEAN_EXPORT lean_obj_res lean_sudo_append_log(b_lean_obj_arg path, b_lean_obj_arg text) {
