@@ -2,11 +2,13 @@
 # Run the end-to-end sudo suite in a throwaway container.
 #
 #   integration/run.sh <impl> [test-name-filter]
-#   integration/run.sh --visudo reference|<path-to-visudo> [test-name-filter]
+#   integration/run.sh --visudo reference|<path-to-visudo>|--build [test-name-filter]
 #
 # <impl>:  reference   original sudo.ws (Ubuntu package `sudo`, /usr/bin/sudo.ws)
 #          sudo-rs     Ubuntu's sudo-rs (/usr/lib/cargo/bin/sudo)
-#          <path>      a sudo binary on the host, e.g. .lake/build/bin/sudo
+#          <path>      a sudo binary on the host, e.g. .lake/linux/sudo
+#          --build     build lean-sudo's Linux sudo/visudo first (integration/build.sh,
+#                      a container build; works on macOS) and test that binary
 # filter:  extended regex matched against test names (e.g. 'tty-|env-').
 # --visudo runs visudo-tests.sh (copied in) instead of tests.sh, against
 #          /usr/sbin/visudo.ws (reference) or a host visudo binary.
@@ -17,13 +19,18 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-usage() { echo "usage: $0 [--visudo] reference|sudo-rs|<path-to-binary> [test-name-filter]" >&2; exit 2; }
+usage() { echo "usage: $0 [--visudo] reference|sudo-rs|--build|<path-to-binary> [test-name-filter]" >&2; exit 2; }
 visudo=0
 if [[ ${1:-} == --visudo ]]; then visudo=1; shift; fi
 [[ $# -ge 1 && $# -le 2 ]] || usage
 impl=$1
 filter=${2:-}
 image=${SUDO_IT_IMAGE:-lean-sudo-it}
+if [[ $impl == --build ]]; then
+  "$here/build.sh" >/dev/null
+  impl="$(dirname "$here")/.lake/linux/sudo"
+  [[ $visudo == 1 ]] && impl="$(dirname "$here")/.lake/linux/visudo"
+fi
 
 host_bin=
 case $impl in
