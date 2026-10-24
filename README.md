@@ -24,7 +24,15 @@ $ sudo id -u
 
 It reads your existing `/etc/sudoers` and `/etc/sudoers.d`, uses the system's PAM stack
 (`/etc/pam.d/sudo`, `sudo-i`), prints the same prompts and messages, and passes the same
-end-to-end test suite as the original [sudo.ws](https://www.sudo.ws).
+end-to-end test suite as the original sudo.
+
+> **"sudo.ws"** in this document means the original sudo: the C implementation
+> written around 1980 and maintained by Todd C. Miller since the 1990s, whose home is
+> [sudo.ws](https://www.sudo.ws). It is the `sudo` shipped by Debian, Fedora, Arch and
+> macOS, among others. Ubuntu switched its default to the Rust rewrite
+> [sudo-rs](https://github.com/trifectatechfoundation/sudo-rs) in 25.10 and installs the
+> original as `/usr/bin/sudo.ws` (package `sudo`), hence the name. lean-sudo's
+> behaviour is measured against sudo.ws 1.9.17p2.
 
 ## Why this matters
 
@@ -98,8 +106,16 @@ flowchart LR
 | **Globbing** | `fnmatch` agrees with string equality on literal patterns; with `FNM_PATHNAME`, `*` never crosses `/`. | `fnmatch_literal`, `fnmatch_star_pathname`, `fnmatch_prefix_star_pathname` |
 | **Parser** | Every command path in a parsed rule is absolute. | `parse_command_absolute` |
 
-In total there are 177 theorems across the code base, plus about 700 compile-time
-regression checks (`#guard`) that run on every build.
+In total there are 182 hand-written theorems across the code base, plus 700 compile-time
+regression checks (`#guard`) that run on every build. `scripts/AxiomAudit.lean` checks
+mechanically that every theorem in the library (681 including generated lemmas) rests
+only on Lean's three standard axioms (`propext`, `Quot.sound`, `Classical.choice`); a
+`sorry` or `native_decide` anywhere would make it fail:
+
+```console
+$ lake env lean scripts/AxiomAudit.lean
+681 theorems checked; axioms used ⊆ propext, Quot.sound, Classical.choice
+```
 
 A proof is only as good as its statement, so the statements are written to be read:
 see `LeanSudo/CoreProofs.lean`, `LeanSudo/Policy/Proofs.lean` and
@@ -116,7 +132,7 @@ byte for byte where it matters:
 
 | Suite | sudo.ws 1.9.17p2 | lean-sudo |
 |---|---|---|
-| `sudo` end-to-end (passwords, NOPASSWD, run-as users and groups, `!` rules and aliases, argument matching, env sanitisation, `-E`/`SETENV`, `-l`, `-v`/`-k`/`-K`, per-tty timestamps, `-i`/`-s`, exit status and signal propagation, insecure sudoers files) | 81/81 | 81/81 |
+| `sudo` end-to-end (passwords, NOPASSWD, run-as users and groups, `!` rules and aliases, argument matching, env sanitisation, `-E`/`SETENV`, `-l`, `-v`/`-k`/`-K`, per-tty timestamps, `-i`/`-s`, exit status and signal propagation, insecure sudoers files, sudoedit) | 96/96 | 96/96 |
 | `visudo` (check mode, edit mode, locking, permissions) | 44/47 (3 lean-sudo-only) | 47/47 |
 
 ## Features
