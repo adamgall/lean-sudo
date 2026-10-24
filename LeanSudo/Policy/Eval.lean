@@ -115,12 +115,33 @@ def netgroupMatch (st : Settings) (facts : Option Request) (n : String)
     r.netgroups.any fun (ng, u, h, yes) =>
       ng == n && u == user && (h == host || (host.isSome && h == some r.host)) && yes)
 
+/-- External membership is an exact query fact, not a Unix/NSS inference. -/
+def pluginGroupMatch (st : Settings) (facts : Option Request) (user group : String) : Bool :=
+  st.groupPlugin.isSome && facts.any (fun r =>
+    r.pluginGroups.any fun (u, g, yes) => u == user && g == group && yes)
+
+theorem pluginGroupMatch_requires_yes (st : Settings) (facts : Option Request)
+    (user group : String) (h : pluginGroupMatch st facts user group = true) :
+    ∃ r, facts = some r ∧ (user, group, true) ∈ r.pluginGroups := by
+  cases facts with
+  | none => simp [pluginGroupMatch] at h
+  | some r =>
+    simp only [pluginGroupMatch, Option.any_some, Bool.and_eq_true] at h
+    obtain ⟨⟨u, g, yes⟩, hm, he⟩ := List.any_eq_true.mp h.2
+    simp only [Bool.and_eq_true, beq_iff_eq] at he
+    rcases he with ⟨⟨rfl, rfl⟩, rfl⟩
+    exact ⟨r, rfl, hm⟩
+
 def userBase (p : Principal) (st : Settings) (facts : Option Request) : UserAtom → Bool
   | .all => true
   | .name n => nameEq st.caseInsensitiveUser n p.name
   | .id n => n == p.uid
-  | .group n => p.groups.any (fun g => nameEq st.caseInsensitiveGroup n g.1)
-  | .gid n => n == p.gid || p.groups.any (·.2 == n)
+  | .group n => p.groups.any (fun g => nameEq st.caseInsensitiveGroup n g.1) ||
+      (st.alwaysQueryGroupPlugin && pluginGroupMatch st facts p.name n)
+  | .gid n => n == p.gid || p.groups.any (·.2 == n) ||
+      (st.alwaysQueryGroupPlugin && pluginGroupMatch st facts p.name ("#" ++ toString n))
+  | .nonunixGroup n => pluginGroupMatch st facts p.name n
+  | .nonunixGid n => pluginGroupMatch st facts p.name ("#" ++ toString n)
   | .netgroup n => netgroupMatch st facts n (some p.name)
       (if st.netgroupTuple then facts.map (fun r => if r.lhost.isEmpty then r.host else r.lhost) else none)
   | _ => false

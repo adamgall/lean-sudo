@@ -1,4 +1,5 @@
 import LeanSudo.Policy.Defaults
+import LeanSudo.Sss
 
 /-!
 # `sudo -l` rendering
@@ -234,12 +235,14 @@ where
 private def longHeader (al : Aliases) (st : Settings) (user file : String) (cs : CmndSpec) : String :=
   let option (name : String) (v : Option Bool) :=
     v.map fun b => (if b then "" else "!") ++ name
-  let options := [option "setenv" cs.tags.setenv, option "noexec" cs.tags.noexec,
-    option "intercept" cs.tags.intercept, option "authenticate" cs.tags.passwd,
-    option "log_input" cs.tags.logInput, option "log_output" cs.tags.logOutput].filterMap id
+  let options := if cs.ldapRole.isSome then cs.ldapOptions.map (renderSetting ∘ Sss.parseOption)
+    else [option "setenv" cs.tags.setenv, option "noexec" cs.tags.noexec,
+      option "intercept" cs.tags.intercept, option "authenticate" cs.tags.passwd,
+      option "log_input" cs.tags.logInput, option "log_output" cs.tags.logOutput].filterMap id
   let field (name : String) (v : Option String) :=
     (v.map fun text => "    " ++ name ++ ": " ++ text ++ "\n").getD ""
-  s!"Sudoers entry: {file}\n    RunAsUsers: {runasUsers al st user cs.runas}\n" ++
+  (cs.ldapRole.map (fun name => s!"LDAP Role: {name}\n") |>.getD s!"Sudoers entry: {file}\n") ++
+  s!"    RunAsUsers: {runasUsers al st user cs.runas}\n" ++
   field "RunAsGroups" ((cs.runas.bind (·.groups)).map (expandedUsers al user)) ++
   (if options.isEmpty then "" else "    Options: " ++ ", ".intercalate options ++ "\n") ++
   field "ApparmorProfile" cs.options.apparmorProfile ++

@@ -59,6 +59,8 @@ structure Request where
   interfaces : List (Sudoers.IpAddr × Sudoers.IpAddr) := []
   /-- (netgroup, user, host, innetgr result). -/
   netgroups : List (String × Option String × Option String × Bool) := []
+  /-- (user, plugin group spelling, provider answered exactly 1). -/
+  pluginGroups : List (String × String × Bool) := []
   regexMatches : List (String × String × Bool) := []
   digests : List Sudoers.Digest := []
   now : Nat := 0

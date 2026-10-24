@@ -58,6 +58,7 @@ Absent catalogs preserve the original English bytes.
 | `LeanSudo/Sys/Pam.lean` (+ `c/core.c`) | PAM handle + conversation (tty / `-S` stdin / `-n`) |
 | `LeanSudo/Sys/Exec.lean` + `c/exec.c` | privilege drop, fork/execve/wait, signal relay, pty |
 | `LeanSudo/Sys/Timestamp.lean` + `c/ts.c` | timestamp file storage, boot clock, session/process identity |
+| `LeanSudo/Sys/GroupPlugin.lean` + `c/groupplugin.c` | sudo group-provider ABI loading (`dlopen`), version validation, init/query/cleanup; the shell supplies exact `(user, group, answer)` facts to pure policy matching |
 | `LeanSudo/Sys/IoLog.lean` + `c/iolog.c` | fail-closed session creation, locked sequence allocation, owner/mode enforcement, plain/gzip streams, password-prompt filtering; pty and pipe relay hooks in `c/exec.c` |
 | `LeanSudo/Core/Types.lean` | decision-core contract: `Context`, `Decision`, `ExecPlan`, `EditPlan`, `Action` |
 | `LeanSudo/Core.lean`, `LeanSudo/CoreProofs.lean` | pure decision core (`decide`) + end-to-end theorems |
@@ -105,6 +106,15 @@ syslog : (facility : String) → (priority : String) → (msg : String) → IO U
 getcwd : IO String
 writeStderr : String → IO Unit                   -- unbuffered
 ```
+
+Group-provider membership is separate from NSS/Unix membership. The shell loads
+`group_plugin` relative to `/usr/libexec/sudo` unless its path is absolute, passes
+space/tab-separated arguments to the provider's version-1 ABI, and closes it after
+collecting facts (with a finalizer for exceptional exits). Only a query return of
+exactly `1` becomes an affirmative fact. `%:` atoms require that fact; ordinary
+`%group`/`%#gid` atoms retain Unix membership and additionally consult it when
+`always_query_group_plugin` is enabled. A loader/init error does not itself deny
+independent rules, matching sudo.ws, but can never manufacture plugin membership.
 
 ### `LeanSudo.Sys.Pam`
 ```lean
@@ -182,16 +192,17 @@ Timestamp directory: `/run/lean-sudo/ts/<uid>`.
    or `authenticate` is off.
 5. **Glob**: `fnmatch` agrees with literal equality on metacharacter-free patterns;
    `*` with `pathname` never crosses `/`.
-6. **Environment**: with `env_reset`, every output variable is either set by sudo or
-   whitelisted (`env_keep`, or `env_check` with a safe value); `LD_*`, bash function
-   exports and `env_delete` entries never survive without `env_reset`; `PATH` equals
-   `secure_path` when set; `SUDO_USER/UID/GID/COMMAND` are present and correct; no
-   duplicate keys.
+6. **Environment** (sudo's env.c order): with `env_reset`, every output variable is
+   set by sudo, whitelisted (`env_keep`, or `env_check` with a safe value) or comes
+   from a trusted source (`env_file`, PAM); without `SETENV`, `LD_*` and `env_delete`
+   entries never come from the caller, and the caller cannot override `secure_path`;
+   `SUDO_USER/UID/GID/COMMAND` are correct unless an explicitly permitted later write
+   sets them (as in sudo); no duplicate keys.
 7. **CLI**: the command vector is exactly the operands after option parsing; `--`
    stops option processing; mutually exclusive modes are rejected.
 8. **Timestamp**: a record is accepted only if same uid, same scope (tty/ppid/
    session identity incl. start time), age ≤ timeout and not in the future; `-k`
-   makes every record invalid.
+   invalidates every record of the current scope (sudo's `timestamp_remove`).
 9. **Decision core**: `decide` yields `exec` only if the policy allows the request
    and either authentication succeeded, or no authentication is required (invoker is
    root, NOPASSWD/`!authenticate`, valid timestamp, or target = invoker without

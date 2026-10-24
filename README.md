@@ -25,7 +25,7 @@ $ sudo id -u
 It reads your existing `/etc/sudoers`, `/etc/sudoers.d` and `/etc/sudo.conf`, uses the
 system's PAM stack (`/etc/pam.d/sudo`, `sudo-i`), prints the same prompts and messages
 (translated, like the original), writes the same syslog lines and I/O logs, and passes
-the same 544-test end-to-end suite as the original sudo, byte for byte where it matters.
+the same 602-test end-to-end suite as the original sudo, byte for byte where it matters.
 
 > **"sudo.ws"** in this document means the original sudo: the C implementation
 > written around 1980 and maintained by Todd C. Miller since the 1990s, whose home is
@@ -96,7 +96,7 @@ flowchart LR
 | **Decision core** | A command is executed only if the policy allows that exact request (path, arguments, run-as user and group). The file executed is the one the policy compared: the canonical parent directory resolved before the check plus the basename, or the very descriptor that was digested. | `exec_allowed`, `exec_origin`, `exec_path_is_canonical`, `exec_fd_is_pinned` |
 | | It runs with exactly the target's uid, the target's (or `-g`) gid, and the target's groups (with `stay_setuid`, sudo's exact real/effective split). | `exec_identity`, `edit_identity` |
 | | No password is skipped except for root, a `NOPASSWD`/`!authenticate` rule, `exempt_group`, a valid timestamp for the same user and terminal, or running as yourself with an unchanged security context. | `exec_noauth`, `edit_noauth`, `exempt_user_no_auth` |
-| | A denied request, a command that was not found, an invalid target shell (`runas_check_shell`), an invalid timeout, a forbidden `-l -U`, or a rule needing a feature lean-sudo cannot provide never executes anything. | `deny_no_execution`, `command_not_found_no_exec`, `invalid_runas_shell_no_exec`, `invalid_timeout_no_execution`, `list_other_denied_no_execution`, `enforcement_error_no_exec`, `intercept_no_exec`, `group_plugin_no_execution` |
+| | A denied request, a command that was not found, an invalid target shell (`runas_check_shell`), an invalid timeout, a forbidden `-l -U`, or a rule needing a feature lean-sudo cannot provide never executes anything. | `deny_no_execution`, `command_not_found_no_exec`, `invalid_runas_shell_no_exec`, `invalid_timeout_no_execution`, `list_other_denied_no_execution`, `enforcement_error_no_exec`, `intercept_no_exec` |
 | | `-k` always forces authentication; the timestamp is only refreshed for allowed requests. | `decide_reset_requires_auth`, `timestamp_update_allowed` |
 | | sudoedit writes back exactly the files the policy evaluated. | `edit_allowed`, `edit_files_match_policy` |
 | **Policy** (sudoers semantics) | Default deny: the empty policy, or a policy with no rule for you, denies. | `evaluate_nil`, `evaluate_no_user_match` |
@@ -104,16 +104,17 @@ flowchart LR
 | | Last match wins: a later `!command`, including one *inside a `Cmnd_Alias`*, denies; an inner `!` in a `User_Alias` excludes that user. | `evaluate_last_deny`, `evaluate_last_alias_deny`, `evaluate_append_negated`, `evaluate_append_deny_all`, `notbob_alias_no_candidates` |
 | | A literal command rule matches only the same file: equal basename, equal canonical parent directory, same device and inode. A rule for `/usr/bin/id` never matches `/usr/bin/rm`, even when both are links to one multicall binary. | `literal_match_identity`, `pathMatches_literal_basename` |
 | | `()` (run as yourself) never authorises another target; rules outside their `NOTBEFORE`/`NOTAFTER` window never apply; a digest rule needs a matching hash; negated names match case-insensitively like sudo. | `myself_never_other`, `before_window_no_candidate`, `after_window_no_candidate`, `digest_command_requires_hash`, `negated_case_insensitive_name` |
+| | `%:group` and `%:#gid` membership requires an affirmative answer from the configured sudo group plugin for the exact user and group; Unix groups only fall back to the plugin with `always_query_group_plugin`. | `group_plugin_requires_yes`, `pluginGroupMatch_requires_yes` |
 | | `NOPASSWD` is the only way to skip authentication. | `evaluate_noauth_run`, `evaluate_noauth_listing` |
 | | `Defaults` lines and include directives cannot change who may run what. | `evaluate_irrelevant`, `evaluate_congr` |
-| **Environment** | Without `SETENV`, `LD_*` and other blocked variables, exported bash functions and every `env_delete` entry can only come from trusted sources (`env_file`, PAM), never from the caller; with `env_reset` only whitelisted variables (sudo's full pattern syntax) survive; `PATH` is `secure_path` and `SUDO_USER/UID/GID/COMMAND` are correct unless a later write the policy explicitly permits (`SETENV`, PAM) sets them, exactly as in sudo; no duplicate keys. | `buildEnv_no_LD`, `buildEnv_no_bash_fn`, `buildEnv_delete_respected`, `buildEnv_reset_whitelist`, `buildEnv_securePath`, `buildEnv_sudo_vars`, `buildEnv_nodup`, `fileVars_origin` |
+| **Environment** | Without `SETENV`, `LD_*` variables and `env_delete` entries reach the command only from trusted sources (`env_file`, PAM) or through the reset-mode whitelist the administrator configured; with `env_reset`, every variable is set by sudo, whitelisted (sudo's full `env_keep`/`env_check` pattern syntax) or trusted; a caller without `SETENV` cannot override `secure_path`; `SUDO_USER/UID/GID/COMMAND` are correct unless an explicitly permitted later write (`SETENV`, an `env_keep` pattern covering them, PAM) sets them, exactly as in sudo; no duplicate keys. As in sudo, `!env_reset` copies exported bash functions that pass the `env_delete`/`env_check` filters. | `buildEnv_no_LD`, `buildEnv_no_bash_fn`, `buildEnv_delete_respected`, `buildEnv_reset_whitelist`, `buildEnv_securePath`, `buildEnv_sudo_vars`, `buildEnv_nodup`, `fileVars_origin` |
 | **Command line** | The command run is exactly the words you typed after the options, never reordered or rewritten; `--` ends option parsing; conflicting modes are rejected. The `-s`/`-i` shell escaping round-trips. | `parseArgs_command`, `parseArgs_command_suffix`, `parseArgs_dashdash`, `parseArgs_login_shell`, `lex_escapeJoin` |
-| **Credential cache** | A cached authentication is honoured only for the same uid, the same terminal session (device, session id and the session leader's start time), within the timeout and not from the future; `sudo -k` invalidates everything; timestamps for one terminal never leak to another. | `lookup_sound`, `lookup_invalidate`, `lookup_update_other`, `valid_not_future`, `decode_encode` |
+| **Credential cache** | A cached authentication is honoured only for the same uid, the same scope (terminal device, session id and the session leader's start time; or parent process and its start time), within the timeout and not from the future; `sudo -k` invalidates the records of the current scope, as in sudo; records for one scope never authorise another. | `lookup_sound`, `lookup_invalidateScope`, `invalidateScope_other`, `lookup_update_other`, `kernel_scope_terminal_separation`, `valid_not_future`, `decode_encode` |
 | **sudoedit** | The chosen editor is the first resolvable candidate; a file is written back only if it changed and passed the safety checks. | `selectEditor_first`, `writeBack_sound`, `tempSafe_sound` |
 | **Parser and config** | Every command path in a parsed rule is absolute; regex commands are anchored; digests always guard a command; non-default plugins in `sudo.conf` are refused. | `parse_command_absolute`, `parse_regex_anchored`, `parse_digest_command_absolute`, `unknown_plugin_refused` |
 | **Globbing, logging, translations** | `fnmatch` agrees with string equality on literal patterns and `*` never crosses `/` with `FNM_PATHNAME`; I/O logging is on exactly when the policy says so; a missing translation falls back to the original English text. | `fnmatch_literal`, `fnmatch_star_pathname`, `plan_enabled`, `lookup_absent` |
 
-In total there are 246 hand-written theorems, plus 1,407 compile-time regression checks
+In total there are 256 hand-written theorems, plus 1,467 compile-time regression checks
 (`#guard`) that run on every build. `scripts/AxiomAudit.lean` checks mechanically that
 every declaration defined in a `LeanSudo` module (definitions, theorems and instances,
 including private and generated ones) rests only on Lean's three standard axioms
@@ -123,7 +124,7 @@ the library would make it fail; it is backed by a source grep for those words an
 
 ```console
 $ lake env lean scripts/AxiomAudit.lean
-6573 declarations (1816 theorems) checked; axioms used ⊆ propext, Quot.sound, Classical.choice
+6717 declarations (1846 theorems) checked; axioms used ⊆ propext, Quot.sound, Classical.choice
 ```
 
 A proof is only as good as its statement, so the statements are written to be read:
@@ -141,7 +142,7 @@ byte for byte where it matters:
 
 | Suite | sudo.ws 1.9.17p2 | lean-sudo |
 |---|---|---|
-| `sudo` end-to-end: authentication and PAM, run-as users/groups, `!` rules and aliases, globs/regex/digests/netgroups/networks/FQDN hosts, `Defaults` scoping, environment, `-l`/`-ll`/`-U` output, timestamps, `-i`/`-s`/`-b`, exit status, signals and job control, `NOEXEC`, `TIMEOUT`, rlimits, `stay_setuid`, utmp, sudoedit, `sudo.conf`, `nsswitch.conf`, askpass, mail, audit records, syslog/logfile/JSON logs, I/O logs replayed with the system's `sudoreplay`, translations (German, French), command-line errors, security regressions | 544/544 | 544/544 |
+| `sudo` end-to-end: authentication and PAM, run-as users/groups, `!` rules and aliases, globs/regex/digests/netgroups/networks/FQDN hosts, group plugins, SSSD rules (real slapd + sssd), `Defaults` scoping, environment, `-l`/`-ll`/`-U` output, timestamps, `-i`/`-s`/`-b`, exit status, signals and job control, `NOEXEC`, `TIMEOUT`, rlimits, `stay_setuid`, utmp, sudoedit, `sudo.conf`, `nsswitch.conf`, askpass, mail, audit records, syslog/logfile/JSON logs, I/O logs replayed with the system's `sudoreplay`, translations (German, French), command-line errors, security regressions | 602/602 | 602/602 |
 | `visudo` (check mode, edit mode with includes, locking, permissions, export) | 114/114 | 114/114 |
 
 ## Features
@@ -159,6 +160,15 @@ including:
 * **Defaults**: all 163 options, scoped by `@host`, `:user`, `>runas` and `!cmnd`, with
   Ubuntu's compiled-in defaults (`use_pty`, `fqdn`, `admin_flag`, `env_keep` with
   `DPKG_COLORS`, `editor=/usr/bin/editor`, core dumps off, …).
+* **Group providers**: sudo's `group_plugin` ABI, including Ubuntu's `group_file.so`
+  and `system_group.so`, plugin arguments, `%:` membership and
+  `always_query_group_plugin`. Provider load/init failures emit their diagnostics
+  and leave plugin membership unavailable, as in sudo.ws; independent local rules
+  may still authorize the request.
+* **SSSD-backed rules**: `sudoers: files sss` (any order, with `[NOTFOUND=return]`-style
+  actions) in `/etc/nsswitch.conf`, rules fetched through the system's `libsss_sudo`
+  with sudo's `sudoOrder`, `sudoOption` and LDAP-style `sudo -l` output, tested against
+  a real OpenLDAP + SSSD setup.
 * **Running commands**: PAM authentication, account management, sessions and
   credentials; `-u -g -i -s -E --preserve-env -H -n -S -A -p -b -k -K -v -l -ll -U -h -D
   -C -P -N -B -e -V`; askpass; credential cache per tty, per parent process or global;
@@ -171,14 +181,14 @@ including:
 * **Messages**: identical text, translated through the system's gettext catalogs
   (Ubuntu's language packs), insults and lecture when configured.
 * **sudoedit** with sudo's per-component, descriptor-pinned path checks, and **visudo**
-  (`-c`, `-q`, `-f`, `-s`, `-O`, `-P`, edit mode with locking).
+  (`-c`, `-q`, `-f`, `-s`, `-O`, `-P`, `-I`, `-x`, edit mode with includes and locking).
 
 Not implemented, and refused when a rule or setting asks for them (never silently
 ignored): command interception (`INTERCEPT`, `intercept`, `log_subcmds`), remote log
 servers (`log_servers`), `CHROOT`/`runchroot` (deprecated upstream), SELinux `ROLE`/`TYPE`
-on a system without SELinux, `group_plugin`, plugins other than the default sudoers
-plugin in `sudo.conf`, and `sudoers:` sources other than `files` in
-`/etc/nsswitch.conf` (SSSD/LDAP-backed sudo rules).
+on a system without SELinux, plugins other than the default sudoers plugin in
+`sudo.conf`, and the `ldap` sudoers source (Ubuntu's `sudo` package is not built with
+LDAP support either).
 
 ## Fail-closed by design
 
@@ -210,7 +220,7 @@ undefined aliases), so it cannot install a policy that lean-sudo would then refu
 
 Formal verification moves trust; it does not remove it. lean-sudo trusts:
 
-* **The C shim** (`c/*.c`, about 5,400 lines): PAM via `dlopen`, `setgroups` →
+* **The C shim** (`c/*.c`, about 5,800 lines): PAM, `libsss_sudo`, group plugins and gzip via `dlopen`, `setgroups` →
   `setresgid` → `setresuid` (each drop re-checked with `getres[ug]id`, and for a
   non-root target `setuid(0)` must fail before `execve`), fork/exec, signal relay, the
   pty monitor, timestamp file locking, sudoedit's file workers, the I/O log writer

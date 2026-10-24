@@ -316,3 +316,37 @@ PY
   rm -f /usr/local/bin/exec-winch.py
   end
 }
+
+begin exec-nopty-shell-suspend-resume && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-job-control <<'EOF'
+Defaults !use_pty
+EOF
+  pty root 'PS1="OUTER> " /bin/bash --noprofile --norc -i' \
+    -e 'OUTER> ' -s 'SHELL=/bin/bash sudo -s\r' \
+    -s 'echo INNER-READY\r' -e '\r\nINNER-READY\r\n' \
+    -s 'suspend\r' -e Stopped -s 'fg\r' \
+    -s 'echo INNER-RESUMED; exit\r' -e '\r\nINNER-RESUMED\r\n' \
+    -e 'OUTER> ' -s 'exit\r'
+  expect_rc 0
+  expect_out_has INNER-RESUMED
+  end
+}
+
+begin exec-nopty-separate-group-stop-resume && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-job-control <<'EOF'
+Defaults !use_pty
+EOF
+  cat >/usr/local/bin/exec-stop-group.pl <<'PERL'
+setpgrp(0, 0) or die "setpgrp: $!";
+kill 'STOP', $$;
+print "group-resumed\n";
+PERL
+  pty root 'PS1="OUTER> " /bin/bash --noprofile --norc -i' \
+    -e 'OUTER> ' -s 'sudo /usr/bin/perl /usr/local/bin/exec-stop-group.pl\r' \
+    -e Stopped -s 'fg\r' -e '\r\ngroup-resumed\r\n' \
+    -e 'OUTER> ' -s 'exit\r'
+  expect_rc 0
+  expect_out_has group-resumed
+  rm -f /usr/local/bin/exec-stop-group.pl
+  end
+}

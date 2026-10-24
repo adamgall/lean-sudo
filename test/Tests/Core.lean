@@ -193,14 +193,10 @@ def editPath (file : String) : Context :=
 #guard match (decide { ctx with execFd := some 7 }).action with
   | .exec p => p.execFd == none | _ => false
 
-#guard failure { ctx with settings := { ctx.settings with groupPlugin := some "group_file.so" } } ==
-  some "sudo: group_plugin is not supported\n"
-#guard failure { editCtx with settings := { editCtx.settings with groupPlugin := some "group_file.so" } } ==
-  some "sudo: group_plugin is not supported\n"
-#guard failure { ctx with opts := { ctx.opts with mode := .list }, settings := { ctx.settings with groupPlugin := some "group_file.so" } } ==
-  some "sudo: group_plugin is not supported\n"
-#guard failure { ctx with opts := { ctx.opts with mode := .validate }, settings := { ctx.settings with groupPlugin := some "group_file.so" } } ==
-  some "sudo: group_plugin is not supported\n"
+#guard failure { ctx with settings := { ctx.settings with groupPlugin := some "group_file.so" } } == none
+#guard failure { editCtx with settings := { editCtx.settings with groupPlugin := some "group_file.so" } } == none
+#guard failure { ctx with opts := { ctx.opts with mode := .list }, settings := { ctx.settings with groupPlugin := some "group_file.so" } } == none
+#guard failure { ctx with opts := { ctx.opts with mode := .validate }, settings := { ctx.settings with groupPlugin := some "group_file.so" } } == none
 #guard failure { ctx with opts := { ctx.opts with mode := .help }, settings := { ctx.settings with groupPlugin := some "group_file.so" } } == none
 
 -- Residual sudo.ws policy/message parity.

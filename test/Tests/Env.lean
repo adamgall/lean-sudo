@@ -252,7 +252,19 @@ def preserveAll : EnvInput := { base with preserve := .all, setenvAllowed := tru
 /-! ### Theorems instantiated -/
 example (out : EnvList) (h : buildEnv base = .ok out) : (out.map Prod.fst).Nodup := buildEnv_nodup h
 example (out : EnvList) (h : buildEnv { base with settings := { securePath := some "/sbin" } } = .ok out) :
-    ("PATH", "/sbin") ∈ out := (buildEnv_securePath h rfl (by
-      simp [BindingSafe, extraVars, pamVars, base])).1
+    ("PATH", "/sbin") ∈ out := (buildEnv_securePath h rfl rfl (by
+      simp [pamVars, base])).1
+
+example (i : EnvInput) (out : EnvList) (p : String)
+    (h : buildEnv i = .ok out) (hp : effectiveSecurePath i = some p)
+    (hs : i.setenvAllowed = false) :
+    ∀ kv ∈ extraVars i, kv.1 ≠ "PATH" :=
+  buildEnv_securePath_no_extra h hp hs
+
+example (out : EnvList)
+    (h : buildEnv { base with settings := { securePath := some "/sbin" }, setenvAllowed := true, cmdlineVars := [("PATH", "/sbin")] } = .ok out) :
+    ("PATH", "/sbin") ∈ out :=
+  (buildEnv_securePath_of_bindingSafe h rfl (by
+    simp [BindingSafe, extraVars, pamVars, base])).1
 
 end Tests.Env

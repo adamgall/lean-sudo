@@ -16,6 +16,8 @@ returns the command's status.
 Non-pty job control hands the foreground terminal to a separately grouped command
 stopped by SIGTTIN/SIGTTOU, or suspends sudo until the invoking shell resumes it.
 Foreground restoration refuses to steal a terminal from another job.
+The invoking shell's SIGCONT is relayed to the command even in a separate process
+group; command-originated signals are filtered rather than bounced back.
 User-generated SIGWINCH is relayed without a pty; with a pty, size changes update
 the terminal and explicitly signal the command's process group, as sudo does.
 

@@ -9,8 +9,10 @@ import LeanSudo.Sys.Exec
 import LeanSudo.Sys.Timestamp
 import LeanSudo.Sys.Extra
 import LeanSudo.Sys.Lookup
+import LeanSudo.Sys.GroupPlugin
 import LeanSudo.SudoConf
 import LeanSudo.Nsswitch
+import LeanSudo.Sys.Sss
 import LeanSudo.Util.Sha2
 import LeanSudo.Insults
 import LeanSudo.EventLog
@@ -154,6 +156,34 @@ private def netgroupNames : Sudoers.Entry → List String
         c.runas.toList.flatMap (fun r => userNetgroups (r.users.getD []))))
   | _ => []
 
+private def userPluginGroups (ms : List (Sudoers.Member Sudoers.UserAtom)) : List String :=
+  ms.filterMap fun m => match m.atom with
+    | .nonunixGroup n | .group n => some n
+    | .nonunixGid n | .gid n => some ("#" ++ toString n)
+    | _ => none
+
+private def pluginGroupNames : Sudoers.Entry → List String
+  | .userAlias _ ms | .runasAlias _ ms => userPluginGroups ms
+  | .defaults (.user ms) _ | .defaults (.runas ms) _ => userPluginGroups ms
+  | .userSpec us => userPluginGroups us.users ++ us.entries.flatMap (fun h =>
+      h.cmnds.flatMap (fun c =>
+        c.runas.toList.flatMap (fun r => userPluginGroups (r.users.getD []))))
+  | _ => []
+
+private def loadGroupPlugin (config : Option String) : IO (Option Sys.GroupPlugin.Handle) := do
+  let some config := config | return none
+  try Sys.GroupPlugin.load config catch e => warn e.toString; return none
+
+private def gatherPluginFacts (policy : Sudoers.Sudoers) (r : Request)
+    (plugin : Option Sys.GroupPlugin.Handle) (otherUsers : List String := []) : IO Request := do
+  let some plugin := plugin | return { r with pluginGroups := [] }
+  let users := ([r.user.name, r.runasUser.name, "root"] ++ otherUsers).eraseDups
+  let groups := (policy.flatMap pluginGroupNames).eraseDups
+  let queries := users.flatMap fun u => groups.map (u, ·)
+  let pluginGroups ← queries.mapM fun (u, g) =>
+    return (u, g, ← Sys.GroupPlugin.query plugin u g)
+  return { r with pluginGroups }
+
 private def regexPatterns : Sudoers.CmndAtom → List String
   | .commandRegex re a => re :: (match a with | .regex r => [r] | _ => [])
   | .command _ a | .sudoedit a => match a with | .regex r => [r] | _ => []
@@ -197,7 +227,8 @@ private def readEnvFile (path : Option String) : IO EnvList := do
     return some (key, value)
 
 private def gatherFacts (policy : Sudoers.Sudoers) (r : Request)
-    (otherUsers : List String := []) (policyLocale : String := "C") : IO Request := do
+    (otherUsers : List String := []) (policyLocale : String := "C")
+    (otherHosts : List String := []) : IO Request := do
   let atoms := policy.flatMap commandAtoms
   let paths := (atoms.flatMap atomPaths).eraseDups
   let globPaths ← (paths.filter Glob.hasGlob).mapM fun p => return (p, ← Sys.globPaths p policyLocale)
@@ -229,7 +260,7 @@ private def gatherFacts (policy : Sudoers.Sudoers) (r : Request)
     (fun p => subjects.map (p, ·))).mapM fun (p, s) => return (p, s, ← Sys.regexMatches p s policyLocale)
   let users := ([none, some r.user.name, some r.runasUser.name, some "root"] ++
     otherUsers.map some).eraseDups
-  let hosts := [none, some r.lhost, some r.host]
+  let hosts := ([none, some r.lhost, some r.host] ++ otherHosts.map some).eraseDups
   let queries := (policy.flatMap netgroupNames).eraseDups.flatMap fun n =>
     users.flatMap fun u => hosts.map fun h => (n, u, h)
   let domain ← Sys.domainName
@@ -258,6 +289,40 @@ private def identityInitializationFailure (opts : Cli.Options) (invoking : Princ
     Sys.syslogBytes "authpriv" "alert" bytes false
   warn message
   throw (IO.userError "error initializing audit plugin sudoers_audit")
+
+private def loadSources (sources : List Nsswitch.Source) (host : String)
+    (invoking : Principal) (other : Option Principal) :
+    IO (List (Nsswitch.Source × List Sudoers.Located)) :=
+  sources.mapM fun source => do
+    if source.name == "files" then return (source, ← Sudoers.load host)
+    let (defs, rules) ← Sys.Sss.query invoking.uid.toUInt32 invoking.name
+    let rules ← match other with
+      | some p => do
+        if p.uid == invoking.uid then pure rules else
+          let (_, extra) ← Sys.Sss.query p.uid.toUInt32 p.name
+          pure ((rules.toList ++ extra.toList).eraseDups.toArray)
+      | none => pure rules
+    return (source, ← fromExcept (Sss.convert defs rules))
+
+private def selectSources (sources : List (Nsswitch.Source × List Sudoers.Located))
+    (st : Settings) (r : Request) : List Sudoers.Located :=
+  let selected := Nsswitch.select (fun entries =>
+    !(Policy.candidates (entries.map (·.entry)) st r).isEmpty)
+    (!Policy.isRunCmd r.command) sources false
+  -- Defaults are collected from all backends before authorization lookup.
+  let defs := sources.flatMap fun (_, entries) => entries.filter fun l =>
+    match l.entry with | .defaults _ _ => true | _ => false
+  defs ++ selected.flatten.filter (fun l =>
+    match l.entry with | .defaults _ _ => false | _ => true)
+
+private def privilegeDefaults (policy : Sudoers.Sudoers) (st : Settings)
+    (r : Request) : IO Settings := do
+  if !Policy.isRunCmd r.command then return st
+  let some winner := (Policy.candidates policy st r).getLast? | return st
+  let (st, warnings) ← fromExcept
+    (Policy.applySettings st (winner.spec.ldapOptions.map Sss.parseOption))
+  for message in warnings do warn message
+  return st
 
 private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Config) : IO Core.Context := do
   if let some message := Cli.timeoutError opts then
@@ -289,8 +354,15 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
     identityInitializationFailure opts invoking ttyName cwd (targetGroupInfo.map (·.1.name)) e.toString
   let nss ← try IO.FS.readFile "/etc/nsswitch.conf" catch e =>
     match e with | .noFileOrDirectory _ _ _ => pure "" | _ => throw e
-  fromExcept (Nsswitch.approve nss)
-  let locatedSudoers ← Sudoers.load host
+  let sources ← fromExcept (Nsswitch.configure nss)
+  let listUser ← opts.otherUser.mapM user
+  let loadedSources ← loadSources sources host invoking listUser
+  let ipaHost ← if sources.any (·.name == "sss") && lookupHost.toLower == rawHost.toLower then
+      try pure (Sss.ipaHostname (← IO.FS.readFile "/etc/sssd/sssd.conf"))
+      catch _ => pure none
+    else pure none
+  let ipaHosts := ipaHost.toList.flatMap fun h => [h, (h.splitOn ".").headD h]
+  let locatedSudoers := loadedSources.flatMap (·.2)
   let policy := locatedSudoers.map (·.entry)
   let _ ← fromExcept (Policy.validate policy)
   let addresses ← if conf.probeInterfaces then Sys.interfaceAddresses else pure #[]
@@ -305,6 +377,10 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
     command := .list, now := wallTime, utcOffset }
   let preliminary ← gatherFacts policy base
   let initial ← defaults policy invoking host none none preliminary opts.prompt.isSome
+  let plugin ← loadGroupPlugin initial.groupPlugin
+  let pluginConfig := initial.groupPlugin
+  let preliminary ← gatherPluginFacts policy preliminary plugin
+  let initial ← defaults policy invoking host none none preliminary opts.prompt.isSome
   if initial.fqdn then
     if let .error message := hostResult then warn ("unable to resolve host " ++ lookupHost ++ ": " ++ message)
   let longHost := if initial.fqdn then canonicalHost else lookupHost
@@ -316,7 +392,6 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
       else targetUser initial.runasDefault invokingRealGid
   let targetGroup := targetGroupInfo.map (·.1)
   let targetUnknownGid := targetGroupInfo.any (·.2)
-  let listUser ← opts.otherUser.mapM user
   let (command, commandFoundInDot) ← resolveCommand opts invoking target userEnv cwd initial
     invokingRealGid targetGroup
   let policyCommand := if opts.mode == .edit then some (.sudoedit opts.command) else
@@ -327,9 +402,25 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
     lhost := longHost
     runasUser := target
     runasGroup := targetGroup
-    command := policyCommand.getD .list } (listUser.toList.map (·.name)) initial.sudoersLocale
+    command := policyCommand.getD .list } (listUser.toList.map (·.name)) initial.sudoersLocale ipaHosts
+  let facts ← gatherPluginFacts policy facts plugin (listUser.toList.map (·.name))
   let algos := ((policy.flatMap commandAtoms).flatMap digestAlgos).eraseDups
   let beforeDigest ← defaults policy invoking host (some target) policyCommand facts opts.prompt.isSome
+  let facts ← if beforeDigest.groupPlugin == pluginConfig then pure facts else do
+    for handle in plugin do Sys.GroupPlugin.close handle
+    let replacement ← loadGroupPlugin beforeDigest.groupPlugin
+    try gatherPluginFacts policy facts replacement (listUser.toList.map (·.name))
+    finally for handle in replacement do Sys.GroupPlugin.close handle
+  for handle in plugin do Sys.GroupPlugin.close handle
+  let loadedSources := loadedSources.map fun (source, entries) =>
+    (source, if source.name == "sss" then
+      ipaHost.map (Sss.withIpaHost entries initial facts (invoking :: listUser.toList)) |>.getD entries
+    else entries)
+  let policy := (loadedSources.flatMap (·.2)).map (·.entry)
+  let beforeDigest ← defaults policy invoking host (some target) policyCommand facts opts.prompt.isSome
+  let digestPolicy := (selectSources loadedSources beforeDigest
+    { facts with fastGlob := beforeDigest.fastGlob }).map (·.entry)
+  let beforeDigest ← privilegeDefaults digestPolicy beforeDigest facts
   let pinned ← match command with
     | some c => do
       if algos.isEmpty && beforeDigest.fdexec != "always" then pure none
@@ -347,6 +438,15 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
     | _, _ => facts.fileIds
   let facts := { facts with digests, fileIds }
   let settings ← defaults policy invoking host (some target) policyCommand facts opts.prompt.isSome true
+  let locatedSudoers := selectSources loadedSources settings { facts with fastGlob := settings.fastGlob }
+  let policy := locatedSudoers.map (·.entry)
+  let policySettings := settings
+  let settings ← privilegeDefaults policy settings { facts with fastGlob := settings.fastGlob }
+  let policyTarget := target
+  let (target, targetUnknownUid) ← if opts.user.isNone && opts.group.isNone &&
+      settings.runasDefault != policySettings.runasDefault then
+      targetUser settings.runasDefault invokingRealGid
+    else pure (target, targetUnknownUid)
   let settings := { settings with noexecFile := some ((settings.noexecFile.or conf.noexec).getD "") }
   let sid ← Sys.getsid
   let ppid ← Sys.getppid
@@ -380,9 +480,13 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
     else pure none
   return {
     progname, opts, invoking, host, longHost, sudoers := policy, locatedSudoers, settings, target
+    listingSources := loadedSources.flatMap (·.2)
+    policySettings := some policySettings
+    policyTarget := some policyTarget
     targetGroup, listUser, command, userEnv, cwd, userUmask := mask.toNat
     ttyName, canon := facts.canon, now := ← Sys.bootTimeNanos, tsScope, tsRecords
     interfaces, netgroups := facts.netgroups, regexMatches := facts.regexMatches,
+    pluginGroups := facts.pluginGroups,
     digests, wallTime, utcOffset, fileIds, globPaths := facts.globPaths, execFd, homes
     envFile := ← readEnvFile settings.envFile, restrictedEnvFile := ← readEnvFile settings.restrictedEnvFile
     selinuxEnabled := (← Sys.stat "/sys/fs/selinux/enforce").isSome
@@ -398,10 +502,10 @@ private def jsonDetails (ctx : Core.Context) (accepted : Bool) : IO EventLog.Det
   let al := Policy.aliasesOf ctx.sudoers
   let candidates := ctx.locatedSudoers.flatMap fun l =>
     match l.entry with
-    | .userSpec us => (Policy.usCandidates al al.fuel ctx.settings r us).map ((l.file, us.source), ·)
+    | .userSpec us => (Policy.usCandidates al al.fuel (Core.authorizationSettings ctx) r us).map ((l.file, us.source), ·)
     | _ => []
   let chosen := candidates.getLast?
-  let allowed := chosen.filter (·.2.allow) |>.map (Policy.allowedOf ctx.settings ·.2)
+  let allowed := chosen.filter (·.2.allow) |>.map (Policy.allowedOf (Core.authorizationSettings ctx) ·.2)
   let cwd := (ctx.opts.chdir.or (allowed.bind (·.cwd.join))).or ctx.settings.runcwd
     |>.filter (· != "*")
   let cwd := (cwd.bind (Core.expandHome ctx)).getD

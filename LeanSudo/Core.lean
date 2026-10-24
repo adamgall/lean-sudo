@@ -51,14 +51,18 @@ def runCommand (ctx : Context) : Command :=
   | some rc => .run rc.path rc.canonical (policyArgs ctx rc)
   | none => let typed := ctx.opts.command.headD ""; .run typed typed ctx.opts.command.tail
 
+def authorizationSettings (ctx : Context) : Settings :=
+  ctx.policySettings.getD ctx.settings
+
 def request (ctx : Context) : Request :=
   { user := if ctx.opts.mode == .list then ctx.listUser.getD ctx.invoking else ctx.invoking
-    host := ctx.opts.host.getD ctx.host, runasUser := ctx.target,
+    host := ctx.opts.host.getD ctx.host, runasUser := ctx.policyTarget.getD ctx.target,
     runasGroup := ctx.targetGroup, runasUserExplicit := ctx.opts.user.isSome, canon := ctx.canon,
     lhost := ctx.opts.host.getD ctx.longHost, interfaces := ctx.interfaces,
     netgroups := ctx.netgroups, regexMatches := ctx.regexMatches, digests := ctx.digests,
+    pluginGroups := ctx.pluginGroups,
     now := ctx.wallTime, utcOffset := ctx.utcOffset, fileIds := ctx.fileIds, globPaths := ctx.globPaths,
-    fastGlob := ctx.settings.fastGlob,
+    fastGlob := (authorizationSettings ctx).fastGlob,
     command := match ctx.opts.mode with
       | .edit => .sudoedit ctx.opts.command
       | .list => if ctx.opts.command.isEmpty then .list else runCommand ctx
@@ -81,12 +85,12 @@ def displayShortHost (ctx : Context) : String :=
 
 def listOtherDenied (ctx : Context) : Bool :=
   ctx.opts.mode == .list && ctx.opts.otherUser.isSome &&
-    !canListOther ctx.sudoers ctx.settings { request ctx with user := ctx.invoking }
+    !canListOther ctx.sudoers (authorizationSettings ctx) { request ctx with user := ctx.invoking }
       (ctx.listUser.getD ctx.invoking) ctx.root
 
 /-- Listing another user is an authorization decision, not a pre-authentication error. -/
 def policyJudgement (ctx : Context) : Judgement :=
-  if listOtherDenied ctx then .deny else evaluate ctx.sudoers ctx.settings (request ctx)
+  if listOtherDenied ctx then .deny else evaluate ctx.sudoers (authorizationSettings ctx) (request ctx)
 
 def sameIdentity (ctx : Context) : Bool :=
   ctx.target.uid == ctx.invoking.uid &&
@@ -283,25 +287,27 @@ def allowedAction (ctx : Context) (a : Allowed) : Action :=
       | .ok _ => .edit (editPlan ctx a)
   | .list =>
     if ctx.opts.command.isEmpty then
-      .print (listPrivileges ctx.sudoers ctx.settings (ctx.listUser.getD ctx.invoking)
-        (displayShortHost ctx) ctx.canon (ctx.opts.listVerbose > 1) ctx.locatedSudoers
+      let located := if ctx.listingSources.isEmpty then ctx.locatedSudoers else ctx.listingSources
+      let policy := if ctx.listingSources.isEmpty then ctx.sudoers else located.map (·.entry)
+      .print (listPrivileges policy ctx.settings (ctx.listUser.getD ctx.invoking)
+        (displayShortHost ctx) ctx.canon (ctx.opts.listVerbose > 1) located
           (some (request ctx)) ctx.listColumns) 0
     else match ctx.command with
       | none => notFound ctx
-      | some _ => .print (listCommand ctx.sudoers ctx.settings (request ctx)
+      | some _ => .print (listCommand ctx.sudoers (authorizationSettings ctx) (request ctx)
           ctx.locatedSudoers (ctx.opts.listVerbose > 1)) 0
   | .validate => .validate
   | _ => .fail "sudo: invalid policy mode\n" 1
 
 def userMatches (ctx : Context) : Bool :=
   let al := aliasesOf ctx.sudoers
-  (specsOf ctx.sudoers).any (fun us => userListOk al al.fuel ctx.invoking us.users ctx.settings (some (request ctx)))
+  (specsOf ctx.sudoers).any (fun us => userListOk al al.fuel ctx.invoking us.users (authorizationSettings ctx) (some (request ctx)))
 
 def hostMatches (ctx : Context) : Bool :=
   let al := aliasesOf ctx.sudoers
   (specsOf ctx.sudoers).any fun us =>
-    userListOk al al.fuel ctx.invoking us.users ctx.settings (some (request ctx)) &&
-    us.entries.any (fun hc => hostListOk al al.fuel ctx.host hc.hosts ctx.settings (some (request ctx)))
+    userListOk al al.fuel ctx.invoking us.users (authorizationSettings ctx) (some (request ctx)) &&
+    us.entries.any (fun hc => hostListOk al al.fuel ctx.host hc.hosts (authorizationSettings ctx) (some (request ctx)))
 
 def denialReason (ctx : Context) : String :=
   if ctx.opts.mode == .list || ctx.opts.mode == .validate then "command not allowed"
@@ -413,9 +419,7 @@ def earlyAction (ctx : Context) : Option Action :=
   | .resetTimestamp => some .resetTimestamp
   | .removeTimestamp => some .removeTimestamp
   | _ =>
-    if ctx.settings.groupPlugin.isSome then
-      some (.fail "sudo: group_plugin is not supported\n" 1)
-    else if (Cli.timeoutError ctx.opts).isSome then
+    if (Cli.timeoutError ctx.opts).isSome then
       some (.fail s!"sudo: {(Cli.timeoutError ctx.opts).getD ""}\nsudo: error initializing audit plugin sudoers_audit\n" 1)
     else if ctx.opts.mode = .edit ∧ (invalidEditFile ctx).isSome then
       some (.fail s!"sudoedit: {(invalidEditFile ctx).getD ""}: path is not absolute or contains a NUL byte, refusing\n" 1)

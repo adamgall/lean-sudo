@@ -5,6 +5,18 @@ The IO shell must successfully perform the returned authentication before execut
 namespace LeanSudo.Core
 open Policy
 
+/-- LDAP privilege Defaults are post-lookup runtime settings, never a second
+opportunity to authorize under a changed runas/user/host matching policy. -/
+theorem privilege_defaults_preserve_authorization (ctx : Context)
+    (before after : Settings) :
+    policyJudgement { ctx with settings := after, policySettings := some before } =
+      policyJudgement { ctx with settings := before, policySettings := some before } := rfl
+
+theorem privilege_runas_default_preserves_lookup (ctx : Context)
+    (matched runtime : Principal) :
+    policyJudgement { ctx with target := runtime, policyTarget := some matched } =
+      policyJudgement { ctx with target := matched, policyTarget := some matched } := rfl
+
 private theorem branch_of_ite_eq {α : Type} {p : Prop} [Decidable p] {a b c : α}
     (h : (if p then a else b) = c) : a = c ∨ b = c := by
   split at h
@@ -30,7 +42,7 @@ private theorem denied_safe (ctx : Context) :
 
 private theorem policyJudgement_allow (ctx : Context) (a : Allowed)
     (h : policyJudgement ctx = .allow a) :
-    evaluate ctx.sudoers ctx.settings (request ctx) = .allow a := by
+    evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a := by
   unfold policyJudgement at h
   split at h
   · cases h
@@ -38,13 +50,13 @@ private theorem policyJudgement_allow (ctx : Context) (a : Allowed)
 
 private theorem authJudgement_policyJudgement (ctx : Context) :
     authJudgement ctx (policyJudgement ctx) =
-      authJudgement ctx (evaluate ctx.sudoers ctx.settings (request ctx)) := by
+      authJudgement ctx (evaluate ctx.sudoers (authorizationSettings ctx) (request ctx)) := by
   by_cases hm : ctx.opts.mode = .list <;>
     simp [authJudgement, policyJudgement, listOtherDenied, hm]
 
 /-- Every executable plan comes from an allowed resolved run with a checked environment. -/
 theorem exec_origin (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .exec p) :
-    ∃ a rc, evaluate ctx.sudoers ctx.settings (request ctx) = .allow a ∧
+    ∃ a rc, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
       ctx.opts.mode = .run ∧ ctx.command = some rc ∧ p = execPlan ctx a rc ∧
       (∃ env, buildEnv (environment ctx a) = .ok env) ∧
       decide ctx = policyDecision ctx (.allow a) ∧
@@ -80,7 +92,7 @@ theorem exec_origin (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .e
 
 /-- Editing is authorized for precisely the absolute file list in the returned plan. -/
 theorem edit_origin (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .edit p) :
-    ∃ a, evaluate ctx.sudoers ctx.settings (request ctx) = .allow a ∧
+    ∃ a, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
       ctx.opts.mode = .edit ∧ p = editPlan ctx a ∧
       (∃ env, buildEnv (environment ctx a) = .ok env) ∧
       decide ctx = policyDecision ctx (.allow a) := by
@@ -109,7 +121,7 @@ theorem edit_origin (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .e
       all_goals repeat' first | split at h | cases h
 
 theorem exec_allowed (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .exec p) :
-    ∃ a rc, evaluate ctx.sudoers ctx.settings (request ctx) = .allow a ∧
+    ∃ a rc, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
       ctx.command = some rc ∧
       (request ctx).command = .run rc.path rc.canonical (policyArgs ctx rc) ∧
       p.path = executionPath ctx rc ∧ p.argv = rc.argv0 :: rc.args := by
@@ -126,7 +138,7 @@ theorem exec_path_is_canonical (ctx : Context) (p : ExecPlan)
   exact ⟨rc, hc, rfl⟩
 
 theorem edit_allowed (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .edit p) :
-    ∃ a, evaluate ctx.sudoers ctx.settings (request ctx) = .allow a ∧
+    ∃ a, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
       (request ctx).command = .sudoedit p.policyFiles := by
   obtain ⟨a, ha, hm, rfl, _, _⟩ := edit_origin ctx p h
   exact ⟨a, ha, by simp [request, hm, editPlan]⟩
@@ -238,7 +250,7 @@ private theorem authentication_none (ctx : Context) (a : Allowed)
 
 theorem exec_noauth (ctx : Context) (p : ExecPlan)
     (h : (decide ctx).action = .exec p) (hn : (decide ctx).auth = .none) :
-    ∃ a, evaluate ctx.sudoers ctx.settings (request ctx) = .allow a ∧ AuthExemption ctx a := by
+    ∃ a, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧ AuthExemption ctx a := by
   obtain ⟨a, rc, ha, hm, _, _, _, hd, _⟩ := exec_origin ctx p h
   rw [hd] at hn
   simp only [policyDecision, authJudgement, hm, reduceCtorEq, ↓reduceIte] at hn
@@ -246,14 +258,14 @@ theorem exec_noauth (ctx : Context) (p : ExecPlan)
 
 theorem edit_noauth (ctx : Context) (p : EditPlan)
     (h : (decide ctx).action = .edit p) (hn : (decide ctx).auth = .none) :
-    ∃ a, evaluate ctx.sudoers ctx.settings (request ctx) = .allow a ∧ AuthExemption ctx a := by
+    ∃ a, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧ AuthExemption ctx a := by
   obtain ⟨a, ha, hm, _, _, hd⟩ := edit_origin ctx p h
   rw [hd] at hn
   simp only [policyDecision, authJudgement, hm, reduceCtorEq, ↓reduceIte] at hn
   exact ⟨a, ha, authentication_none ctx a hn⟩
 
 theorem exec_environment (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .exec p) :
-    ∃ a env, evaluate ctx.sudoers ctx.settings (request ctx) = .allow a ∧
+    ∃ a env, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
       buildEnv p.envInput = .ok env ∧ p.envInput.pamEnv = [] ∧
       p.envInput.settings = ctx.settings ∧ p.envInput.target = ctx.target ∧
       p.envInput.invoking = ctx.invoking ∧ p.envInput.setenvAllowed = a.setenv := by
@@ -261,7 +273,7 @@ theorem exec_environment (ctx : Context) (p : ExecPlan) (h : (decide ctx).action
   exact ⟨a, env, ha, hb, rfl, rfl, rfl, rfl, rfl⟩
 
 theorem edit_environment (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .edit p) :
-    ∃ a env, evaluate ctx.sudoers ctx.settings (request ctx) = .allow a ∧
+    ∃ a env, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
       buildEnv p.envInput = .ok env ∧ p.envInput.pamEnv = [] ∧
       p.envInput.settings = ctx.settings ∧ p.envInput.target = ctx.target ∧
       p.envInput.invoking = ctx.invoking ∧ p.envInput.setenvAllowed = a.setenv := by
@@ -269,7 +281,7 @@ theorem edit_environment (ctx : Context) (p : EditPlan) (h : (decide ctx).action
   exact ⟨a, env, ha, hb, rfl, rfl, rfl, rfl, rfl⟩
 
 theorem deny_no_execution (ctx : Context)
-    (h : evaluate ctx.sudoers ctx.settings (request ctx) = .deny) :
+    (h : evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .deny) :
     (∀ p, (decide ctx).action ≠ .exec p) ∧ (∀ p, (decide ctx).action ≠ .edit p) := by
   constructor
   · intro p hp; obtain ⟨a, _, ha, _⟩ := exec_allowed ctx p hp; rw [h] at ha; cases ha
@@ -298,7 +310,7 @@ theorem buildEnv_success_pam_independent (i : EnvInput) (pam : EnvList) :
   rfl
 
 theorem timestamp_update_allowed (ctx : Context) (h : (decide ctx).updateTimestamp = true) :
-    (∃ a, evaluate ctx.sudoers ctx.settings (request ctx) = .allow a) ∧
+    (∃ a, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a) ∧
       ctx.opts.noUpdate = false ∧ ctx.opts.resetTimestamp = false := by
   unfold decide at h
   split at h
@@ -319,7 +331,7 @@ theorem reset_never_waives_auth (ctx : Context) (j : Judgement)
 theorem decide_reset_requires_auth (ctx : Context) (he : earlyAction ctx = none)
     (hk : ctx.opts.resetTimestamp = true)
     (hn : policyNeedsAuth ctx (authJudgement ctx
-      (evaluate ctx.sudoers ctx.settings (request ctx))) = true) :
+      (evaluate ctx.sudoers (authorizationSettings ctx) (request ctx))) = true) :
     (decide ctx).auth = .required (authUser ctx) := by
   simp only [decide, he, policyDecision, authJudgement_policyJudgement]
   exact reset_never_waives_auth ctx _ hk hn
@@ -360,7 +372,7 @@ theorem exec_fd_is_pinned (ctx : Context) (p : ExecPlan)
 
 /-- An unsupported deciding restriction cannot authorize execution. -/
 theorem enforcement_error_no_exec (ctx : Context) (a : Allowed)
-    (ha : evaluate ctx.sudoers ctx.settings (request ctx) = .allow a)
+    (ha : evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a)
     (he : (enforcementError ctx a).isSome = true) :
     ∀ p, (decide ctx).action ≠ .exec p := by
   intro p hp
@@ -371,25 +383,27 @@ theorem enforcement_error_no_exec (ctx : Context) (a : Allowed)
   simp [policyDecision, allowedAction, hm, hc, he] at hp
 
 theorem intercept_no_exec (ctx : Context) (a : Allowed)
-    (ha : evaluate ctx.sudoers ctx.settings (request ctx) = .allow a)
+    (ha : evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a)
     (hi : a.intercept.getD ctx.settings.intercept = true) :
     ∀ p, (decide ctx).action ≠ .exec p :=
   enforcement_error_no_exec ctx a ha (by simp [enforcementError, hi])
 
-/-- An unsupported external group provider must never be silently bypassed. -/
-theorem group_plugin_no_execution (ctx : Context)
-    (h : ctx.settings.groupPlugin.isSome = true) :
-    (∀ p, (decide ctx).action ≠ .exec p) ∧
-    (∀ p, (decide ctx).action ≠ .edit p) := by
-  cases hm : ctx.opts.mode <;> simp [decide, earlyAction, hm, h]
+/-- A `%:` atom matches only an affirmative provider answer for this exact
+principal and group. Neither Unix membership nor a missing provider grants it. -/
+theorem group_plugin_requires_yes (ctx : Context) (p : Principal) (group : String)
+    (h : userBase p ctx.settings (some (request ctx)) (.nonunixGroup group) = true) :
+    (p.name, group, true) ∈ ctx.pluginGroups := by
+  obtain ⟨r, hr, hm⟩ := pluginGroupMatch_requires_yes ctx.settings
+    (some (request ctx)) p.name group h
+  cases Option.some.inj hr
+  exact hm
 
 /-- A malformed plugin timeout cannot silently become an unlimited execution. -/
 theorem invalid_timeout_no_execution (ctx : Context)
     (h : (Cli.timeoutError ctx.opts).isSome = true) :
     (∀ p, (decide ctx).action ≠ .exec p) ∧
     (∀ p, (decide ctx).action ≠ .edit p) := by
-  cases hg : ctx.settings.groupPlugin.isSome <;>
-    cases hm : ctx.opts.mode <;> simp [decide, earlyAction, hm, hg, h]
+  cases hm : ctx.opts.mode <;> simp [decide, earlyAction, hm, h]
 
 /-- An explicitly configured command directory wins over login-home selection
 and cannot be treated as an optional missing home directory. -/

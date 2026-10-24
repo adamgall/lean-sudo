@@ -85,6 +85,7 @@ structure Context where
   longHost : String := ""
   interfaces : List (IpAddr × IpAddr) := []
   netgroups : List (String × Option String × Option String × Bool) := []
+  pluginGroups : List (String × String × Bool) := []
   regexMatches : List (String × String × Bool) := []
   digests : List Digest := []
   wallTime : Nat := 0
@@ -96,6 +97,12 @@ structure Context where
   selinuxEnabled : Bool := false
   mailerAvailable : Bool := false
   locatedSudoers : List Located := []
+  /-- Listing displays all queried NSS backends, even beyond authorization return actions. -/
+  listingSources : List Located := []
+  /-- Pre-privilege Defaults snapshot: winning LDAP options cannot re-authorize a different rule. -/
+  policySettings : Option Settings := none
+  /-- The target matched before a winning LDAP runas_default callback changes it. -/
+  policyTarget : Option Principal := none
   execFd : Option Nat := none
   root : Principal := { name := "root", uid := 0, gid := 0, groups := [], home := "/root", shell := "/bin/bash" }
   previousUser : Option Principal := none

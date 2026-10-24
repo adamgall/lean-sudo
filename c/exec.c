@@ -393,18 +393,18 @@ static int user_sent(const struct sigrec *r) { return r->code <= 0 && r->pid > 0
 static int is_forwarded(int signo) {
   switch (signo) {
   case SIGINT: case SIGQUIT: case SIGTSTP: case SIGTERM: case SIGHUP:
-  case SIGALRM: case SIGUSR1: case SIGUSR2: case SIGPIPE: case SIGWINCH:
+  case SIGALRM: case SIGUSR1: case SIGUSR2: case SIGPIPE: case SIGWINCH: case SIGCONT:
     return 1;
   default:
     return 0;
   }
 }
 
-/* Forwarding policy shared by both modes.
- *  - SIGINT/SIGQUIT/SIGTSTP: only when sent by a process, and not by one in our own
- *    process group (a terminal- or pgrp-wide signal already reached the command).
- *  - never forward a signal sent by the command itself (or, in pty mode, by anything
- *    in the command's session) — that would bounce it straight back.
+/* Non-pty forwarding follows signal_cb_nopty: ignore user signals from the
+ * command or a group led by sudo/the command; tty-generated INT/QUIT/TSTP/WINCH
+ * already reach the command. SIGCONT from the invoking shell must be relayed
+ * even when the command moved to a different process group.
+ * Pty mode also excludes senders in the command's session.
  * `cmd_pid` is the command (non-pty) or the monitor = pty session id (pty). */
 static int should_forward(const struct sigrec *r, pid_t cmd_pid, int pty) {
   if (!is_forwarded(r->signo))
@@ -413,6 +413,9 @@ static int should_forward(const struct sigrec *r, pid_t cmd_pid, int pty) {
   if (from_user) {
     if (r->pid == cmd_pid)
       return 0;
+    if (!pty && r->pgrp != -1 &&
+        (r->pgrp == cmd_pid || r->pgrp == getpid()))
+      return 0;
     if (pty && r->sid != -1 && r->sid == cmd_pid)
       return 0;
   }
@@ -420,7 +423,7 @@ static int should_forward(const struct sigrec *r, pid_t cmd_pid, int pty) {
       (!pty && r->signo == SIGWINCH)) {
     if (!from_user)
       return 0;
-    if (r->pgrp != -1 && r->pgrp == getpgrp())
+    if (pty && r->pgrp != -1 && r->pgrp == getpgrp())
       return 0;
   }
   return 1;
@@ -967,7 +970,7 @@ static lean_obj_res nopty_wait(struct sigstate *ss, pid_t child, unsigned timeou
     }
     struct sigrec rec;
     while (sigpipe_next(ss->pipe_rd, &rec)) {
-      if (rec.signo == SIGCHLD || rec.signo == SIGCONT)
+      if (rec.signo == SIGCHLD)
         continue; /* reaped at the top of the loop */
       if (should_forward(&rec, child, 0))
         kill(child, rec.signo);

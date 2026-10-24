@@ -1,7 +1,6 @@
 # sudo_nss.c compatibility: local files are consulted only when configured.
-# Run reference-first. The explicit stricter branches below are intentional:
-# lean-sudo cannot enforce remote policy and refuses the whole configuration,
-# whereas sudo.ws may continue using files when the SSSD service is absent.
+# Run reference-first. SSSD without its responder contributes no rules; it never
+# causes an implicit fallback to files. Unknown sources still fail closed.
 
 nsswitch_setup() {
   cp -a /etc/nsswitch.conf "$WORK/nsswitch.orig"
@@ -89,7 +88,6 @@ begin nsswitch-sss-only && {
   run ivan 'sudo -n /usr/bin/id -u'
   expect_rc 1
   expect_out_empty
-  if [[ $LABEL != reference ]]; then nsswitch_expect_unsupported; fi
   nsswitch_restore
   end
 }
@@ -98,12 +96,8 @@ begin nsswitch-mixed-files-sss && {
   nsswitch_setup
   printf '\nsudoers: files sss\n' >>/etc/nsswitch.conf
   run ivan 'sudo -n /usr/bin/id -u'
-  if [[ $LABEL == reference ]]; then
-    expect_rc 0
-    expect_out_line 0
-  else
-    nsswitch_expect_unsupported
-  fi
+  expect_rc 0
+  expect_out_line 0
   nsswitch_restore
   end
 }
@@ -112,12 +106,8 @@ begin nsswitch-return-does-not-hide-sss && {
   nsswitch_setup
   printf '\nsudoers: files [SUCCESS=return] sss\n' >>/etc/nsswitch.conf
   run ivan 'sudo -n /usr/bin/id -u'
-  if [[ $LABEL == reference ]]; then
-    expect_rc 0
-    expect_out_line 0
-  else
-    nsswitch_expect_unsupported
-  fi
+  expect_rc 0
+  expect_out_line 0
   nsswitch_restore
   end
 }
@@ -165,7 +155,6 @@ begin nsswitch-sss-never-loads-local-policy && {
   expect_out_empty
   expect_err_lacks 'syntax error'
   expect_err_lacks 'NSS_LOCAL_POLICY_MUST_NOT_BE_READ'
-  if [[ $LABEL != reference ]]; then nsswitch_expect_unsupported; fi
   nsswitch_restore
   end
 }

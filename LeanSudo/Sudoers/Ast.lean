@@ -178,6 +178,9 @@ structure CmndSpec where
   runasExplicit : Bool := false
   /-- String-valued options written here, for pointer-sensitive sudo -l rendering. -/
   optionsExplicit : List String := []
+  /-- SSSD privilege metadata; options remain separate from global Defaults. -/
+  ldapRole : Option String := none
+  ldapOptions : List String := []
   deriving Repr, BEq, DecidableEq, Inhabited
 
 /-- `Host_List = Cmnd_Spec_List` -/

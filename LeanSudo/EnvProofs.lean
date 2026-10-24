@@ -13,9 +13,10 @@ Headline properties of `buildEnv` (DESIGN.md, verified property 6):
 * `buildEnv_no_bash_fn`: function values have trusted or explicitly authorized
   provenance. `userPass_unapproved_function` excludes reset-mode functions without
   a value-qualified match; SETENV and copy-mode policy can authorize functions.
-* `buildEnv_securePath` / `buildEnv_sudo_vars`: rebuilt values are unique and
-  survive unless an authorized explicit assignment or PAM merge replaces them.
-  `BindingSafe` requires every later write to preserve the rebuilt binding.
+* `buildEnv_securePath`: without SETENV, successful validation rejects every
+  explicit PATH assignment; only a trusted PAM overwrite can replace secure_path.
+* `buildEnv_securePath_of_bindingSafe` / `buildEnv_sudo_vars`: rebuilt values
+  survive compatible later writes, including explicitly authorized overrides.
 -/
 
 namespace LeanSudo
@@ -675,9 +676,11 @@ theorem mem_assemble_of_bindingSafe {i : EnvInput} {k v : String}
   exact mem_mergePam_of_compatible
     (mem_setAll_of_compatible (mem_addDefaults_of_mem hm) hs.1) hs.2
 
-/-- An effective secure_path survives compatible later writes, remaining unique.
-SETENV-approved PATH and non-kept PAM PATH may replace it. -/
-theorem buildEnv_securePath {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out)
+/-- With SETENV, secure_path is not protected against explicit assignments.
+This compatible-write variant also covers that case: the rebuilt value remains
+unique if every explicit PATH assignment agrees and PAM does not change it. -/
+theorem buildEnv_securePath_of_bindingSafe {i : EnvInput} {out : EnvList}
+    (h : buildEnv i = .ok out)
     {p : String} (hp : effectiveSecurePath i = some p) (hs : BindingSafe i "PATH" p) :
     ("PATH", p) ∈ out ∧ ∀ v, ("PATH", v) ∈ out → v = p := by
   have hmem : ("PATH", p) ∈ out := by
@@ -690,8 +693,35 @@ theorem buildEnv_securePath {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok
       simp
   exact ⟨hmem, fun v hv => buildEnv_unique h hv hmem⟩
 
+/-- Validation, not a caller-supplied compatibility premise, excludes all explicit
+PATH assignments when secure_path is effective and SETENV is unavailable. This
+includes assignments materialized from --preserve-env by the CLI. -/
+theorem buildEnv_securePath_no_extra {i : EnvInput} {out : EnvList}
+    (h : buildEnv i = .ok out) {p : String} (hp : effectiveSecurePath i = some p)
+    (hs : i.setenvAllowed = false) :
+    ∀ kv ∈ extraVars i, kv.1 ≠ "PATH" := by
+  intro kv hm hk
+  have ha := (buildEnv_ok h).2.1 kv hm
+  simp [extraAllowed, hs, hp, hk] at ha
+
+/-- A caller without SETENV cannot override effective secure_path: successful
+validation rules out explicit PATH assignments. Only the trusted PAM merge needs
+a compatibility premise, since PAM can independently replace the binding. -/
+theorem buildEnv_securePath {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out)
+    {p : String} (hp : effectiveSecurePath i = some p) (hs : i.setenvAllowed = false)
+    (hpam : ∀ kv ∈ pamVars i, kv.1 = "PATH" →
+      pamOverwrite i kv.1 kv.2 = false ∨ kv.2 = p) :
+    ("PATH", p) ∈ out ∧ ∀ v, ("PATH", v) ∈ out → v = p := by
+  apply buildEnv_securePath_of_bindingSafe h hp
+  refine ⟨?_, hpam⟩
+  intro kv hm hk
+  exact False.elim (buildEnv_securePath_no_extra h hp hs kv hm hk)
+
 /-- Rebuilt identity values (including the real invoking gid) survive compatible
-explicit/PAM writes; output uniqueness still holds with authorized overrides. -/
+explicit/PAM writes; output uniqueness still holds with authorized overrides.
+Unlike secure_path, even a caller without SETENV can explicitly replace SUDO_*
+when an administrator's env_keep pattern allows it. Trusted PAM may also replace
+these values, so neither half of the BindingSafe premises can be dropped. -/
 theorem buildEnv_sudo_vars {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out)
     (hc : BindingSafe i "SUDO_COMMAND" i.command)
     (hu : BindingSafe i "SUDO_USER" i.invoking.name)

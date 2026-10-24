@@ -14,24 +14,23 @@ private def diagnostic : Except String Unit → String
 #guard (parse " \tSuDoErS:\tFiLeS  # local policy\r\n").toOption == some ["files"]
 #guard (approve "sudoers: files files FILES").isOk
 
--- Never consult files when the explicit entry omits it, or drop a remote source.
+-- Explicit empty/unsupported sources never fall back to files.
 #guard !(approve "sudoers:").isOk
 #guard !(approve "sudoers: # no sources").isOk
-#guard !(approve "sudoers: sss").isOk
+#guard (approve "sudoers: sss").isOk
 #guard !(approve "sudoers: ldap").isOk
 #guard !(approve "sudoers: custom_backend").isOk
-#guard !(approve "sudoers: files sss").isOk
-#guard !(approve "sudoers: sss files").isOk
+#guard (approve "sudoers: files sss").isOk
+#guard (approve "sudoers: sss files").isOk
 #guard !(approve "sudoers: files ldap").isOk
 #guard !(approve "sudoers: files custom_backend").isOk
-#guard diagnostic (approve "sudoers: SSS") ==
-  "/etc/nsswitch.conf: unsupported sudoers source: sss"
+#guard (approve "sudoers: SSS").isOk
 #guard diagnostic (approve "sudoers:") ==
   "/etc/nsswitch.conf: sudoers entry has no files source"
 
 -- Upstream only considers the first exact, case-insensitive sudoers: entry.
 #guard (approve "sudoers: files\nsudoers: sss\n").isOk
-#guard !(approve "sudoers: sss\nsudoers: files\n").isOk
+#guard (approve "sudoers: sss\nsudoers: files\n").isOk
 #guard (approve "sudoers : sss\nsudoers: files").isOk
 #guard (approve "sudoers_extra: sss\n").isOk
 
@@ -42,9 +41,9 @@ private def diagnostic : Except String Unit → String
 #guard (approve "sudoers: files [SUCCESS=return] [NOTFOUND=return]").isOk
 #guard (approve "sudoers: [SUCCESS=return] files").isOk
 #guard !(approve "sudoers: [SUCCESS=return]").isOk
-#guard !(approve "sudoers: files [SUCCESS=return] sss").isOk
+#guard (approve "sudoers: files [SUCCESS=return] sss").isOk
 #guard !(approve "sudoers: files [NOTFOUND=return] ldap").isOk
-#guard !(approve "sudoers: sss [SUCCESS=return] files").isOk
+#guard (approve "sudoers: sss [SUCCESS=return] files").isOk
 #guard !(approve "sudoers: files [SUCCESS=return sss]").isOk
 #guard !(approve "sudoers: files [SUCCESS=return").isOk
 #guard !(approve "sudoers: files [SUCCESS=continue]").isOk
@@ -55,7 +54,7 @@ private def diagnostic : Except String Unit → String
 -- sudo_parseln strips leading space/tab on every continued physical line,
 -- preserves whitespace before the backslash, and does not continue comments.
 #guard (parse "sudoers: fi\\\n  les\n").toOption == some ["files"]
-#guard !(approve "sudoers: files \\\n \tsss\n").isOk
+#guard (approve "sudoers: files \\\n \tsss\n").isOk
 #guard !(approve "sudoers: files \\\r\n ldap\r\n").isOk
 #guard (approve "sudoers: files # ignored \\\nsudoers: sss\n").isOk
 #guard (approve "sudoers: files # sss").isOk
@@ -66,12 +65,12 @@ private def diagnostic : Except String Unit → String
 
 example (text : String) (sources : List String)
     (parsed : parse text = .ok sources) (approved : approve text = .ok ()) :
-    ∀ source ∈ sources, source = "files" :=
+    ∀ source ∈ sources, source = "files" ∨ source = "sss" :=
   (approve_supported_only text sources parsed approved).2
 
 example (text : String) (sources : List String)
-    (parsed : parse text = .ok sources) (remote : "sss" ∈ sources) :
+    (parsed : parse text = .ok sources) (remote : "ldap" ∈ sources) :
     approve text ≠ .ok () := by
   intro approved
-  have h := (approve_supported_only text sources parsed approved).2 "sss" remote
-  exact (by decide : ("sss" : String) ≠ "files") h
+  have h := (approve_supported_only text sources parsed approved).2 "ldap" remote
+  rcases h with h | h <;> contradiction

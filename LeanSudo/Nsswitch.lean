@@ -1,22 +1,12 @@
 namespace LeanSudo.Nsswitch
 
 /-!
-The sudoers source gate, checked before opening any sudoers policy file.
-
-Syntax follows sudo 1.9.17p2's plugins/sudoers/sudo_nss.c and
-lib/util/parseln.c: the first case-insensitive `sudoers:` logical line wins;
-comments, space/tab trimming, CRLF and single-backslash continuations are
-handled before space/tab tokenization. Only `[SUCCESS=return]` and
-`[NOTFOUND=return]` are action tokens upstream. They cannot change the result
-with the sole supported backend, files (duplicate files entries are ignored
-upstream). Other action syntax is refused rather than interpreted as a source
-or silently discarded. Every source is checked, even after a return action.
-
-No sudoers line (including a missing nsswitch.conf supplied as empty text)
-defaults to files. Unlike upstream's fallback when *no recognized backend*
-remains, an explicit line without files is refused. Unsupported sources must
-never cause the local policy to be consulted instead of the configured one.
-Diagnostics omit the `sudo: ` prefix, which belongs to the IO shell.
+Ordered sudoers sources, matching sudo 1.9.17p2's sudo_nss.c. The first
+case-insensitive sudoers line wins. Files and SSSD are supported; LDAP and
+unknown sources remain explicit errors rather than falling back to local policy.
+Return actions attach only to the immediately preceding newly added source.
+The source selector retains global Defaults from every source, but never
+consults authorization entries beyond a terminal action.
 -/
 
 private def blank (c : Char) : Bool := c == ' ' || c == '\t'
@@ -73,10 +63,10 @@ def parse (text : String) : Except String (List String) :=
 private def checkSources : List String → Except String Unit
   | [] => .ok ()
   | source :: rest =>
-    if source = "files" then checkSources rest
+    if source = "files" ∨ source = "sss" then checkSources rest
     else .error ("/etc/nsswitch.conf: unsupported sudoers source: " ++ source)
 
-/-- Approval requires an explicitly present files backend, and nothing else. -/
+/-- Approval requires at least one supported backend and no unsupported source. -/
 def approveSources : List String → Except String Unit
   | [] => .error "/etc/nsswitch.conf: sudoers entry has no files source"
   | source :: rest => checkSources (source :: rest)
@@ -89,16 +79,16 @@ def approve (text : String) : Except String Unit := do
 
 private theorem checkSources_supported_only (sources : List String)
     (h : checkSources sources = .ok ()) :
-    ∀ source ∈ sources, source = "files" := by
+    ∀ source ∈ sources, source = "files" ∨ source = "sss" := by
   induction sources with
   | nil => simp
   | cons source rest ih =>
-    by_cases hs : source = "files"
+    by_cases hs : source = "files" ∨ source = "sss"
     · have hr : checkSources rest = .ok () := by
         simpa [checkSources, hs] using h
       intro candidate hc
       rcases List.mem_cons.mp hc with hc | hc
-      · exact hc.trans hs
+      · subst candidate; exact hs
       · exact ih hr candidate hc
     · simp [checkSources, hs] at h
 
@@ -106,19 +96,73 @@ private theorem checkSources_supported_only (sources : List String)
 source list. This is the condition needed before consulting local sudoers. -/
 theorem approveSources_supported_only (sources : List String)
     (h : approveSources sources = .ok ()) :
-    sources ≠ [] ∧ ∀ source ∈ sources, source = "files" := by
+    sources ≠ [] ∧ ∀ source ∈ sources, source = "files" ∨ source = "sss" := by
   cases sources with
   | nil => simp [approveSources] at h
   | cons source rest =>
     exact ⟨by simp, checkSources_supported_only _ h⟩
 
-/-- End-to-end source safety: successful textual approval implies that every
-parsed backend is files and at least one backend exists. -/
+/-- Successful approval cannot silently ignore an unsupported source. -/
 theorem approve_supported_only (text : String) (sources : List String)
     (parsed : parse text = .ok sources) (h : approve text = .ok ()) :
-    sources ≠ [] ∧ ∀ source ∈ sources, source = "files" := by
+    sources ≠ [] ∧ ∀ source ∈ sources, source = "files" ∨ source = "sss" := by
   unfold approve at h
   rw [parsed] at h
   exact approveSources_supported_only sources h
+
+structure Source where
+  name : String
+  returnIfFound : Bool := false
+  returnIfNotFound : Bool := false
+  deriving Repr, BEq, Inhabited
+
+/-- Match denotes a specified allow or deny, not merely an allow. -/
+def canContinue (source : Source) (found : Bool) : Bool :=
+  !(source.returnIfNotFound && !found || source.returnIfFound && found)
+
+private def rawEntry : List String → List String
+  | [] => ["files"]
+  | line :: rest =>
+    if line.toLower.startsWith "sudoers:" then
+      ((String.ofList (line.toList.drop 8)).splitOn " "
+        |>.flatMap (·.splitOn "\t") |>.filter (!·.isEmpty)).map String.toLower
+    else rawEntry rest
+
+def configure (text : String) : Except String (List Source) := do
+  approve text
+  let mut sources : List Source := []
+  let mut attached := false
+  for token in rawEntry (joinLines (text.splitOn "\n") "") do
+    if token == "files" || token == "sss" then
+      if sources.any (·.name == token) then attached := false
+      else
+        sources := { name := token } :: sources
+        attached := true
+    else
+      if attached then
+        sources := sources.modifyHead fun s =>
+          if token == "[success=return]" then { s with returnIfFound := true }
+          else if token == "[notfound=return]" then { s with returnIfNotFound := true }
+          else s
+      attached := false
+  return sources.reverse
+
+/-- Retain the visited prefix. Pseudo-command lookup passes cumulative matches;
+execution passes the current source's match, as lookup.c does. -/
+def select {α : Type} (hasMatch : α → Bool) (pseudo : Bool) :
+    List (Source × α) → Bool → List α
+  | [], _ => []
+  | (source, policy) :: rest, previous =>
+    let found := hasMatch policy || (pseudo && previous)
+    policy :: if canContinue source found then select hasMatch pseudo rest found else []
+
+theorem select_terminal {α : Type} (hasMatch : α → Bool) (pseudo : Bool)
+    (source : Source) (policy : α) (rest : List (Source × α)) (previous : Bool)
+    (h : canContinue source (hasMatch policy || (pseudo && previous)) = false) :
+    select hasMatch pseudo ((source, policy) :: rest) previous = [policy] := by
+  simp [select, h]
+
+theorem notfound_return_stops (name : String) :
+    canContinue { name, returnIfNotFound := true } false = false := rfl
 
 end LeanSudo.Nsswitch

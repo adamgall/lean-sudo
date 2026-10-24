@@ -11,6 +11,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       sudo sudo-rs python3 procps util-linux passwd login libpam-modules libpam-runtime \
       locales language-pack-de-base language-pack-fr-base strace \
+      slapd ldap-utils sssd sssd-ldap libsss-sudo libnss-sss \
  && rm -rf /var/lib/apt/lists/*
 RUN localedef -i de_DE -f UTF-8 de_DE.UTF-8 \
  && localedef -i fr_FR -f UTF-8 fr_FR.UTF-8
@@ -33,6 +34,7 @@ RUN set -eu; \
 
 COPY ptyrun.py tests.sh /opt/sudo-it/
 COPY tests.d/ /opt/sudo-it/tests.d/
+COPY sudo-schema.ldif /opt/sudo-it/sudo-schema.ldif
 RUN chmod 0755 /opt/sudo-it/ptyrun.py /opt/sudo-it/tests.sh && mkdir -p /opt/impl
 
 ENTRYPOINT ["/opt/sudo-it/tests.sh"]
