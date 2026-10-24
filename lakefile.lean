@@ -1,0 +1,28 @@
+import Lake
+open Lake DSL System
+
+package «lean-sudo» where
+  -- The C shim dlopen()s libpam at runtime, so only libdl/libutil are needed at link time.
+  moreLinkArgs := #["-ldl", "-lutil"]
+
+/-- C shim translation units (each owned by one Lean `LeanSudo.Sys.*` module). -/
+def shimSources : Array String := #["core", "exec", "ts"]
+
+def shimCFlags : Array String :=
+  #["-fPIC", "-O2", "-Wall", "-Wextra", "-Werror", "-D_GNU_SOURCE",
+    "-fstack-protector-strong", "-D_FORTIFY_SOURCE=2"]
+
+extern_lib leansudoshim pkg := do
+  let leanInc := (← getLeanIncludeDir).toString
+  let objs ← shimSources.mapM fun src => do
+    let oFile := pkg.buildDir / "c" / s!"{src}.o"
+    let srcJob ← inputTextFile <| pkg.dir / "c" / s!"{src}.c"
+    buildO oFile srcJob #["-I", leanInc] shimCFlags "cc" getLeanTrace
+  buildStaticLib (pkg.staticLibDir / nameToStaticLib "leansudoshim") objs
+
+@[default_target]
+lean_lib LeanSudo where
+
+@[default_target]
+lean_exe sudo where
+  root := `Main
