@@ -19,7 +19,7 @@ pushed.
 | Contracts | `LeanSudo/Sudoers/Ast.lean`, `LeanSudo/Policy/Types.lean` | frozen, done |
 | Parser | `LeanSudo/Sudoers/Parser.lean`, `test/Tests/Parser.lean`, `test/fixtures/sudoers/*` | done, proved |
 | Loader (includes, perms) | `LeanSudo/Sudoers/Load.lean` | done, builds; not yet exercised end-to-end |
-| Glob + policy + defaults + `-l` listing | `LeanSudo/Util/Glob.lean`, `LeanSudo/Policy/{Eval,Defaults,List,Proofs}.lean`, `test/Tests/{Glob,Policy}.lean` | done, proved |
+| Glob + policy + defaults + `-l` listing | `LeanSudo/Util/Glob.lean`, `LeanSudo/Policy/{Eval,Defaults,List,Proofs}.lean`, `test/Tests/{Glob,Policy}.lean` | proved, **but has a known security bug (alias deny collapse): see "Known bugs" below. Must be fixed before calling policy done.** |
 | Timestamp (pure + storage) | `LeanSudo/Timestamp.lean`, `LeanSudo/Sys/Timestamp.lean`, `c/ts.c`, `test/Tests/Timestamp.lean`, `test/Smoke/Ts.lean` | done, proved; root path untested |
 | Sys core + PAM FFI | `LeanSudo/Sys/{Core,Pam}.lean`, `c/core.c`, `test/Smoke/Core.lean` | done, smoke-tested unprivileged |
 | CLI + env + prompt | `LeanSudo/{Cli,CliProofs,Env,EnvProofs,Prompt}.lean`, `test/Tests/{Cli,Env}.lean` | done, proved (~195 `#guard` tests; help/usage text byte-identical to sudo 1.9) |
@@ -31,6 +31,61 @@ pushed.
 | sudoedit (`-e`) | `LeanSudo/Sudoedit.lean` | not started |
 | Root import | `LeanSudo.lean` imports every finished module | done: `lake build LeanSudo Tests visudo` succeeds (48 jobs); the audit grep for sorry/axiom/native_decide is clean |
 | Proof audit, README, install docs, LICENSE | — | not started (no LICENSE chosen yet: ask the user) |
+
+## Known bugs (MUST fix, with regression tests)
+
+### Alias explicit-deny is collapsed into "no match" (policy widening)
+
+**Where:** `LeanSudo/Policy/Eval.lean`.
+* `atomMatches` (around line 102) returns `Bool`:
+  `matchList (…) ms == some true`. When an alias's own list ends in an explicit
+  deny (`some false`), the alias is reported as "no match" instead of "deny".
+* `hcCandidates` (around line 269) then filters out specs whose atom doesn't match,
+  so the denying spec never becomes a candidate.
+
+**Reproduced** (`#eval` against the built library, 2026-10-24):
+```
+Cmnd_Alias LIMITED = /usr/bin/true, !/usr/bin/false
+alice ALL=(root) NOPASSWD: ALL, LIMITED
+```
+For `alice` running `/usr/bin/false` as root, `evaluate` returned
+`.allow {needsAuth := false, setenv := true, cwd := none}`. sudo denies this: the
+`LIMITED` spec is the last match and its result is DENY.
+
+**The same flaw affects every list kind** (user, host, run-as, and the alias
+lists inside them). Example: `User_Alias NOTBOB = ALL, !bob` with the user list
+`ALL, NOTBOB` matches `bob` here, but sudo excludes him. Outer negation is also
+wrong: `!NOTBOB` should *match* bob (DENY flipped is ALLOW), and here it does not.
+
+**Fix:**
+* Make alias-aware atom matching tri-state: `Option Bool` (`none` = no match,
+  `some true` = allow, `some false` = deny), preserved through nested aliases.
+* Let `matchList` apply the member's negation by flipping `some b` to `some !b`,
+  while `none` stays `none`.
+* The undefined-alias and out-of-fuel cases stay `none` (`validate` rejects
+  undefined aliases and cycles).
+* In the decision:
+  * A cmnd spec is a candidate whenever its command member's result is `some b`
+    and run-as matches.
+  * `Candidate.allow` is `b`, with the member's negation already applied. It is no
+    longer simply `!cs.cmnd.negated`.
+  * User, host and run-as checks use `== some true` only at the top level.
+
+**Theorems to update:** `evaluate_sound` / `evaluate_sound_run` (state allow in terms of
+the tri-state result being `some true`), `evaluate_append_negated`, and
+`evaluate_noauth_*`. Add a theorem along these lines: if the last applicable spec's
+command result is `some false`, the judgement is `.deny`, including when the result
+comes from inside an alias.
+
+**Regression tests to add** in `test/Tests/Policy.lean`:
+* The `LIMITED` example above gives deny for `/usr/bin/false` and allow for
+  `/usr/bin/true`.
+* The `NOTBOB` user-list example, with and without outer `!`.
+* A host alias and a Runas_Alias with an inner `!`.
+* Nested aliases (`A = B`, `B = ALL, !x`).
+
+Add a docker scenario as well: an integration test with this Cmnd_Alias, which must
+pass against the reference sudo.ws first.
 
 ### Slice notes worth knowing
 
