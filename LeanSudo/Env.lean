@@ -15,9 +15,9 @@ Two modes:
   minus `env_delete` matches and `env_check` matches with unsafe values.
 
 Bash function exports (values starting with `()`) and malformed names are always
-dropped. `PATH` is forced to `secure_path` when set; `SUDO_COMMAND`, `SUDO_USER`,
-`SUDO_UID`, `SUDO_GID` are always set last and cannot be overridden. The list never has
-duplicate keys.
+dropped. `PATH` is forced to `secure_path` unless the invoking user belongs to
+`exempt_group`; `SUDO_COMMAND`, `SUDO_USER`, `SUDO_UID`, and the real invoking
+`SUDO_GID` cannot be overridden. The list never has duplicate keys.
 
 Proofs are in `LeanSudo.EnvProofs`.
 -/
@@ -52,6 +52,15 @@ structure EnvInput where
   ttyName : Option String := none
   envFile : EnvList := []
   restrictedEnvFile : EnvList := []
+  /-- Real invoking gid, which may differ from passwd's primary gid after newgrp. -/
+  invokingRealGid : Option Nat := none
+
+/-- sudo's exempt_group bypasses authentication and secure_path, not authorization. -/
+def userIsExempt (settings : Settings) (user : Principal) : Bool :=
+  settings.exemptGroup.any fun name => user.groups.any (fun g => g.1 == name)
+
+def effectiveSecurePath (i : EnvInput) : Option String :=
+  if userIsExempt i.settings i.invoking then none else i.settings.securePath
 
 /-! ## Primitive list operations -/
 
@@ -153,7 +162,7 @@ def pamPass (i : EnvInput) (k v : String) : Bool :=
 def extraAllowed (i : EnvInput) (reset : Bool) (k v : String) : Bool :=
   entryOk k v &&
     (i.setenvAllowed ||
-      (!(i.settings.securePath.isSome && k == "PATH") &&
+      (!((effectiveSecurePath i).isSome && k == "PATH") &&
         (if reset then keepReset i k v else !deleteCopy i k v)))
 
 /-- `--preserve-env=a,b` behaves like `a=$a b=$b` on the command line (sudo's
@@ -208,7 +217,7 @@ def commonDefaults (i : EnvInput) (e : EnvList) : EnvList :=
   | none => e3
 
 def applySecurePath (i : EnvInput) (e : EnvList) : EnvList :=
-  match i.settings.securePath with
+  match effectiveSecurePath i with
   | some p => setVar e "PATH" p
   | none => e
 
@@ -218,7 +227,7 @@ def sudoVars (i : EnvInput) (e : EnvList) : EnvList :=
     | some tty => setVar e "SUDO_TTY" tty
     | none => e.filter (fun kv => kv.1 != "SUDO_TTY")
   setVar (setVar (setVar (setVar e "SUDO_COMMAND" i.command) "SUDO_USER" i.invoking.name)
-    "SUDO_UID" (toString i.invoking.uid)) "SUDO_GID" (toString i.invoking.gid)
+    "SUDO_UID" (toString i.invoking.uid)) "SUDO_GID" (toString (i.invokingRealGid.getD i.invoking.gid))
 
 def pamVars (i : EnvInput) : EnvList := i.pamEnv.filter fun kv => pamPass i kv.1 kv.2
 

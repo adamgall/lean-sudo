@@ -313,3 +313,88 @@ begin cli-core-edit-checkdir-disabled && {
   expect_rc 0
   end
 }
+
+begin cli-core-residual-denial-fqdn && {
+  cp /etc/hosts "$WORK/cli-hosts"
+  { printf '127.0.1.1 %s.example.test %s\n' "$host" "$host"; cat "$WORK/cli-hosts"; } > /etc/hosts
+  run carol 'printf "carolpw\n" | sudo -kS /usr/bin/cat /etc/hostname'
+  expect_rc 1
+  expect_err_has "as root on $host.example.test."
+  cat "$WORK/cli-hosts" > /etc/hosts
+  end
+}
+begin cli-core-residual-denial-message && {
+  printf 'Defaults:carol cmddenial_message="Ask IT"\n' > /etc/sudoers.d/40-cli
+  chmod 0440 /etc/sudoers.d/40-cli
+  run carol 'printf "carolpw\n" | sudo -kS /usr/bin/cat /etc/hostname'
+  expect_rc 1
+  [[ $ERR == *"as root on $host."$'\nAsk IT' ]] || fail "custom denial must follow the Sorry line"
+  end
+}
+begin cli-core-residual-authfail-message && {
+  printf '%s\n' 'Defaults:alice authfail_message="%d bad %% %x %", logfile="/tmp/cli-auth-failure"' > /etc/sudoers.d/40-cli
+  chmod 0440 /etc/sudoers.d/40-cli
+  rm -f /tmp/cli-auth-failure
+  run alice 'printf "bad\nbad\nbad\n" | sudo -kS /usr/bin/true'
+  expect_rc 1
+  expect_err_has '3 bad % %x %'
+  [[ $(cat /tmp/cli-auth-failure) == *"3 bad % %x % ;"* ]] || fail "auth failure log must expand configured message"
+  end
+}
+begin cli-core-residual-exempt-password && {
+  printf 'Defaults exempt_group=sudo\n' > /etc/sudoers.d/40-cli
+  chmod 0440 /etc/sudoers.d/40-cli
+  run alice 'sudo -nk /usr/bin/true'
+  expect_rc 0
+  end
+}
+begin cli-core-residual-exempt-path && {
+  printf 'Defaults exempt_group=sudo\n' > /etc/sudoers.d/40-cli
+  chmod 0440 /etc/sudoers.d/40-cli
+  mkdir -p /home/alice/bin
+  printf '#!/bin/sh\nprintf "exempt\\n%%s\\n" "$PATH"\n' > /home/alice/bin/cli-exempt-check
+  chmod 0755 /home/alice/bin/cli-exempt-check
+  run alice 'PATH=/home/alice/bin:/usr/bin:/bin sudo -nk cli-exempt-check'
+  expect_rc 0
+  expect_out_line exempt
+  expect_out_line /home/alice/bin:/usr/bin:/bin
+  end
+}
+begin cli-core-residual-runas-shell-invalid && {
+  printf 'Defaults runas_check_shell\n' > /etc/sudoers.d/40-cli
+  chmod 0440 /etc/sudoers.d/40-cli
+  run root 'sudo -n -u nobody /usr/bin/true'
+  expect_rc 1
+  expect_err_has 'invalid shell for user nobody:'
+  end
+}
+begin cli-core-residual-runas-shell-valid && {
+  printf 'Defaults runas_check_shell\n' > /etc/sudoers.d/40-cli
+  chmod 0440 /etc/sudoers.d/40-cli
+  run root 'sudo -n -u bob /usr/bin/id -un'
+  expect_rc 0
+  expect_out_line bob
+  end
+}
+begin cli-core-residual-runas-unknown-id && {
+  printf 'Defaults runas_allow_unknown_id\n' > /etc/sudoers.d/40-cli
+  chmod 0440 /etc/sudoers.d/40-cli
+  run root "sudo -n -u '#54321' /usr/bin/id -u"
+  expect_rc 0
+  expect_out_line 54321
+  end
+}
+begin cli-core-residual-runas-unknown-id-disabled && {
+  run root "sudo -n -u '#54321' /usr/bin/id -u"
+  expect_rc 1
+  expect_err_has 'unknown user #54321'
+  end
+}
+begin cli-core-residual-self-apparmor-auth && {
+  printf 'ivan ALL=(ivan) APPARMOR_PROFILE=cli-test-profile /usr/bin/id\n' > /etc/sudoers.d/40-cli
+  chmod 0440 /etc/sudoers.d/40-cli
+  run ivan 'sudo -nk -u ivan /usr/bin/id'
+  expect_rc 1
+  expect_err_has 'a password is required'
+  end
+}

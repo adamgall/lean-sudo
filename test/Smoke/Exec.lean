@@ -39,6 +39,12 @@ def spec (ids : Ids) (path : String) (argv : Array String) : ExecSpec :=
   { path, argv, env := #["PATH=/usr/bin:/bin"], uid := ids.uid, gid := ids.gid,
     groups := ids.groups, cwd := none, umask := 0o022, usePty := false, background := false }
 
+#guard !(spec ⟨1000, 1000, #[]⟩ "/bin/true" #["true"]).staySetuid
+#guard (Exec.check { spec ⟨1000, 1000, #[]⟩ "/bin/true" #["true"] with
+    staySetuid := true }).isOk
+#guard !(Exec.check { spec ⟨4294967295, 1000, #[]⟩ "/bin/true" #["true"] with
+    staySetuid := true }).isOk
+
 def fmtStatus : ExitStatus → String
   | .exited c => s!"exited {c}"
   | .signaled s => s!"signaled {s}"

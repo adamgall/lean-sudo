@@ -3,7 +3,8 @@
 
 `runCommand` forks, drops privileges in the child in the order
 setgroups → setresgid → setresuid, verifies the drop (`getres[ug]id`, `getgroups`,
-and — for a non-root target — that `setuid(0)` fails), then `chdir`, `umask`, marks
+and — unless the target or retained real UID is root — that `setuid(0)` fails),
+then `chdir`, `umask`, marks
 fds ≥ `closeFrom` close-on-exec and `execve`s. Any failure before a successful
 `execve` is reported through a close-on-exec pipe and raised here as an
 `IO.userError` (sudo-style text, e.g. `unable to execute /x: No such file or directory`);
@@ -26,6 +27,12 @@ are ignored when the kernel module is disabled; enabled transitions fail closed.
 Both execution modes enforce command deadlines with
 HUP/TERM followed by KILL after two seconds. Backgrounding forks the supervisor,
 not just the command, so PAM cleanup occurs only after completion.
+`staySetuid` retains the invoking real UID captured at process startup; effective
+and saved UIDs and supplementary groups remain the policy target. All three GIDs
+use the invoking real GID, matching sudo's setegid(target) → setgid(invoking) order.
+All six real/effective/saved IDs are checked after the transition. PAM and the
+command environment still describe the target; shells may voluntarily drop the
+effective IDs when they differ from the real IDs, just as with sudo.
 
 CHROOT is deliberately not an execution option: the deprecated interface remains
 refused by the deciding core, avoiding NSS and command-resolution exposure inside
@@ -61,6 +68,8 @@ structure ExecSpec where
   utmpUser : Option String := none
   execFd : Option Nat := none
   execBackground : Bool := false
+  /-- Retain invoking real UID and all GIDs; effective/saved UID still use uid. -/
+  staySetuid : Bool := false
   deriving Repr, Inhabited
 
 inductive ExitStatus where
@@ -182,12 +191,18 @@ def check (s : ExecSpec) : Except String Checked := do
     throw "invalid executable descriptor"
   pure { uid, gid, groups, umask := s.umask.toUInt32, closeFrom := s.closeFrom.toUInt32 }
 
+/-- Retaining invoking real IDs cannot bypass any checked target-ID or argument
+constraint; the same validation applies in both credential modes. -/
+theorem check_staySetuid (s : ExecSpec) (stay : Bool) :
+    check { s with staySetuid := stay } = check s := by
+  rfl
+
 @[extern "leansudo_exec_run"]
 opaque runRaw (path : @& String) (argv : @& Array String) (env : @& Array String)
     (uid gid : UInt32) (groups : @& Array UInt32) (cwd : @& Option String) (umask : UInt32)
     (usePty background : Bool) (closeFrom : UInt32) (cwdOptional : Bool) (timeout : UInt32)
     (noexecFile apparmorProfile : @& Option String) (rlimits : @& Array (String × String))
-    (utmpUser : @& Option String) (execFd : UInt32) (execBackground : Bool) : IO UInt32
+    (utmpUser : @& Option String) (execFd : UInt32) (execBackground staySetuid : Bool) : IO UInt32
 
 @[extern "leansudo_exec_exit"]
 opaque exitRaw (isSignal : Bool) (n : UInt32) : IO Unit
@@ -221,7 +236,7 @@ def runCommand (s : ExecSpec) : IO ExitStatus := do
   let r ← Exec.runRaw s.path s.argv s.env c.uid c.gid c.groups s.cwd c.umask
     s.usePty s.background c.closeFrom s.cwdOptional s.timeout.toUInt32
     s.noexecFile s.apparmorProfile s.rlimits s.utmpUser
-    (s.execFd.map Nat.toUInt32 |>.getD 0xFFFFFFFF) s.execBackground
+    (s.execFd.map Nat.toUInt32 |>.getD 0xFFFFFFFF) s.execBackground s.staySetuid
   pure (Exec.decodeStatus r)
 
 /-- exit(code) or re-raise the signal on ourselves with default disposition

@@ -308,4 +308,42 @@ def formatJsonSyslog (e : Event) : String :=
 def formatJsonLine (e : Event) : String :=
   "{" ++ formatJsonMember e true ++ "}\n"
 
+/-- Authentication disposition, separate from conversation diagnostics. An EOF
+does not count as a bad password; completed failed verifications do. -/
+structure AuthFailure where
+  attempts : Nat := 0
+  noInput : Bool := false
+  /-- PAM errors/noninteractive refusal do not subsequently log a policy denial. -/
+  error : Bool := false
+  /-- Caught terminal signal, re-raised only after logging and PAM cleanup. -/
+  signal : Nat := 0
+  deriving Repr, Inhabited
+
+/-- sudoers/logging.c log_auth_failure syslog disposition: denied commands log
+the denial instead; noninteractive list/validate and zero-attempt reads are quiet. -/
+def logAuthFailure (allowed logDenied listOrValidate : Bool) (f : AuthFailure) : Bool :=
+  allowed && logDenied && (if f.noInput then !listOrValidate else f.attempts != 0)
+
+/-- The file backend retains auth failure events even when syslog is suppressed.
+Noninteractive list/validate are excluded from both backends (Ubuntu differential tests). -/
+def fileAuthFailure (listOrValidate : Bool) (f : AuthFailure) : Bool :=
+  !(f.noInput && listOrValidate)
+
+def mailAuthFailure (allowed mailBadpass mailAlways denialMail listOrValidate : Bool)
+    (f : AuthFailure) : Bool :=
+  !(f.noInput && listOrValidate) &&
+    (if allowed then mailBadpass || mailAlways else mailBadpass && !denialMail)
+
+theorem denied_auth_failure_not_logged (logDenied listOrValidate : Bool) (f : AuthFailure) :
+    logAuthFailure false logDenied listOrValidate f = false := by
+  simp [logAuthFailure]
+
+theorem disabled_auth_failure_not_logged (allowed listOrValidate : Bool) (f : AuthFailure) :
+    logAuthFailure allowed false listOrValidate f = false := by
+  simp [logAuthFailure]
+
+theorem noninteractive_list_auth_failure_not_logged (allowed logDenied : Bool) (n : Nat) (e : Bool) :
+    logAuthFailure allowed logDenied true { attempts := n, noInput := true, error := e } = false := by
+  simp [logAuthFailure]
+
 end LeanSudo.EventLog

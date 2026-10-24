@@ -54,6 +54,11 @@ def sudoTail : EnvList :=
   some "/usr/sbin:/usr/bin"
 #guard ((run { base with settings := { securePath := some "/sbin" } }).getD []).filter
   (·.1 == "PATH") == [("PATH", "/sbin")]
+#guard get { base with settings := { securePath := some "/sbin", exemptGroup := some "users" } } "PATH" ==
+  some "/home/alice/bin:/usr/bin"
+#guard get { base with settings := { securePath := some "/sbin", exemptGroup := some "other" } } "PATH" ==
+  some "/sbin"
+#guard get { base with invokingRealGid := some 4 } "SUDO_GID" == some "4"
 
 -- env_keep wildcard and exact names
 #guard get { base with settings := { envKeep := ["FO*"] } } "FOO" == some "bar"

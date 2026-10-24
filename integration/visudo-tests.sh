@@ -5,9 +5,8 @@
 #   visudo-tests.sh VISUDO_BINARY [NAME_FILTER]
 #
 # VISUDO_BINARY is run directly as root (reference: /usr/sbin/visudo.ws).
-# Expectations are the ACTUAL behaviour of sudo.ws 1.9.17p2's visudo; where
-# lean-sudo deliberately differs the test says so and is skipped for the
-# reference.
+# Expectations are shared with Ubuntu's sudo.ws 1.9.17p2, including compatibility
+# export, explicit-include editing, strict checking and stale temporary files.
 set -u
 
 VISUDO=${1:?usage: visudo-tests.sh VISUDO_BINARY [NAME_FILTER]}
@@ -18,7 +17,6 @@ WORK=$(mktemp -d /tmp/visudo-it.XXXXXX)
 chmod 0755 "$WORK"
 REFERENCE=/usr/sbin/visudo.ws
 CMD_TIMEOUT=40
-[[ $VISUDO == "$REFERENCE" ]] && IS_REF=1 || IS_REF=0
 
 [[ -f $VISUDO ]] || { echo "Bail out! $VISUDO does not exist"; exit 2; }
 chmod 0755 "$VISUDO"
@@ -92,12 +90,6 @@ begin() {
   return 0
 }
 
-# skip REASON: report the current test as skipped (returns 1 to end the block)
-skip() {
-  NUM=$((NUM + 1)) SKIPPED=$((SKIPPED + 1))
-  emit "ok $NUM - $CUR # SKIP $1"
-  return 1
-}
 
 # vrun [-u USER] ARGS...: run "$VISUDO ARGS..." as root (or USER) with a clean
 # environment plus XENV, stdin from $STDIN. Sets RC, OUT, ERR.
@@ -346,8 +338,7 @@ begin check-invalid-defaults-value && {
 }
 
 begin check-undefined-alias-is-error && {
-  # sudo.ws only warns (an error with -s); lean-sudo's sudo refuses such a
-  # policy, so its visudo must reject it. Same expectation under -s.
+  # Undefined aliases become fatal only under strict checking.
   printf 'bob FOO = /usr/bin/id\n' >"$WORK/scratch/s"
   vrun -c -s -f "$WORK/scratch/s"
   expect_rc 1
@@ -530,7 +521,6 @@ begin edit-busy-concurrent && {
 
 begin edit-busy-against-sudo-ws && {
   # a sudo.ws visudo holds the lock: lean-sudo's visudo must back off
-  if [[ $IS_REF == 1 ]]; then skip "lean-sudo interoperability check"; else
   XENV=(EDITOR="$ED/wait" STARTED="$WORK/scratch/started" RELEASE="$WORK/scratch/release")
   env -i PATH=/usr/bin:/bin "${XENV[@]}" timeout 30 "$REFERENCE" </dev/null >/dev/null 2>&1 &
   first=$!
@@ -543,13 +533,12 @@ begin edit-busy-against-sudo-ws && {
   expect_rc 1
   expect_err_has '/etc/sudoers busy, try again later'
   expect_unchanged
-  end; fi
+  end
 }
 
-begin edit-sudo-ws-busy-against-lean && {
-  # the reverse: sudo.ws's visudo ignores the temp file, so this checks that
-  # lean-sudo's lock (F_OFD_SETLK) conflicts with sudo.ws's fcntl lock
-  if [[ $IS_REF == 1 ]]; then skip "lean-sudo interoperability check"; else
+begin edit-sudo-ws-busy-against-selected && {
+  # The reverse direction checks that the selected implementation's record lock
+  # conflicts with sudo.ws, independently of any temporary file.
   XENV=(EDITOR="$ED/wait" STARTED="$WORK/scratch/started" RELEASE="$WORK/scratch/release")
   env -i PATH=/usr/bin:/bin "${XENV[@]}" timeout 30 "$VISUDO" </dev/null >/dev/null 2>&1 &
   first=$!
@@ -566,22 +555,19 @@ begin edit-sudo-ws-busy-against-lean && {
   [[ $(cat "$WORK/edlog") == "" ]] || fail "sudo.ws visudo ran its editor"
   expect_unchanged
   expect_no_tmp
-  end; fi
+  end
 }
 
-begin edit-busy-stale-temp-file && {
-  # lean-sudo creates <file>.tmp with O_EXCL; an existing one means busy.
-  # (sudo.ws's visudo truncates and reuses it instead.)
-  if [[ $IS_REF == 1 ]]; then skip "sudo.ws reuses an existing temp file"; else
+begin edit-reuses-stale-temp-file && {
   echo 'stale' >/etc/sudoers.tmp
   XENV=(EDITOR="$ED/append" LINE='bob ALL=/usr/bin/id')
   vrun
-  expect_rc 1
-  expect_err_has '/etc/sudoers busy, try again later'
-  expect_unchanged
-  [[ $(cat /etc/sudoers.tmp) == stale ]] || fail "stale temp file was modified"
-  [[ $(cat "$WORK/edlog") == "" ]] || fail "editor ran"
-  end; fi
+  expect_rc 0
+  expect_last_line /etc/sudoers 'bob ALL=/usr/bin/id'
+  ! grep -qx stale /etc/sudoers || fail "stale contents installed"
+  expect_no_tmp
+  [[ $(wc -l <"$WORK/edlog") == 1 ]] || fail "editor did not run once"
+  end
 }
 
 begin edit-new-file && {
@@ -589,9 +575,7 @@ begin edit-new-file && {
   vrun -f "$WORK/scratch/new"
   expect_rc 0
   expect_last_line "$WORK/scratch/new" 'bob ALL=/usr/bin/id'
-  # sudo.ws creates a new -f file 0640, lean-sudo 0440; both root:root.
-  [[ $(stat -c '%a %U %G' "$WORK/scratch/new") =~ ^[46]40\ root\ root$ ]] ||
-    fail "new file: expected 440/640 root root, got $(stat -c '%a %U %G' "$WORK/scratch/new")"
+  expect_stat "$WORK/scratch/new" '640 root root'
   expect_no_tmp "$WORK/scratch/new.tmp"
   end
 }
@@ -673,6 +657,320 @@ begin missing-option-argument && {
   vrun -c -f
   expect_rc 1
   expect_err_has "option requires an argument -- 'f'"
+  end
+}
+
+# Exact reference comparison for read-only operations. Only argv[0] differs.
+compare_reference() {
+  local ours_rc=$RC
+  sed 's/visudo\.ws/visudo/g' "$WORK/out" >"$WORK/ours.out"
+  sed 's/visudo\.ws/visudo/g' "$WORK/err" >"$WORK/ours.err"
+  env -i HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LANG=C.UTF-8 "${XENV[@]}" "$REFERENCE" "$@" \
+    <"$STDIN" >"$WORK/ref.out" 2>"$WORK/ref.err"
+  local ref_rc=$?
+  [[ $ours_rc == "$ref_rc" ]] || fail "reference rc=$ref_rc, ours rc=$ours_rc"
+  sed 's/visudo\.ws/visudo/g' "$WORK/ref.out" >"$WORK/ref.norm.out"
+  sed 's/visudo\.ws/visudo/g' "$WORK/ref.err" >"$WORK/ref.norm.err"
+  cmp -s "$WORK/ours.out" "$WORK/ref.norm.out" || fail "stdout differs from reference"
+  cmp -s "$WORK/ours.err" "$WORK/ref.norm.err" || fail "stderr differs from reference"
+}
+
+for flag in '' -s -q -sq; do
+  for kind in undefined cycle unused; do
+    begin "check-alias-${kind}-${flag:-normal}" && {
+      case $kind in
+        undefined) printf 'bob FOO = /usr/bin/id\n' >"$WORK/scratch/s";;
+        cycle) printf 'User_Alias A = B\nUser_Alias B = A\nA ALL = ALL\n' >"$WORK/scratch/s";;
+        unused) printf 'Cmnd_Alias C = /bin/ls\nroot ALL = ALL\n' >"$WORK/scratch/s";;
+      esac
+      vrun -cf "$WORK/scratch/s" ${flag:+"$flag"}
+      compare_reference -cf "$WORK/scratch/s" ${flag:+"$flag"}
+      end
+    }
+  done
+done
+
+for directive in @include '#include'; do
+  begin "edit-explicit-${directive#\#}-files-in-order" && {
+    printf '%s %s\n' "$directive" "$WORK/scratch/child" >"$WORK/scratch/s"
+    printf 'root ALL=ALL\n' >"$WORK/scratch/child"
+    XENV=(EDITOR="$ED/append" LINE='# changed')
+    vrun -f "$WORK/scratch/s"
+    expect_rc 0
+    expect_out_exactly "press return to edit $WORK/scratch/child: "
+    [[ $(cat "$WORK/edlog") == "-- $WORK/scratch/s.tmp"$'\n'"-- $WORK/scratch/child.tmp" ]] ||
+      fail "include editor order differs"
+    expect_last_line "$WORK/scratch/s" '# changed'
+    expect_last_line "$WORK/scratch/child" '# changed'
+    expect_no_tmp "$WORK/scratch/child.tmp"
+    end
+  }
+done
+
+begin edit-no-includes-still-checks-include && {
+  printf '@include %s\n' "$WORK/scratch/child" >"$WORK/scratch/s"
+  printf 'foo bar baz\n' >"$WORK/scratch/child"
+  XENV=(EDITOR="$ED/append" LINE='# changed')
+  answer $'x\n'
+  vrun -I -f "$WORK/scratch/s"
+  expect_rc 0
+  expect_out_exactly 'What now? '
+  [[ $(wc -l <"$WORK/edlog") == 1 ]] || fail "-I edited include"
+  expect_err_has "$WORK/scratch/child:1:"
+  [[ $(wc -l <"$WORK/scratch/s") == 1 ]] || fail "discard installed main file"
+  expect_no_tmp "$WORK/scratch/s.tmp"
+  end
+}
+
+begin edit-includes-discard-entire-session && {
+  printf '@include %s\n' "$WORK/scratch/child" >"$WORK/scratch/s"
+  printf 'root ALL=ALL\n' >"$WORK/scratch/child"
+  cp "$WORK/scratch/s" "$WORK/scratch/orig-main"
+  cp "$WORK/scratch/child" "$WORK/scratch/orig-child"
+  XENV=(EDITOR="$ED/append" LINE='foo bar baz')
+  answer $'\nx\n'
+  vrun -f "$WORK/scratch/s"
+  expect_rc 0
+  cmp -s "$WORK/scratch/s" "$WORK/scratch/orig-main" || fail "main partially installed"
+  cmp -s "$WORK/scratch/child" "$WORK/scratch/orig-child" || fail "child partially installed"
+  expect_no_tmp "$WORK/scratch/s.tmp"
+  expect_no_tmp "$WORK/scratch/child.tmp"
+  end
+}
+
+for noincludes in '' -I; do
+begin "edit-new-include-added-during-session-${noincludes:-normal}" && {
+  printf 'root ALL=ALL\n' >"$WORK/scratch/s"
+  printf 'root ALL=ALL\n' >"$WORK/scratch/child"
+  cat >"$ED/add-include" <<'EOF'
+#!/bin/sh
+for a; do f=$a; done
+printf '%s\n' "$*" >>"$EDLOG"
+case "$f" in
+  */s.tmp) printf '@include %s\n' "$CHILD" >>"$f";;
+  *) printf '# child changed\n' >>"$f";;
+esac
+EOF
+  chmod 0755 "$ED/add-include"
+  XENV=(EDITOR="$ED/add-include" CHILD="$WORK/scratch/child")
+  vrun ${noincludes:+"$noincludes"} -f "$WORK/scratch/s"
+  expect_rc 0
+  expect_out_exactly "press return to edit $WORK/scratch/child: "
+  expect_last_line "$WORK/scratch/child" '# child changed'
+  [[ $(wc -l <"$WORK/edlog") == 2 ]] || fail "new include not edited once"
+  expect_no_tmp "$WORK/scratch/child.tmp"
+  end
+}
+done
+
+begin edit-includedir-not-edited && {
+  mkdir "$WORK/scratch/d"
+  printf '@includedir %s\n' "$WORK/scratch/d" >"$WORK/scratch/s"
+  printf 'root ALL=ALL\n' >"$WORK/scratch/d/child"
+  XENV=(EDITOR="$ED/append" LINE='# changed')
+  vrun -f "$WORK/scratch/s"
+  expect_rc 0
+  expect_out_empty
+  [[ $(wc -l <"$WORK/edlog") == 1 ]] || fail "includedir entry edited"
+  expect_last_line "$WORK/scratch/d/child" 'root ALL=ALL'
+  end
+}
+
+begin edit-quiet-unchanged-still-reported && {
+  XENV=(EDITOR="$ED/noop")
+  vrun -q
+  expect_rc 0
+  expect_err_has '/etc/sudoers.tmp unchanged'
+  expect_no_tmp
+  end
+}
+
+begin edit-unchanged-enforces-owner-mode && {
+  printf 'root ALL=ALL\n' >"$WORK/scratch/s"
+  chown bob:bob "$WORK/scratch/s"
+  chmod 0600 "$WORK/scratch/s"
+  XENV=(EDITOR="$ED/noop")
+  vrun -OPf "$WORK/scratch/s"
+  expect_rc 0
+  expect_stat "$WORK/scratch/s" '440 root root'
+  end
+}
+
+begin check-no-includes-still-loads-files && {
+  printf '@include %s\n' "$WORK/scratch/child" >"$WORK/scratch/s"
+  printf 'root ALL=ALL\n' >"$WORK/scratch/child"
+  vrun -cIf "$WORK/scratch/s"
+  compare_reference -cIf "$WORK/scratch/s"
+  end
+}
+
+for opt in -x --export; do
+  begin "export-${opt#--}-ubuntu-command-lookup" && {
+    printf 'root ALL=ALL\n' >"$WORK/scratch/s"
+    vrun -q -f "$WORK/scratch/s" "$opt" "$WORK/scratch/json"
+    compare_reference -q -f "$WORK/scratch/s" "$opt" "$WORK/scratch/json"
+    end
+  }
+  begin "export-${opt#--}-json-via-cvtsudoers" && {
+    mkdir "$WORK/scratch/bin"
+    ln -s /usr/bin/cvtsudoers.ws "$WORK/scratch/bin/cvtsudoers"
+    printf 'User_Alias OPS = bob, root\nOPS ALL=(ALL:ALL) NOPASSWD: /usr/bin/id\n' >"$WORK/scratch/s"
+    XENV=(PATH="$WORK/scratch/bin:/usr/bin:/bin")
+    vrun -f "$WORK/scratch/s" "$opt" "$WORK/scratch/json"
+    expect_rc 0
+    cp "$WORK/scratch/json" "$WORK/scratch/ours.json"
+    compare_reference -f "$WORK/scratch/s" "$opt" "$WORK/scratch/json"
+    cmp -s "$WORK/scratch/ours.json" "$WORK/scratch/json" || fail "JSON differs from reference"
+    end
+  }
+done
+
+for opt in -h -V -hz -Vh --help --version; do
+  begin "cli-exact-$opt" && {
+    vrun "$opt"
+    compare_reference "$opt"
+    end
+  }
+done
+
+for kind in unknown-default invalid-default duplicate unused-undefined unused-cycle mixed missing-include syntax; do
+  for flag in '' -s -q; do
+    begin "check-exact-${kind}-${flag:-normal}" && {
+      case $kind in
+        unknown-default) text='Defaults foobar\n';;
+        invalid-default) text='Defaults passwd_tries=abc\n';;
+        duplicate) text='User_Alias A = bob\nUser_Alias A = carol\nA ALL=ALL\n';;
+        unused-undefined) text='User_Alias A = MISSING\nroot ALL=ALL\n';;
+        unused-cycle) text='User_Alias A = B\nUser_Alias B = A\nroot ALL=ALL\n';;
+        mixed) text='Defaults foobar\nCmnd_Alias UNUSED = /bin/ls\nbob FOO=/bin/ls\n';;
+        missing-include) text='@include /nonexistent-file\n';;
+        syntax) text='foo bar baz\n';;
+      esac
+      printf '%b' "$text" >"$WORK/scratch/s"
+      vrun -cf "$WORK/scratch/s" ${flag:+"$flag"}
+      compare_reference -cf "$WORK/scratch/s" ${flag:+"$flag"}
+      end
+    }
+  done
+done
+
+begin check-stdin-owner-perms && {
+  printf 'root ALL=ALL\n' >"$WORK/scratch/input"
+  STDIN="$WORK/scratch/input"
+  vrun -cOPf -
+  compare_reference -cOPf -
+  end
+}
+
+begin edit-empty-include-installed && {
+  printf '@include %s\n' "$WORK/scratch/child" >"$WORK/scratch/s"
+  printf 'root ALL=ALL\n' >"$WORK/scratch/child"
+  cat >"$ED/empty-child" <<'EOF'
+#!/bin/sh
+for a; do f=$a; done
+case "$f" in */child.tmp) : >"$f";; esac
+EOF
+  chmod 0755 "$ED/empty-child"
+  XENV=(EDITOR="$ED/empty-child")
+  vrun -f "$WORK/scratch/s"
+  expect_rc 0
+  [[ -f $WORK/scratch/child && ! -s $WORK/scratch/child ]] || fail "empty include not installed"
+  expect_no_tmp "$WORK/scratch/child.tmp"
+  end
+}
+
+begin edit-reedit-include-under-no-includes && {
+  printf '@include %s\n' "$WORK/scratch/child" >"$WORK/scratch/s"
+  printf 'foo bar baz\n' >"$WORK/scratch/child"
+  cat >"$ED/fix-child" <<'EOF'
+#!/bin/sh
+for a; do f=$a; done
+printf '%s\n' "$*" >>"$EDLOG"
+case "$f" in */child.tmp) printf 'root ALL=ALL\n' >"$f";; esac
+EOF
+  chmod 0755 "$ED/fix-child"
+  XENV=(EDITOR="$ED/fix-child")
+  answer $'e\n'
+  vrun -If "$WORK/scratch/s"
+  expect_rc 0
+  expect_last_line "$WORK/scratch/child" 'root ALL=ALL'
+  [[ $(wc -l <"$WORK/edlog") == 2 ]] || fail "include error not re-edited"
+  expect_no_tmp "$WORK/scratch/child.tmp"
+  end
+}
+
+begin edit-busy-explicit-include && {
+  printf '@include %s\n' "$WORK/scratch/child" >"$WORK/scratch/s"
+  printf 'root ALL=ALL\n' >"$WORK/scratch/child"
+  XENV=(EDITOR="$ED/wait" STARTED="$WORK/scratch/started" RELEASE="$WORK/scratch/release")
+  env -i PATH=/usr/bin:/bin "${XENV[@]}" timeout 30 "$VISUDO" -f "$WORK/scratch/s" \
+    </dev/null >/dev/null 2>&1 &
+  first=$!
+  for _ in $(seq 100); do [[ -e $WORK/scratch/started ]] && break; sleep 0.1; done
+  [[ -e $WORK/scratch/started ]] || fail "first editor did not start"
+  XENV=(EDITOR="$ED/noop")
+  vrun -f "$WORK/scratch/child"
+  touch "$WORK/scratch/release"
+  wait "$first"
+  expect_rc 1
+  expect_err_has "$WORK/scratch/child busy, try again later"
+  expect_no_tmp "$WORK/scratch/s.tmp"
+  expect_no_tmp "$WORK/scratch/child.tmp"
+  end
+}
+
+begin edit-signal-cleans-temporary-copy && {
+  XENV=(EDITOR="$ED/wait" STARTED="$WORK/scratch/started" RELEASE="$WORK/scratch/release")
+  env -i PATH=/usr/bin:/bin "${XENV[@]}" "$VISUDO" \
+    </dev/null >"$WORK/out" 2>"$WORK/err" &
+  first=$!
+  for _ in $(seq 100); do [[ -e $WORK/scratch/started ]] && break; sleep 0.1; done
+  [[ -e $WORK/scratch/started ]] || fail "editor did not start"
+  kill -TERM "$first"
+  wait "$first"
+  RC=$? OUT=$(cat "$WORK/out") ERR=$(cat "$WORK/err") CMD="visudo (SIGTERM)"
+  touch "$WORK/scratch/release"
+  expect_rc 15
+  expect_err_has 'exiting due to signal: Terminated'
+  expect_unchanged
+  expect_no_tmp
+  end
+}
+
+for status in exit signal; do
+  begin "edit-editor-$status-status" && {
+    cat >"$ED/status" <<'EOF'
+#!/bin/sh
+for a; do f=$a; done
+printf '# changed\n' >>"$f"
+if [ "$STATUS" = signal ]; then kill -TERM $$; else exit 7; fi
+EOF
+    chmod 0755 "$ED/status"
+    XENV=(EDITOR="$ED/status" STATUS="$status")
+    vrun
+    expect_rc 0
+    if [[ $status == signal ]]; then
+      expect_unchanged
+      expect_err_has "editor ($ED/status) failed, /etc/sudoers unchanged"
+    else
+      expect_last_line /etc/sudoers '# changed'
+      expect_err_empty
+    fi
+    expect_no_tmp
+    end
+  }
+done
+
+begin edit-dash-is-literal-filename && {
+  XENV=(EDITOR="$ED/append" LINE='root ALL=ALL')
+  pushd "$WORK/scratch" >/dev/null
+  vrun -f -
+  popd >/dev/null
+  expect_rc 0
+  expect_last_line "$WORK/scratch/-" 'root ALL=ALL'
+  expect_stat "$WORK/scratch/-" '640 root root'
+  expect_no_tmp "$WORK/scratch/-.tmp"
   end
 }
 

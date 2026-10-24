@@ -101,6 +101,11 @@ structure Context where
   previousUser : Option Principal := none
   listColumns : Nat := 0
   utcOffset : Int := 0
+  validShells : List String := []
+  invokingRealGid : Option Nat := none
+  commandFoundInDot : Bool := false
+  targetUnknownUid : Bool := false
+  targetUnknownGid : Bool := false
 
 /-- Whose credentials must be checked before `action` may happen. -/
 inductive AuthReq where
@@ -142,6 +147,7 @@ structure ExecPlan where
   execFd : Option Nat := none
   iolog : Option IoLog.Plan := none
   execBackground : Bool := false
+  staySetuid : Bool := false
 
 /-- `sudoedit` (`-e`): files are copied to temporary files owned by the invoking user,
 the editor runs as the invoking user, and changed files are written back as the target

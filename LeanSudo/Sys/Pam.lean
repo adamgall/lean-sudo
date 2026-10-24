@@ -13,7 +13,8 @@ Flags used (as sudo does with its defaults): `pam_authenticate(PAM_SILENT)`,
 Conversation:
 * `PAM_PROMPT_ECHO_OFF`/`ECHO_ON`: with `nonInteractive` the conversation fails
   (`PAM_CONV_ERR`). With `useStdin` the prompt goes to stderr and a line is read from
-  fd 0; otherwise `/dev/tty` is opened (failure ⇒ conversation error). For echo-off
+  fd 0; otherwise `/dev/tty` is opened (with `visiblepw`, failure falls back to
+  stdin/stderr; otherwise it is a conversation error). For echo-off
   prompts echo is disabled while reading (restored on return and before any
   terminating/stopping signal is acted upon), with `pwfeedback` a `*` is printed per
   character and erase/kill characters are honoured; a newline is printed afterwards.
@@ -26,6 +27,9 @@ Conversation:
   The original process environment remains intact during PAM authentication, so
   `KRB5CCNAME` is visible to Kerberos modules; command environment filtering is later.
 Why a conversation failed is available from `pamLastConvError`.
+SIGINT/SIGQUIT during password entry wake the reading thread through a self-pipe,
+even if delivered to another Lean runtime thread. The shell reports prior failed
+attempts and finishes PAM cleanup before re-raising the captured signal.
 -/
 
 namespace LeanSudo.Sys
@@ -42,6 +46,8 @@ structure ConvConfig where
   useStdin : Bool := false
   /-- `-n`: any prompt fails the conversation -/
   nonInteractive : Bool := false
+  /-- Permit visible stdin input when no controlling terminal can be opened. -/
+  visiblepw : Bool := false
   /-- expanded passprompt; replaces PAM's "Password: " style prompts when
   `override` is true or the PAM prompt is the generic one -/
   prompt : String := "Password: "
@@ -54,7 +60,7 @@ structure ConvConfig where
 @[extern "lean_sudo_pam_start"]
 private opaque pamStartRaw (service : @& String) (user : @& String) (useStdin : Bool)
     (nonInteractive : Bool) (prompt : @& String) (override : Bool) (pwfeedback : Bool)
-    (timeout : UInt32) (ruser : @& String) (tty : @& Option String) : IO PamHandle
+    (timeout : UInt32) (ruser : @& String) (tty : @& Option String) (visiblepw : Bool) : IO PamHandle
 
 /-- `pam_start(service, user)` with our conversation, then sets `PAM_RUSER` to `ruser` and
 `PAM_TTY` to `tty` (if given). Errors: `unable to initialize PAM: <pam_strerror>`, or
@@ -62,7 +68,7 @@ private opaque pamStartRaw (service : @& String) (user : @& String) (useStdin : 
 def pamStart (service : String) (user : String) (cfg : ConvConfig) (ruser : String)
     (tty : Option String) : IO PamHandle :=
   pamStartRaw service user cfg.useStdin cfg.nonInteractive cfg.prompt cfg.override
-    cfg.pwfeedback (min cfg.timeout (UInt32.size - 1)).toUInt32 ruser tty
+    cfg.pwfeedback (min cfg.timeout (UInt32.size - 1)).toUInt32 ruser tty cfg.visiblepw
 
 /-- Front-end flags and helper chosen by the shell, not by the PAM shim. -/
 @[extern "lean_sudo_pam_configure"]
@@ -115,5 +121,8 @@ def pamGetEnv (h : PamHandle) : IO (List (String × String)) :=
 * `unable to read password`, `unable to allocate memory`,
   `unsupported PAM conversation message` -/
 @[extern "lean_sudo_pam_last_conv_error"] opaque pamLastConvError (h : @& PamHandle) : IO (Option String)
+
+/-- SIGINT/SIGQUIT caught during the last password read, or zero. -/
+@[extern "lean_sudo_pam_interrupted"] opaque pamInterrupted (h : @& PamHandle) : IO UInt32
 
 end LeanSudo.Sys

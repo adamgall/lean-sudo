@@ -75,6 +75,9 @@ def getpwuid (uid : Nat) : IO (Option Passwd) :=
   | some u => getpwuidRaw u
   | none => pure none
 
+/-- libc's getusershell list, including its missing-file fallback and token rules. -/
+@[extern "lean_sudo_valid_shells"] opaque validShells : IO (Array String)
+
 @[extern "lean_sudo_getgrnam"] private opaque getgrnamRaw (name : @& String) : IO (Option (String × Nat))
 @[extern "lean_sudo_getgrgid"] private opaque getgrgidRaw (gid : UInt32) : IO (Option (String × Nat))
 

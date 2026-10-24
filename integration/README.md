@@ -76,9 +76,11 @@ exact-output assertion.
   Ubuntu's stock `/etc/sudoers` and checks them with `visudo.ws -c`.
 * `run.sh` builds the image (layer cache: only the last layers change when
   `tests.sh`/`ptyrun.py` change), `docker create`s a container with
-  `--network none`, `docker cp`s a host binary in (for a path argument), and
-  starts it. Only `integration/out/` is mounted (writable); nothing else from
-  the host.
+  `--network none --cap-add SYS_PTRACE`, `docker cp`s a host binary in (for a path
+  argument), and starts it. `SYS_PTRACE` lets `strace` inspect actual Linux audit
+  netlink records after sudo's credential transitions reset dumpability; tests
+  do not need a host audit daemon or `AUDIT_CONTROL`. Only `integration/out/` is
+  mounted (writable); nothing else from the host.
 * `tests.sh` (container entrypoint, runs as root) installs the binary as
   `/usr/bin/sudo` root:root 4755, then runs each test after resetting state
   (timestamp dirs of sudo.ws/sudo-rs/lean-sudo, `/etc/sudoers`,
@@ -212,9 +214,9 @@ that`, `interactive authentication is required`, …).
 ## visudo suite
 
 ```
-integration/run.sh --visudo reference                 # sudo.ws's /usr/sbin/visudo.ws (44 pass, 3 skipped)
-integration/run.sh --visudo .lake/build/bin/visudo    # lean-sudo's visudo
-integration/run.sh --visudo .lake/build/bin/visudo 'edit-'
+integration/run.sh --visudo reference              # Ubuntu sudo.ws 1.9.17p2
+integration/run.sh --visudo .lake/linux/visudo     # Linux build of lean-sudo
+integration/run.sh --visudo .lake/linux/visudo 'edit-'
 ```
 
 Same image; `run.sh` copies `visudo-tests.sh` and the binary into the
@@ -224,23 +226,33 @@ or wait for a release file; `What now?` answers on stdin) and restores
 `/etc/sudoers{,.d}` before every test. Logs: `out/visudo-reference.*`,
 `out/custom-visudo.*`.
 
-Covered: `-c` on the stock policy (exact `parsed OK` lines), `-c -q`, `-f -`,
-syntax errors in `/etc/sudoers` and in `sudoers.d`, wrong owner/mode
-(checked by default, only with `-O`/`-P` when `-f` is given), missing
-`@include`, duplicate aliases, bad/unknown `Defaults`; edit mode: valid
-append installed `0440 root:root`, syntax/semantic error then `x`, EOF, `e`
-then `x`, unknown answer, `Q` (installs anyway), unchanged file, zero-length
-file, `$EDITOR` words and the `--` before the file, `SUDO_EDITOR` precedence,
-missing editor, `!env_editor` + `editor` list, no usable editor, a second
-visudo while the first one's editor runs (busy), `-f` new file, `-f` keeps
-owner/mode unless `-O`, non-root refused; `-h`, `-V`, usage errors.
+The suite has no implementation-specific skips. It checks stock-policy output,
+`-c`, `-q`, `-s`, `-f -`, `-O`/`-P`, help/version and argument handling. Exact
+reference comparisons cover syntax and semantic diagnostics, including source
+columns, undefined/cyclic/unused aliases, and invalid Defaults.
 
-Observed sudo.ws visudo behaviour the tests encode: `x`/EOF/`Q` exit 0;
-unchanged ⇒ `visudo: /etc/sudoers.tmp unchanged`, exit 0; the editor's exit
-status is ignored; `-I` does not affect `-c`; unreadable `sudoers.d` entries
-are warned about and skipped. lean-sudo-only tests (skipped for the
-reference): its lock (`F_OFD_SETLK`) and sudo.ws's `fcntl` lock exclude each
-other in both directions, and a stale `/etc/sudoers.tmp` means busy (sudo.ws
-truncates and reuses it). Deliberate difference: undefined aliases, alias
-cycles and `Defaults` lean-sudo refuses (e.g. `noexec`) are errors (sudo.ws
-warns or accepts), because lean-sudo's `sudo` would refuse such a policy.
+Edit coverage includes explicit `@include` and `#include` files in order, nested
+session validation before installation, newly added includes, empty includes,
+discarding the whole session, re-editing an include with an error, and the
+`press return to edit ...: ` prompt. `-I` suppresses the initial include editing
+pass, not parsing. As in upstream 1.9.17p2, files newly discovered while reparsing
+are still edited with `-I`, and choosing `e` edits an erroneous included file.
+Includedir entries are normally checked without being opened in the editor.
+
+Temporary copies are truncated and reused, not treated as locks. Record locks
+on all originals (including include files and newly created originals) exclude
+concurrent visudos; interoperability tests exercise both directions with
+sudo.ws. File size and mtime determine whether the editor changed a file.
+Unchanged files still receive requested owner/mode corrections; new `-f` files
+use mode 0640 (subject to the inherited umask) unless `-P` requests 0440.
+`x`/EOF/`Q` exit 0; `-q` still reports an unchanged editor buffer. Tests also cover
+editor selection, arguments and exit/signal status, signal cleanup, zero-length
+main files, stale temporary files, and owner/mode preservation. In edit mode
+`-f -` names a literal file `-`; only check mode treats it as standard input.
+
+`-x file` / `--export=file` reproduces upstream's compatibility implementation:
+print its two deprecation warnings, then execute
+`cvtsudoers -f json -o file input` via PATH. Ubuntu installs `cvtsudoers.ws`
+instead of `cvtsudoers`, so the normal PATH produces the same “unable to execute”
+failure as visudo.ws. Additional tests expose the installed converter as
+`cvtsudoers` and compare the resulting JSON byte-for-byte with reference output.

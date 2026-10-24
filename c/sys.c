@@ -5,11 +5,13 @@
 #include <glob.h>
 #include <ifaddrs.h>
 #include <limits.h>
+#include <locale.h>
 #include <linux/audit.h>
 #include <linux/netlink.h>
 #include <net/if.h>
 #include <netdb.h>
 #include <poll.h>
+#include <pthread.h>
 #include <regex.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -138,7 +140,44 @@ static int regex_check(const char *pattern) {
   return 0;
 }
 
-LEAN_EXPORT lean_obj_res leansudo_sys_regex(b_lean_obj_arg pattern, b_lean_obj_arg text, lean_obj_arg world) {
+/* sudoers.c switches to sudoers_locale around lookup, not the invoking
+ * user's locale. Use a thread-local locale scope so PAM/libc messages retain
+ * the user locale. Cache the default C object for all ordinary lookups. */
+static pthread_once_t match_locale_once = PTHREAD_ONCE_INIT;
+static locale_t match_c_locale;
+
+static void match_locale_init(void) {
+  match_c_locale = newlocale(LC_ALL_MASK, "C", (locale_t)0);
+}
+
+static locale_t match_locale_enter(const char *name, locale_t *previous) {
+  pthread_once(&match_locale_once, match_locale_init);
+  if (!match_c_locale) return (locale_t)0;
+  locale_t locale = match_c_locale;
+  if (*name && strcmp(name, "C") != 0 && strcmp(name, "POSIX") != 0) {
+    locale = newlocale(LC_ALL_MASK, name, (locale_t)0);
+    /* Like sudoers_setlocale, unavailable configured locales fall back to C;
+     * an allocation failure is not an unavailable locale. */
+    if (!locale) {
+      if (errno == ENOMEM) return (locale_t)0;
+      locale = match_c_locale;
+    }
+  }
+  *previous = uselocale(locale);
+  if (!*previous) {
+    if (locale != match_c_locale) freelocale(locale);
+    return (locale_t)0;
+  }
+  return locale;
+}
+
+static void match_locale_leave(locale_t locale, locale_t previous) {
+  (void)uselocale(previous);
+  if (locale != match_c_locale) freelocale(locale);
+}
+
+LEAN_EXPORT lean_obj_res leansudo_sys_regex(b_lean_obj_arg pattern, b_lean_obj_arg text,
+    b_lean_obj_arg locale_name, lean_obj_arg world) {
   (void)world;
   regex_t re = {0};
   const char *expr = lean_string_cstr(pattern);
@@ -157,20 +196,29 @@ LEAN_EXPORT lean_obj_res leansudo_sys_regex(b_lean_obj_arg pattern, b_lean_obj_a
       expr += 4;
     }
   }
+  locale_t previous;
+  locale_t locale = match_locale_enter(lean_string_cstr(locale_name), &previous);
+  if (!locale) return failure("unable to initialize matching locale");
   int err = regex_check(expr);
   if (!err) err = regcomp(&re, expr, flags);
   if (err) {
     char msg[256];
     regerror(err, &re, msg, sizeof msg);
+    match_locale_leave(locale, previous);
     return failure(msg);
   }
   err = regexec(&re, lean_string_cstr(text), 0, NULL, 0);
   regfree(&re);
+  match_locale_leave(locale, previous);
   if (err != 0 && err != REG_NOMATCH) return failure("unable to match regular expression");
   return lean_io_result_mk_ok(lean_box(err == 0));
 }
-LEAN_EXPORT lean_obj_res leansudo_sys_glob(b_lean_obj_arg pattern, lean_obj_arg world) {
+LEAN_EXPORT lean_obj_res leansudo_sys_glob(b_lean_obj_arg pattern,
+    b_lean_obj_arg locale_name, lean_obj_arg world) {
   (void)world;
+  locale_t previous;
+  locale_t locale = match_locale_enter(lean_string_cstr(locale_name), &previous);
+  if (!locale) return failure("unable to initialize matching locale");
   glob_t g = {0};
   int err = glob(lean_string_cstr(pattern), GLOB_NOSORT, NULL, &g);
   lean_object *out = lean_box(0);
@@ -183,6 +231,7 @@ LEAN_EXPORT lean_obj_res leansudo_sys_glob(b_lean_obj_arg pattern, lean_obj_arg 
     }
   }
   globfree(&g);
+  match_locale_leave(locale, previous);
   if (err != 0 && err != GLOB_NOMATCH) return failure("unable to expand command glob");
   return lean_io_result_mk_ok(out);
 }

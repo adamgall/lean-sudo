@@ -33,11 +33,14 @@ def argErr (as : List String) : Option String :=
 #guard argErr ["--check=1"] == some "option '--check' doesn't allow an argument"
 #guard argErr ["--bogus"] == some "unrecognized option '--bogus'"
 #guard argErr ["a", "b"] == some ""
-#guard argErr ["-f", "a", "b"] == some ""
+#guard args ["-f", "a", "b"] == some { file := some "a" }
+#guard args ["-xout", "-f", "in"] == some { file := some "in", exportFile := some "out" }
+#guard args ["--export=out"] == some { exportFile := some "out" }
+#guard argErr ["-x"] == some "option requires an argument -- 'x'"
 
 def errorsOf (t : String) : List String :=
   match parse "s" t with
-  | .ok es => semanticErrors es
+  | .ok es => semanticErrors es true
   | .error e => [e.toString]
 
 def warningsOf (t : String) : List String :=
@@ -49,7 +52,7 @@ def warningsOf (t : String) : List String :=
 #guard errorsOf "User_Alias A = bob\nUser_Alias A = carol\nA ALL = ALL\n" ==
   ["s:2: duplicate User_Alias \"A\", previously defined at s:1"]
 #guard errorsOf "bob FOO = /usr/bin/id\n" == ["s:1: Host_Alias \"FOO\" referenced but not defined"]
-#guard errorsOf "User_Alias A = B\nUser_Alias B = A\nA ALL = ALL\n" == ["s:1: cycle in User_Alias \"A\""]
+#guard errorsOf "User_Alias A = B\nUser_Alias B = A\nA ALL = ALL\n" == ["s:2: cycle in User_Alias \"A\""]
 #guard errorsOf "Defaults passwd_tries=abc\n" ==
   ["s:1: value \"abc\" is invalid for option \"passwd_tries\""]
 #guard errorsOf "Defaults foobar\n" == ["s:1: unknown defaults entry \"foobar\""]
@@ -59,11 +62,15 @@ def warningsOf (t : String) : List String :=
 #guard warningsOf "Cmnd_Alias C = /bin/ls\nroot ALL = ALL\n" == ["Warning: s:1: unused Cmnd_Alias \"C\""]
 #guard warningsOf "Cmnd_Alias C = /bin/ls\nroot ALL = C\n" == []
 
+#guard (parse "s" "bob FOO = /usr/bin/id\n").toOption.map (semanticErrors · false) == some []
+
 #guard renderSyntaxError { file := "s", line := 2, col := 5, msg := "" } "a\nfoo bar\n" ==
-  "s:2:5: syntax error\nfoo bar\n    ^"
+  "s:2:5: syntax error\nfoo bar\n    ^~~"
 #guard renderSyntaxError { file := "s", line := 1, col := 3, msg := "" } "\tx y\n" ==
   "s:1:3: syntax error\n\tx y\n\t ^"
 #guard renderSyntaxError { file := "s", line := 9, col := 1, msg := "" } "a\n" == "s:9:1: syntax error"
+#guard renderSyntaxError { file := "s", line := 1, col := 9, msg := "expected '=', found 'b'" }
+    "foo bar baz\n" == "s:1:9: syntax error\nfoo bar baz\n        ^~~"
 
 #guard envEditorValues [("EDITOR", "vi"), ("VISUAL", " "), ("SUDO_EDITOR", "nano -w")] ==
   ["nano -w", "vi"]

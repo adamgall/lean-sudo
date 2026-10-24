@@ -216,3 +216,70 @@ EOF
   rm -f "$marker"
   end
 }
+
+begin exec-stay-setuid-root-invoker && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-stay-setuid <<'EOF'
+Defaults stay_setuid
+EOF
+  bob_uid=$(id -u bob)
+  run root "sudo -n -u bob /usr/bin/python3 -c 'import os; print(\"uid\", os.getresuid()); print(\"gid\", os.getresgid())'"
+  expect_rc 0
+  expect_out_line "uid (0, $bob_uid, $bob_uid)"
+  expect_out_line "gid (0, 0, 0)"
+  end
+}
+
+begin exec-stay-setuid-nonroot-invoker && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-stay-setuid <<'EOF'
+Defaults stay_setuid
+ivan ALL = (ALL:ALL) NOPASSWD: ALL
+EOF
+  ivan_uid=$(id -u ivan); ivan_gid=$(id -g ivan)
+  bob_uid=$(id -u bob)
+  run ivan "sudo -n -u bob -g daemon /usr/bin/python3 -c 'import os; print(\"uid\", os.getresuid()); print(\"gid\", os.getresgid()); print(os.environ[\"USER\"]); print(os.environ[\"SUDO_UID\"])'"
+  expect_rc 0
+  expect_out_line "uid ($ivan_uid, $bob_uid, $bob_uid)"
+  expect_out_line "gid ($ivan_gid, $ivan_gid, $ivan_gid)"
+  expect_out_line bob
+  expect_out_line "$ivan_uid"
+  end
+}
+
+begin exec-stay-setuid-root-target && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-stay-setuid <<'EOF'
+Defaults stay_setuid, use_pty
+ivan ALL = (ALL) NOPASSWD: ALL
+EOF
+  ivan_uid=$(id -u ivan); ivan_gid=$(id -g ivan)
+  pty ivan "sudo -n /usr/bin/python3 -c 'import os; print(\"uid\", os.getresuid()); print(\"gid\", os.getresgid())'"
+  expect_rc 0
+  expect_out_has "uid ($ivan_uid, 0, 0)"
+  expect_out_has "gid ($ivan_gid, $ivan_gid, $ivan_gid)"
+  end
+}
+
+begin exec-stay-setuid-disabled && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-stay-setuid <<'EOF'
+Defaults !stay_setuid
+EOF
+  bob_uid=$(id -u bob); bob_gid=$(id -g bob)
+  run root "sudo -n -u bob /usr/bin/python3 -c 'import os; print(\"uid\", os.getresuid()); print(\"gid\", os.getresgid())'"
+  expect_rc 0
+  expect_out_line "uid ($bob_uid, $bob_uid, $bob_uid)"
+  expect_out_line "gid ($bob_gid, $bob_gid, $bob_gid)"
+  end
+}
+
+begin exec-stay-setuid-actual-invoking-gid && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-stay-setuid <<'EOF'
+Defaults stay_setuid
+ivan ALL = (ALL) NOPASSWD: ALL
+EOF
+  ivan_uid=$(id -u ivan); bob_uid=$(id -u bob)
+  daemon_gid=$(getent group daemon | cut -d: -f3)
+  run root "setpriv --reuid=ivan --regid=daemon --init-groups sudo -n -u bob /usr/bin/python3 -c 'import os; print(\"uid\", os.getresuid()); print(\"gid\", os.getresgid())'"
+  expect_rc 0
+  expect_out_line "uid ($ivan_uid, $bob_uid, $bob_uid)"
+  expect_out_line "gid ($daemon_gid, $daemon_gid, $daemon_gid)"
+  end
+}

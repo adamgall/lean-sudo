@@ -20,7 +20,8 @@
  *     the child needs (argv/envp arrays, group buffers) is allocated before fork.
  *   - The child resets signal dispositions/mask to the state recorded at process start
  *     (before the Lean runtime initialised), then: setgroups → setresgid → setresuid →
- *     verify (getres[ug]id, getgroups, setuid(0) must fail) → chdir → umask →
+ *     verify (getres[ug]id, getgroups, setuid(0) must fail unless a requested ID is 0) →
+ *     chdir → umask →
  *     mark fds >= closefrom close-on-exec → execve.
  *   - Any failure in the child is reported through a CLOEXEC pipe as (errno, stage);
  *     EOF on that pipe means execve succeeded.
@@ -62,6 +63,7 @@ extern int ls_iolog_winsize(unsigned, unsigned);
 extern int ls_iolog_suspend(int);
 extern int ls_iolog_close(int, int);
 extern void ls_iolog_child_close(void);
+extern int lean_sudo_initialize_locale(void);
 
 struct io_channel {
   int parent, child, enabled;
@@ -172,6 +174,9 @@ static int io_channels_drain(void) {
  * an ignored/default SIGPIPE) rather than whatever the runtime changed. */
 static unsigned char g_startup_ignored[NSIG];
 static sigset_t g_startup_mask;
+/* stay_setuid retains the invoking real IDs, even if PAM changes credentials. */
+static uid_t g_invoking_uid;
+static gid_t g_invoking_gid;
 static struct rlimit g_core_limit;
 static int g_core_saved;
 static int g_dumpable = -1;
@@ -180,6 +185,8 @@ static unsigned char g_user_limit_saved[RLIM_NLIMITS];
 
 __attribute__((constructor)) static void leansudo_exec_save_signals(void) {
   struct sigaction sa;
+  g_invoking_uid = getuid();
+  g_invoking_gid = getgid();
   for (int i = 0; i < RLIM_NLIMITS; i++)
     g_user_limit_saved[i] = getrlimit(i, &g_user_limits[i]) == 0;
   for (int sig = 1; sig < NSIG; sig++) {
@@ -444,6 +451,7 @@ struct exec_req {
   char **shargv; /* "sh", path, argv[1..], NULL — the ENOEXEC fallback */
   uid_t uid;
   gid_t gid;
+  uid_t ruid;
   gid_t *groups;      /* as given (passed to setgroups) */
   gid_t *groups_sort; /* sorted copy for comparisons */
   size_t ngroups;
@@ -538,7 +546,7 @@ static void drop_privileges(const struct exec_req *r) {
       if (setrlimit(RLIMIT_NPROC, &unlimited) != 0) warn_limit(RLIMIT_NPROC);
     }
   }
-  if (setresuid(r->uid, r->uid, r->uid) != 0)
+  if (setresuid(r->ruid, r->uid, r->uid) != 0)
     child_fail(r->errfd, ST_SETUID, errno, 0, 0);
   if (saved_nproc) (void)setrlimit(RLIMIT_NPROC, &nproc);
 
@@ -551,13 +559,14 @@ static void drop_privileges(const struct exec_req *r) {
     child_fail(r->errfd, ST_VERIFY_GID, 0, (long)rg, (long)eg);
   if (getresuid(&ru, &eu, &su) != 0)
     child_fail(r->errfd, ST_VERIFY_UID, errno, -1, -1);
-  if (ru != r->uid || eu != r->uid || su != r->uid)
+  if (ru != r->ruid || eu != r->uid || su != r->uid)
     child_fail(r->errfd, ST_VERIFY_UID, 0, (long)ru, (long)eu);
   if (!groups_match(r))
     child_fail(r->errfd, ST_VERIFY_GROUPS, 0, 0, 0);
   if (r->uid != 0) {
-    /* With a non-root uid, regaining root must be impossible. */
-    if (setuid(0) == 0)
+    /* With stay_setuid a real ID of zero legitimately permits restoring that
+     * effective ID. Do not mutate the verified IDs by probing this case. */
+    if (r->ruid != 0 && setuid(0) == 0)
       child_fail(r->errfd, ST_VERIFY_REGAIN_UID, 0, 0, 0);
     if (r->gid != 0 && setgid(0) == 0)
       child_fail(r->errfd, ST_VERIFY_REGAIN_GID, 0, 0, 0);
@@ -1569,6 +1578,8 @@ LEAN_EXPORT lean_obj_res leansudo_exec_initialize(uint8_t disable_core, lean_obj
       close(nullfd);
     }
   }
+  if (lean_sudo_initialize_locale() != 0)
+    return io_errno("unable to initialize locale", errno);
   if (disable_core && !g_core_saved) {
     if (getrlimit(RLIMIT_CORE, &g_core_limit) != 0)
       return io_errno("unable to read core dump limit", errno);
@@ -1594,7 +1605,7 @@ LEAN_EXPORT lean_obj_res leansudo_exec_run(b_lean_obj_arg path, b_lean_obj_arg a
                                            uint8_t cwd_optional, uint32_t timeout,
                                            b_lean_obj_arg noexec, b_lean_obj_arg apparmor,
                                            b_lean_obj_arg limits, b_lean_obj_arg utmp_user,
-                                           uint32_t execfd, uint8_t exec_background,
+                                           uint32_t execfd, uint8_t exec_background, uint8_t stay_setuid,
                                            lean_obj_arg world) {
   (void)world;
   last_dumped_core = false;
@@ -1602,7 +1613,10 @@ LEAN_EXPORT lean_obj_res leansudo_exec_run(b_lean_obj_arg path, b_lean_obj_arg a
   memset(&r, 0, sizeof r);
   r.path = lean_string_cstr(path);
   r.uid = (uid_t)uid;
-  r.gid = (gid_t)gid;
+  /* sudo's set_user_groups does setegid(target), then setgid(invoking) as
+   * root for stay_setuid. The latter sets all three GIDs to the invoking GID. */
+  r.gid = stay_setuid ? g_invoking_gid : (gid_t)gid;
+  r.ruid = stay_setuid ? g_invoking_uid : r.uid;
   r.umask = (mode_t)(umask_ & 0777);
   r.closefrom = closefrom < 3 ? 3 : closefrom;
   r.cwd = lean_is_scalar(cwd) ? NULL : lean_string_cstr(lean_ctor_get(cwd, 0));

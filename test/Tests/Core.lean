@@ -199,6 +199,32 @@ def editPath (file : String) : Context :=
   some "sudo: group_plugin is not supported\n"
 #guard failure { ctx with opts := { ctx.opts with mode := .help }, settings := { ctx.settings with groupPlugin := some "group_file.so" } } == none
 
+-- Residual sudo.ws policy/message parity.
+#guard failure { catCtx with longHost := "box.example.test" } ==
+  some "Sorry, user carol is not allowed to execute '/usr/bin/cat /etc/shadow' as root on box.example.test.\n"
+#guard failure { catCtx with settings := { catCtx.settings with cmddenialMessage := some "Ask IT" } } ==
+  some "Sorry, user carol is not allowed to execute '/usr/bin/cat /etc/shadow' as root on box.\nAsk IT\n"
+#guard formatAuthFailure "%d bad %% %x %" 3 == "3 bad % %x %"
+#guard (authFailureLog { ctx with settings := { ctx.settings with authfailMessage := some "%d bad %%" } } 2 false).reason ==
+  some "2 bad %"
+#guard auth { ctx with settings := { ctx.settings with exemptGroup := some "sudo" } } == .none
+#guard failure { ctx with settings := { ctx.settings with runasCheckShell := true }, validShells := [] } ==
+  some "sudo: invalid shell for user root: /bin/bash\n"
+#guard execution { ctx with settings := { ctx.settings with runasCheckShell := true }, validShells := ["/bin/bash"] } |>.isSome
+def selfAuth : Allowed := { needsAuth := true, setenv := false, cwd := none }
+#guard !policyNeedsAuth { ctx with target := alice } (.allow selfAuth)
+#guard policyNeedsAuth { ctx with target := alice } (.allow { selfAuth with role := some "role" })
+#guard policyNeedsAuth { ctx with target := alice } (.allow { selfAuth with type := some "type" })
+#guard policyNeedsAuth { ctx with target := alice } (.allow { selfAuth with apparmorProfile := some "profile" })
+#guard policyNeedsAuth { ctx with target := alice } (.allow { selfAuth with privs := some "basic" })
+#guard policyNeedsAuth { ctx with target := alice } (.allow { selfAuth with limitprivs := some "basic" })
+
+#guard failure { ctx with targetUnknownUid := true } == some "sudo: unknown user root\n"
+#guard execution { ctx with targetUnknownUid := true, settings := { ctx.settings with runasAllowUnknownId := true } } |>.isSome
+#guard match (decide { ctx with invokingRealGid := some 4, settings := { ctx.settings with staySetuid := true } }).action with
+  | .exec p => p.gid == 4 && p.staySetuid
+  | _ => false
+
 example (c : Context) (p : ExecPlan) (h : (decide c).action = .exec p) :
     p.uid = c.target.uid := (exec_identity c p h).1
 

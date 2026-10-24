@@ -138,4 +138,17 @@ private def accepted : Event := {
   ["submituser", "rungroup", "runchroot", "runcwd", "source", "ttyname", "submithost",
    "submitcwd", "rungid", "runuid", "columns", "lines", "runargv", "runenv", "submitenv"]
 
+#guard logAuthFailure true true false { attempts := 1 }
+#guard !(logAuthFailure true true false {})
+#guard !(logAuthFailure false true false { attempts := 3 })
+#guard !(logAuthFailure true false false { attempts := 3 })
+#guard logAuthFailure true true false { noInput := true }
+#guard !(logAuthFailure true true true { noInput := true })
+#guard mailAuthFailure true true false false false {}
+#guard !(mailAuthFailure true true true false true { noInput := true })
+#guard !(mailAuthFailure false true true true false { attempts := 3 })
+#guard mailAuthFailure false true false false false { attempts := 3 }
+#guard fileAuthFailure false {}
+#guard !(fileAuthFailure true { noInput := true })
+
 end Tests.EventLog

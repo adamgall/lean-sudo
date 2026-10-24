@@ -198,9 +198,9 @@ def sudoValues (i : EnvInput) : EnvList :=
    ("MAIL", "/var/mail/" ++ i.target.name), ("SHELL", i.target.shell), ("TERM", "unknown"),
    ("PATH", stdPath), ("PATH", loginPath), ("SUDO_COMMAND", i.command),
    ("SUDO_USER", i.invoking.name), ("SUDO_UID", toString i.invoking.uid),
-   ("SUDO_GID", toString i.invoking.gid), ("SUDO_HOME", i.invoking.home),
+   ("SUDO_GID", toString (i.invokingRealGid.getD i.invoking.gid)), ("SUDO_HOME", i.invoking.home),
    ("SUDO_TTY", i.ttyName.getD ""), ("LOGNAME", i.invoking.name), ("USER", i.invoking.name)] ++
-  (match i.settings.securePath with
+  (match effectiveSecurePath i with
    | some p => [("PATH", p)]
    | none => [])
 
@@ -337,7 +337,7 @@ theorem mem_assemble_origin {i : EnvInput} {reset : Bool} {extra : EnvList} {kv 
     (sv ("SUDO_COMMAND", i.command) (by simp [sudoValues])))
     (sv ("SUDO_USER", i.invoking.name) (by simp [sudoValues])))
     (sv ("SUDO_UID", toString i.invoking.uid) (by simp [sudoValues])))
-    (sv ("SUDO_GID", toString i.invoking.gid) (by simp [sudoValues]))
+    (sv ("SUDO_GID", toString (i.invokingRealGid.getD i.invoking.gid)) (by simp [sudoValues]))
   have h6 := inv_addDefaults (l := pamVars i) h5 (fun kv hm => by
     have := List.mem_filter.1 hm
     exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inl this)))))
@@ -574,9 +574,9 @@ theorem buildEnv_no_bash_fn {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok
   · simp [pamPass, entryOk, hf] at hp
   · exact hsv
 
-/-- (d) `secure_path` is the one and only `PATH`. -/
+/-- (d) An effective `secure_path` (non-exempt user) is the one and only `PATH`. -/
 theorem buildEnv_securePath {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out)
-    {p : String} (hp : i.settings.securePath = some p) :
+    {p : String} (hp : effectiveSecurePath i = some p) :
     ("PATH", p) ∈ out ∧ ∀ v, ("PATH", v) ∈ out → v = p := by
   have hmem : ("PATH", p) ∈ out := by
     obtain ⟨rfl, -, -⟩ := buildEnv_ok h
@@ -593,7 +593,7 @@ theorem buildEnv_securePath {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok
 invoking user's name, uid and gid (and, by `buildEnv_unique`, no other value). -/
 theorem buildEnv_sudo_vars {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out) :
     ("SUDO_COMMAND", i.command) ∈ out ∧ ("SUDO_USER", i.invoking.name) ∈ out ∧
-    ("SUDO_UID", toString i.invoking.uid) ∈ out ∧ ("SUDO_GID", toString i.invoking.gid) ∈ out := by
+    ("SUDO_UID", toString i.invoking.uid) ∈ out ∧ ("SUDO_GID", toString (i.invokingRealGid.getD i.invoking.gid)) ∈ out := by
   obtain ⟨rfl, -, -⟩ := buildEnv_ok h
   unfold assemble sudoVars
   simp only

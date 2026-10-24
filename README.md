@@ -247,7 +247,11 @@ sudo install -o root -g root -m 0755 .lake/build/bin/visudo /usr/lib/lean-sudo/v
 /usr/lib/lean-sudo/visudo -c            # your policy must pass lean-sudo's checks
 sudo update-alternatives --install /usr/bin/sudo sudo /usr/lib/lean-sudo/sudo 10 \
   --slave /usr/bin/sudoedit sudoedit /usr/lib/lean-sudo/sudo \
-  --slave /usr/sbin/visudo  visudo   /usr/lib/lean-sudo/visudo
+  --slave /usr/sbin/visudo  visudo   /usr/lib/lean-sudo/visudo \
+  --slave /usr/share/man/man8/sudo.8.gz     sudo.8.gz     /usr/share/man/man8/sudo.ws.8.gz \
+  --slave /usr/share/man/man8/sudoedit.8.gz sudoedit.8.gz /usr/share/man/man8/sudo.ws.8.gz \
+  --slave /usr/share/man/man5/sudoers.5.gz  sudoers.5.gz  /usr/share/man/man5/sudoers.ws.5.gz \
+  --slave /usr/share/man/man8/visudo.8.gz   visudo.8.gz   /usr/share/man/man8/visudo.ws.8.gz
 sudo update-alternatives --set sudo /usr/lib/lean-sudo/sudo
 ```
 

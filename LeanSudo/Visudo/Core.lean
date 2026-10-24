@@ -7,18 +7,8 @@ import LeanSudo.Sudoers.Parser
 Command-line parsing, diagnostics rendering and the semantic checks run on a parsed
 (include-resolved) policy.
 
-visudo must reject everything lean-sudo's `sudo` would refuse to run with, otherwise
-an "OK" edit could lock the administrator out. Hence, compared with sudo.ws's visudo:
-
-* undefined alias references and alias cycles are always errors (sudo.ws only warns
-  unless `-s`); `-s` is accepted and changes nothing,
-* `Defaults` names and values use the same complete typed table as runtime sudo.
-  Unknown names are diagnosed and make check mode fail, as in sudo.ws. Recognised
-  options are accepted independently of whether an execution request needs an
-  unavailable runtime facility; that refusal belongs to the decision core,
-* `Policy.validate` runs last as the authoritative check.
-
-Diagnostics carry `file:line` (the AST records no column for entries).
+Alias checks follow visudo: undefined references and cycles warn by default and
+become errors with `-s`. Defaults use the runtime's complete typed option table.
 -/
 
 namespace LeanSudo.Visudo
@@ -31,6 +21,7 @@ structure Options where
   check : Bool := false
   /-- `-f file` or the single operand; `none` = `/etc/sudoers` -/
   file : Option String := none
+  exportFile : Option String := none
   quiet : Bool := false
   strict : Bool := false
   noIncludes : Bool := false
@@ -48,14 +39,12 @@ def helpText : String :=
   "  -f, --file=sudoers       specify sudoers file location\n" ++
   "  -h, --help               display help message and exit\n" ++
   "  -I, --no-includes        do not edit include files\n" ++
-  "  -O, --owner              enforce the default ownership of the sudoers file\n" ++
-  "  -P, --perms              enforce the default permissions of the sudoers file\n" ++
   "  -q, --quiet              less verbose (quiet) syntax error messages\n" ++
   "  -s, --strict             strict syntax checking\n" ++
   "  -V, --version            display version information and exit\n\n"
 
 def versionText : String :=
-  "visudo version 1.9.16 (lean-sudo 0.1.0)\nvisudo grammar version 50\n"
+  "visudo version 1.9.17p2\nvisudo grammar version 50\n"
 
 /-- Boolean short options. -/
 def flagOf : Char → Option (Options → Options)
@@ -70,8 +59,9 @@ def flagOf : Char → Option (Options → Options)
   | _ => none
 
 def longOptions : List (String × Char) :=
-  [("check", 'c'), ("file", 'f'), ("help", 'h'), ("no-includes", 'I'), ("owner", 'O'),
-   ("perms", 'P'), ("quiet", 'q'), ("strict", 's'), ("version", 'V')]
+  [("check", 'c'), ("export", 'x'), ("file", 'f'), ("help", 'h'),
+   ("no-includes", 'I'), ("owner", 'O'), ("perms", 'P'), ("quiet", 'q'),
+   ("strict", 's'), ("version", 'V')]
 
 /-- `getopt_long` lookup: exact name, else a unique prefix. -/
 def lookupLong (name : String) : Except String Char :=
@@ -83,32 +73,35 @@ def lookupLong (name : String) : Except String Char :=
     | [] => .error s!"unrecognized option '--{name}'"
     | _ => .error s!"option '--{name}' is ambiguous"
 
-/-- Short-option bundle (`-cq`, `-ffile`, `-cf file`). Returns the updated options and,
-when `f` was reached, the rest of the bundle as its value (`""` = take the next word). -/
-def shortBundle : List Char → Options → Except String (Options × Option String)
+/-- Short-option bundles stop at options taking arguments. -/
+def shortBundle : List Char → Options → Except String (Options × Option (Char × String))
   | [], o => .ok (o, none)
-  | 'f' :: rest, o => .ok (o, some (String.ofList rest))
+  | 'f' :: rest, o => .ok (o, some ('f', String.ofList rest))
+  | 'x' :: rest, o => .ok (o, some ('x', String.ofList rest))
   | c :: rest, o =>
     match flagOf c with
-    | some f => shortBundle rest (f o)
+    | some f =>
+      if c == 'h' || c == 'V' then .ok (f o, none) else shortBundle rest (f o)
     | none => .error s!"invalid option -- '{c}'"
 
 /-- The single operand is the sudoers file (only if `-f` was not given). -/
 def finishArgs (o : Options) : List String → Except String Options
   | [] => .ok o
-  | [f] => if o.file.isSome then .error "" else .ok { o with file := some f }
+  | [f] => .ok (if o.file.isSome then o else { o with file := some f })
   | _ => .error ""
+
+def setArgument (o : Options) (c : Char) (v : String) : Options :=
+  if c == 'x' then { o with exportFile := some v } else { o with file := some v }
 
 /-- GNU-style parsing (options may follow operands; `--` ends options). An error's text
 is the diagnostic line (without `visudo: `), empty when only the usage line applies. -/
 def parseArgs (args : List String) : Except String Options :=
   go args {} [] none
 where
-  /-- `pending = some msg`: the next word is the `-f` value (`msg` if it is missing). -/
-  go : List String → Options → List String → Option String → Except String Options
-  | [], _, _, some msg => .error msg
+  go : List String → Options → List String → Option (Char × String) → Except String Options
+  | [], _, _, some (_, msg) => .error msg
   | [], o, ops, none => finishArgs o ops.reverse
-  | a :: rest, o, ops, some _ => go rest { o with file := some a } ops none
+  | a :: rest, o, ops, some (c, _) => go rest (setArgument o c a) ops none
   | "--" :: rest, o, ops, none => finishArgs o (ops.reverse ++ rest)
   | a :: rest, o, ops, none =>
     match a.toList with
@@ -120,39 +113,50 @@ where
       let name := String.ofList name
       match lookupLong name with
       | .error e => .error e
-      | .ok 'f' =>
-        match val? with
-        | some v => go rest { o with file := some (String.ofList v) } ops none
-        | none => go rest o ops (some "option '--file' requires an argument")
       | .ok c =>
-        match val?, flagOf c with
-        | some _, _ =>
-          let full := ((longOptions.find? (·.2 == c)).map (·.1)).getD name
-          .error s!"option '--{full}' doesn't allow an argument"
-        | none, some f => go rest (f o) ops none
-        | none, none => .error s!"unrecognized option '--{name}'"
+        if c == 'f' || c == 'x' then
+          match val? with
+          | some v => go rest (setArgument o c (String.ofList v)) ops none
+          | none => go rest o ops (some (c, s!"option '--{name}' requires an argument"))
+        else
+          match val?, flagOf c with
+          | some _, _ =>
+            let full := ((longOptions.find? (·.2 == c)).map (·.1)).getD name
+            .error s!"option '--{full}' doesn't allow an argument"
+          | none, some f =>
+            if c == 'h' || c == 'V' then .ok (f o) else go rest (f o) ops none
+          | none, none => .error s!"unrecognized option '--{name}'"
     | '-' :: c :: cs =>
       match shortBundle (c :: cs) o with
       | .error e => .error e
-      | .ok (o', none) => go rest o' ops none
-      | .ok (o', some "") => go rest o' ops (some "option requires an argument -- 'f'")
-      | .ok (o', some v) => go rest { o' with file := some v } ops none
+      | .ok (o', none) => if o'.help || o'.version then .ok o' else go rest o' ops none
+      | .ok (o', some (c, "")) =>
+        go rest o' ops (some (c, s!"option requires an argument -- '{c}'"))
+      | .ok (o', some (c, v)) => go rest (setArgument o' c v) ops none
     | _ => go rest o (a :: ops) none
 
 /-! ## Diagnostics -/
 
 def locPos (l : Located) : String := s!"{l.file}:{l.line}"
 
-/-- sudo-style syntax error: the message, the offending line, and a caret under the
-column (tabs in the line are kept so the caret lines up). -/
+/-- Upstream's syntax diagnostic underlines the offending token. Parser-internal
+expectation details are not part of visudo's public diagnostic format. -/
 def renderSyntaxError (e : ParseError) (text : String) : String :=
+  let message := if e.msg.startsWith "expected a fully-qualified path name" then
+      "expected a fully-qualified path name" else "syntax error"
+  let header := s!"{e.file}:{e.line}:{e.col}: {message}"
   match (text.splitOn "\n")[e.line - 1]? with
   | some ln =>
-    if e.line == 0 || ln.isEmpty then e.toString
+    if e.line == 0 || ln.isEmpty then header
     else
-      let pad := (ln.toList.take (e.col - 1)).map fun c => if c == '\t' then '\t' else ' '
-      s!"{e}\n{ln}\n{String.ofList pad}^"
-  | none => e.toString
+      let chars := ln.toList
+      let pad := (chars.take (e.col - 1)).map fun c => if c == '\t' then '\t' else ' '
+      let pad := pad ++ List.replicate (e.col - 1 - chars.length) ' '
+      let token := (chars.drop (e.col - 1)).takeWhile fun c =>
+        !c.isWhitespace && !(",=:()!" : String).contains c
+      let underline := String.ofList (List.replicate (token.length - 1) '~')
+      s!"{header}\n{ln}\n{String.ofList pad}^{underline}"
+  | none => header
 
 /-! ## Semantic checks -/
 
@@ -170,8 +174,6 @@ def refsByKind (r : Refs) : List (String × List String) :=
   [("User_Alias", r.user), ("Runas_Alias", r.runas), ("Host_Alias", r.host),
    ("Cmnd_Alias", r.cmnd)]
 
-def isDefined (defs : List (String × String × Located)) (k n : String) : Bool :=
-  defs.any fun (k', n', _) => k' == k && n' == n
 
 def duplicateErrors (es : List Located) : List String :=
   go (aliasDefs es) []
@@ -184,25 +186,46 @@ where
       s!"{locPos l}: duplicate {k} \"{n}\", previously defined at {locPos l0}" :: go ds seen
     | none => go ds ((k, n, l) :: seen)
 
-def undefinedErrors (es : List Located) : List String :=
-  let defs := aliasDefs es
-  es.flatMap fun l =>
-    (refsByKind (entryRefs l.entry)).flatMap fun (k, ns) =>
-      ns.eraseDups.filterMap fun n =>
-        if isDefined defs k n then none
-        else some s!"{locPos l}: {k} \"{n}\" referenced but not defined"
+structure AliasScan where
+  errors : List String := []
+  used : List (String × String) := []
+  warned : List String := []
 
-def cycleErrors (es : List Located) : List String :=
-  let al := aliasesOf (es.map (·.entry))
+/-- Walk aliases from user specifications, keeping the referencing location.
+Unreferenced definitions are unused, not undefined/cycle errors. -/
+def scanAlias (defs : List (String × String × Located)) :
+    Nat → List (String × String) → String → String → Located → AliasScan → AliasScan
+  | 0, _, _, _, _, state => state
+  | fuel + 1, active, kind, name, loc, state =>
+    let key := (kind, name)
+    let cycle := active.contains key
+    match defs.find? (fun (k, n, _) => k == kind && n == name) with
+    | some (_, _, defn) =>
+      if cycle then
+        if state.warned.contains name then state else
+          { state with errors := state.errors ++ [s!"{locPos loc}: cycle in {kind} \"{name}\""]
+                       warned := name :: state.warned }
+      else if state.used.contains key then state
+      else
+        let refs := ((refsByKind (entryRefs defn.entry)).find? (·.1 == kind)).map (·.2)
+        (refs.getD []).foldl
+          (fun s n => scanAlias defs fuel (key :: active) kind n defn s)
+          { state with used := key :: state.used }
+    | none =>
+      if state.warned.contains name then state else
+        { state with errors := state.errors ++
+            [s!"{locPos loc}: {kind} \"{name}\" referenced but not defined"]
+                     warned := name :: state.warned }
+
+def scanAliases (es : List Located) : AliasScan :=
   let defs := aliasDefs es
-  let at_ (k n : String) : String :=
-    ((defs.find? fun (k', n', _) => k' == k && n' == n).map fun (_, _, l) => locPos l).getD "visudo"
-  let cycles : List (String × Option String) :=
-    [("User_Alias", firstCycle al.user userAliasRefs),
-     ("Runas_Alias", firstCycle al.runas userAliasRefs),
-     ("Host_Alias", firstCycle al.host hostAliasRefs),
-     ("Cmnd_Alias", firstCycle al.cmnd cmndAliasRefs)]
-  cycles.filterMap fun (k, c) => c.map fun n => s!"{at_ k n}: cycle in {k} \"{n}\""
+  es.foldl (fun state loc =>
+    match loc.entry with
+    | .userSpec _ =>
+      (refsByKind (entryRefs loc.entry)).foldl (fun state (kind, names) =>
+        names.foldl (fun state name =>
+          scanAlias defs (defs.length + 1) [] kind name loc state) state) state
+    | _ => state) {}
 
 /-- Share the runtime's authoritative sudo 1.9.17p2 option table. -/
 def sudoOptionNames : List String := defaultOptionNames
@@ -235,26 +258,22 @@ def defaultsWarnings (es : List Located) : List String :=
     | (l, .warn m) => some s!"Warning: {locPos l}: {m}"
     | _ => none
 
-/-- All semantic errors; `Policy.validate` is the final, authoritative check. -/
-def semanticErrors (es : List Located) : List String :=
-  let errs := duplicateErrors es ++ undefinedErrors es ++ cycleErrors es ++ defaultsErrors es
-  if !errs.isEmpty then errs
-  else
-    match validate (es.map (·.entry)) with
-    | .error e => [s!"visudo: {e}"]
-    | .ok () => []
+/-- Undefined references and cycles are fatal only in strict mode. -/
+def semanticErrors (es : List Located) (strict : Bool := false) : List String :=
+  duplicateErrors es ++ defaultsErrors es ++
+    (if strict then (scanAliases es).errors else [])
 
 /-- `Warning: file:line: unused <kind> "<name>"` for aliases nothing refers to. -/
 def unusedWarnings (es : List Located) : List String :=
-  let used := es.foldl (fun (acc : Refs) l => acc.append (entryRefs l.entry)) {}
-  let usedK := refsByKind used
-  (aliasDefs es).filterMap fun (k, n, l) =>
-    let refs := ((usedK.find? (·.1 == k)).map (·.2)).getD []
-    if refs.contains n then none else some s!"Warning: {locPos l}: unused {k} \"{n}\""
+  let used := (scanAliases es).used
+  ((aliasDefs es).mergeSort (fun a b => a.2.1 ≤ b.2.1)).filterMap fun (k, n, l) =>
+    if used.contains (k, n) then none else some s!"Warning: {locPos l}: unused {k} \"{n}\""
 
-/-- Non-fatal findings: ignored `Defaults` options and unused aliases. -/
-def semanticWarnings (es : List Located) : List String :=
-  defaultsWarnings es ++ unusedWarnings es
+/-- Alias warnings do not prevent installation unless strict checking is requested. -/
+def semanticWarnings (es : List Located) (strict : Bool := false) : List String :=
+  defaultsWarnings es ++
+    (if strict then [] else (scanAliases es).errors) ++
+    unusedWarnings es
 
 /-! ## Edit mode helpers -/
 

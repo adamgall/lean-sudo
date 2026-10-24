@@ -18,6 +18,8 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <limits.h>
+#include <libintl.h>
+#include <locale.h>
 #include <poll.h>
 #include <pthread.h>
 #include <pwd.h>
@@ -42,6 +44,25 @@
 #include <unistd.h>
 
 extern char **environ;
+
+/* Keep the submitted TZ only for Lean's command-environment construction.
+ * libc/PAM and all policy/logging clocks must use the system timezone.
+ * Ubuntu's CVE-2026-96512.patch requires unsetenv, not a temporary environ
+ * swap: mktime/localtime may consult TZ again after tzset. */
+static char *submitted_tz;
+static bool locale_initialized;
+
+int lean_sudo_initialize_locale(void) {
+    if (!locale_initialized) {
+        const char *tz = getenv("TZ");
+        if (tz && !(submitted_tz = strdup(tz))) return -1;
+        locale_initialized = true;
+    }
+    if (unsetenv("TZ") != 0) return -1;
+    tzset();
+    (void)setlocale(LC_ALL, "");
+    return 0;
+}
 
 /* ------------------------------------------------------------------------- */
 /* Helpers                                                                    */
@@ -170,6 +191,18 @@ static lean_obj_res gid_array(const gid_t *g, size_t n) {
     lean_object *arr = lean_mk_empty_array_with_capacity(lean_box(n));
     for (size_t i = 0; i < n; i++) arr = lean_array_push(arr, mk_nat(g[i]));
     return arr;
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_valid_shells(void) {
+    lean_object *shells = lean_mk_empty_array_with_capacity(lean_box(8));
+    setusershell();
+    const char *path;
+    while ((path = getusershell()) != NULL) {
+        lean_object *shell = mk_str(path);
+        if (shell) shells = lean_array_push(shells, shell);
+    }
+    endusershell();
+    return io_ok(shells);
 }
 
 /* getgroups : IO (Array Nat) */
@@ -345,12 +378,17 @@ LEAN_EXPORT lean_obj_res lean_sudo_environ(void) {
         const char *eq = strchr(*e, '=');
         if (!eq) continue;
         size_t klen = (size_t)(eq - *e);
+        if (locale_initialized && klen == 2 && memcmp(*e, "TZ", 2) == 0) continue;
         const char *v = eq + 1;
         size_t vlen = strlen(v);
         if (!utf8_valid(*e, klen) || !utf8_valid(v, vlen)) continue;
         lean_object *k = lean_mk_string_from_bytes_unchecked(*e, klen);
         lean_object *val = lean_mk_string_from_bytes_unchecked(v, vlen);
         arr = lean_array_push(arr, mk_pair(k, val));
+    }
+    if (submitted_tz) {
+        lean_object *val = mk_str(submitted_tz);
+        if (val) arr = lean_array_push(arr, mk_pair(lean_mk_string("TZ"), val));
     }
     return io_ok(arr);
 }
@@ -1008,17 +1046,19 @@ typedef struct {
     bool ended;
     int last_status;
     struct pam_conv conv;
-    bool use_stdin, noninteractive, override, pwfeedback;
+    bool use_stdin, noninteractive, override, pwfeedback, visiblepw;
     uint32_t timeout;
     char *prompt;
     char *user, *ruser, *askpass, *lecture;
     bool silent, session_silent, bell, lectured;
     int conv_error;
+    int interrupted;
 } sudo_pam_t;
 
 /* --- terminal handling during password reads --- */
 
 static volatile sig_atomic_t tty_active;
+static volatile sig_atomic_t tty_interrupted;
 static int tty_fd = -1;
 static struct termios tty_saved, tty_noecho;
 
@@ -1026,6 +1066,21 @@ static const int tty_sigs[] = {SIGINT, SIGQUIT, SIGTERM, SIGHUP, SIGTSTP, SIGTTI
 #define N_TTY_SIGS (sizeof tty_sigs / sizeof tty_sigs[0])
 static struct sigaction tty_old_actions[N_TTY_SIGS];
 static bool tty_installed[N_TTY_SIGS];
+/* A signal may land on another Lean runtime thread, so EINTR alone cannot
+ * wake the thread waiting for a password. Keep one close-on-exec self-pipe
+ * for the process lifetime, avoiding close/reuse races with the handler. */
+static int tty_wakeup[2] = {-1, -1};
+
+static int tty_prepare_wakeup(void) {
+    if (tty_wakeup[0] < 0 && pipe2(tty_wakeup, O_NONBLOCK | O_CLOEXEC) != 0)
+        return -1;
+    char bytes[64];
+    for (;;) {
+        ssize_t n = read(tty_wakeup[0], bytes, sizeof bytes);
+        if (n > 0 || (n < 0 && errno == EINTR)) continue;
+        return n < 0 && errno == EAGAIN ? 0 : -1;
+    }
+}
 
 static void tty_sig_handler(int sig);
 
@@ -1038,11 +1093,20 @@ static void tty_install_one(size_t i) {
     sigaction(tty_sigs[i], &sa, NULL);
 }
 
-/* Restore the terminal, then deliver the signal with its default action. For job
- * control stops we re-arm and re-disable echo once continued. Async-signal-safe. */
+/* Interrupts return through PAM so Lean can report prior failed attempts.
+ * Other signals retain their normal action; job-control stops re-arm echo
+ * suppression after continuing. Async-signal-safe. */
 static void tty_sig_handler(int sig) {
     int saved_errno = errno;
     if (tty_active) tcsetattr(tty_fd, TCSANOW, &tty_saved);
+    if (sig == SIGINT || sig == SIGQUIT) {
+        tty_interrupted = sig;
+        const char byte = 0;
+        /* EAGAIN means a wakeup is already queued; the pipe is never closed. */
+        while (write(tty_wakeup[1], &byte, 1) < 0 && errno == EINTR) {}
+        errno = saved_errno;
+        return;
+    }
     struct sigaction dfl;
     memset(&dfl, 0, sizeof dfl);
     dfl.sa_handler = SIG_DFL;
@@ -1146,20 +1210,38 @@ static int read_password(sudo_pam_t *st, const char *prompt, bool echo, char *bu
         out = STDERR_FILENO;
     } else {
         own_fd = open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
-        if (own_fd < 0) return CONV_ERR_NO_TTY;
-        in = out = own_fd;
+        if (own_fd < 0) {
+            if (!echo && !st->visiblepw) return CONV_ERR_NO_TTY;
+            in = STDIN_FILENO;
+            out = STDERR_FILENO;
+        } else {
+            in = out = own_fd;
+        }
     }
-
-    if (st->bell && !st->use_stdin && isatty(out)) (void)write_str(out, "\a");
-    (void)write_str(out, prompt);
 
     bool noecho = false, feedback = false;
     struct termios saved;
     memset(&saved, 0, sizeof saved);
+    if (tty_prepare_wakeup() != 0) {
+        if (own_fd >= 0) close(own_fd);
+        return CONV_ERR_READ;
+    }
+    sigset_t interrupts, oldmask;
+    sigemptyset(&interrupts);
+    sigaddset(&interrupts, SIGINT);
+    sigaddset(&interrupts, SIGQUIT);
+    tty_interrupted = 0;
+    tty_fd = in;
+    tty_install_handlers();
+    if (sigprocmask(SIG_UNBLOCK, &interrupts, &oldmask) != 0) {
+        tty_restore_handlers();
+        if (own_fd >= 0) close(own_fd);
+        return CONV_ERR_READ;
+    }
     if (!echo && tcgetattr(in, &saved) == 0) {
         struct termios t = saved;
         t.c_lflag &= ~(tcflag_t)(ECHO | ECHONL);
-        if (st->pwfeedback) {
+        if (st->pwfeedback && own_fd >= 0) {
             t.c_lflag &= ~(tcflag_t)(ICANON | IEXTEN);
             t.c_cc[VMIN] = 1;
             t.c_cc[VTIME] = 0;
@@ -1167,39 +1249,44 @@ static int read_password(sudo_pam_t *st, const char *prompt, bool echo, char *bu
         tty_fd = in;
         tty_saved = saved;
         tty_noecho = t;
-        tty_install_handlers();
         int rc;
         do {
             rc = tcsetattr(in, TCSADRAIN, &t);
-        } while (rc != 0 && errno == EINTR);
+        } while (rc != 0 && errno == EINTR && !tty_interrupted);
         if (rc == 0) {
             tty_active = 1;
             noecho = true;
-            feedback = st->pwfeedback;
-        } else {
-            tty_restore_handlers();
+            feedback = st->pwfeedback && own_fd >= 0;
         }
     }
+
+    if (st->bell && own_fd >= 0) (void)write_str(out, "\a");
+    (void)write_str(out, prompt);
 
     int64_t deadline = st->timeout > 0 ? monotonic_ms() + (int64_t)st->timeout * 1000 : 0;
     size_t n = 0;
     bool got_any = false;
     int result = CONV_OK;
     for (;;) {
-        struct pollfd pfd = {.fd = in, .events = POLLIN, .revents = 0};
+        if (tty_interrupted) { result = CONV_ERR_NO_PASSWORD; break; }
+        struct pollfd pfds[2] = {
+            {.fd = in, .events = POLLIN},
+            {.fd = tty_wakeup[0], .events = POLLIN}
+        };
         int remaining = -1;
         if (deadline) {
             int64_t left = deadline - monotonic_ms();
             if (left <= 0) { result = CONV_ERR_TIMEOUT; break; }
             remaining = left > INT_MAX ? INT_MAX : (int)left;
         }
-        int pr = poll(&pfd, 1, remaining);
+        int pr = poll(pfds, 2, remaining);
         if (pr < 0) {
             if (errno == EINTR) continue;
             result = CONV_ERR_READ;
             break;
         }
         if (pr == 0) { result = CONV_ERR_TIMEOUT; break; }
+        if (tty_interrupted) { result = CONV_ERR_NO_PASSWORD; break; }
         char c;
         ssize_t k = read(in, &c, 1);
         if (k < 0) {
@@ -1246,11 +1333,14 @@ static int read_password(sudo_pam_t *st, const char *prompt, bool echo, char *bu
     if (noecho) {
         while (tcsetattr(in, TCSADRAIN, &saved) != 0 && errno == EINTR) {}
         tty_active = 0;
-        tty_restore_handlers();
-        tty_fd = -1;
-        explicit_bzero(&tty_saved, sizeof tty_saved);
         (void)write_str(out, "\n");
     }
+    (void)sigprocmask(SIG_SETMASK, &oldmask, NULL);
+    tty_restore_handlers();
+    tty_fd = -1;
+    explicit_bzero(&tty_saved, sizeof tty_saved);
+    st->interrupted = tty_interrupted;
+    if (st->interrupted) result = CONV_ERR_NO_PASSWORD;
     if (own_fd >= 0) close(own_fd);
     if (result != CONV_OK) explicit_bzero(buf, size);
     return result;
@@ -1260,10 +1350,18 @@ static bool is_generic_password_prompt(const char *p) {
     return p && (strcmp(p, "Password:") == 0 || strcmp(p, "Password: ") == 0);
 }
 
+/* sudo auth/pam.c distinguishes the literal sudo prompt from the translated
+ * Linux-PAM generic prompt (challenge/response prompts must pass through). */
+static bool is_generic_pam_password_prompt(const char *p) {
+    return p && (is_generic_password_prompt(p) ||
+        strcmp(p, dgettext("Linux-PAM", "Password:")) == 0 ||
+        strcmp(p, dgettext("Linux-PAM", "Password: ")) == 0);
+}
+
 static bool use_sudo_prompt(const sudo_pam_t *st, const char *p) {
     if (st->override) return true;
     if (is_generic_password_prompt(st->prompt)) return false;
-    if (is_generic_password_prompt(p)) return true;
+    if (is_generic_pam_password_prompt(p)) return true;
     size_t n = strlen(st->ruser);
     return p && strncmp(p, st->ruser, n) == 0 &&
         (strcmp(p + n, "'s Password:") == 0 || strcmp(p + n, "'s Password: ") == 0);
@@ -1384,13 +1482,14 @@ static lean_obj_res pam_start_fail(sudo_pam_t *st, int rc) {
 }
 
 /* pamStartRaw (service user : @& String) (useStdin nonInteractive : Bool) (prompt : @& String)
- *   (override pwfeedback : Bool) (timeout : UInt32) (ruser : @& String) (tty : @& Option String)
+ *   (override pwfeedback : Bool) (timeout : UInt32) (ruser : @& String) (tty : @& Option String) (visiblepw : Bool)
  *   : IO PamHandle */
 LEAN_EXPORT lean_obj_res lean_sudo_pam_start(b_lean_obj_arg service, b_lean_obj_arg user,
                                              uint8_t use_stdin, uint8_t noninteractive,
                                              b_lean_obj_arg prompt, uint8_t override,
                                              uint8_t pwfeedback, uint32_t timeout,
-                                             b_lean_obj_arg ruser, b_lean_obj_arg tty) {
+                                             b_lean_obj_arg ruser, b_lean_obj_arg tty,
+                                             uint8_t visiblepw) {
     if (!pam_ensure_loaded()) return io_err(pam_load_error);
     const char *svc = cstr_arg(service), *usr = cstr_arg(user), *pr = cstr_arg(prompt),
                *ru = cstr_arg(ruser);
@@ -1414,6 +1513,7 @@ LEAN_EXPORT lean_obj_res lean_sudo_pam_start(b_lean_obj_arg service, b_lean_obj_
     st->noninteractive = noninteractive;
     st->override = override;
     st->pwfeedback = pwfeedback;
+    st->visiblepw = visiblepw;
     st->timeout = timeout;
     st->conv.conv = sudo_conv;
     st->conv.appdata_ptr = st;
@@ -1423,6 +1523,10 @@ LEAN_EXPORT lean_obj_res lean_sudo_pam_start(b_lean_obj_arg service, b_lean_obj_
     if (*ru) (void)pamfn.set_item(st->pamh, PAM_RUSER, ru);
     if (tt) (void)pamfn.set_item(st->pamh, PAM_TTY, tt);
     return io_ok(lean_alloc_external(pam_class, st));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_pam_interrupted(b_lean_obj_arg h) {
+    return io_ok(lean_box_uint32((uint32_t)pam_data(h)->interrupted));
 }
 
 LEAN_EXPORT lean_obj_res lean_sudo_pam_configure(b_lean_obj_arg h, uint8_t silent,
@@ -1467,6 +1571,7 @@ static lean_obj_res pam_call(b_lean_obj_arg h, int (*fn)(pam_handle_t *, int), i
     sudo_pam_t *st = pam_data(h);
     if (st->ended) return io_err("PAM handle already ended");
     st->conv_error = CONV_OK;
+    st->interrupted = 0;
     int rc = fn(st->pamh, flags);
     st->last_status = rc;
     return io_ok(lean_int_to_int(rc));
@@ -1476,6 +1581,7 @@ LEAN_EXPORT lean_obj_res lean_sudo_pam_authenticate(b_lean_obj_arg h) {
     sudo_pam_t *st = pam_data(h);
     if (st->ended) return io_err("PAM handle already ended");
     st->conv_error = CONV_OK;
+    st->interrupted = 0;
     int rc = pamfn.authenticate(st->pamh, st->silent ? PAM_SILENT : 0);
     if (rc == PAM_SUCCESS) {
         const void *user = NULL;

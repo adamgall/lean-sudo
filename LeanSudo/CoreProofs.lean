@@ -5,12 +5,21 @@ The IO shell must successfully perform the returned authentication before execut
 namespace LeanSudo.Core
 open Policy
 
+private theorem branch_of_ite_eq {α : Type} {p : Prop} [Decidable p] {a b c : α}
+    (h : (if p then a else b) = c) : a = c ∨ b = c := by
+  split at h
+  · exact Or.inl h
+  · exact Or.inr h
+
 private theorem early_safe (ctx : Context) (act : Action)
     (h : earlyAction ctx = some act) :
     (∀ p, act ≠ .exec p) ∧ (∀ p, act ≠ .edit p) := by
   unfold earlyAction at h
-  split at h <;> repeat' first | split at h | cases h
-  all_goals simp
+  split at h
+  all_goals
+    repeat' first
+      | (solve | cases h <;> constructor <;> intro p hp <;> cases hp)
+      | (rcases branch_of_ite_eq h with h | h)
 
 private theorem denied_safe (ctx : Context) :
     (∀ p, deniedAction ctx ≠ .exec p) ∧ (∀ p, deniedAction ctx ≠ .edit p) := by
@@ -150,7 +159,9 @@ theorem commandTimeout_policy_bound (ctx : Context) (a : Allowed)
       exact Nat.min_le_right _ _
 
 theorem exec_identity (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .exec p) :
-    p.uid = ctx.target.uid ∧ p.gid = (ctx.targetGroup.map (·.gid)).getD ctx.target.gid ∧
+    p.uid = ctx.target.uid ∧ p.gid =
+      (if ctx.settings.staySetuid then ctx.invokingRealGid.getD ctx.invoking.gid
+       else (ctx.targetGroup.map (·.gid)).getD ctx.target.gid) ∧
     p.groups = (if ctx.opts.preserveGroups || ctx.settings.preserveGroups then
       ctx.invoking.groups else ctx.target.groups).map (·.2) := by
   obtain ⟨a, rc, _, _, _, rfl, _, _⟩ := exec_origin ctx p h
@@ -165,12 +176,36 @@ theorem edit_identity (ctx : Context) (p : EditPlan) (h : (decide ctx).action = 
 
 /-- The alternatives which can legitimately waive a password check. -/
 def AuthExemption (ctx : Context) (a : Allowed) : Prop :=
-  ctx.invoking.uid = 0 ∨ a.needsAuth = false ∨
+  ctx.invoking.uid = 0 ∨ a.needsAuth = false ∨ userIsExempt ctx.settings ctx.invoking = true ∨
     (Timestamp.lookup ctx.now ctx.settings.timestampTimeout ctx.tsScope
       (authUser ctx).uid ctx.tsRecords = true ∧ ctx.opts.resetTimestamp = false) ∨
     (ctx.target.uid = ctx.invoking.uid ∧
       (ctx.opts.group.isNone = true ∨ ∃ g, ctx.targetGroup = some g ∧
-        ctx.invoking.groups.any (fun x => x.2 == g.gid) = true))
+        ctx.invoking.groups.any (fun x => x.2 == g.gid) = true) ∧
+      sameSecurityContext ctx a = true)
+
+/-- A shell restriction cannot be bypassed by an otherwise authorized command. -/
+theorem invalid_runas_shell_no_exec (ctx : Context)
+    (hs : ctx.settings.runasCheckShell = true)
+    (hv : ctx.validShells.contains ctx.target.shell = false) :
+    ∀ p, (decide ctx).action ≠ .exec p := by
+  intro p hp
+  have he : earlyAction ctx = none := by
+    cases hx : earlyAction ctx with
+    | none => rfl
+    | some act =>
+      have ha : act = .exec p := by simpa [decide, hx] using hp
+      exact False.elim ((early_safe ctx act hx).1 p ha)
+  obtain ⟨a, rc, _, hm, _⟩ := exec_origin ctx p hp
+  have hv' : ctx.target.shell ∉ ctx.validShells := by simpa using hv
+  simp [earlyAction, hm, hs, hv'] at he
+  repeat' first | contradiction | (rcases branch_of_ite_eq he with he | he)
+
+/-- Exemption waives authentication but does not alter authorization. -/
+theorem exempt_user_no_auth (ctx : Context) (j : Judgement)
+    (h : userIsExempt ctx.settings ctx.invoking = true) :
+    authentication ctx j = .none := by
+  simp [authentication, policyNeedsAuth, h]
 
 /-- Disabling authentication also suppresses password prompts for denied commands;
 the independent authorization decision remains a denial. -/
