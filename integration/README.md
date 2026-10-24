@@ -8,8 +8,10 @@ reference), Ubuntu's sudo-rs, and our Lean binary.
 ```
 integration/run.sh reference                  # sudo.ws 1.9.17p2 (must pass 100%)
 integration/run.sh sudo-rs                    # optional comparison
-integration/run.sh .lake/build/bin/sudo       # any sudo binary on the host
-integration/run.sh .lake/build/bin/sudo 'tty-|env-'   # ERE filter on test names
+integration/run.sh --build                    # build lean-sudo for Linux in a container
+                                              # (integration/build.sh → .lake/linux/), then test it
+integration/run.sh .lake/linux/sudo          # any sudo binary on the host
+integration/run.sh .lake/linux/sudo 'tty-|env-'      # ERE filter on test names
 ```
 
 Output is TAP (`ok N - name` / `not ok N - name` + `#` diagnostics with expected

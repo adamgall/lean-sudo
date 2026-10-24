@@ -43,11 +43,14 @@ getpw*/getgr*  ├─► IO shell (Main.lean) ──► pure core (LeanSudo.Core
 | `LeanSudo/Sys/Pam.lean` (+ `c/core.c`) | PAM handle + conversation (tty / `-S` stdin / `-n`) |
 | `LeanSudo/Sys/Exec.lean` + `c/exec.c` | privilege drop, fork/execve/wait, signal relay, pty |
 | `LeanSudo/Sys/Timestamp.lean` + `c/ts.c` | timestamp file storage, boot clock, session/process identity |
-| `LeanSudo/Core.lean` | pure decision core (`decide`) + end-to-end theorems |
+| `LeanSudo/Core/Types.lean` | decision-core contract: `Context`, `Decision`, `ExecPlan`, `EditPlan`, `Action` |
+| `LeanSudo/Core.lean`, `LeanSudo/CoreProofs.lean` | pure decision core (`decide`) + end-to-end theorems |
 | `LeanSudo/Sudoers/Load.lean` | include resolution + file ownership/mode checks |
-| `Main.lean` | `sudo` / `sudoedit` entry point |
+| `Main.lean`, `LeanSudo/Shell.lean` | `sudo` / `sudoedit` entry point; IO shell (gathers the `Context`, runs PAM, executes the `Decision`) |
+| `LeanSudo/Sudoedit.lean`, `LeanSudo/Sudoedit/Check.lean`, `LeanSudo/Sys/Edit.lean` + `c/edit.c` | sudoedit: proved editor selection/copy-back checks; privilege-dropped file workers |
 | `Visudo.lean`, `LeanSudo/Visudo/Core.lean`, `LeanSudo/Visudo/Sys.lean` + `c/visudo.c` | `visudo` entry point; pure CLI/checks; lock, `O_EXCL` temp file, owner/mode |
-| `test/` | Lean unit-test executable (`lake exe tests`) |
+| `test/` | `Tests` library (`#guard` unit tests, checked by `lake build Tests`) and IO smoke executables |
+| `scripts/AxiomAudit.lean` | checks every `LeanSudo` declaration uses only the standard axioms |
 | `integration/` | Docker-based end-to-end suite (runs as real root in a container) |
 
 ## Sys API contract (Lean signatures)
@@ -190,7 +193,8 @@ Timestamp directory: `/run/lean-sudo/ts/<uid>`.
 ## Build
 
 ```
-lake build              # library + sudo exe (+ visudo)
-lake exe tests          # unit tests
-integration/run.sh      # docker end-to-end suite (needs docker)
+lake build LeanSudo Tests        # library, proofs, unit tests (Linux or macOS)
+lake build sudo visudo           # executables (Linux only; on macOS: integration/build.sh)
+lake env lean scripts/AxiomAudit.lean
+integration/run.sh --build       # docker end-to-end suite (needs docker)
 ```
