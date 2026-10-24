@@ -1,0 +1,3 @@
+# carol: a few specific commands; NOPASSWD as root, password needed as bob.
+carol	ALL = (root) NOPASSWD: /usr/bin/id, /usr/bin/whoami
+carol	ALL = (bob) /usr/bin/id

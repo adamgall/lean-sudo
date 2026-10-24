@@ -1,0 +1,3 @@
+# erin: group-only run-as rule, and SETENV for env(1).
+erin	ALL = (:adm) NOPASSWD: /usr/bin/id
+erin	ALL = (root) NOPASSWD: SETENV: /usr/bin/env

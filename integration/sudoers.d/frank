@@ -1,0 +1,2 @@
+# frank: argument matching. "" = no arguments allowed.
+frank	ALL = (root) NOPASSWD: /usr/bin/cat /etc/hostname, /usr/bin/ls /tmp/*, /usr/bin/true ""
