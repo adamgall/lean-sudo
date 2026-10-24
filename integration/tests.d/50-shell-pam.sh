@@ -230,3 +230,52 @@ EOF
   rm -f /etc/pam.d/shell-account-error
   end
 }
+
+begin shell_pam_validate_expired_account && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/shell-expired <<'EOF'
+Defaults:judy timestamp_type=global
+judy ALL=(root) /usr/bin/true
+EOF
+  chage -E 0 judy
+  run judy "printf 'judypw\n' | sudo -S -v"
+  expect_rc 1
+  expect_err_has 'account validation failure, is your account locked?'
+  chage -E -1 judy
+  run judy 'sudo -n /usr/bin/true'
+  expect_rc 1
+  expect_err_has 'a password is required'
+  end
+}
+
+begin shell_pam_list_expired_account && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/shell-expired <<'EOF'
+Defaults:judy timestamp_type=global
+judy ALL=(root) /usr/bin/true
+EOF
+  chage -E 0 judy
+  run judy "printf 'judypw\n' | sudo -S -l"
+  expect_rc 1
+  expect_err_has 'account validation failure, is your account locked?'
+  chage -E -1 judy
+  run judy 'sudo -n /usr/bin/true'
+  expect_rc 1
+  expect_err_has 'a password is required'
+  end
+}
+
+begin shell_sudo_conf_group_writable_ignored && {
+  cp -a /etc/sudo.conf "$WORK/shell-sudo.conf"
+  printf 'Path noexec /nonexistent/noexec.so\n' >/etc/sudo.conf
+  chown root:adm /etc/sudo.conf
+  chmod 0664 /etc/sudo.conf
+  install -m 0440 /dev/stdin /etc/sudoers.d/shell-noexec <<'EOF'
+judy ALL=(root) NOPASSWD: NOEXEC: /usr/bin/sh
+EOF
+  run judy 'sudo -n /usr/bin/sh -c /usr/bin/true'
+  expect_rc 126
+  expect_err_has 'sudo: /etc/sudo.conf is group writable'
+  expect_err_has 'Permission denied'
+  expect_err_lacks '/nonexistent/noexec.so'
+  cp -a "$WORK/shell-sudo.conf" /etc/sudo.conf
+  end
+}

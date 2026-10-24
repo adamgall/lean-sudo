@@ -169,7 +169,10 @@ previous mask. -/
 
 /-- Pin the executable and inspect that descriptor, not a second pathname lookup. -/
 @[extern "lean_sudo_open_command"] opaque openCommand (path : @& String) : IO (Nat × FileStat)
-@[extern "lean_sudo_close_command"] opaque closeCommand (fd : UInt32) : IO Unit
+/-- Open nonblocking, following symlinks, and return the opened descriptor's fstat.
+The caller checks ownership/type/mode before reading any bytes. -/
+@[extern "lean_sudo_open_readonly"] opaque openReadOnly (path : @& String) : IO (Nat × FileStat)
+@[extern "lean_sudo_close_descriptor"] opaque closeDescriptor (fd : UInt32) : IO Unit
 
 @[extern "lean_sudo_admin_flag"] private opaque adminFlagRaw (path : @& String)
     (uid gid : UInt32) (groups : @& Array Nat) : IO Unit

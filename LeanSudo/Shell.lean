@@ -628,7 +628,8 @@ private def execute (ctx : Core.Context) (decision : Core.Decision)
           cleanup do
             let _ ← Sys.stateMarker ctx.settings.lectureStatusDir ctx.invoking.uid true
             pure ()
-        if needsSession then account ctx h
+        -- Approval precedes timestamp renewal in validate/list modes too.
+        account ctx h
         let out ← if decision.updateTimestamp then do
             pure (some (Timestamp.encode (Timestamp.update (← Sys.bootTimeNanos)
               ctx.tsScope authUser.uid records)))
@@ -640,16 +641,30 @@ private def execute (ctx : Core.Context) (decision : Core.Decision)
   finally
     cleanup (Sys.pamEnd h 0)
 
+private def configuration : IO SudoConf.Config := do
+  let path := "/etc/sudo.conf"
+  if (← Sys.stat path).isNone then return {}
+  let opened ← try pure (some (← Sys.openReadOnly path)) catch e =>
+    warn e.toString
+    pure none
+  let some (fd, st) := opened | return {}
+  try
+    if let some problem := SudoConf.fileProblem st.uid st.mode then
+      warn (path ++ " " ++ problem)
+      return ← fromExcept (SudoConf.parseFile st.uid st.mode "")
+    -- Read the object whose fstat was approved, never reopen the pathname.
+    let (_, text) ← Sys.readFileFollow s!"/proc/self/fd/{fd}"
+    fromExcept (SudoConf.parseFile st.uid st.mode text)
+  finally
+    Sys.closeDescriptor fd.toUInt32
+
 /-- `/proc/self/cmdline` preserves argv[0] (unlike the executable's realpath) and
 lets us reject invalid UTF-8 before decoded Lean arguments reach policy. -/
 def run (args : List String) : IO UInt32 := do
   try
     Sys.initializeProcess false
     I18n.initializeLocale
-    let conf ← if (← Sys.stat "/etc/sudo.conf").isSome then do
-        let (_, text) ← Sys.readFileFollow "/etc/sudo.conf"
-        fromExcept (SudoConf.parse text)
-      else pure {}
+    let conf ← configuration
     Sys.initializeProcess conf.disableCoredump
     if (← Sys.geteuid) != 0 then
       if ← Sys.noNewPrivs then
@@ -698,7 +713,7 @@ def run (args : List String) : IO UInt32 := do
     let ctx ← context progname opts conf
     let status ← try execute ctx (Core.decide ctx) conf
       finally
-        if let some fd := ctx.execFd then cleanup (Sys.closeCommand fd.toUInt32)
+        if let some fd := ctx.execFd then cleanup (Sys.closeDescriptor fd.toUInt32)
     Sys.exitWith status
   catch e =>
     warn e.toString

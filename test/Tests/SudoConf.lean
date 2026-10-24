@@ -21,3 +21,15 @@ open LeanSudo
 #guard (SudoConf.parse "Path askpass \\\n/helper\nDebug sudo /tmp/debug all@debug").toOption.map (·.askpass) == some (some "/helper")
 #guard expandPrompt "%h/%H %u %U %p %%" "alice" "root" "host.example.com" "alice" ==
   "host/host.example.com alice root alice %"
+
+#guard SudoConf.fileProblem 1000 0o100666 == some "is owned by uid 1000, should be 0"
+#guard SudoConf.fileProblem 0 0o100666 == some "is world writable"
+#guard SudoConf.fileProblem 0 0o100664 == some "is group writable"
+#guard SudoConf.fileProblem 0 0o040755 == some "is not a regular file"
+#guard SudoConf.fileProblem 0 0o100644 == none
+#guard (SudoConf.parseFile 0 0o100664 "Path noexec /nonexistent").toOption == some {}
+#guard (SudoConf.parseFile 1000 0o100644 "Plugin evil /evil.so").toOption == some {}
+#guard (SudoConf.parseFile 0 0o100666 "Plugin evil /evil.so").toOption == some {}
+#guard !(SudoConf.parseFile 0 0o100644 "Plugin evil /evil.so").isOk
+#guard (SudoConf.parseFile 0 0o100644 "Path noexec /safe").toOption.map (·.noexec) ==
+  some (some "/safe")

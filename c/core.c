@@ -616,13 +616,18 @@ LEAN_EXPORT lean_obj_res lean_sudo_no_new_privs(void) {
     return io_ok(lean_box(prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1));
 }
 
-LEAN_EXPORT lean_obj_res lean_sudo_open_command(b_lean_obj_arg path) {
+static lean_obj_res open_readonly(b_lean_obj_arg path, bool regular) {
     const char *p = cstr_arg(path);
     if (!p) return io_err(NUL_ARG_ERROR);
     int fd = open(p, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
     if (fd < 0) return io_errno_path("unable to open", p, errno);
     struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    if (fstat(fd, &st) != 0) {
+        int saved = errno;
+        close(fd);
+        return io_errno_path("unable to stat", p, saved);
+    }
+    if (regular && !S_ISREG(st.st_mode)) {
         close(fd);
         return io_err("command is not a regular file");
     }
@@ -635,8 +640,16 @@ LEAN_EXPORT lean_obj_res lean_sudo_open_command(b_lean_obj_arg path) {
     return io_ok(mk_pair(mk_nat((uint64_t)fd), mk_filestat(&st)));
 }
 
-LEAN_EXPORT lean_obj_res lean_sudo_close_command(uint32_t fd) {
-    if (fd < 3 || fd > INT_MAX) return io_err("invalid command descriptor");
+LEAN_EXPORT lean_obj_res lean_sudo_open_command(b_lean_obj_arg path) {
+    return open_readonly(path, true);
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_open_readonly(b_lean_obj_arg path) {
+    return open_readonly(path, false);
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_close_descriptor(uint32_t fd) {
+    if (fd < 3 || fd > INT_MAX) return io_err("invalid file descriptor");
     if (close((int)fd) != 0) return io_errno(errno);
     return io_ok(lean_box(0));
 }

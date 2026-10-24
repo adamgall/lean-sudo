@@ -68,6 +68,27 @@ def parse (text : String) : Except String Config := do
     line c (((s.splitOn "#").headD "").splitOn " " |>.flatMap (·.splitOn "\t")
       |>.map (·.trimAscii.toString) |>.filter (!·.isEmpty))) {}
 
+/-- sudo.conf uses sudo_secure_fd with uid 0 and no trusted group: even
+root-group write permission is rejected. Diagnostic precedence matches sudo. -/
+def fileProblem (uid mode : Nat) : Option String :=
+  if mode &&& 0o170000 != 0o100000 then some "is not a regular file"
+  else if uid != 0 then some s!"is owned by uid {uid}, should be 0"
+  else if mode &&& 0o002 != 0 then some "is world writable"
+  else if mode &&& 0o020 != 0 then some "is group writable"
+  else none
+
+/-- An insecure front-end configuration is ignored, not parsed. This differs
+from the deliberately fatal handling of insecure sudoers policy files. -/
+def parseFile (uid mode : Nat) (text : String) : Except String Config :=
+  match fileProblem uid mode with
+  | some _ => .ok {}
+  | none => parse text
+
+theorem insecure_file_uses_defaults (uid mode : Nat) (text problem : String)
+    (h : fileProblem uid mode = some problem) :
+    parseFile uid mode text = .ok {} := by
+  simp [parseFile, h]
+
 /-- Extra arguments can change plugin semantics and cannot be silently discarded. -/
 theorem plugin_arguments_refused (symbol path : String) (arg : String) (args : List String) :
     supportedPlugin symbol path (arg :: args) = false := by
