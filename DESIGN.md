@@ -46,7 +46,7 @@ getpw*/getgr*  ├─► IO shell (Main.lean) ──► pure core (LeanSudo.Core
 | `LeanSudo/Core.lean` | pure decision core (`decide`) + end-to-end theorems |
 | `LeanSudo/Sudoers/Load.lean` | include resolution + file ownership/mode checks |
 | `Main.lean` | `sudo` / `sudoedit` entry point |
-| `Visudo.lean` | `visudo` entry point |
+| `Visudo.lean`, `LeanSudo/Visudo/Core.lean`, `LeanSudo/Visudo/Sys.lean` + `c/visudo.c` | `visudo` entry point; pure CLI/checks; lock, `O_EXCL` temp file, owner/mode |
 | `test/` | Lean unit-test executable (`lake exe tests`) |
 | `integration/` | Docker-based end-to-end suite (runs as real root in a container) |
 

@@ -2,11 +2,14 @@
 # Run the end-to-end sudo suite in a throwaway container.
 #
 #   integration/run.sh <impl> [test-name-filter]
+#   integration/run.sh --visudo reference|<path-to-visudo> [test-name-filter]
 #
 # <impl>:  reference   original sudo.ws (Ubuntu package `sudo`, /usr/bin/sudo.ws)
 #          sudo-rs     Ubuntu's sudo-rs (/usr/lib/cargo/bin/sudo)
 #          <path>      a sudo binary on the host, e.g. .lake/build/bin/sudo
 # filter:  extended regex matched against test names (e.g. 'tty-|env-').
+# --visudo runs visudo-tests.sh (copied in) instead of tests.sh, against
+#          /usr/sbin/visudo.ws (reference) or a host visudo binary.
 #
 # Environment: SUDO_IT_BASE (base image, default ubuntu:26.04, falls back to
 # ubuntu:devel), SUDO_IT_IMAGE (image tag, default lean-sudo-it).
@@ -14,7 +17,9 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-usage() { echo "usage: $0 reference|sudo-rs|<path-to-sudo-binary> [test-name-filter]" >&2; exit 2; }
+usage() { echo "usage: $0 [--visudo] reference|sudo-rs|<path-to-binary> [test-name-filter]" >&2; exit 2; }
+visudo=0
+if [[ ${1:-} == --visudo ]]; then visudo=1; shift; fi
 [[ $# -ge 1 && $# -le 2 ]] || usage
 impl=$1
 filter=${2:-}
@@ -34,6 +39,18 @@ case $impl in
     ;;
 esac
 
+# --- visudo suite hook ------------------------------------------------------
+entry=()
+if [[ $visudo == 1 ]]; then
+  case $impl in
+    reference) bin=/usr/sbin/visudo.ws; label=visudo-reference ;;
+    sudo-rs)   usage ;;
+    *)         bin=/opt/impl/visudo; label=visudo-$(basename "$host_bin")
+               [[ $label == visudo-visudo ]] && label=custom-visudo ;;
+  esac
+  entry=(--entrypoint /opt/impl/visudo-tests.sh)
+fi
+
 mkdir -p "$here/out"
 buildlog="$here/out/build.log"
 build() {
@@ -51,11 +68,14 @@ cid=$(docker create \
   --hostname sudo-it --network none \
   -v "$here/out:/out" \
   -e IMPL_LABEL="$label" -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-  "$image" "$bin" "$filter")
+  "${entry[@]}" "$image" "$bin" "$filter")
 trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 
 if [[ -n $host_bin ]]; then
-  docker cp -q "$host_bin" "$cid:/opt/impl/sudo"
+  docker cp -q "$host_bin" "$cid:$bin"
+fi
+if [[ $visudo == 1 ]]; then
+  docker cp -q "$here/visudo-tests.sh" "$cid:/opt/impl/visudo-tests.sh"
 fi
 
 set +e

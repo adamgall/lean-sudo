@@ -158,3 +158,39 @@ All observed with sudo.ws 1.9.17p2 on Ubuntu 26.04; the tests assert these.
 (wildcards in arguments), and uses different messages throughout
 (`[sudo: authenticate] Password:`, `I'm sorry carol. I'm afraid I can't do
 that`, `interactive authentication is required`, …).
+
+## visudo suite
+
+```
+integration/run.sh --visudo reference                 # sudo.ws's /usr/sbin/visudo.ws (44 pass, 3 skipped)
+integration/run.sh --visudo .lake/build/bin/visudo    # lean-sudo's visudo
+integration/run.sh --visudo .lake/build/bin/visudo 'edit-'
+```
+
+Same image; `run.sh` copies `visudo-tests.sh` and the binary into the
+container and uses the script as entrypoint. It runs visudo directly as root
+(`env -i`, scripted `$EDITOR`s that append a line, do nothing, empty the file
+or wait for a release file; `What now?` answers on stdin) and restores
+`/etc/sudoers{,.d}` before every test. Logs: `out/visudo-reference.*`,
+`out/custom-visudo.*`.
+
+Covered: `-c` on the stock policy (exact `parsed OK` lines), `-c -q`, `-f -`,
+syntax errors in `/etc/sudoers` and in `sudoers.d`, wrong owner/mode
+(checked by default, only with `-O`/`-P` when `-f` is given), missing
+`@include`, duplicate aliases, bad/unknown `Defaults`; edit mode: valid
+append installed `0440 root:root`, syntax/semantic error then `x`, EOF, `e`
+then `x`, unknown answer, `Q` (installs anyway), unchanged file, zero-length
+file, `$EDITOR` words and the `--` before the file, `SUDO_EDITOR` precedence,
+missing editor, `!env_editor` + `editor` list, no usable editor, a second
+visudo while the first one's editor runs (busy), `-f` new file, `-f` keeps
+owner/mode unless `-O`, non-root refused; `-h`, `-V`, usage errors.
+
+Observed sudo.ws visudo behaviour the tests encode: `x`/EOF/`Q` exit 0;
+unchanged ⇒ `visudo: /etc/sudoers.tmp unchanged`, exit 0; the editor's exit
+status is ignored; `-I` does not affect `-c`; unreadable `sudoers.d` entries
+are warned about and skipped. lean-sudo-only tests (skipped for the
+reference): its lock (`F_OFD_SETLK`) and sudo.ws's `fcntl` lock exclude each
+other in both directions, and a stale `/etc/sudoers.tmp` means busy (sudo.ws
+truncates and reuses it). Deliberate difference: undefined aliases, alias
+cycles and `Defaults` lean-sudo refuses (e.g. `noexec`) are errors (sudo.ws
+warns or accepts), because lean-sudo's `sudo` would refuse such a policy.
