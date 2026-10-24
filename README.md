@@ -273,4 +273,4 @@ Core Lean only: no Mathlib, no Batteries. The toolchain is pinned in `lean-toolc
 
 ## License
 
-To be decided.
+Licensed under the [Apache License, Version 2.0](LICENSE).
