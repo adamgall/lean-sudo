@@ -23,6 +23,46 @@ Requirements: docker (the invoking user in the `docker` group). Variables:
 `ubuntu:devel` if that build fails), `SUDO_IT_IMAGE` (tag, default
 `lean-sudo-it`).
 
+### Building the Linux executables on macOS
+
+```
+integration/run.sh --build                    # build sudo/visudo, then run the sudo suite
+integration/run.sh --visudo .lake/linux/visudo
+```
+
+`integration/build.sh` builds the current working tree in an arm64 Ubuntu 26.04
+container and exports the Linux binaries to `.lake/linux/`. Pure Lean modules and
+the entry point can be type-checked natively with `lake build LeanSudo` followed
+by `lake env lean Main.lean`; do not build the Linux C shim natively on macOS.
+
+### IO shell boundaries
+
+`Main.lean` delegates to `LeanSudo.Shell`: it collects account/process facts,
+loads and validates sudoers, resolves command paths without changing the executable
+name, then executes `Core.decide`'s result. Authentication is rechecked under the
+timestamp-file lock; successful authenticated requests refresh the cache only
+after PAM account management succeeds for execution/editing. PAM credentials and
+sessions are bracketed around command execution, including failure paths. PAM
+unavailability is fatal even for NOPASSWD execution.
+
+Linux `/proc/self/cmdline` supplies the original argv[0] (so the `sudoedit` symlink
+is preserved) and raw bytes for UTF-8 validation. In addition to invalid raw UTF-8,
+the shell conservatively refuses a decoded U+FFFD replacement character, including
+a deliberately supplied valid U+FFFD. Invalid UTF-8 environment entries are dropped
+by the existing Sys interface. An unreadable process identity also fails closed
+instead of creating timestamp entries that could survive PID reuse. Unsupported
+Defaults warnings for known ignored settings, such as Ubuntu's `mail_badpass`,
+are suppressed; unsupported security-relevant settings still fail validation.
+
+These boundaries retain the documented fail-closed syntax-error deviation from
+sudo.ws. No sudo test expectations were changed for the IO shell. The visudo
+suite's `STOCK_OK` list is now derived from eligible files in `/etc/sudoers.d`,
+using sudo's filename exclusions. The alias-denial regression added `gina`, but
+the three exact-output stock-policy checks had not been updated. Both
+implementations correctly report the extra parsed file; this fixes a stale test
+expectation and also accommodates the sudoedit fixtures without weakening the
+exact-output assertion.
+
 ## How it works
 
 * `Dockerfile` installs `sudo` (sudo.ws, shipped as `/usr/bin/sudo.ws` on

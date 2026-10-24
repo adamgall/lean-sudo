@@ -915,6 +915,168 @@ begin binary-without-setuid-bit && {
   end
 }
 
+# --- sudoedit ---
+# Editors are root-installed, but must execute with henry's credentials.
+edit_setup() {
+  rm -f /etc/henryfile /etc/henrynew /etc/henrylink
+  printf 'original\n' >/etc/henryfile
+  chmod 0644 /etc/henryfile
+  cat >/usr/local/bin/henry-editor <<'EOF'
+#!/bin/sh
+test "$(id -u)" = "$(id -u henry)" || exit 90
+test "$(stat -c %u "$1")" = "$(id -u henry)" || exit 91
+test "$(stat -c %a "$1")" = 600 || exit 92
+printf 'edited\n' >>"$1"
+EOF
+  chmod 0755 /usr/local/bin/henry-editor
+}
+
+begin sudoedit-edits-as-invoker-preserves-root-owner && {
+  edit_setup
+  run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /etc/henryfile'
+  expect_rc 0
+  [[ $(cat /etc/henryfile) == $'original\nedited' ]] || fail "edited contents missing"
+  [[ $(stat -c %u:%g:%a /etc/henryfile) == 0:0:644 ]] || fail "original ownership/mode changed"
+  end
+}
+
+begin sudoedit-unchanged-message && {
+  edit_setup
+  run henry 'SUDO_EDITOR=/usr/bin/true sudoedit -n /etc/henryfile'
+  expect_rc 0
+  expect_err_has 'sudoedit: /etc/henryfile unchanged'
+  [[ $(cat /etc/henryfile) == original ]] || fail "unchanged original modified"
+  end
+}
+
+begin sudoedit-refuses-symlink && {
+  edit_setup
+  ln -s /etc/henryfile /etc/henrylink
+  run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /etc/henrylink'
+  expect_rc 1
+  expect_err_has '/etc/henrylink: editing symbolic links is not permitted'
+  [[ $(cat /etc/henryfile) == original ]] || fail "symlink target modified"
+  end
+}
+
+begin sudoedit-refuses-user-writable-directory && {
+  edit_setup
+  mkdir -p /home/henry/unsafe
+  chown henry:henry /home/henry/unsafe
+  printf 'original\n' >/home/henry/unsafe/file
+  run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /home/henry/unsafe/file'
+  expect_rc 1
+  expect_err_has 'editing files in a writable directory is not permitted'
+  [[ $(cat /home/henry/unsafe/file) == original ]] || fail "unsafe file modified"
+  end
+}
+
+begin sudoedit-denies-unlisted-file && {
+  edit_setup
+  run henry "printf 'henrypw\n' | SUDO_EDITOR=/usr/bin/true sudoedit -S /etc/hostname"
+  expect_rc 1
+  expect_err_has "Sorry, user henry is not allowed to execute 'sudoedit /etc/hostname' as root"
+  end
+}
+
+begin sudoedit-sudo-e-form && {
+  edit_setup
+  run henry 'EDITOR=/usr/local/bin/henry-editor sudo -n -e /etc/henryfile'
+  expect_rc 0
+  [[ $(cat /etc/henryfile) == $'original\nedited' ]] || fail "sudo -e did not edit"
+  end
+}
+
+begin sudoedit-creates-new-file && {
+  edit_setup
+  run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /etc/henrynew'
+  expect_rc 0
+  [[ $(cat /etc/henrynew) == edited ]] || fail "new file contents missing"
+  [[ $(stat -c %u:%g:%a /etc/henrynew) == 0:0:644 ]] || fail "new file ownership/mode incorrect"
+  end
+}
+
+begin sudoedit-editor-path-lookup && {
+  edit_setup
+  run henry 'SUDO_EDITOR=henry-editor sudoedit -n /etc/henryfile'
+  expect_rc 0
+  [[ $(cat /etc/henryfile) == $'original\nedited' ]] || fail "PATH editor did not edit"
+  end
+}
+
+begin sudoedit-editor-failure-status && {
+  edit_setup
+  run henry 'SUDO_EDITOR=/usr/bin/false sudoedit -n /etc/henryfile'
+  expect_rc 1
+  [[ $(cat /etc/henryfile) == original ]] || fail "failed editor changed original"
+  end
+}
+
+begin sudoedit-refuses-nonregular-file && {
+  edit_setup
+  mkdir -p /etc/henrydir
+  run henry 'SUDO_EDITOR=/usr/bin/true sudoedit -n /etc/henrydir'
+  expect_rc 1
+  expect_err_has '/etc/henrydir: not a regular file'
+  end
+}
+
+begin sudoedit-refuses-replaced-temp-symlink && {
+  edit_setup
+  cat >/usr/local/bin/henry-editor <<'EOF'
+#!/bin/sh
+rm -f "$1"
+ln -s /etc/hostname "$1"
+EOF
+  run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /etc/henryfile'
+  expect_rc 1
+  [[ $(cat /etc/henryfile) == original ]] || fail "unsafe temporary file copied back"
+  end
+}
+
+begin sudoedit-rejects-editor-file-injection && {
+  edit_setup
+  run henry 'SUDO_EDITOR="/usr/bin/true -- /etc/hostname" sudoedit -n /etc/henryfile'
+  expect_rc 1
+  [[ $(cat /etc/henryfile) == original ]] || fail "injected editor changed original"
+  end
+}
+
+begin sudoedit-writeback-as-target-retains-edits-on-error && {
+  edit_setup
+  run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n -u gina /etc/henryfile'
+  expect_rc 1
+  expect_err_has 'Permission denied'
+  expect_err_has 'contents of edit session left in '
+  [[ $(cat /etc/henryfile) == original ]] || fail "writeback failure damaged original"
+  saved=$(printf '%s\n' "$ERR" | sed -n 's/^.*contents of edit session left in //p')
+  [[ -f $saved && $(cat "$saved") == $'original\nedited' ]] || fail "edited temporary contents not retained"
+  [[ -z $saved ]] || rm -f "$saved"
+  end
+}
+
+begin sudoedit-refuses-itself-as-editor && {
+  edit_setup
+  run henry 'SUDO_EDITOR=/usr/bin/sudoedit sudoedit -n /etc/henryfile'
+  expect_rc 1
+  [[ $(cat /etc/henryfile) == original ]] || fail "recursive editor modified original"
+  end
+}
+
+begin sudoedit-refuses-owned-directory-without-write-bit && {
+  edit_setup
+  mkdir -p /etc/henryowned
+  printf 'original\n' >/etc/henryowned/file
+  chown henry:henry /etc/henryowned
+  chmod 0555 /etc/henryowned
+  run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /etc/henryowned/file'
+  expect_rc 1
+  expect_err_has 'editing files in a writable directory is not permitted'
+  [[ $(cat /etc/henryowned/file) == original ]] || fail "owned-directory file modified"
+  end
+}
+# --- end sudoedit ---
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------

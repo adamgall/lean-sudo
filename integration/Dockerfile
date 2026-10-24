@@ -15,9 +15,9 @@ RUN apt-get update \
 # Test users. alice is in the stock `%sudo` rule; the others get rules from
 # /etc/sudoers.d (fixtures below). bob has no sudo rights at all.
 RUN set -eu; \
-    for u in alice bob carol dave erin frank gina; do useradd -m -s /bin/bash "$u"; done; \
+    for u in alice bob carol dave erin frank gina henry; do useradd -m -s /bin/bash "$u"; done; \
     usermod -aG sudo alice; \
-    printf '%s\n' alice:alicepw bob:bobpw carol:carolpw dave:davepw erin:erinpw frank:frankpw gina:ginapw \
+    printf '%s\n' alice:alicepw bob:bobpw carol:carolpw dave:davepw erin:erinpw frank:frankpw gina:ginapw henry:henrypw \
       | chpasswd
 
 COPY sudoers.d/ /opt/sudo-it/sudoers.d/

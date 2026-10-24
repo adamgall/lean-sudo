@@ -19,3 +19,7 @@ import LeanSudo.Sys.Exec
 import LeanSudo.Sys.Timestamp
 import LeanSudo.Visudo.Core
 import LeanSudo.Visudo.Sys
+import LeanSudo.Core
+import LeanSudo.CoreProofs
+import LeanSudo.Shell
+import LeanSudo.Sudoedit

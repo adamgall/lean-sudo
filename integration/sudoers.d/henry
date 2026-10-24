@@ -1,0 +1,4 @@
+# sudoedit exercises: explicit paths, including intentionally unsafe inputs.
+henry ALL = (root) NOPASSWD: sudoedit /etc/henryfile, sudoedit /etc/henrynew, sudoedit /etc/henrylink, sudoedit /home/henry/unsafe/file, sudoedit /etc/henrydir
+henry ALL = (gina) NOPASSWD: sudoedit /etc/henryfile
+henry ALL = (root) NOPASSWD: sudoedit /etc/henryowned/file

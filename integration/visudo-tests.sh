@@ -175,12 +175,15 @@ end() {
   fi
 }
 
-STOCK_OK="/etc/sudoers: parsed OK
-/etc/sudoers.d/README: parsed OK
-/etc/sudoers.d/carol: parsed OK
-/etc/sudoers.d/dave: parsed OK
-/etc/sudoers.d/erin: parsed OK
-/etc/sudoers.d/frank: parsed OK"
+# Match every eligible fixture, including fixtures added by sudo's regression suite.
+# Keep an exact output assertion: includedir ignores names containing '.' or ending '~'.
+STOCK_OK=$(
+  printf '/etc/sudoers: parsed OK\n'
+  for file in /etc/sudoers.d/*; do
+    case "${file##*/}" in *.*|*~) continue ;; esac
+    [[ -f $file ]] && printf '%s: parsed OK\n' "$file"
+  done
+)
 SYNTAX_LINE=$(($(wc -l </etc/sudoers) + 1))
 
 # ===========================================================================
