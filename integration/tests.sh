@@ -836,7 +836,7 @@ begin sudoers-main-syntax-error-reported && {
 begin sudoers-world-writable-include-ignored && {
   # Reference: warns '<file> is world writable' and skips that file; other
   # sources still apply. The grant in the bad file must never take effect.
-  # Tolerant: refusing to run at all is also accepted.
+  # lean-sudo refuses outright rather than dropping a possible denial.
   printf 'bob ALL=(ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/zz-ww
   chmod 0666 /etc/sudoers.d/zz-ww
   run bob "sudo -n id -u"
@@ -848,7 +848,7 @@ begin sudoers-world-writable-include-ignored && {
 
 begin sudoers-group-writable-nonroot-group-ignored && {
   # Reference: a group-writable file whose group is not root is skipped with
-  # 'is owned by gid N, should be 0'. Tolerant on the wording.
+  # 'is owned by gid N, should be 0'. lean-sudo refuses; wording is tolerant.
   printf 'bob ALL=(ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/zz-gw
   chgrp bob /etc/sudoers.d/zz-gw
   chmod 0460 /etc/sudoers.d/zz-gw
@@ -860,6 +860,7 @@ begin sudoers-group-writable-nonroot-group-ignored && {
 }
 
 begin sudoers-include-owned-by-nonroot-ignored && {
+  # Reference skips the insecure include; lean-sudo refuses outright.
   printf 'bob ALL=(ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/zz-own
   chown bob:root /etc/sudoers.d/zz-own
   chmod 0440 /etc/sudoers.d/zz-own
@@ -1076,6 +1077,55 @@ begin sudoedit-refuses-owned-directory-without-write-bit && {
   end
 }
 # --- end sudoedit ---
+
+# --- security boundary regressions -----------------------------------------
+
+begin exec-symlink-swap-during-prompt && {
+  # Keep stdin open until after the swap, so authentication brackets the race.
+  # Wait for sudo itself so a failed launch cannot masquerade as a successful test.
+  run carol 'mkdir -p ~/x; printf "#!/bin/sh\necho pwned\n" > ~/evil; chmod +x ~/evil; ln -sf /usr/bin/id ~/x/id; ( sleep 1; echo carolpw ) | sudo -S -u bob ~/x/id & pid=$!; sleep 0.4; ln -sfn ~/evil ~/x/id; wait "$pid"'
+  expect_err_has '[sudo] password for carol:'
+  # sudo.ws may recheck the path after authentication and refuse the swap.
+  if [[ $RC == 0 ]]; then
+    expect_out_has "uid=$(uid_of bob)(bob)"
+  else
+    expect_rc 1
+    expect_out_empty
+    expect_err_has 'not allowed to execute'
+  fi
+  expect_out_lacks pwned
+  end
+}
+
+begin requiretty-refuses-unrelated-stdin-pty && {
+  printf 'Defaults:carol requiretty\n' >/etc/sudoers.d/zz-requiretty
+  chmod 0440 /etc/sudoers.d/zz-requiretty
+  # A slave inherited after setsid is a tty fd, but not a controlling terminal.
+  # subprocess keeps stdout/stderr in the harness, so refusal remains observable.
+  cat >"$WORK/no-controlling-tty.py" <<'EOF'
+import os
+import pty
+import subprocess
+import sys
+
+master, slave = pty.openpty()
+try:
+    result = subprocess.run(
+        ["sudo", "-n", "id", "-u"], stdin=slave, start_new_session=True
+    )
+finally:
+    os.close(slave)
+    os.close(master)
+sys.exit(result.returncode)
+EOF
+  run carol "python3 '$WORK/no-controlling-tty.py'"
+  expect_rc 1
+  expect_out_empty
+  expect_err_has 'sorry, you must have a tty to run sudo'
+  end
+}
+
+# --- end security boundary regressions -------------------------------------
 
 # ---------------------------------------------------------------------------
 # Summary

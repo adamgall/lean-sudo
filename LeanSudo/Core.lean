@@ -14,6 +14,11 @@ not permitted; the command check itself is silent, as in sudo 1.9.17p2.
 Before policy evaluation, sudoedit rejects nonabsolute paths and empty, `.` or `..`
 components after resolving relative operands against cwd. This deliberate fail-closed
 restriction prevents textual policy matching from authorizing a different filesystem path.
+Execution uses the command's lookup-time canonical path, the realpath used by policy
+matching, rather than the user-controlled lookup path: repointing a lookup symlink
+during authentication must not select a different executable. The original argv0
+is preserved for multicall dispatch; command displays and SUDO_COMMAND retain the
+lookup path. This does not pin an inode against replacement of the canonical file.
 -/
 namespace LeanSudo.Core
 
@@ -95,7 +100,7 @@ def pamService (ctx : Context) : String :=
   if ctx.opts.login then ctx.settings.pamLoginService else ctx.settings.pamService
 
 def execPlan (ctx : Context) (a : Allowed) (rc : ResolvedCmd) : ExecPlan :=
-  { path := rc.path, argv := rc.argv0 :: rc.args, envInput := environment ctx a,
+  { path := rc.canonical, argv := rc.argv0 :: rc.args, envInput := environment ctx a,
     uid := ctx.target.uid, gid := targetGid ctx, groups := targetGroups ctx,
     cwd := if ctx.opts.login then some ctx.target.home else
       ctx.opts.chdir.or (a.cwd.join), umask := commandUmask ctx,

@@ -185,8 +185,17 @@ Timestamp directory: `/run/lean-sudo/ts/<uid>`.
 ## Fail-closed rules
 
 * Unsupported sudoers constructs are parse errors (see `Ast.lean`).
-* Any sudoers file not owned by uid 0, writable by group/other, or not a regular
-  file ⇒ refuse to run (as sudo does).
+* Every sudoers source must be a regular file owned by uid 0, not world-writable,
+  and group-writable only when owned by gid 0. Included directories must be real
+  directories with the same ownership/mode restrictions. Any violation ⇒ refuse
+  to run, including in an included file/directory: skipping it could discard a
+  denial and widen policy. Unlike sudo, insecure includes are fatal, not skipped.
+* `requiretty`, PAM_TTY and log TTY use only a terminal whose device matches the
+  process's controlling terminal, never an unrelated pty supplied on stdin.
+* Timestamp-based authentication waivers are rechecked under the timestamp lock;
+  invalidated or expired records require authentication, including with `-N`.
+  Failed authentication never refreshes a record, and `-N` never writes one.
+* PAM cleanup failures are warnings and preserve the command's exit status.
 * Non-UTF-8 command-line arguments ⇒ refuse to run (Lean `String`s are UTF-8).
 * Not running with euid 0 ⇒ the standard sudo "effective uid is not 0" error.
 

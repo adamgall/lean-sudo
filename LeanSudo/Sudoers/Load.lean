@@ -81,8 +81,8 @@ def readSource (path : String) : IO Source := do
     | .ok entries => return .parsed entries
     | .error err => throw <| IO.userError err.toString
 
-/-- Directory policy for `@includedir`: a real directory owned by root and not
-world-writable (sudo skips the whole directory otherwise). -/
+/-- Directory policy for `@includedir`: a real directory owned by root, not
+world-writable, and group-writable only when owned by gid 0. Violations are fatal. -/
 def checkDirPerms (path : String) (st : FileStat) : Except String Unit :=
   if !st.isDir then .error s!"{path} is not a directory"
   else if st.uid != 0 then .error s!"{path} is owned by uid {st.uid}, should be 0"
@@ -94,46 +94,42 @@ def checkDirPerms (path : String) (st : FileStat) : Except String Unit :=
 mutual
 /-- Load `path` and splice includes, depth-bounded.
 
-An *included* file that fails the ownership/mode policy is skipped with a warning
-(as sudo does: its contents are attacker-controllable, so neither its grants nor its
-denials can be trusted). The main sudoers file failing the policy is fatal. Syntax
-errors anywhere are fatal (stricter than sudo, which keeps the parsable part). -/
-partial def loadFile (warn : String → IO Unit) (host : String) (depth : Nat) (path : String) :
+Ownership/mode violations and syntax errors anywhere are fatal. Skipping an
+insecure included source could discard a denial and widen the policy. -/
+partial def loadFile (host : String) (depth : Nat) (path : String) :
     IO (List Located) := do
   if depth > maxDepth then
     throw <| IO.userError s!"{path}: too many levels of includes"
   let entries ← match ← readSource path with
     | .parsed es => pure es
-    | .insecure msg =>
-      if depth == 0 then throw <| IO.userError msg
-      else do warn msg; return []
+    | .insecure msg => throw <| IO.userError msg
   let mut out : Array Located := #[]
   for loc in entries do
     match loc.entry with
     | .include raw =>
-      out := out ++ (← loadFile warn host (depth + 1) (resolveIncludePath path host raw))
+      out := out ++ (← loadFile host (depth + 1) (resolveIncludePath path host raw))
     | .includeDir raw =>
-      out := out ++ (← loadDir warn host (depth + 1) (resolveIncludePath path host raw))
+      out := out ++ (← loadDir host (depth + 1) (resolveIncludePath path host raw))
     | _ => out := out.push loc
   return out.toList
 
-partial def loadDir (warn : String → IO Unit) (host : String) (depth : Nat) (dir : String) :
+partial def loadDir (host : String) (depth : Nat) (dir : String) :
     IO (List Located) := do
   -- A missing include directory is not an error (sudo ignores it).
   let some st ← lstat dir | return []
   match checkDirPerms dir st with
-  | .error msg => warn msg; return []
+  | .error msg => throw <| IO.userError msg
   | .ok () => pure ()
   let names ← listDir dir
   let mut out : Array Located := #[]
   for name in sortNames (names.filter includeDirEntryOk) do
-    out := out ++ (← loadFile warn host depth (dir ++ "/" ++ name))
+    out := out ++ (← loadFile host depth (dir ++ "/" ++ name))
   return out.toList
 end
 
 /-- Load the complete policy starting at `/etc/sudoers` (or `path`). -/
-def load (warn : String → IO Unit) (host : String) (path : String := mainSudoersPath) :
+def load (host : String) (path : String := mainSudoersPath) :
     IO (List Located) :=
-  loadFile warn host 0 path
+  loadFile host 0 path
 
 end LeanSudo.Sudoers

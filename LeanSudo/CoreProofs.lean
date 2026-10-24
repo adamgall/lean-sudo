@@ -23,7 +23,8 @@ theorem exec_origin (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .e
     ∃ a rc, evaluate ctx.sudoers ctx.settings (request ctx) = .allow a ∧
       ctx.opts.mode = .run ∧ ctx.command = some rc ∧ p = execPlan ctx a rc ∧
       (∃ env, buildEnv (environment ctx a) = .ok env) ∧
-      decide ctx = policyDecision ctx (.allow a) := by
+      decide ctx = policyDecision ctx (.allow a) ∧
+      (request ctx).command = .run rc.path p.path rc.args ∧ p.argv.tail = rc.args := by
   unfold decide at h ⊢
   cases he : earlyAction ctx with
   | some act => simp only [he] at h; exact False.elim ((early_safe ctx act he).1 p h)
@@ -46,7 +47,9 @@ theorem exec_origin (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .e
             | error e => simp [hb] at h
             | ok env =>
               simp only [hb, Action.exec.injEq] at h
-              exact ⟨a, rc, rfl, hm, rfl, h.symm, ⟨env, hb⟩, rfl⟩
+              refine ⟨a, rc, rfl, hm, rfl, h.symm, ⟨env, hb⟩, rfl, ?_, ?_⟩
+              · simp [← h, request, hm, runCommand, hc, execPlan]
+              · simp [← h, execPlan]
       all_goals repeat' first | split at h | cases h
 
 /-- Editing is authorized for precisely the absolute file list in the returned plan. -/
@@ -78,10 +81,17 @@ theorem edit_origin (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .e
       all_goals repeat' first | split at h | cases h
 
 theorem exec_allowed (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .exec p) :
-    ∃ a canonical args, evaluate ctx.sudoers ctx.settings (request ctx) = .allow a ∧
-      (request ctx).command = .run p.path canonical args ∧ p.argv.tail = args := by
-  obtain ⟨a, rc, ha, hm, hc, rfl, _, _⟩ := exec_origin ctx p h
-  exact ⟨a, rc.canonical, rc.args, ha, by simp [request, hm, runCommand, hc, execPlan], rfl⟩
+    ∃ a path args, evaluate ctx.sudoers ctx.settings (request ctx) = .allow a ∧
+      (request ctx).command = .run path p.path args ∧ p.argv.tail = args := by
+  obtain ⟨a, rc, ha, _, _, _, _, _, hr, ht⟩ := exec_origin ctx p h
+  exact ⟨a, rc.path, rc.args, ha, hr, ht⟩
+
+/-- Execution uses the lookup-time realpath, never the user-controlled lookup alias. -/
+theorem exec_path_is_canonical (ctx : Context) (p : ExecPlan)
+    (h : (decide ctx).action = .exec p) :
+    ∃ rc, ctx.command = some rc ∧ p.path = rc.canonical := by
+  obtain ⟨a, rc, _, _, hc, rfl, _⟩ := exec_origin ctx p h
+  exact ⟨rc, hc, rfl⟩
 
 theorem edit_allowed (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .edit p) :
     ∃ a, evaluate ctx.sudoers ctx.settings (request ctx) = .allow a ∧
@@ -142,7 +152,7 @@ private theorem authentication_none (ctx : Context) (a : Allowed)
 theorem exec_noauth (ctx : Context) (p : ExecPlan)
     (h : (decide ctx).action = .exec p) (hn : (decide ctx).auth = .none) :
     ∃ a, evaluate ctx.sudoers ctx.settings (request ctx) = .allow a ∧ AuthExemption ctx a := by
-  obtain ⟨a, rc, ha, hm, _, _, _, hd⟩ := exec_origin ctx p h
+  obtain ⟨a, rc, ha, hm, _, _, _, hd, _⟩ := exec_origin ctx p h
   rw [hd] at hn
   simp only [policyDecision, authJudgement, hm, reduceCtorEq, ↓reduceIte] at hn
   exact ⟨a, ha, authentication_none ctx a hn⟩

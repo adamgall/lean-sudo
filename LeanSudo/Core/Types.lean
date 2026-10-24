@@ -25,10 +25,13 @@ open LeanSudo.Sudoers
 
 /-- A command resolved by the IO shell (PATH search, or the shell for `-s`/`-i`). -/
 structure ResolvedCmd where
-  /-- absolute path handed to `execve`: the path *as found* (not the realpath), so
-  multicall binaries dispatch on the name -/
+  /-- absolute path as found by the lookup (as the user named it); used for policy
+  matching and for display (`SUDO_COMMAND`, logs, `-l cmd`), NOT for `execve` -/
   path : String
-  /-- `realpath` of `path` (used for policy matching only) -/
+  /-- `realpath` of `path`, resolved at lookup time: what the policy compares literal
+  rules against, and the file handed to `execve` (so re-pointing a user-owned symlink
+  after the check cannot change what runs). Multicall binaries still dispatch on
+  `argv0`. -/
   canonical : String
   /-- `argv[0]`: as typed by the user; `-<basename>` for `-i` -/
   argv0 : String

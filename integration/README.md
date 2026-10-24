@@ -41,11 +41,14 @@ by `lake env lean Main.lean`; do not build the Linux C shim natively on macOS.
 
 `Main.lean` delegates to `LeanSudo.Shell`: it collects account/process facts,
 loads and validates sudoers, resolves command paths without changing the executable
-name, then executes `Core.decide`'s result. Authentication is rechecked under the
-timestamp-file lock; successful authenticated requests refresh the cache only
-after PAM account management succeeds for execution/editing. PAM credentials and
-sessions are bracketed around command execution, including failure paths. PAM
-unavailability is fatal even for NOPASSWD execution.
+name, then executes `Core.decide`'s result. Authentication waivers from timestamps
+are rechecked under the timestamp-file lock, including with `-N`; successful
+authenticated requests refresh the cache only when updating is permitted and after
+PAM account management succeeds for execution/editing. PAM credentials and sessions
+are bracketed around command execution, including failure paths; cleanup errors
+warn without replacing the command's exit status. PAM unavailability is fatal even
+for NOPASSWD execution. Only a standard-stream tty matching `/proc/self/stat`'s
+controlling-terminal device supplies `requiretty`, PAM_TTY and log TTY.
 
 Linux `/proc/self/cmdline` supplies the original argv[0] (so the `sudoedit` symlink
 is preserved) and raw bytes for UTF-8 validation. In addition to invalid raw UTF-8,
@@ -125,6 +128,8 @@ Users (password = name + `pw`): `alice` (group `sudo` ⇒ `%sudo ALL=(ALL:ALL) A
 | tty-validate-then-noninteractive, tty-timestamp-reused-without-prompt | `-v` then `-n` in one session; one prompt per session |
 | tty-k-invalidates, tty-K-removes | `-k`/`-K` then `-n` ⇒ `a password is required` |
 | tty-timestamp-is-per-tty | a second pty session must ask again |
+| exec-symlink-swap-during-prompt | swapping a caller-owned command symlink during authentication cannot replace the authorized executable |
+| requiretty-refuses-unrelated-stdin-pty | a pty supplied as stdin without a controlling terminal does not satisfy `requiretty` |
 | login-shell-i, login-shell-i-is-login-shell | `-i`: cwd and HOME `/root`, bash login shell |
 | shell-s-runs-SHELL, shell-s-interactive | `-s` runs `$SHELL -c …` / `$SHELL` |
 | help-exit-0, version-exit-0, usage-error-no-args | `-h`/`-V` exit 0; no args ⇒ exit 1 `usage: sudo` |
@@ -156,10 +161,12 @@ All observed with sudo.ws 1.9.17p2 on Ubuntu 26.04; the tests assert these.
    `<file> is owned by uid N, should be 0`; a group-writable file whose group is
    not root prints `<file> is owned by gid N, should be 0`. The file is
    ignored and the rest of the policy still applies. A group-writable file
-   with group root is accepted silently (not tested; DESIGN.md's fail-closed
-   rule is stricter). A world-writable `/etc/sudoers.d` directory is skipped
-   as a whole. Tests assert the grant inside the bad file never takes effect
-   and the warning is printed; refusing outright also passes.
+   with group root is accepted silently by both implementations. A world-writable
+   `/etc/sudoers.d` directory is skipped as a whole by sudo.ws. **lean-sudo refuses
+   (exit 1) on any insecure included file or directory**, with the same diagnostic:
+   skipping a source could discard a denial and widen the policy. Tests assert the
+   grant inside the bad file never takes effect and the diagnostic is printed;
+   refusing outright also passes.
 5. **`/etc/sudoers` itself** world-writable or not root-owned ⇒ refuses
    (exit 1) with `/etc/sudoers is world writable` /
    `/etc/sudoers is owned by uid N, should be 0` (followed by

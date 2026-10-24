@@ -108,11 +108,16 @@ private def context (progname : String) (opts : Cli.Options) : IO Core.Context :
   let cwd ← Sys.getcwd
   let mask ← Sys.umask 0
   let _ ← Sys.umask mask
+  let ttyDevice ← Sys.ttyDevice
   let mut ttyName := none
-  for fd in [0, 1, 2] do
-    if ttyName.isNone then ttyName ← Sys.ttyname fd
+  if let some device := ttyDevice then
+    for fd in [0, 1, 2] do
+      if ttyName.isNone then
+        if let some name ← Sys.ttyname fd then
+          if let some st ← Sys.stat name then
+            if st.rdev == device then ttyName := some name
   let userEnv ← Sys.environ
-  let policy := (← Sudoers.load warn host).map (·.entry)
+  let policy := (← Sudoers.load host).map (·.entry)
   let _ ← fromExcept (Policy.validate policy)
   let table ← canonTable policy
   let canon := fun p => (table.lookup p).getD p
@@ -131,7 +136,7 @@ private def context (progname : String) (opts : Cli.Options) : IO Core.Context :
   -- Missing process identity must not reuse an unbound cache entry.
   if sidStart.isNone || ppidStart.isNone then
     throw (IO.userError "unable to determine timestamp process identity")
-  let tsScope := Timestamp.scopeFor settings.timestampType (← Sys.ttyDevice)
+  let tsScope := Timestamp.scopeFor settings.timestampType ttyDevice
     sid (sidStart.getD 0) ppid (ppidStart.getD 0)
   let tsRecords ← try
       Sys.withTimestampFile uid (fun bytes => pure (none, Timestamp.load bytes))
@@ -163,6 +168,13 @@ private def checkPam (h : Sys.PamHandle) (operation : String) (result : IO Int) 
   let rc ← result
   if rc != 0 then throw (IO.userError (operation ++ ": " ++ (← Sys.pamStrerror h rc)))
 
+-- Cleanup must preserve the command's status, even if reporting the warning fails.
+private def cleanup (action : IO Unit) : IO Unit := do
+  try action
+  catch e =>
+    try warn e.toString
+    catch _ => pure ()
+
 private def environment (input : EnvInput) (h : Sys.PamHandle) : IO (Array String) := do
   let pamEnv ← Sys.pamGetEnv h
   return envToArray (← fromExcept (buildEnv { input with pamEnv }))
@@ -175,9 +187,9 @@ private def session (ctx : Core.Context) (h : Sys.PamHandle) (setcred openSessio
     if openSession then checkPam h "unable to open session" (Sys.pamOpenSession h)
     try run
     finally
-      if openSession then checkPam h "unable to close session" (Sys.pamCloseSession h)
+      if openSession then cleanup (checkPam h "unable to close session" (Sys.pamCloseSession h))
   finally
-    if setcred then checkPam h "unable to delete credentials" (Sys.pamSetcred h false)
+    if setcred then cleanup (checkPam h "unable to delete credentials" (Sys.pamSetcred h false))
 
 private def executeAction (ctx : Core.Context) (decision : Core.Decision)
     (h : Option Sys.PamHandle) : IO Sys.ExitStatus := do
@@ -212,8 +224,17 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
 
 private def execute (ctx : Core.Context) (decision : Core.Decision) : IO Sys.ExitStatus := do
   let needsSession := match decision.action with | .exec _ | .edit _ => true | _ => false
-  let authUser := Core.authUser ctx
-  if !needsSession && decision.auth == .none && !decision.updateTimestamp then
+  let authUser := match decision.auth with
+    | .required u => u
+    | .none => Core.authUser ctx
+  -- A pre-lock timestamp snapshot cannot waive authentication on its own.
+  -- Early failures and timestamp-reset actions never enter policy authentication.
+  let needsAuth := match decision.auth with
+    | .required _ => true
+    | .none => (Core.earlyAction ctx).isNone &&
+      Core.policyNeedsAuth ctx (Core.authJudgement ctx
+        (Policy.evaluate ctx.sudoers ctx.settings (Core.request ctx)))
+  if !needsSession && !needsAuth && !decision.updateTimestamp then
     return ← executeAction ctx decision none
   let service := if ctx.opts.login then ctx.settings.pamLoginService else ctx.settings.pamService
   let prompt := expandPrompt (ctx.opts.prompt.getD ctx.settings.passprompt)
@@ -225,7 +246,6 @@ private def execute (ctx : Core.Context) (decision : Core.Decision) : IO Sys.Exi
     pwfeedback := ctx.settings.pwfeedback } ctx.invoking.name ctx.ttyName
   try
     let authorized : IO Bool := do
-      let needsAuth := match decision.auth with | .required _ => true | .none => false
       if !needsAuth && !decision.updateTimestamp then
         if needsSession then checkPam h "PAM account management error" (Sys.pamAcctMgmt h)
         return true
@@ -246,7 +266,7 @@ private def execute (ctx : Core.Context) (decision : Core.Decision) : IO Sys.Exi
       return .exited 1
     executeAction ctx decision (some h)
   finally
-    Sys.pamEnd h 0
+    cleanup (Sys.pamEnd h 0)
 
 /-- `/proc/self/cmdline` preserves argv[0] (unlike the executable's realpath) and
 lets us reject invalid UTF-8 before decoded Lean arguments reach policy. -/

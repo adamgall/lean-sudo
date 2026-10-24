@@ -89,7 +89,7 @@ flowchart LR
 
 | Area | Guarantee | Theorems |
 |---|---|---|
-| **Decision core** | A command is executed only if the policy allows that exact request (path, arguments, run-as user and group). | `exec_allowed`, `exec_origin`, `edit_allowed` |
+| **Decision core** | A command is executed only if the policy allows that exact request (path, arguments, run-as user and group), and the file executed is the one the policy compared: the path resolved at lookup time, so re-pointing a symlink while the password prompt is open changes nothing. | `exec_allowed`, `exec_origin`, `exec_path_is_canonical`, `edit_allowed` |
 | | It runs with exactly the target's uid, the target's (or `-g`) gid, and the target's groups. | `exec_identity`, `edit_identity` |
 | | No password is skipped except for root, a `NOPASSWD`/`!authenticate` rule, a valid timestamp for the same user and terminal, or running as yourself. | `exec_noauth`, `edit_noauth` |
 | | A denied request, or a command that was not found, never executes anything. | `deny_no_execution`, `command_not_found_no_exec` |
@@ -106,7 +106,7 @@ flowchart LR
 | **Globbing** | `fnmatch` agrees with string equality on literal patterns; with `FNM_PATHNAME`, `*` never crosses `/`. | `fnmatch_literal`, `fnmatch_star_pathname`, `fnmatch_prefix_star_pathname` |
 | **Parser** | Every command path in a parsed rule is absolute. | `parse_command_absolute` |
 
-In total there are 182 hand-written theorems across the code base, plus 700 compile-time
+In total there are 183 hand-written theorems across the code base, plus 703 compile-time
 regression checks (`#guard`) that run on every build. `scripts/AxiomAudit.lean` checks
 mechanically that every declaration defined in a `LeanSudo` module (definitions,
 theorems and instances, including private and generated ones) rests only on Lean's
@@ -116,7 +116,7 @@ those words and for `implemented_by`.
 
 ```console
 $ lake env lean scripts/AxiomAudit.lean
-4218 declarations (1327 theorems) checked; axioms used ⊆ propext, Quot.sound, Classical.choice
+4221 declarations (1328 theorems) checked; axioms used ⊆ propext, Quot.sound, Classical.choice
 ```
 
 A proof is only as good as its statement, so the statements are written to be read:
@@ -134,7 +134,7 @@ byte for byte where it matters:
 
 | Suite | sudo.ws 1.9.17p2 | lean-sudo |
 |---|---|---|
-| `sudo` end-to-end (passwords, NOPASSWD, run-as users and groups, `!` rules and aliases, argument matching, env sanitisation, `-E`/`SETENV`, `-l`, `-v`/`-k`/`-K`, per-tty timestamps, `-i`/`-s`, exit status and signal propagation, insecure sudoers files, sudoedit) | 96/96 | 96/96 |
+| `sudo` end-to-end (passwords, NOPASSWD, run-as users and groups, `!` rules and aliases, argument matching, env sanitisation, `-E`/`SETENV`, `-l`, `-v`/`-k`/`-K`, per-tty timestamps, `-i`/`-s`, exit status and signal propagation, insecure sudoers files, sudoedit, symlink swap during the prompt, `requiretty`) | 98/98 | 98/98 |
 | `visudo` (check mode, edit mode, locking, permissions) | 44/47 (3 lean-sudo-only) | 47/47 |
 
 ## Features
@@ -165,6 +165,10 @@ refuses instead of guessing:
 
 * **A syntax error anywhere in the policy stops lean-sudo.** sudo.ws reports the error
   and carries on with the rules it could parse; that can silently drop a `!` rule.
+* **An insecure included file stops lean-sudo** (world- or group-writable, or not owned
+  by root). sudo.ws skips the file with a warning, which can likewise drop a `!` rule.
+* The terminal used for `requiretty`, timestamps, `PAM_TTY` and logs is the
+  controlling terminal, not whatever terminal happens to be on stdin.
 * Undefined aliases and alias cycles are errors (sudo warns), because a `!UNDEFINED`
   that matches nothing would widen access.
 * Unsupported sudoers constructs and `Defaults` that restrict what a command may do

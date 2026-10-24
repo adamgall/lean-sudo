@@ -114,7 +114,21 @@ def cwdCtx : Context :=
 #guard match (decide { ctx with opts := { ctx.opts with login := true } }).action with
   | .exec p => p.cwd == some "/root" && p.pamService == "sudo-i" | _ => false
 #guard match (decide ctx).action with
-  | .exec p => p.envInput.command == "/usr/bin/id -u" && p.argv == ["id", "-u"] | _ => false
+  | .exec p => p.path == "/usr/bin/id" &&
+    p.envInput.command == "/usr/bin/id -u" && p.argv == ["id", "-u"] | _ => false
+
+-- A user-controlled lookup alias may match the literal rule through its realpath.
+-- Only execution switches to that realpath; argv0 and display text stay unchanged.
+def aliasCtx : Context :=
+  { carolCtx with
+    command := some ⟨"/home/carol/bin/id", "/usr/bin/id", "id", ["-u"]⟩ }
+#guard match (decide aliasCtx).action with
+  | .exec p => p.path == "/usr/bin/id" && p.argv == ["id", "-u"] &&
+    p.envInput.command == "/home/carol/bin/id -u"
+  | _ => false
+#guard commandText aliasCtx == "/home/carol/bin/id -u"
+#guard printed { aliasCtx with opts := { aliasCtx.opts with mode := .list } } ==
+  some ("/home/carol/bin/id -u\n", 0)
 
 -- sudoedit file and identity planning is pure; copy/edit/write safety is tested separately.
 def editCtx : Context :=
