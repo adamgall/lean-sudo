@@ -374,6 +374,32 @@ begin dave-id-allowed && {
   end
 }
 
+begin gina-alias-inner-deny && {
+  # `ALL, LIMITED` with LIMITED = /usr/bin/id, !/usr/bin/whoami: the LIMITED
+  # member is the last match for whoami and its result is DENY, so the broader
+  # ALL before it does not apply. The password is supplied so the outcome
+  # does not depend on whether the denial is reported before or after auth.
+  run gina "echo ginapw | sudo -S whoami"
+  expect_rc 1
+  expect_out_empty
+  expect_err_has "gina $NOT_ALLOWED"
+  end
+}
+
+begin gina-alias-inner-allow && {
+  run gina "sudo -n id -u"
+  expect_rc 0
+  expect_out_line 0
+  end
+}
+
+begin gina-alias-other-command-allowed-by-all && {
+  run gina "sudo -n env true && echo ok"
+  expect_rc 0
+  expect_out_line ok
+  end
+}
+
 begin erin-group-only-runas && {
   run erin "sudo -n -g adm id -gn && sudo -n -g adm id -un"
   expect_rc 0

@@ -45,7 +45,7 @@ Requirements: docker (the invoking user in the `docker` group). Variables:
   Every command has a 40 s timeout.
 
 Users (password = name + `pw`): `alice` (group `sudo` ⇒ `%sudo ALL=(ALL:ALL) ALL`),
-`bob` (no rights), `carol`, `dave`, `erin`, `frank` — rules in `sudoers.d/`.
+`bob` (no rights), `carol`, `dave`, `erin`, `frank`, `gina` — rules in `sudoers.d/`.
 
 ## Scenarios
 
@@ -64,6 +64,7 @@ Users (password = name + `pw`): `alice` (group `sudo` ⇒ `%sudo ALL=(ALL:ALL) A
 | carol-runas-bob-with-password / -needs-password | `(bob) /usr/bin/id` needs a password |
 | carol-runas-alice-denied | runas not permitted |
 | dave-su-denied / dave-shell-alias-denied / dave-id-allowed | `ALL, !/usr/bin/su, !SHELLS` |
+| gina-alias-inner-deny / -inner-allow / -other-command-allowed-by-all | `ALL, LIMITED` with `LIMITED = /usr/bin/id, !/usr/bin/whoami`: the alias's inner `!` denies whoami despite the earlier `ALL` |
 | erin-group-only-runas / erin-user-and-group-denied | `(:adm)` rule: gid adm, uid erin; `-u root -g adm` denied |
 | frank-* | exact args, other args, missing args, `/tmp/*` glob, `""` (no args) |
 | unknown-runas-user | `unknown user nosuchuser` |

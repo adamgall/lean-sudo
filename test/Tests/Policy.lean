@@ -1,3 +1,4 @@
+import LeanSudo.Sudoers.Parser
 import LeanSudo.Policy.Eval
 import LeanSudo.Policy.Defaults
 import LeanSudo.Policy.List
@@ -395,5 +396,54 @@ def listPol2 : Sudoers := [
   "    (ALL : ALL) CWD=* SETENV: sudoedit /etc/hosts\n"
 
 #guard notAllowedMessage "bob" "box" == "User bob is not allowed to run sudo on box."
+
+/-! ## Alias DENY propagation through real sudoers syntax -/
+
+def parsed (text : String) : Option Sudoers :=
+  (LeanSudo.Sudoers.parse "alias-regression" text).toOption.map (·.map (·.entry))
+
+def parsedEval (text : String) (r : Request) : Option Judgement :=
+  (parsed text).map (fun s => evaluate s st r)
+
+def limitedText :=
+  "Cmnd_Alias LIMITED = /usr/bin/true, !/usr/bin/false\nalice ALL=(root) NOPASSWD: ALL, LIMITED\n"
+#guard parsedEval limitedText (req alice (run "/usr/bin/false")) == some .deny
+#guard parsedEval limitedText (req alice (run "/usr/bin/true")) == some allowNoAuth
+
+def notbobText := "User_Alias NOTBOB = ALL, !bob\nNOTBOB ALL=(ALL) ALL\n"
+#guard parsedEval notbobText (req bob (run "/usr/bin/id")) == some .deny
+#guard (parsedEval notbobText (req alice (run "/usr/bin/id"))).map isAllow == some true
+def notbobLastText := "User_Alias NOTBOB = ALL, !bob\nALL, NOTBOB ALL=(ALL) ALL\n"
+#guard parsedEval notbobLastText (req bob (run "/usr/bin/id")) == some .deny
+def notbobNegText := "User_Alias NOTBOB = ALL, !bob\nALL, !NOTBOB ALL=(ALL) ALL\n"
+#guard (parsedEval notbobNegText (req bob (run "/usr/bin/id"))).map isAllow == some true
+#guard parsedEval notbobNegText (req alice (run "/usr/bin/id")) == some .deny
+
+def hostDenyText := "Host_Alias H = ALL, !thishost\nalice H=(ALL) ALL\n"
+#guard parsedEval hostDenyText (req alice (run "/usr/bin/id") (host := "thishost")) == some .deny
+#guard (parsedEval hostDenyText (req alice (run "/usr/bin/id") (host := "elsewhere"))).map isAllow == some true
+
+def runasDenyText := "Runas_Alias R = ALL, !root\nalice ALL=(R) ALL\n"
+#guard parsedEval runasDenyText (req alice (run "/usr/bin/id")) == some .deny
+#guard (parsedEval runasDenyText (req alice (run "/usr/bin/id") (target := bob))).map isAllow == some true
+def groupDenyText := "Runas_Alias R = ALL, !root\nalice ALL=(ALL:R) ALL\n"
+#guard parsedEval groupDenyText (req alice (run "/usr/bin/id") (g := some rootG)) == some .deny
+#guard (parsedEval groupDenyText (req alice (run "/usr/bin/id") (g := some wheelG))).map isAllow == some true
+
+def nestedCmndText := "Cmnd_Alias A = B\nCmnd_Alias B = ALL, !/usr/bin/x\nalice ALL=(ALL) ALL, A\n"
+#guard parsedEval nestedCmndText (req alice (run "/usr/bin/x")) == some .deny
+#guard (parsedEval nestedCmndText (req alice (run "/usr/bin/y"))).map isAllow == some true
+def nestedUserText := "User_Alias A = B\nUser_Alias B = ALL, !bob\nALL, A ALL=(ALL) ALL\n"
+#guard parsedEval nestedUserText (req bob (run "/usr/bin/id")) == some .deny
+#guard (parsedEval nestedUserText (req alice (run "/usr/bin/id"))).map isAllow == some true
+
+def scopedText :=
+  "User_Alias NOTBOB = ALL, !bob\nDefaults:NOTBOB !authenticate\n"
+def parsedAuth (text : String) (u : Principal) : Option Bool := do
+  let s ← parsed text
+  let result ← (resolveDefaults s u "box" none none).toOption
+  pure result.1.authenticate
+#guard parsedAuth scopedText bob == some true
+#guard parsedAuth scopedText alice == some false
 
 end Tests.Policy

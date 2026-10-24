@@ -9,10 +9,9 @@ import LeanSudo.Util.Glob
 ## List semantics (sudo's last-match-wins)
 
 Every list (user, host, run-as, command, and alias member lists) is scanned in order;
-the result is decided by the **last** element that matches: `some true` if that
-element is not negated, `some false` if it is; `none` if no element matches
-(`matchList`). An alias atom matches iff its own member list yields `some true`
-(recursively, same rule).
+the result is decided by the **last** member with a non-`none` result.
+Alias atoms preserve their own member list's tri-state result recursively.
+Member negation flips `some b` to `some (!b)`; `none` stays `none`.
 
 Alias recursion is bounded by fuel `Aliases.fuel` = number of alias definitions + 1.
 `validate` rejects alias cycles, undefined alias references and duplicate alias
@@ -29,6 +28,8 @@ depend on this: soundness is stated in terms of the same matching functions.
 `Candidate` per command spec whose user list, host list, run-as spec and command
 member all match (for `-l`/`-v` only user and host lists are checked). For running a
 command the last candidate decides (`judge`); no candidate ⇒ `.deny`.
+For `-l`/`-v`, every spec of a matching user/host entry remains a candidate,
+with `allow := !cs.cmnd.negated`: listing does not evaluate command aliases or run-as.
 -/
 
 namespace LeanSudo.Policy
@@ -38,13 +39,13 @@ open LeanSudo.Glob (fnmatch hasGlob)
 
 /-! ## Generic list matching -/
 
-/-- Last-match-wins: `some (!negated)` of the last member whose atom matches. -/
-def matchList {α : Type} (m : α → Bool) : List (Member α) → Option Bool
+/-- Last non-UNSPEC result wins; member negation flips ALLOW and DENY. -/
+def matchList {α : Type} (m : α → Option Bool) : List (Member α) → Option Bool
   | [] => none
   | x :: xs =>
     match matchList m xs with
     | some b => some b
-    | none => if m x.atom then some (!x.negated) else none
+    | none => (m x.atom).map (fun b => b != x.negated)
 
 /-! ## Aliases and user specifications -/
 
@@ -90,18 +91,17 @@ def CmndAtom.aliasName : CmndAtom → Option String
   | .alias n => some n
   | _ => none
 
-/-- Alias-aware atom matching. `base` decides non-alias atoms; an alias atom matches
-iff its member list's last match allows. Out of fuel / undefined alias ⇒ no match. -/
+/-- Alias-aware tri-state matching. Undefined aliases / exhausted fuel give `none`. -/
 def atomMatches {α : Type} (aliasName : α → Option String)
-    (defs : List (String × List (Member α))) (base : α → Bool) : Nat → α → Bool
-  | 0, a => (aliasName a).isNone && base a
+    (defs : List (String × List (Member α))) (base : α → Bool) : Nat → α → Option Bool
+  | 0, a => if (aliasName a).isNone && base a then some true else none
   | f + 1, a =>
     match aliasName a with
     | some n =>
       match lookupAlias defs n with
-      | some ms => matchList (atomMatches aliasName defs base f) ms == some true
-      | none => false
-    | none => base a
+      | some ms => matchList (atomMatches aliasName defs base f) ms
+      | none => none
+    | none => if base a then some true else none
 
 /-! ## Users, groups, hosts -/
 
@@ -237,13 +237,13 @@ def cmndBase (canon : String → String) : Command → CmndAtom → Bool
   | .sudoedit files, .sudoedit a => argsMatch a files
   | _, _ => false
 
-def cmndAtomOk (al : Aliases) (fuel : Nat) (canon : String → String) (cmd : Command) (a : CmndAtom) :
-    Bool :=
-  atomMatches CmndAtom.aliasName al.cmnd (cmndBase canon cmd) fuel a
-
 def cmndListResult (al : Aliases) (fuel : Nat) (canon : String → String) (cmd : Command)
     (l : List (Member CmndAtom)) : Option Bool :=
   matchList (atomMatches CmndAtom.aliasName al.cmnd (cmndBase canon cmd) fuel) l
+
+def cmndMemberResult (al : Aliases) (fuel : Nat) (canon : String → String) (cmd : Command)
+    (m : Member CmndAtom) : Option Bool :=
+  cmndListResult al fuel canon cmd [m]
 
 /-! ## Decision -/
 
@@ -252,7 +252,7 @@ def isRunCmd : Command → Bool
   | .run _ _ _ | .sudoedit _ => true
   | .list | .validate => false
 
-/-- A matching command spec; `allow = !negated`. -/
+/-- A matching command spec, retaining its command member's ALLOW or DENY result. -/
 structure Candidate where
   spec : CmndSpec
   allow : Bool
@@ -261,12 +261,18 @@ structure Candidate where
 /-- Does a command spec apply to the request? For `-l`/`-v` every spec does (only the
 user and host lists are relevant); otherwise run-as and the command member must match. -/
 def specApplies (al : Aliases) (fuel : Nat) (st : Settings) (r : Request) (cs : CmndSpec) : Bool :=
-  !isRunCmd r.command || (runasOk al fuel st r cs.runas && cmndAtomOk al fuel r.canon r.command cs.cmnd.atom)
+  !isRunCmd r.command ||
+    (runasOk al fuel st r cs.runas && (cmndMemberResult al fuel r.canon r.command cs.cmnd).isSome)
+
+/-- Listing retains syntactic negation; run requests retain the tri-state result. -/
+def specAllow (al : Aliases) (fuel : Nat) (r : Request) (cs : CmndSpec) : Bool :=
+  if isRunCmd r.command then (cmndMemberResult al fuel r.canon r.command cs.cmnd).getD false
+  else !cs.cmnd.negated
 
 def hcCandidates (al : Aliases) (fuel : Nat) (st : Settings) (r : Request) (hc : HostCmnds) :
     List Candidate :=
   if hostListOk al fuel r.host hc.hosts then
-    (hc.cmnds.filter (specApplies al fuel st r)).map fun cs => ⟨cs, !cs.cmnd.negated⟩
+    (hc.cmnds.filter (specApplies al fuel st r)).map fun cs => ⟨cs, specAllow al fuel r cs⟩
   else []
 
 def usCandidates (al : Aliases) (fuel : Nat) (st : Settings) (r : Request) (us : UserSpec) :

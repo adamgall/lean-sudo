@@ -8,9 +8,9 @@ Properties of `LeanSudo.Policy.evaluate`, stated in terms of the matching functi
 
 1. `evaluate_nil` — default deny on the empty policy;
 2. `evaluate_sound` / `evaluate_sound_run` — an allow is backed by a user spec in the
-   policy whose user, host, run-as and command lists match and whose command member is
-   not negated; for running commands it is the *last* matching spec, and the
-   permissions are taken from it;
+   policy whose user, host and command conditions match; for run requests the
+   command member's tri-state result allows, the *last* matching spec decides,
+   and its permissions are used;
 3. `evaluate_no_user_match` — no user spec matches the invoking user ⇒ deny;
 4. `evaluate_append_negated`, `evaluate_append_deny_all` — last match wins: a final
    matching negated rule denies;
@@ -44,7 +44,7 @@ theorem mem_specsOf {s : Sudoers} {us : UserSpec} : us ∈ specsOf s ↔ Entry.u
 theorem mem_hcCandidates {al : Aliases} {f : Nat} {st : Settings} {r : Request} {hc : HostCmnds}
     {c : Candidate} :
     c ∈ hcCandidates al f st r hc ↔ hostListOk al f r.host hc.hosts = true ∧
-      ∃ cs, cs ∈ hc.cmnds ∧ specApplies al f st r cs = true ∧ c = ⟨cs, !cs.cmnd.negated⟩ := by
+      ∃ cs, cs ∈ hc.cmnds ∧ specApplies al f st r cs = true ∧ c = ⟨cs, specAllow al f r cs⟩ := by
   unfold hcCandidates
   by_cases h : hostListOk al f r.host hc.hosts = true
   · simp only [h, ↓reduceIte, true_and]
@@ -69,7 +69,7 @@ theorem mem_usCandidates {al : Aliases} {f : Nat} {st : Settings} {r : Request} 
 theorem mem_candidates {s : Sudoers} {st : Settings} {r : Request} {c : Candidate} :
     c ∈ candidates s st r ↔
       ∃ us hc cs, Entry.userSpec us ∈ s ∧ hc ∈ us.entries ∧ cs ∈ hc.cmnds ∧
-        SpecMatches s st r us hc cs ∧ c = ⟨cs, !cs.cmnd.negated⟩ := by
+        SpecMatches s st r us hc cs ∧ c = ⟨cs, specAllow (aliasesOf s) (aliasesOf s).fuel r cs⟩ := by
   simp only [candidates, candidatesCore, List.mem_flatMap]
   constructor
   · rintro ⟨us, hus, hmem⟩
@@ -92,7 +92,7 @@ theorem judge_listing {st : Settings} {cmd : Command} {cands : List Candidate}
 theorem specApplies_run {al : Aliases} {f : Nat} {st : Settings} {r : Request} {cs : CmndSpec}
     (h : isRunCmd r.command = true) :
     specApplies al f st r cs =
-      (runasOk al f st r cs.runas && cmndAtomOk al f r.canon r.command cs.cmnd.atom) := by
+      (runasOk al f st r cs.runas && (cmndMemberResult al f r.canon r.command cs.cmnd).isSome) := by
   simp [specApplies, h]
 
 theorem judge_nil (st : Settings) (cmd : Command) : judge st cmd [] = .deny := by
@@ -154,18 +154,25 @@ theorem evaluate_no_user_match {s : Sudoers} {st : Settings} {r : Request}
 
 /-! ## (2) Soundness -/
 
-/-- Every allow is backed by a matching, non-negated command spec of a user spec in the
-policy. -/
+/-- Every allow is backed by an allowing spec: command semantics for run requests,
+syntactic negation for listing/validation. -/
 theorem evaluate_sound {s : Sudoers} {st : Settings} {r : Request} {a : Allowed}
     (h : evaluate s st r = .allow a) :
     ∃ us hc cs, Entry.userSpec us ∈ s ∧ hc ∈ us.entries ∧ cs ∈ hc.cmnds ∧
-      SpecMatches s st r us hc cs ∧ cs.cmnd.negated = false := by
+      SpecMatches s st r us hc cs ∧
+      (if isRunCmd r.command then
+        cmndMemberResult (aliasesOf s) (aliasesOf s).fuel r.canon r.command cs.cmnd = some true
+       else cs.cmnd.negated = false) := by
   obtain ⟨c, hc, hca⟩ := judge_allow_mem h
   obtain ⟨us, hcm, cs, hus, hhc, hcs, hm, rfl⟩ := mem_candidates.mp hc
-  exact ⟨us, hcm, cs, hus, hhc, hcs, hm, by simpa using hca⟩
+  refine ⟨us, hcm, cs, hus, hhc, hcs, hm, ?_⟩
+  cases hr : isRunCmd r.command <;> simp [specAllow, hr] at hca ⊢
+  · exact hca
+  · cases he : cmndMemberResult (aliasesOf s) (aliasesOf s).fuel r.canon r.command cs.cmnd <;>
+      simp_all
 
 /-- For a run request (command or sudoedit), the allow is decided by the **last**
-candidate, which is non-negated and whose run-as spec and command member match; the
+candidate, whose run-as spec matches and whose command member result allows;
 permissions are taken from it. -/
 theorem evaluate_sound_run {s : Sudoers} {st : Settings} {r : Request} {a : Allowed}
     (hrun : isRunCmd r.command = true) (h : evaluate s st r = .allow a) :
@@ -174,8 +181,7 @@ theorem evaluate_sound_run {s : Sudoers} {st : Settings} {r : Request} {a : Allo
         userListOk (aliasesOf s) (aliasesOf s).fuel r.user us.users = true ∧
         hostListOk (aliasesOf s) (aliasesOf s).fuel r.host hc.hosts = true ∧
         runasOk (aliasesOf s) (aliasesOf s).fuel st r c.spec.runas = true ∧
-        cmndAtomOk (aliasesOf s) (aliasesOf s).fuel r.canon r.command c.spec.cmnd.atom = true ∧
-        c.spec.cmnd.negated = false := by
+        cmndMemberResult (aliasesOf s) (aliasesOf s).fuel r.canon r.command c.spec.cmnd = some true := by
   unfold evaluate at h
   rw [judge_run hrun] at h
   obtain ⟨c, hc, hca, rfl⟩ := judgeRun_allow h
@@ -183,7 +189,39 @@ theorem evaluate_sound_run {s : Sudoers} {st : Settings} {r : Request} {a : Allo
   obtain ⟨us, hcm, cs, hus, hhc, hcs, ⟨hu, hh, ha⟩, rfl⟩ :=
     mem_candidates.mp (List.mem_of_getLast? hc)
   rw [specApplies_run hrun, Bool.and_eq_true] at ha
-  exact ⟨us, hcm, hus, hhc, hcs, hu, hh, ha.1, ha.2, by simpa using hca⟩
+  refine ⟨us, hcm, hus, hhc, hcs, hu, hh, ha.1, ?_⟩
+  simp only [specAllow, hrun, ↓reduceIte] at hca
+  cases he : cmndMemberResult (aliasesOf s) (aliasesOf s).fuel r.canon r.command cs.cmnd <;>
+    simp_all
+
+/-- A last candidate whose command member denies makes a run request denied. -/
+theorem evaluate_last_deny {s : Sudoers} {st : Settings} {r : Request} {c : Candidate}
+    (hrun : isRunCmd r.command = true)
+    (hlast : (candidates s st r).getLast? = some c)
+    (hdeny : cmndMemberResult (aliasesOf s) (aliasesOf s).fuel r.canon r.command c.spec.cmnd = some false) :
+    evaluate s st r = .deny := by
+  obtain ⟨us, hc, cs, hus, hhc, hcs, hm, rfl⟩ :=
+    mem_candidates.mp (List.mem_of_getLast? hlast)
+  simp [evaluate, judge, hrun, judgeRun, hlast, specAllow, hdeny]
+
+/-- A non-negated command alias inherits an internal DENY at the last candidate. -/
+theorem evaluate_last_alias_deny {s : Sudoers} {st : Settings} {r : Request}
+    {c : Candidate} {name : String} {ms : List (Member CmndAtom)} {f : Nat}
+    (hrun : isRunCmd r.command = true)
+    (hlast : (candidates s st r).getLast? = some c)
+    (hmember : c.spec.cmnd = ⟨false, .alias name⟩)
+    (hf : (aliasesOf s).fuel = f + 1)
+    (hlookup : lookupAlias (aliasesOf s).cmnd name = some ms)
+    (hinner : matchList (atomMatches CmndAtom.aliasName (aliasesOf s).cmnd
+      (cmndBase r.canon r.command) f) ms = some false) :
+    evaluate s st r = .deny := by
+  apply evaluate_last_deny hrun hlast
+  simp [cmndMemberResult, cmndListResult, matchList, hmember, hf,
+    atomMatches, CmndAtom.aliasName, hlookup, hinner]
+
+theorem matchList_negation {α : Type} (m : α → Option Bool) (a : α) :
+    matchList m [⟨true, a⟩] = (m a).map (!·) := by
+  simp [matchList]
 
 /-! ## (4) Negation: last match wins -/
 
@@ -203,44 +241,60 @@ theorem candidates_append_userSpec (s : Sudoers) (st : Settings) (r : Request) (
       candidates s st r ++ usCandidates (aliasesOf s) (aliasesOf s).fuel st r u := by
   simp [candidates, candidatesCore, aliasesOf_append_userSpec, specsOf_append, specsOf]
 
-/-- Appending a rule `users hosts = (runas) !cmnd` whose user list, host list, run-as
-spec and (negated) command member all match a run request makes the request denied,
-whatever came before. -/
+/-- Appending a matching rule with a DENY command result denies, including a
+DENY inherited from inside an alias. -/
 theorem evaluate_append_negated (s : Sudoers) (st : Settings) (r : Request)
     (users : List (Member UserAtom)) (hosts : List (Member HostAtom)) (cs : CmndSpec)
     (hrun : isRunCmd r.command = true)
     (hu : userListOk (aliasesOf s) (aliasesOf s).fuel r.user users = true)
     (hh : hostListOk (aliasesOf s) (aliasesOf s).fuel r.host hosts = true)
     (hra : runasOk (aliasesOf s) (aliasesOf s).fuel st r cs.runas = true)
-    (hcm : cmndAtomOk (aliasesOf s) (aliasesOf s).fuel r.canon r.command cs.cmnd.atom = true)
-    (hneg : cs.cmnd.negated = true) :
+    (hcm : cmndMemberResult (aliasesOf s) (aliasesOf s).fuel r.canon r.command cs.cmnd = some false) :
     evaluate (s ++ [.userSpec ⟨users, [⟨hosts, [cs]⟩]⟩]) st r = .deny := by
   have happ : specApplies (aliasesOf s) (aliasesOf s).fuel st r cs = true := by
     simp [specApplies_run hrun, hra, hcm]
   have hlast : (candidates (s ++ [.userSpec ⟨users, [⟨hosts, [cs]⟩]⟩]) st r).getLast? =
       some ⟨cs, false⟩ := by
     rw [candidates_append_userSpec]
-    simp [usCandidates, hcCandidates, hu, hh, happ, hneg]
+    simp [usCandidates, hcCandidates, hu, hh, happ, specAllow, hrun, hcm]
   unfold evaluate
   rw [judge_run hrun]
   simp [judgeRun, hlast]
 
 theorem atomMatches_nonAlias {α : Type} (aliasName : α → Option String)
     (defs : List (String × List (Member α))) (base : α → Bool) (f : Nat) (a : α)
-    (h : aliasName a = none) : atomMatches aliasName defs base f a = base a := by
+    (h : aliasName a = none) :
+    atomMatches aliasName defs base f a = (if base a then some true else none) := by
   cases f <;> simp [atomMatches, h]
 
 theorem atomMatches_user_all (defs : List (String × List (Member UserAtom))) (base : UserAtom → Bool)
-    (f : Nat) : atomMatches UserAtom.aliasName defs base f .all = base .all :=
+    (f : Nat) : atomMatches UserAtom.aliasName defs base f .all = (if base .all then some true else none) :=
   atomMatches_nonAlias _ _ _ _ _ rfl
 
 theorem atomMatches_user_name (defs : List (String × List (Member UserAtom))) (base : UserAtom → Bool)
-    (f : Nat) (n : String) : atomMatches UserAtom.aliasName defs base f (.name n) = base (.name n) :=
+    (f : Nat) (n : String) :
+    atomMatches UserAtom.aliasName defs base f (.name n) = (if base (.name n) then some true else none) :=
   atomMatches_nonAlias _ _ _ _ _ rfl
 
 theorem atomMatches_host_all (defs : List (String × List (Member HostAtom))) (base : HostAtom → Bool)
-    (f : Nat) : atomMatches HostAtom.aliasName defs base f .all = base .all :=
+    (f : Nat) : atomMatches HostAtom.aliasName defs base f .all = (if base .all then some true else none) :=
   atomMatches_nonAlias _ _ _ _ _ rfl
+
+/-- Concrete alias body `ALL, !path`: its internal negated last match denies even
+when the referencing command member itself is not negated. -/
+theorem evaluate_last_alias_negated_path {s : Sudoers} {st : Settings} {r : Request}
+    {c : Candidate} {name path : String} {f : Nat}
+    (hrun : isRunCmd r.command = true)
+    (hlast : (candidates s st r).getLast? = some c)
+    (hmember : c.spec.cmnd = ⟨false, .alias name⟩)
+    (hf : (aliasesOf s).fuel = f + 1)
+    (hlookup : lookupAlias (aliasesOf s).cmnd name =
+      some [⟨false, .all⟩, ⟨true, .command path .any⟩])
+    (hpath : cmndBase r.canon r.command (.command path .any) = true) :
+    evaluate s st r = .deny := by
+  apply evaluate_last_alias_deny hrun hlast hmember hf hlookup
+  simp [matchList, atomMatches_nonAlias CmndAtom.aliasName _ _ f
+    (.command path .any) rfl, hpath]
 
 /-- `<user> ALL = (ALL : ALL) !ALL` -/
 def denyAllRule (user : String) : Entry :=
@@ -258,10 +312,9 @@ theorem evaluate_append_deny_all (s : Sudoers) (st : Settings) (r : Request)
   · unfold runasOk runasGroupOk
     cases r.runasGroup <;>
       simp [runasUserResult, runasGroupResult, matchList, atomMatches_user_all, userBase, groupBase]
-  · simp only [cmndAtomOk]
+  · simp only [cmndMemberResult, cmndListResult, matchList]
     rw [atomMatches_nonAlias _ _ _ _ _ rfl]
     cases hc : r.command <;> simp_all [isRunCmd, cmndBase]
-  · rfl
 
 /-! ## (5) Authentication -/
 

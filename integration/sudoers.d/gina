@@ -1,0 +1,4 @@
+# gina: an explicit deny inside a Cmnd_Alias must not be overridden by a broader
+# earlier rule (last match wins, and the alias's own result is DENY).
+Cmnd_Alias	LIMITED = /usr/bin/id, !/usr/bin/whoami
+gina	ALL = (root) NOPASSWD: ALL, LIMITED
