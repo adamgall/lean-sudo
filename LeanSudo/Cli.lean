@@ -1,3 +1,6 @@
+import LeanSudo.Policy.Types
+import LeanSudo.Sudoers.Parser
+
 /-!
 # Command-line parsing (`sudo` / `sudoedit`)
 
@@ -71,6 +74,12 @@ structure Options where
   /-- operands after option processing (the command and its arguments, or the files
   for `-e`/`sudoedit`, or the command to check for `-l`) -/
   command : List String := []
+  host : Option String := none
+  role : Option String := none
+  type : Option String := none
+  chroot : Option String := none
+  timeout : Option Nat := none
+  impliedShell : Bool := false
   deriving Repr, DecidableEq, Inhabited
 
 /-! ## Usage, help and version text -/
@@ -84,16 +93,16 @@ private def sudoUsage : List (List String) :=
     ["-v [-ABkNnS] [-g group] [-h host] [-p prompt] [-u user]"],
     ["-l [-ABkNnS] [-g group] [-h host] [-p prompt] [-U user]",
      "[-u user] [command [arg ...]]"],
-    ["[-ABbEHkNnPS] [-C num] [-D directory]",
+    ["[-ABbEHkNnPS] [-r role] [-t type] [-C num] [-D directory]",
      "[-g group] [-h host] [-p prompt] [-R directory] [-T timeout]",
      "[-u user] [VAR=value] [-i | -s] [command [arg ...]]"],
-    ["-e [-ABkNnS] [-C num] [-D directory]",
+    ["-e [-ABkNnS] [-r role] [-t type] [-C num] [-D directory]",
      "[-g group] [-h host] [-p prompt] [-R directory] [-T timeout]",
      "[-u user] file ..."] ]
 
 private def sudoeditUsage : List (List String) :=
   [ ["-h | -V"],
-    ["[-ABkNnS] [-C num] [-D directory]",
+    ["[-ABkNnS] [-r role] [-t type] [-C num] [-D directory]",
      "[-g group] [-h host] [-p prompt] [-R directory] [-T timeout]",
      "[-u user] file ..."] ]
 
@@ -153,8 +162,10 @@ private def helpEntries (sudoedit : Bool) : List String :=
   sudoOnly "  -P, --preserve-groups         preserve group vector instead of setting to target's" ++
   both     "  -p, --prompt=prompt           use the specified password prompt" ++
   both     "  -R, --chroot=directory        change the root directory before running command" ++
+  both     "  -r, --role=role               create SELinux security context with specified role" ++
   both     "  -S, --stdin                   read password from standard input" ++
   sudoOnly "  -s, --shell                   run shell as the target user; a command may also be specified" ++
+  both     "  -t, --type=type               create SELinux security context with specified type" ++
   both     "  -T, --command-timeout=timeout terminate command after the specified time limit" ++
   sudoOnly "  -U, --other-user=user         in list mode, display privileges for user" ++
   both     "  -u, --user=user               run command (or edit file) as specified user name or ID" ++
@@ -174,9 +185,132 @@ def helpText : String := helpFor "sudo"
 
 /-- Output of `sudo -V`. -/
 def versionText : String :=
-  "Sudo version 1.9.16 (lean-sudo 0.1.0)\n" ++
-  "Sudoers policy plugin version 1.9.16 (lean-sudo 0.1.0)\n" ++
-  "Sudoers file grammar version 50\n"
+  "Sudo version 1.9.17p2\n" ++
+  "Sudoers policy plugin version 1.9.17p2\n" ++
+  "Sudoers file grammar version 50\n" ++
+  "Sudoers I/O plugin version 1.9.17p2\n" ++
+  "Sudoers audit plugin version 1.9.17p2\n"
+
+/-- Ubuntu's configured sudo.ws feature set, with the native Debian multiarch tuple. -/
+def configureOptions (architecture : String) : String :=
+  let triplet := architecture ++ "-linux-gnu"
+  "--build=" ++ triplet ++ " --prefix=/usr --includedir=${prefix}/include --mandir=${prefix}/share/man --infodir=${prefix}/share/info --sysconfdir=/etc --localstatedir=/var --disable-option-checking --disable-silent-rules --libdir=${prefix}/lib/" ++ triplet ++
+  " --runstatedir=/run --disable-maintainer-mode --disable-dependency-tracking --with-all-insults --with-pam --with-pam-login --with-fqdn --with-logging=syslog --with-logfac=authpriv --with-devel --with-env-editor --with-editor=/usr/bin/editor --with-timeout=15 --with-password-timeout=0 --with-passprompt=[sudo] password for %p:  --with-tty-tickets --without-lecture --disable-root-mailer --with-sendmail=/usr/sbin/sendmail --with-rundir=/run/sudo --with-sssd --with-sssd-lib=/usr/lib/" ++ triplet ++
+  " --enable-zlib=system --enable-admin-flag --with-apparmor --with-selinux --with-linux-audit --enable-tmpfiles.d=/usr/lib/tmpfiles.d MVPROG=/bin/mv --with-exampledir=/usr/share/doc/sudo/examples"
+
+private def pwPolicyText : PwPolicy → String
+  | .all => "all" | .always => "always" | .any => "any" | .never => "never"
+
+private def timestampTypeText : TimestampType → String
+  | .tty => "tty" | .ppid => "ppid" | .global => "global" | .kernel => "kernel"
+
+private def minutesText (seconds : Option Nat) : String :=
+  match seconds with
+  | none => "-1.0"
+  | some n => s!"{n / 60}.{(n % 60) * 10 / 60}"
+
+private def octalText (n : Nat) : String :=
+  String.ofList [Char.ofNat (48 + n / 64 % 8), Char.ofNat (48 + n / 8 % 8), Char.ofNat (48 + n % 8)]
+
+/-- Root's verbose plugin report is computed from effective Defaults, not the
+invoker's environment or an external sudo binary. Interface strings are OS facts. -/
+def versionFor (root : Bool) (s : Settings := {}) (interfaces : List String := [])
+    (architecture : String := "aarch64") : String :=
+  if !root then versionText else
+  let line (label value : String) := label ++ ": " ++ value ++ "\n"
+  let flag (enabled : Bool) (text : String) := if enabled then text ++ "\n" else ""
+  let opt (label : String) (value : Option String) := value.map (line label) |>.getD ""
+  let entries (label : String) (values : List String) :=
+    if values.isEmpty then "" else label ++ ":\n" ++ String.join (values.reverse.map ("\t" ++ · ++ "\n"))
+  "Sudo version 1.9.17p2\nConfigure options: " ++ configureOptions architecture ++ "\n" ++
+  "Sudoers policy plugin version 1.9.17p2\nSudoers file grammar version 50\n\n" ++
+  "Sudoers path: /etc/sudoers\nAuthentication methods: 'pam'\n" ++
+  opt "Syslog facility if syslog is being used for logging" s.syslog ++
+  opt "Syslog priority to use when user authenticates successfully" s.syslogGoodpri ++
+  opt "Syslog priority to use when user authenticates unsuccessfully" s.syslogBadpri ++
+  flag s.ignoreDot "Ignore '.' in $PATH" ++
+  flag s.mailAlways "Send mail if the user runs sudo" ++
+  flag s.mailBadpass "Send mail if user authentication fails" ++
+  flag s.mailNoUser "Send mail if the user is not in sudoers" ++
+  flag s.mailNoHost "Send mail if the user is not in sudoers for this host" ++
+  flag s.mailNoPerms "Send mail if the user is not allowed to run a command" ++
+  -- Upstream's tuple description has no substitution: printed even for "never".
+  "Lecture user the first time they run sudo\n" ++
+  flag s.authenticate "Require users to authenticate by default" ++
+  flag s.rootSudo "Root may run sudo" ++
+  flag s.pathInfo "Allow some information gathering to give useful error messages" ++
+  flag s.fqdn "Require fully-qualified hostnames in the sudoers file" ++
+  flag s.insults "Insult the user when they enter an incorrect password" ++
+  flag s.requiretty "Only allow the user to run sudo if they have a tty" ++
+  flag s.envEditor "Visudo will honor the EDITOR environment variable" ++
+  flag s.setLogname "Set the LOGNAME and USER environment variables" ++
+  flag s.rootpw "Prompt for root's password, not the user's" ++
+  flag s.runaspw "Prompt for the runas_default user's password, not the user's" ++
+  flag s.targetpw "Prompt for the target user's password, not the user's" ++
+  line "Length at which to wrap log file lines (0 for no wrap)" (toString s.loglinelen) ++
+  line "Authentication timestamp timeout" (minutesText s.timestampTimeout ++ " minutes") ++
+  line "Password prompt timeout" (minutesText s.passwdTimeout ++ " minutes") ++
+  line "Number of tries to enter a password" (toString s.passwdTries) ++
+  line "Umask to use or 0777 to use user's" (octalText s.umask) ++
+  opt "Path to mail program" s.mailerpath ++ opt "Flags for mail program" s.mailerflags ++
+  opt "Address to send mail to" s.mailto ++ opt "Address to send mail from" s.mailfrom ++
+  line "Subject line for mail messages" s.mailsub ++
+  line "Incorrect password message" s.badpassMessage ++
+  line "Path to lecture status dir" s.lectureStatusDir ++
+  line "Path to authentication timestamp dir" s.timestampdir ++
+  line "Default password prompt" s.passprompt ++
+  line "Default user to run commands as" s.runasDefault ++
+  opt "Value to override user's $PATH with" s.securePath ++
+  line "Path to the editor for use by visudo" s.editor ++
+  line "When to require a password for 'list' pseudocommand" (pwPolicyText s.listpw) ++
+  line "When to require a password for 'verify' pseudocommand" (pwPolicyText s.verifypw) ++
+  s!"File descriptors >= {s.closefrom} will be closed before executing a command\n" ++
+  flag s.envReset "Reset the environment to a default set of variables" ++
+  entries "Environment variables to check for safety" s.envCheck ++
+  entries "Environment variables to remove" s.envDelete ++
+  entries "Environment variables to preserve" s.envKeep ++
+  line "Locale to use while parsing sudoers" s.sudoersLocale ++
+  flag s.compressIo "Compress I/O logs using zlib" ++
+  flag s.usePty "Always run commands in a pseudo-tty" ++
+  line "Directory in which to store input/output logs" s.iologDir ++
+  line "File in which to store the input/output log" s.iologFile ++
+  flag s.setUtmp "Add an entry to the utmp/utmpx file when allocating a pty" ++
+  line "PAM service name to use" s.pamService ++
+  line "PAM service name to use for login shells" s.pamLoginService ++
+  flag s.pamSetcred "Attempt to establish PAM credentials for the target user" ++
+  flag s.pamSession "Create a new PAM session for the command to run in" ++
+  flag s.pamAcctMgmt "Perform PAM account validation management" ++
+  flag s.pamSilent "Do not allow PAM authentication modules to generate output" ++
+  flag s.useNetgroups "Enable sudoers netgroup support" ++
+  flag s.sudoeditCheckdir "Check parent directories for writability when editing files with sudoedit" ++
+  flag s.ignoreAuditErrors "Allow commands to be run even if sudo cannot write to the audit log" ++
+  flag s.ignoreLogfileErrors "Allow commands to be run even if sudo cannot write to the log file" ++
+  line "Log entries larger than this value will be split into multiple syslog messages" (toString s.syslogMaxlen) ++
+  line "File mode to use for the I/O log files" ("0" ++ octalText s.iologMode) ++
+  line "Execute commands by file descriptor instead of by path" s.fdexec ++
+  line "Type of authentication timestamp record" (timestampTypeText s.timestampType) ++
+  flag s.caseInsensitiveUser "Ignore case when matching user names" ++
+  flag s.caseInsensitiveGroup "Ignore case when matching group names" ++
+  flag s.logAllowed "Log when a command is allowed by sudoers" ++
+  flag s.logDenied "Log when a command is denied by sudoers" ++
+  line "Sudo log server timeout in seconds" (toString s.logServerTimeout) ++
+  flag s.logServerKeepalive "Enable SO_KEEPALIVE socket option on the socket connected to the logserver" ++
+  flag s.logServerVerify "Verify that the log server's certificate is valid" ++
+  flag s.pamRuser "Set the pam remote user to the user running sudo" ++
+  line "The format of logs to produce" s.logFormat ++
+  flag s.selinux "Enable SELinux RBAC support" ++
+  opt "Path to the file that is created the first time sudo is run" s.adminFlag ++
+  flag s.interceptAllowSetid "Allow an intercepted command to run set setuid or setgid programs" ++
+  opt "The largest size core dump file that may be created (in bytes)" s.rlimitCore ++
+  flag s.logPasswords "Store plaintext passwords in I/O log input" ++
+  (if s.passpromptRegex.isEmpty then "" else
+    "List of regular expressions to use when matching a password prompt\n" ++
+      String.join (s.passpromptRegex.reverse.map ("\t" ++ · ++ "\n"))) ++
+  line "The mechanism used by the intercept and log_subcmds options" s.interceptType ++
+  flag s.interceptVerify "Attempt to verify the command and arguments after execution" ++
+  (if interfaces.isEmpty then "" else
+    "\nLocal IP address and netmask pairs:\n" ++ String.join (interfaces.map ("\t" ++ · ++ "\n"))) ++
+  "\nSudoers I/O plugin version 1.9.17p2\nSudoers audit plugin version 1.9.17p2\n"
 
 /-- Complete stderr text for a `parseArgs` error. -/
 def formatError (progname : String) (e : String) : String :=
@@ -261,6 +395,11 @@ structure Raw where
   askpass : Bool := false
   stdin : Bool := false
   bell : Bool := false
+  host : Option String := none
+  role : Option String := none
+  type : Option String := none
+  chroot : Option String := none
+  timeout : Option Nat := none
 
 def Raw.init (progname : String) : Raw :=
   let se := progname == "sudoedit"
@@ -322,11 +461,11 @@ def applyOpt (r : Raw) (key : Char) (arg : Option String) : Except String Raw :=
   | 'H' => .ok { r with resetHome := true }
   | 'h' =>
     match arg with
-    | some _ => .error "the -h (--host) option is not supported"
+    | some a => if r.host.isSome then usage else .ok { r with host := some a }
     | none =>
       if r.mode.isSome && r.mode != some .help && !r.sudoedit then excl
       else .ok { r with mode := some .help }
-  | '#' => .error "the -h (--host) option is not supported"
+  | '#' => nonEmpty fun a => if r.host.isSome then usage else .ok { r with host := some a }
   | 'i' => .ok { r with login := true }
   | 'K' =>
     if r.mode.isSome && r.mode != some .removeTimestamp then excl
@@ -343,8 +482,13 @@ def applyOpt (r : Raw) (key : Char) (arg : Option String) : Except String Raw :=
     match arg with
     | some a => if r.prompt.isSome then usage else .ok { r with prompt := some a }
     | none => usage
-  | 'R' => .error "you are not permitted to use the -R option"
-  | 'T' => .error "you are not permitted to use the -T option"
+  | 'R' => nonEmpty fun a => if r.chroot.isSome then usage else .ok { r with chroot := some a }
+  | 'r' => nonEmpty fun a => if r.role.isSome then usage else .ok { r with role := some a }
+  | 't' => nonEmpty fun a => if r.type.isSome then usage else .ok { r with type := some a }
+  | 'T' => nonEmpty fun a =>
+    match Sudoers.Parser.parseTimeout a with
+    | some n => if r.timeout.isSome then usage else .ok { r with timeout := some n }
+    | none => .error s!"{a}: invalid timeout value"
   | 'S' => .ok { r with stdin := true }
   | 's' => .ok { r with shell := true }
   | 'U' => nonEmpty fun a => if r.otherUser.isSome then usage else .ok { r with otherUser := some a }
@@ -354,7 +498,7 @@ def applyOpt (r : Raw) (key : Char) (arg : Option String) : Except String Raw :=
   | 'V' =>
     if r.mode.isSome && r.mode != some .version && !r.sudoedit then excl
     else .ok { r with mode := some .version }
-  -- `-a`, `-c`, `-r`, `-t`: BSD auth / login class / SELinux are not compiled in
+  -- BSD authentication and login classes are not compiled in.
   | _ => usage
 
 /-- Process a bundle of short options (the characters after the leading `-`).
@@ -465,22 +609,15 @@ def Raw.rules (r : Raw) (ops : List String) : List (Bool × String) :=
   let editEnv := !(r.envVars.isEmpty && r.preserveVars.isEmpty)
   [ (r.login && r.shell, usageErr r "you may not specify both the -i and -s options"),
     (r.login && r.preserveAll, usageErr r "you may not specify both the -i and -E options"),
-    (m == .edit && r.preserveAll && editEnv,
-      usageErr r ("the -E option is not valid in edit mode\n" ++ r.progname ++
-        ": you may not specify environment variables in edit mode")),
-    (m == .edit && r.preserveAll, usageErr r "the -E option is not valid in edit mode"),
-    (m == .edit && editEnv, usageErr r "you may not specify environment variables in edit mode"),
     (!r.flagsValid m, usage),
+    (m == .edit && editEnv, usageErr r "you may not specify environment variables in edit mode"),
     ((r.user.isSome || r.group.isSome) &&
       !(m == .edit || m == .run || m == .validate || (m == .list && !ops.isEmpty)), usage),
     (r.otherUser.isSome && m != .list,
       usageErr r "the -U option may only be used with the -l option"),
     (r.stdin && r.askpass, usageErr r "the -A and -S options may not be used together"),
     ((ops.isEmpty && m == .edit) || (!ops.isEmpty && !(m == .run || m == .edit || m == .list)),
-      usage),
-    -- sudo would set "implied shell" here and let `shell_noargs` decide; we always
-    -- require -s/-i or a command (sudo's behaviour without `shell_noargs`)
-    (ops.isEmpty && m == .run && !(r.shell || r.login), usage) ]
+      usage) ]
 
 /-- First validation error, if any. -/
 def Raw.check (r : Raw) (ops : List String) : Option String :=
@@ -493,7 +630,7 @@ def Raw.build (r : Raw) (ops : List String) : Options :=
     group := r.group
     otherUser := r.otherUser
     login := r.login
-    shell := r.shell
+    shell := r.shell || (m == .run && ops.isEmpty && !r.login)
     preserveEnv := if r.preserveAll then .all
       else if r.preserveVars.isEmpty then .none else .vars r.preserveVars
     setHome := r.resetHome
@@ -510,7 +647,9 @@ def Raw.build (r : Raw) (ops : List String) : Options :=
     askpass := r.askpass
     noUpdate := r.noUpdate
     envVars := r.envVars
-    command := ops }
+    command := ops
+    host := r.host, role := r.role, type := r.type, chroot := r.chroot, timeout := r.timeout
+    impliedShell := m == .run && ops.isEmpty && !(r.shell || r.login) }
 
 def finish (r : Raw) (ops : List String) : Except String Options :=
   match r.check ops with
@@ -557,6 +696,18 @@ structure ShellCmd where
 def shellCommand (shell : String) (login : Bool) (command : List String) : ShellCmd :=
   let argv0 := if login then "-" ++ basename shell else shell
   { path := shell
-    argv := if command.isEmpty then [argv0] else [argv0, "-c", shellEscape command] }
+    argv := if command.isEmpty then [argv0] else
+      [argv0] ++ (if login && basename shell == "bash" then ["--login"] else []) ++
+        ["-c", shellEscape command] }
+
+/-- Empty environment and passwd shells fall back exactly as sudo's get_user_info. -/
+def userShell (envShell : Option String) (passwdShell : String) : String :=
+  match envShell with
+  | some s => if s.isEmpty then (if passwdShell.isEmpty then "/bin/sh" else passwdShell) else s
+  | none => if passwdShell.isEmpty then "/bin/sh" else passwdShell
+
+/-- Only sudoedit changes the front-end identity, regardless of the executable name. -/
+def programName (argv0 : String) : String :=
+  if basename argv0 == "sudoedit" then "sudoedit" else "sudo"
 
 end LeanSudo.Cli

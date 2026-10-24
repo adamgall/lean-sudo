@@ -21,7 +21,9 @@ def ctx : Context :=
     host := "box", sudoers := policy, settings := {}, target := root, targetGroup := none,
     listUser := none, command := some idCmd, userEnv := [], cwd := "/home/alice",
     userUmask := 0o022, ttyName := none, canon := id, now := 1000000000,
-    tsScope := .ppid 1 1, tsRecords := [] }
+    tsScope := .ppid 1 1, tsRecords := [],
+    fileIds := [("/usr/bin/id", 1, 1), ("/usr/bin/cat", 1, 2),
+      ("/usr/bin/true", 1, 3), ("/usr/bin/false", 1, 4)], root }
 
 def auth (c : Context) := (decide c).auth
 def failure (c : Context) : Option String :=
@@ -102,8 +104,8 @@ def ginaCtx : Context :=
 #guard auth { ctx with settings := { ctx.settings with targetpw := true } } == .required root
 #guard failure { ctx with target := bob, settings := { ctx.settings with runaspw := true } } ==
   some "sudo: runaspw requires the default runas user as target\n"
-#guard failure { ctx with opts := { ctx.opts with otherUser := some "bob" } } ==
-  some "sudo: only root may use the -U option\n"
+#guard failure { ctx with opts := { mode := .list, otherUser := some "bob" }, listUser := some bob } ==
+  some "User bob is not allowed to run sudo on box.\n"
 
 -- Parsing a real CWD rule exercises the policy-to-plan option handoff.
 def cwdCtx : Context :=
@@ -117,10 +119,11 @@ def cwdCtx : Context :=
   | .exec p => p.path == "/usr/bin/id" &&
     p.envInput.command == "/usr/bin/id -u" && p.argv == ["id", "-u"] | _ => false
 
--- A user-controlled lookup alias may match the literal rule through its realpath.
--- Only execution switches to that realpath; argv0 and display text stay unchanged.
+-- Canonical parent lookup preserves the requested basename for multicall dispatch.
 def aliasCtx : Context :=
   { carolCtx with
+    canon := fun p => if p == "/home/carol/bin" then "/usr/bin" else p
+    fileIds := ctx.fileIds ++ [("/home/carol/bin/id", 1, 1)]
     command := some ⟨"/home/carol/bin/id", "/usr/bin/id", "id", ["-u"]⟩ }
 #guard match (decide aliasCtx).action with
   | .exec p => p.path == "/usr/bin/id" && p.argv == ["id", "-u"] &&
@@ -143,24 +146,55 @@ def editCtx : Context :=
 
 def editPath (file : String) : Context :=
   { editCtx with opts := { editCtx.opts with command := [file] } }
-#guard failure (editPath "/etc/../shadow") ==
-  some "sudoedit: /etc/../shadow: path is not absolute or contains empty, . or .. components, refusing\n"
-#guard failure (editPath "./notes") ==
-  some "sudoedit: /home/alice/./notes: path is not absolute or contains empty, . or .. components, refusing\n"
-#guard failure (editPath "/etc//shadow") |>.isSome
-#guard failure (editPath "//etc/shadow") |>.isSome
-#guard failure (editPath "/etc/") |>.isSome
-#guard failure (editPath "") |>.isSome
-#guard failure { editPath "notes" with cwd := "/home/../root" } |>.isSome
+#guard failure (editPath "/etc/../shadow") == none
+#guard failure (editPath "./notes") == none
+#guard failure (editPath "/etc//shadow") == none
+#guard failure (editPath "//etc/shadow") == none
+#guard failure (editPath "/etc/") == none
+#guard failure { editPath "notes" with cwd := "/home/../root" } == none
 #guard failure { editPath "notes" with cwd := "relative" } |>.isSome
-#guard auth (editPath "/etc/../shadow") == .none
-#guard !(decide (editPath "./notes")).updateTimestamp
--- Rejection is independent of authorization, and precedes requiretty too.
-#guard auth { editPath "/etc//shadow" with sudoers := [] } == .none
 #guard failure { editPath "/etc//shadow" with settings := { ctx.settings with requiretty := true } } ==
-  failure (editPath "/etc//shadow")
+  some "sudo: sorry, you must have a tty to run sudo\n"
 #guard failure (editPath "/etc/.hidden") == none
 #guard failure (editPath "/etc/name..suffix") == none
+#guard match (decide (editPath "./notes")).action with
+  | .edit p => p.policyFiles == ["./notes"] && p.files == ["/home/alice/./notes"]
+  | _ => false
+
+-- New execution restrictions are enforced after authentication, never dropped.
+#guard failure { ctx with settings := { ctx.settings with intercept := true } } ==
+  some "sudo: intercept mode is not supported on this system\n"
+#guard execution { ctx with settings := { ctx.settings with logSubcmds := true } } == none
+#guard execution { ctx with opts := { ctx.opts with host := some "remote" } } == none
+#guard execution { ctx with opts := { ctx.opts with closeFrom := some 3 } } |>.isSome
+#guard execution { ctx with opts := { ctx.opts with closeFrom := some 4 } } == none
+#guard execution { ctx with opts := { ctx.opts with closeFrom := some 4 }, settings := { ctx.settings with closefromOverride := true } } |>.isSome
+#guard execution { ctx with opts := { ctx.opts with timeout := some 2 } } == none
+#guard match (decide { ctx with opts := { ctx.opts with timeout := some 2 }, settings := { ctx.settings with userCommandTimeouts := true } }).action with
+  | .exec p => p.timeout == 2 | _ => false
+#guard commandTimeout { ctx with opts := { ctx.opts with timeout := some 30 } } { needsAuth := false, setenv := false, cwd := none, timeout := some 5 } == 5
+#guard (decide ctx).adminFlag == some "/home/alice/.sudo_as_admin_successful"
+#guard (decide catCtx).adminFlag == none
+#guard match (decide { ctx with settings := { ctx.settings with noexec := true } }).action with
+  | .exec p => p.noexecFile == some "/usr/libexec/sudo/sudo_noexec.so" | _ => false
+#guard commandText { ctx with opts := { shell := true, command := ["echo", "a b"] } } ==
+  "/usr/bin/id -c echo a b"
+#guard (sudoCommand { ctx with command := some { idCmd with args := [String.ofList (List.replicate 5000 'x')] } }).utf8ByteSize ==
+  "/usr/bin/id ".utf8ByteSize + 4096
+#guard match (decide { ctx with execFd := some 7, settings := { ctx.settings with fdexec := "always" } }).action with
+  | .exec p => p.execFd == some 7 | _ => false
+#guard match (decide { ctx with execFd := some 7 }).action with
+  | .exec p => p.execFd == none | _ => false
+
+#guard failure { ctx with settings := { ctx.settings with groupPlugin := some "group_file.so" } } ==
+  some "sudo: group_plugin is not supported\n"
+#guard failure { editCtx with settings := { editCtx.settings with groupPlugin := some "group_file.so" } } ==
+  some "sudo: group_plugin is not supported\n"
+#guard failure { ctx with opts := { ctx.opts with mode := .list }, settings := { ctx.settings with groupPlugin := some "group_file.so" } } ==
+  some "sudo: group_plugin is not supported\n"
+#guard failure { ctx with opts := { ctx.opts with mode := .validate }, settings := { ctx.settings with groupPlugin := some "group_file.so" } } ==
+  some "sudo: group_plugin is not supported\n"
+#guard failure { ctx with opts := { ctx.opts with mode := .help }, settings := { ctx.settings with groupPlugin := some "group_file.so" } } == none
 
 example (c : Context) (p : ExecPlan) (h : (decide c).action = .exec p) :
     p.uid = c.target.uid := (exec_identity c p h).1

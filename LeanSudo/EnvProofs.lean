@@ -25,6 +25,9 @@ namespace LeanSudo
 
 abbrev NodupKeys (e : EnvList) : Prop := (e.map Prod.fst).Nodup
 
+theorem nodup_filter {e : EnvList} (p : String × String → Bool) (h : NodupKeys e) :
+    NodupKeys (e.filter p) := (List.filter_sublist.map _).nodup h
+
 theorem mem_setVar {e : EnvList} {k v : String} {kv : String × String} :
     kv ∈ setVar e k v ↔ (kv ∈ e ∧ kv.1 ≠ k) ∨ kv = (k, v) := by
   simp [setVar, List.mem_filter]
@@ -195,7 +198,8 @@ def sudoValues (i : EnvInput) : EnvList :=
    ("MAIL", "/var/mail/" ++ i.target.name), ("SHELL", i.target.shell), ("TERM", "unknown"),
    ("PATH", stdPath), ("PATH", loginPath), ("SUDO_COMMAND", i.command),
    ("SUDO_USER", i.invoking.name), ("SUDO_UID", toString i.invoking.uid),
-   ("SUDO_GID", toString i.invoking.gid)] ++
+   ("SUDO_GID", toString i.invoking.gid), ("SUDO_HOME", i.invoking.home),
+   ("SUDO_TTY", i.ttyName.getD ""), ("LOGNAME", i.invoking.name), ("USER", i.invoking.name)] ++
   (match i.settings.securePath with
    | some p => [("PATH", p)]
    | none => [])
@@ -243,18 +247,21 @@ theorem inv_defaultsReset (i : EnvInput) (reset : Bool) (extra : EnvList) :
       (if i.loginShell then
         setVar (setVar (setVar (baseEnv i reset) "SHELL" i.target.shell) "LOGNAME" i.target.name)
           "USER" i.target.name
-      else lognameReset i (baseEnv i reset)) := by
+      else if i.settings.setLogname then lognameReset i (baseEnv i reset)
+      else setDefault (setDefault (baseEnv i reset) "LOGNAME" i.invoking.name) "USER" i.invoking.name) := by
     split
     · exact inv_setVar (inv_setVar (inv_setVar hb (sv _ (by simp [sudoValues])))
         (sv _ (by simp [sudoValues]))) (sv _ (by simp [sudoValues]))
-    · unfold lognameReset
-      split
-      · exact inv_setVar (inv_setVar hb (sv _ (by simp [sudoValues]))) (sv _ (by simp [sudoValues]))
-      · rename_i l _ hl _
-        exact inv_setVar hb (copy _ _ _ (by simp) (lookup_mem hl))
-      · rename_i u _ hu
-        exact inv_setVar hb (copy _ _ _ (by simp) (lookup_mem hu))
-      · exact hb
+    · split
+      · unfold lognameReset
+        split
+        · exact inv_setVar (inv_setVar hb (sv _ (by simp [sudoValues]))) (sv _ (by simp [sudoValues]))
+        · rename_i l _ hl _
+          exact inv_setVar hb (copy _ _ _ (by simp) (lookup_mem hl))
+        · rename_i u _ hu
+          exact inv_setVar hb (copy _ _ _ (by simp) (lookup_mem hu))
+        · exact hb
+      · exact inv_setDefault (inv_setDefault hb (sv _ (by simp [sudoValues]))) (sv _ (by simp [sudoValues]))
   unfold defaultsReset
   simp only
   split <;> split
@@ -270,8 +277,13 @@ theorem inv_defaultsCopy (i : EnvInput) (reset : Bool) (extra : EnvList) :
     simp only [Origin]; exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr h))))
   unfold defaultsCopy
   simp only
-  have h1 := inv_setVar (inv_setVar hb (sv ("LOGNAME", i.target.name) (by simp [sudoValues])))
-    (sv ("USER", i.target.name) (by simp [sudoValues]))
+  have h1 : Inv (Origin i reset extra)
+      (if i.settings.setLogname then
+        setVar (setVar (baseEnv i reset) "LOGNAME" i.target.name) "USER" i.target.name
+       else baseEnv i reset) := by
+    split
+    · exact inv_setVar (inv_setVar hb (sv _ (by simp [sudoValues]))) (sv _ (by simp [sudoValues]))
+    · exact hb
   split
   · exact inv_setVar h1 (sv _ (by simp [sudoValues]))
   · exact h1
@@ -284,12 +296,7 @@ theorem inv_commonDefaults (i : EnvInput) (reset : Bool) (extra : EnvList) {e : 
   simp only
   have h2 := inv_setDefault (inv_setDefault he (sv ("SHELL", i.target.shell) (by simp [sudoValues])))
     (sv ("TERM", "unknown") (by simp [sudoValues]))
-  have h3 : Inv (Origin i reset extra)
-      (if i.loginShell = true then setVar (setDefault (setDefault e "SHELL" i.target.shell) "TERM" "unknown") "PATH" loginPath
-       else setDefault (setDefault (setDefault e "SHELL" i.target.shell) "TERM" "unknown") "PATH" stdPath) := by
-    split
-    · exact inv_setVar h2 (sv _ (by simp [sudoValues]))
-    · exact inv_setDefault h2 (sv _ (by simp [sudoValues]))
+  have h3 := inv_setDefault h2 (sv ("PATH", stdPath) (by simp [sudoValues]))
   split
   · rename_i ps1 hps
     refine inv_setVar h3 ?_
@@ -298,7 +305,7 @@ theorem inv_commonDefaults (i : EnvInput) (reset : Bool) (extra : EnvList) {e : 
   · exact h3
 
 theorem mem_assemble_origin {i : EnvInput} {reset : Bool} {extra : EnvList} {kv : String × String}
-    (h : kv ∈ assemble i reset extra) : Origin i reset extra kv := by
+    (h : kv ∈ assemble i reset extra) : Origin i reset extra kv ∨ kv ∈ fileVars i := by
   have sv : ∀ kv ∈ sudoValues i, Origin i reset extra kv := fun kv h => by
     simp only [Origin]; exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr h))))
   have h1 : Inv (Origin i reset extra)
@@ -315,7 +322,18 @@ theorem mem_assemble_origin {i : EnvInput} {reset : Bool} {extra : EnvList} {kv 
     · rename_i p hp
       exact inv_setVar h3 (sv _ (by simp [sudoValues, hp]))
     · exact h3
-  have h5 := inv_setVar (inv_setVar (inv_setVar (inv_setVar h4
+  have hh := inv_setVar h4 (sv ("SUDO_HOME", i.invoking.home) (by simp [sudoValues]))
+  let eh := setVar (applySecurePath i (setAll (commonDefaults i
+    (if reset then defaultsReset i (baseEnv i reset) else defaultsCopy i (baseEnv i reset))) extra))
+      "SUDO_HOME" i.invoking.home
+  have ht : Inv (Origin i reset extra)
+      (match i.ttyName with
+       | some tty => setVar eh "SUDO_TTY" tty
+       | none => eh.filter (fun kv => kv.1 != "SUDO_TTY")) := by
+    cases ht : i.ttyName with
+    | some tty => exact inv_setVar hh (sv _ (by simp [sudoValues, ht]))
+    | none => intro kv hm; exact hh kv (List.mem_filter.1 hm).1
+  have h5 := inv_setVar (inv_setVar (inv_setVar (inv_setVar ht
     (sv ("SUDO_COMMAND", i.command) (by simp [sudoValues])))
     (sv ("SUDO_USER", i.invoking.name) (by simp [sudoValues])))
     (sv ("SUDO_UID", toString i.invoking.uid) (by simp [sudoValues])))
@@ -323,7 +341,9 @@ theorem mem_assemble_origin {i : EnvInput} {reset : Bool} {extra : EnvList} {kv 
   have h6 := inv_addDefaults (l := pamVars i) h5 (fun kv hm => by
     have := List.mem_filter.1 hm
     exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inl this)))))
-  exact h6 kv h
+  rcases mem_addDefaults h with hm | hm
+  · exact Or.inl (h6 kv hm)
+  · exact Or.inr hm
 
 theorem nodup_assemble (i : EnvInput) (reset : Bool) (extra : EnvList) :
     NodupKeys (assemble i reset extra) := by
@@ -333,26 +353,25 @@ theorem nodup_assemble (i : EnvInput) (reset : Bool) (extra : EnvList) :
     split
     · unfold defaultsReset lognameReset
       simp only
-      split <;> split <;> (try split) <;> (try split)
+      split <;> split <;> (try split) <;> (try split) <;> (try split)
       all_goals
         repeat first
           | exact h0
           | apply nodup_setVar
+          | apply nodup_setDefault
     · unfold defaultsCopy
       simp only
-      split <;> repeat first | exact h0 | apply nodup_setVar
+      split <;> (try split) <;> repeat first | exact h0 | apply nodup_setVar
   unfold assemble commonDefaults applySecurePath sudoVars
   simp only
-  apply nodup_addDefaults
-  repeat apply nodup_setVar
-  split
-  all_goals first
+  repeat first
+    | exact h1
+    | apply nodup_addDefaults
     | apply nodup_setVar
-    | skip
-  all_goals apply nodup_setAll
-  all_goals (try split) <;> (try apply nodup_setVar)
-  all_goals (try split) <;> (try apply nodup_setVar) <;> (try apply nodup_setDefault)
-  all_goals repeat first | exact h1 | apply nodup_setDefault
+    | apply nodup_setDefault
+    | apply nodup_setAll
+    | apply nodup_filter
+    | split
 
 /-! ## `buildEnv` -/
 
@@ -393,7 +412,8 @@ theorem buildEnv_unique {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out
   nodup_unique (buildEnv_nodup h) h₁ h₂
 
 theorem buildEnv_origin {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out)
-    {kv : String × String} (hm : kv ∈ out) : Origin i (resetMode i) (extraVars i) kv := by
+    {kv : String × String} (hm : kv ∈ out) :
+    Origin i (resetMode i) (extraVars i) kv ∨ kv ∈ fileVars i := by
   obtain ⟨rfl, -, -⟩ := buildEnv_ok h
   exact mem_assemble_origin hm
 
@@ -406,7 +426,8 @@ theorem sudoValues_key {i : EnvInput} {kv : String × String} (h : kv ∈ sudoVa
   rcases h with h | h
   · simp only [List.mem_cons, Prod.mk.injEq, List.not_mem_nil, or_false] at h
     rcases h with ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ |
-      ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ <;> simp
+      ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ |
+      ⟨rfl, -⟩ | ⟨rfl, -⟩ <;> simp
   · split at h
     · simp only [List.mem_cons, Prod.mk.injEq, List.not_mem_nil, or_false] at h
       obtain ⟨rfl, -⟩ := h
@@ -420,10 +441,13 @@ variable is set by sudo, is a filtered PAM variable, or is whitelisted: it match
 theorem buildEnv_reset_whitelist {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out)
     (hr : resetMode i = true) (hx : i.setenvAllowed = false ∨ extraVars i = [])
     {kv : String × String} (hm : kv ∈ out) :
-    kv.1 ∈ sudoKeys ∨ (kv ∈ i.pamEnv ∧ pamPass i kv.1 kv.2 = true) ∨
+    kv ∈ fileVars i ∨ kv.1 ∈ sudoKeys ∨ (kv ∈ i.pamEnv ∧ pamPass i kv.1 kv.2 = true) ∨
     ((∃ p ∈ i.settings.envCheck, patMatch p kv.1 = true) ∧ checkSafe kv.1 kv.2 = true) ∨
     ((∀ p ∈ i.settings.envCheck, patMatch p kv.1 = false) ∧
       ∃ p ∈ i.settings.envKeep, patMatch p kv.1 = true) := by
+  rcases buildEnv_origin h hm with hor | hf
+  case inr => exact Or.inl hf
+  right
   obtain ⟨_, hallowed, _⟩ := buildEnv_ok h
   have hkeep : ∀ k v, keepReset i k v = true → k ∈ sudoKeys ∨
       ((∃ p ∈ i.settings.envCheck, patMatch p k = true) ∧ checkSafe k v = true) ∨
@@ -441,7 +465,7 @@ theorem buildEnv_reset_whitelist {i : EnvInput} {out : EnvList} (h : buildEnv i 
       · exact Or.inr (Or.inr ⟨fun p hp => by simpa using hc p hp, hk⟩)
       · exact Or.inl (by simp [hk, sudoKeys])
       · exact Or.inl (by simp [hk, sudoKeys])
-  rcases buildEnv_origin h hm with ⟨_, hu⟩ | ⟨hk, -⟩ | ⟨hk, -⟩ | hx' | hp | hs
+  rcases hor with ⟨_, hu⟩ | ⟨hk, -⟩ | ⟨hk, -⟩ | hx' | hp | hs
   · simp only [userPass, hr, ↓reduceIte, Bool.and_eq_true] at hu
     rcases hkeep _ _ hu.2 with h' | h'
     · exact Or.inl h'
@@ -463,9 +487,12 @@ sets it itself, or in reset mode when it is explicitly whitelisted. -/
 theorem buildEnv_delete_respected {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out)
     (hs : i.setenvAllowed = false) {kv : String × String} (hm : kv ∈ out)
     (hd : matchesAny i.settings.envDelete kv.1 = true) :
-    kv.1 ∈ sudoKeys ∨ (resetMode i = true ∧ keepReset i kv.1 kv.2 = true) := by
+    kv ∈ fileVars i ∨ kv.1 ∈ sudoKeys ∨ (resetMode i = true ∧ keepReset i kv.1 kv.2 = true) := by
+  rcases buildEnv_origin h hm with hor | hf
+  case inr => exact Or.inl hf
+  right
   obtain ⟨_, hallowed, _⟩ := buildEnv_ok h
-  rcases buildEnv_origin h hm with ⟨_, hu⟩ | ⟨hk, -⟩ | ⟨hk, -⟩ | hx' | hp | hsv
+  rcases hor with ⟨_, hu⟩ | ⟨hk, -⟩ | ⟨hk, -⟩ | hx' | hp | hsv
   · unfold userPass at hu
     cases hr : resetMode i
     · simp [hr, deleteCopy, hd] at hu
@@ -484,7 +511,7 @@ theorem buildEnv_delete_respected {i : EnvInput} {out : EnvList} (h : buildEnv i
 
 theorem patMatch_LD_sudoKeys {k : String} (hk : k ∈ sudoKeys) : patMatch "LD_*" k = false := by
   simp only [sudoKeys, List.mem_cons, List.not_mem_nil, or_false] at hk
-  rcases hk with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide
+  rcases hk with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide
 
 /-- (c) `LD_*`: when `env_delete` contains `LD_*` (sudo's default) and the user has no
 SETENV permission, an `LD_` variable is present only in reset mode and only if an
@@ -492,13 +519,15 @@ SETENV permission, an `LD_` variable is present only in reset mode and only if a
 theorem buildEnv_no_LD {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out)
     (hdel : "LD_*" ∈ i.settings.envDelete) (hs : i.setenvAllowed = false)
     {k v : String} (hm : (k, v) ∈ out) (hld : patMatch "LD_*" k = true) :
-    resetMode i = true ∧
+    (k, v) ∈ fileVars i ∨ resetMode i = true ∧
     ((∃ p ∈ i.settings.envCheck, patMatch p k = true) ∧ checkSafe k v = true ∨
      ∃ p ∈ i.settings.envKeep, patMatch p k = true) := by
   have hd : matchesAny i.settings.envDelete k = true := List.any_eq_true.2 ⟨_, hdel, hld⟩
-  rcases buildEnv_delete_respected h hs hm hd with hk | ⟨hr, hkeep⟩
+  rcases buildEnv_delete_respected h hs hm hd with hf | hk | ⟨hr, hkeep⟩
+  · exact Or.inl hf
   · rw [patMatch_LD_sudoKeys hk] at hld; cases hld
-  · refine ⟨hr, ?_⟩
+  · right
+    refine ⟨hr, ?_⟩
     unfold keepReset matchesAny at hkeep
     split at hkeep
     · exact Or.inl ⟨List.any_eq_true.1 (by assumption), hkeep⟩
@@ -530,7 +559,13 @@ theorem buildEnv_no_bash_fn {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok
     {kv : String × String} (hm : kv ∈ out) (hf : isBashFn kv.2 = true) :
     kv ∈ sudoValues i := by
   obtain ⟨_, hallowed, _⟩ := buildEnv_ok h
-  rcases buildEnv_origin h hm with ⟨_, hu⟩ | ⟨_, k', _, hu⟩ | ⟨_, _, he⟩ | hx' | hp | hsv
+  rcases buildEnv_origin h hm with hor | hfile
+  case inr =>
+    simp only [fileVars, List.mem_filter, List.mem_append] at hfile
+    rcases hfile.1 with hfile | hfile
+    · simp [userPass, entryOk, hf] at hfile
+    · simp [entryOk, hf] at hfile
+  rcases hor with ⟨_, hu⟩ | ⟨_, k', _, hu⟩ | ⟨_, _, he⟩ | hx' | hp | hsv
   · simp [userPass, entryOk, hf] at hu
   · simp [userPass, entryOk, hf] at hu
   · simp [entryOk, hf] at he
@@ -548,8 +583,10 @@ theorem buildEnv_securePath {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok
     unfold assemble sudoVars applySecurePath
     simp only [hp]
     apply mem_addDefaults_of_mem
-    refine mem_setVar_of_ne (mem_setVar_of_ne (mem_setVar_of_ne (mem_setVar_of_ne
-      (mem_setVar_self _ _ _) ?_) ?_) ?_) ?_ <;> (dsimp only; decide)
+    apply mem_addDefaults_of_mem
+    cases ht : i.ttyName <;>
+      simp only [ht, mem_setVar, List.mem_filter, Prod.fst] <;>
+      simp
   exact ⟨hmem, fun v hv => buildEnv_unique h hv hmem⟩
 
 /-- (e) `SUDO_COMMAND`, `SUDO_USER`, `SUDO_UID` and `SUDO_GID` carry the command and the
@@ -560,13 +597,20 @@ theorem buildEnv_sudo_vars {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok 
   obtain ⟨rfl, -, -⟩ := buildEnv_ok h
   unfold assemble sudoVars
   simp only
-  refine ⟨?_, ?_, ?_, ?_⟩ <;> apply mem_addDefaults_of_mem
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> apply mem_addDefaults_of_mem <;> apply mem_addDefaults_of_mem
   · refine mem_setVar_of_ne (mem_setVar_of_ne (mem_setVar_of_ne (mem_setVar_self _ _ _) ?_) ?_) ?_ <;>
       (dsimp only; decide)
   · refine mem_setVar_of_ne (mem_setVar_of_ne (mem_setVar_self _ _ _) ?_) ?_ <;> (dsimp only; decide)
   · exact mem_setVar_of_ne (mem_setVar_self _ _ _) (by dsimp only; decide)
   · exact mem_setVar_self _ _ _
 
+
+/-- Restricted files use user filtering; unrestricted entries come only from the
+administrator's file, never from user-controlled input. -/
+theorem fileVars_origin {i : EnvInput} {kv : String × String} (h : kv ∈ fileVars i) :
+    (kv ∈ i.restrictedEnvFile ∧ userPass i (resetMode i) kv.1 kv.2 = true) ∨
+    (kv ∈ i.envFile ∧ entryOk kv.1 kv.2 = true) := by
+  simpa [fileVars] using (List.mem_filter.1 h).1
 /-- `-E` without SETENV permission is refused. -/
 theorem buildEnv_preserve_denied {i : EnvInput} (hp : i.preserve = .all)
     (hs : i.setenvAllowed = false) : buildEnv i = .error preserveDeniedMsg := by

@@ -7,8 +7,8 @@ struct, never to Lean objects). Its finalizer calls `pam_end` unless `pamEnd` al
 
 Flags used (as sudo does with its defaults): `pam_authenticate(PAM_SILENT)`,
 `pam_acct_mgmt(PAM_SILENT)`, `pam_chauthtok(PAM_CHANGE_EXPIRED_AUTHTOK)`,
-`pam_setcred(PAM_ESTABLISH_CRED)` / `pam_setcred(PAM_DELETE_CRED|PAM_SILENT)`,
-`pam_open_session(0)`, `pam_close_session(PAM_SILENT)`.
+`pam_setcred(PAM_REINITIALIZE_CRED)` / `pam_setcred(PAM_DELETE_CRED|PAM_SILENT)`,
+`pam_open_session(PAM_SILENT)` except shell mode, `pam_close_session(PAM_SILENT)`.
 
 Conversation:
 * `PAM_PROMPT_ECHO_OFF`/`ECHO_ON`: with `nonInteractive` the conversation fails
@@ -17,9 +17,14 @@ Conversation:
   prompts echo is disabled while reading (restored on return and before any
   terminating/stopping signal is acted upon), with `pwfeedback` a `*` is printed per
   character and erase/kill characters are honoured; a newline is printed afterwards.
-  `timeout > 0` bounds the wait for input. For echo-off prompts `prompt` replaces PAM's
-  prompt when `override` is set or PAM's prompt starts with `Password`.
-* `PAM_ERROR_MSG`/`PAM_TEXT_INFO`: written to stderr followed by a newline.
+  `timeout > 0` bounds the wait for input. The generic password prompts are matched
+  exactly, preserving challenge-response prompts unless override is selected.
+* `PAM_ERROR_MSG`/`PAM_TEXT_INFO`: prefer the controlling tty, falling back to stderr.
+* Askpass helpers run with the invoking process's uid/gid and no privileged fds.
+  Lecture text is emitted once, immediately before the first actual PAM prompt.
+* Authentication re-checks `PAM_USER` against the account passed to `pamStart`.
+  The original process environment remains intact during PAM authentication, so
+  `KRB5CCNAME` is visible to Kerberos modules; command environment filtering is later.
 Why a conversation failed is available from `pamLastConvError`.
 -/
 
@@ -59,6 +64,14 @@ def pamStart (service : String) (user : String) (cfg : ConvConfig) (ruser : Stri
   pamStartRaw service user cfg.useStdin cfg.nonInteractive cfg.prompt cfg.override
     cfg.pwfeedback (min cfg.timeout (UInt32.size - 1)).toUInt32 ruser tty
 
+/-- Front-end flags and helper chosen by the shell, not by the PAM shim. -/
+@[extern "lean_sudo_pam_configure"]
+opaque pamConfigure (h : @& PamHandle) (silent sessionSilent bell : Bool)
+    (askpass rhost promptUser : @& String) : IO Unit
+
+@[extern "lean_sudo_pam_lecture"] opaque pamLecture (h : @& PamHandle) (text : @& String) : IO Unit
+@[extern "lean_sudo_pam_lectured"] opaque pamLectured (h : @& PamHandle) : IO Bool
+
 /-! Each of the following returns the raw PAM return code (0 = `PAM_SUCCESS`). They
 throw only if the handle was already ended with `pamEnd`. -/
 
@@ -66,7 +79,7 @@ throw only if the handle was already ended with `pamEnd`. -/
 @[extern "lean_sudo_pam_acct_mgmt"] opaque pamAcctMgmt (h : @& PamHandle) : IO Int
 /-- `pam_chauthtok(PAM_CHANGE_EXPIRED_AUTHTOK)` -/
 @[extern "lean_sudo_pam_chauthtok"] opaque pamChauthtok (h : @& PamHandle) : IO Int
-/-- `establish = true`: `PAM_ESTABLISH_CRED`; `false`: `PAM_DELETE_CRED|PAM_SILENT`. -/
+/-- `establish = true`: `PAM_REINITIALIZE_CRED`; `false`: `PAM_DELETE_CRED|PAM_SILENT`. -/
 @[extern "lean_sudo_pam_setcred"] opaque pamSetcred (h : @& PamHandle) (establish : Bool) : IO Int
 @[extern "lean_sudo_pam_open_session"] opaque pamOpenSession (h : @& PamHandle) : IO Int
 @[extern "lean_sudo_pam_close_session"] opaque pamCloseSession (h : @& PamHandle) : IO Int

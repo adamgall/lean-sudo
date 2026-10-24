@@ -5,9 +5,9 @@ open LeanSudo.Sudoedit
 #guard pathParts "/etc/henryfile" == some (["etc"], "henryfile")
 #guard pathParts "/newfile" == some ([], "newfile")
 #guard pathParts "relative" == none
-#guard pathParts "/etc/../shadow" == none
-#guard pathParts "/etc/./shadow" == none
-#guard pathParts "/etc/" == none
+#guard pathParts "/etc/../shadow" == some (["etc", ".."], "shadow")
+#guard pathParts "/etc/./shadow" == some (["etc", "."], "shadow")
+#guard pathParts "/etc/" == some (["etc"], ".")
 #guard pathParts "/etc/a\x00b" == none
 #guard editorArgsSafe ["/usr/bin/vi", "-n"]
 #guard !editorArgsSafe []

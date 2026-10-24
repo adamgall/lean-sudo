@@ -55,7 +55,7 @@ def warningsOf (t : String) : List String :=
 #guard errorsOf "Defaults foobar\n" == ["s:1: unknown defaults entry \"foobar\""]
 #guard errorsOf "Defaults mail_badpass\n" == []
 #guard errorsOf "Defaults set_logname, !set_home\n" == []
-#guard (errorsOf "Defaults noexec\n").length == 1
+#guard errorsOf "Defaults noexec\n" == []
 #guard warningsOf "Cmnd_Alias C = /bin/ls\nroot ALL = ALL\n" == ["Warning: s:1: unused Cmnd_Alias \"C\""]
 #guard warningsOf "Cmnd_Alias C = /bin/ls\nroot ALL = C\n" == []
 

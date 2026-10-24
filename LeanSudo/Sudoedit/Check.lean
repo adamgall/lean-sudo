@@ -2,16 +2,14 @@ import LeanSudo.Sys.Exec
 
 namespace LeanSudo.Sudoedit
 
-/-- Reject traversal, NUL and empty final names before descriptor-relative opens.
-Intermediate symbolic links are deliberately refused as well as final links. -/
+/-- Preserve kernel path resolution, including `..`; only reject nonabsolute or
+NUL-containing paths. Empty/dot names are resolved by openat, never folded across links. -/
 def pathParts (path : String) : Option (List String × String) := do
-  if !path.startsWith "/" || !Sys.Exec.cSafe path || path.endsWith "/" then none
+  if !path.startsWith "/" || !Sys.Exec.cSafe path then none
   else
-    let parts := (path.splitOn "/").filter (· != "")
-    if parts.any (fun p => p == "." || p == "..") then none
-    else match parts.reverse with
-      | [] => none
-      | name :: dirs => some (dirs.reverse, name)
+    match (path.splitOn "/").reverse with
+    | [] => none
+    | name :: dirs => some ((dirs.reverse).filter (· != ""), if name == "" then "." else name)
 
 /-- The editor cannot inject additional sudoedit file operands via `--`. -/
 def editorArgsSafe (words : List String) : Bool :=

@@ -23,3 +23,13 @@ import LeanSudo.Core
 import LeanSudo.CoreProofs
 import LeanSudo.Shell
 import LeanSudo.Sudoedit
+import LeanSudo.Core.Types
+import LeanSudo.EventLog
+import LeanSudo.Insults
+import LeanSudo.IoLog
+import LeanSudo.SudoConf
+import LeanSudo.Sudoedit.Check
+import LeanSudo.Sys.Edit
+import LeanSudo.Sys.Extra
+import LeanSudo.Sys.IoLog
+import LeanSudo.Util.Sha2

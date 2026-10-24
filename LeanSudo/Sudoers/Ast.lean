@@ -64,8 +64,10 @@ inductive HostAtom where
   | name (n : String)
   /-- `+netgroup` -/
   | netgroup (n : String)
-  /-- `ip`, `ip/bits` or `ip/netmask`; `mask` is the (normalised) netmask of the same
-  family, all ones for a bare address -/
+  /-- `ip`, `ip/bits` or `ip/netmask`; masks have the same family as the address.
+  Empty bytes mean a bare address (match the interface or its network); `[0]`
+  marks an invalid prefix length (accepted syntax but never matches). Explicit
+  valid masks are normalized to 4/16 bytes, including all-zero dotted masks. -/
   | network (addr : IpAddr) (mask : IpAddr)
   | alias (n : String)
   deriving Repr, BEq, DecidableEq, Inhabited
@@ -93,6 +95,8 @@ inductive DigestAlgo where
 structure Digest where
   algo : DigestAlgo
   bytes : List UInt8
+  /-- Original hex/base64 spelling for sudo -l; never part of digest matching. -/
+  spelling : String := ""
   deriving Repr, BEq, DecidableEq, Inhabited
 
 inductive CmndAtom where
@@ -106,8 +110,8 @@ inductive CmndAtom where
   | sudoedit (args : CmndArgs)
   /-- the `list` pseudo-command (permits `sudo -l -U user`) -/
   | list
-  /-- `digest_list command`: `cmd` (a `command`/`commandRegex`) whose file must match
-  one of the digests -/
+  /-- `digest_list command`: a command or pseudo-command (never an alias),
+  constrained by one of the digests. Negation belongs outside this atom. -/
   | digest (ds : List Digest) (cmd : CmndAtom)
   deriving Repr, BEq, DecidableEq, Inhabited
 
@@ -149,6 +153,11 @@ structure CmndOptions where
   /-- `NOTBEFORE=` / `NOTAFTER=` as Unix time (seconds, UTC) -/
   notBefore : Option Nat := Option.none
   notAfter : Option Nat := Option.none
+  /-- Zone-less Generalized Time values need the machine-local UTC offset.
+  The stored seconds are computed as UTC; negative epoch values are clamped to
+  zero (equivalent for authorization at contemporary positive wall clocks). -/
+  notBeforeLocal : Bool := false
+  notAfterLocal : Bool := false
   /-- SELinux `ROLE=` / `TYPE=` -/
   role : Option String := Option.none
   type : Option String := Option.none
@@ -165,6 +174,10 @@ structure CmndSpec where
   options : CmndOptions
   tags : Tags
   cmnd : Member CmndAtom
+  /-- Explicit run-as syntax starts a new listing group even when equal to its predecessor. -/
+  runasExplicit : Bool := false
+  /-- String-valued options written here, for pointer-sensitive sudo -l rendering. -/
+  optionsExplicit : List String := []
   deriving Repr, BEq, DecidableEq, Inhabited
 
 /-- `Host_List = Cmnd_Spec_List` -/

@@ -70,6 +70,13 @@ private def uidToUInt32 (uid : Nat) : IO UInt32 :=
   if uid < UInt32.size then return uid.toUInt32
   else throw (IO.userError s!"timestamp: uid {uid} out of range")
 
+@[extern "lean_sudo_state_marker"]
+private opaque stateMarkerRaw (dir : @& String) (uid : UInt32) (create : Bool) : IO Bool
+
+/-- Test/create a root-owned per-user state marker, with checked directory traversal. -/
+def stateMarker (dir : String) (uid : Nat) (create : Bool) : IO Bool := do
+  stateMarkerRaw dir (← uidToUInt32 uid) create
+
 /-- Open `<base>/ts/<uid>` (creating `<base>` 0711 and `<base>/ts` 0700 if missing;
 both must be root-owned real directories that are not group/world writable; the file
 is opened `O_NOFOLLOW`, 0600, and must be a root-owned regular file with one link),

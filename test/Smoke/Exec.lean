@@ -14,6 +14,11 @@ open LeanSudo.Sys
 
 namespace SmokeExec
 
+#guard Exec.validExecFd none
+#guard Exec.validExecFd (some 3)
+#guard !Exec.validExecFd (some 2)
+#guard !Exec.validExecFd (some 0xFFFFFFFF)
+
 structure Ids where
   uid : Nat
   gid : Nat
@@ -67,6 +72,13 @@ def runCase (name : String) (rest : List String) : IO Unit := do
   | "file", [f] => report (spec ids f #["script-argv0", "arg1"])
   | "env", _ => report { spec ids "/usr/bin/env" #["env"] with env := #["FOO=bar", "SPACE=a b"] }
   | "cwd", [d] => report { spec ids "/bin/pwd" #["pwd"] with cwd := some d }
+  | "cwdOptional", _ => report { sh "echo continued" with
+      cwd := some "/nonexistent-dir", cwdOptional := true }
+  | "corelimit", _ => report (sh "ulimit -c")
+  | "timeout", _ => report { sh "exec sleep 10" with timeout := 1 }
+  | "missing-noexec", _ => report { sh "echo must-not-run" with
+      noexecFile := some "/nonexistent/lean-sudo-noexec.so" }
+  | "badapparmor", _ => report { sh "true" with apparmorProfile := some "bad\x00profile" }
   | "umask", _ => report { sh "umask" with umask := 0o027 }
   | "closefrom", [n] =>
     -- fd 5 is opened (without CLOEXEC) by the wrapping shell
@@ -80,9 +92,7 @@ def runCase (name : String) (rest : List String) : IO Unit := do
   | "nul", _ => report (sh "echo a\x00b")
   | "relpath", _ => report (spec ids "bin/sh" #["sh"])
   | "background", [f] =>
-    let t0 ← IO.monoMsNow
     report { sh s!"sleep 0.5; echo bg-done > {f}" with background := true }
-    IO.println s!"ELAPSED {(← IO.monoMsNow) - t0}"
   | "signals", _ =>
     report (sh "trap 'echo got-int' INT; trap 'echo got-term; exit 9' TERM; echo ready; \
       while :; do sleep 0.05; done")
@@ -207,6 +217,18 @@ def orchestrate : IO UInt32 := do
     "ERROR unable to change directory to /nonexistent-dir: No such file or directory") o.stdout
   let o ← sub #["umask"]
   check t "umask 027" (o.stdout == "0027\nSTATUS exited 0\n") o.stdout
+  let o ← sub #["cwdOptional"]
+  check t "login cwd failure warns and continues" (has o.stdout "continued" &&
+    has o.stdout "STATUS exited 0" && contains o.stderr "unable to change directory") (o.stdout ++ o.stderr)
+  let o ← sub #["corelimit"]
+  check t "default command core limit is zero" (has o.stdout "0") o.stdout
+  let o ← sub #["timeout"]
+  check t "timeout kills command" (contains o.stdout "STATUS signaled") o.stdout
+  let o ← sub #["missing-noexec"]
+  check t "missing noexec library fails closed" (contains o.stdout "ERROR" &&
+    !contains o.stdout "must-not-run") o.stdout
+  let o ← sub #["badapparmor"]
+  check t "AppArmor profile cannot contain NUL" (contains o.stdout "argument contains a NUL byte") o.stdout
 
   -- closefrom: the wrapper shell opens fd 5 without CLOEXEC
   let cfScript := "exec 5</etc/hostname; exec \"$0\" case closefrom \"$1\""
@@ -245,10 +267,12 @@ def orchestrate : IO UInt32 := do
 
   -- background
   let bgf := s!"{dir}/bg"
-  let o ← sub #["background", bgf]
-  let elapsed := ((lines o.stdout).find? (·.startsWith "ELAPSED ")).map
-    (fun l => (l.drop 8).toString.toNat!) |>.getD 99999
-  check t "background returns immediately with 0" (has o.stdout "STATUS exited 0" &&
+  -- Capture files rather than pipes: the background supervisor intentionally
+  -- retains stdio until the command exits, just like sudo -b.
+  let t0 ← IO.monoMsNow
+  let o ← shOut "\"$0\" case background \"$1\" >\"$2\" 2>&1" #[self, bgf, s!"{dir}/bg-output"]
+  let elapsed := (← IO.monoMsNow) - t0
+  check t "background original process exits immediately with 0" (o.exitCode == 0 &&
     elapsed < 400) o.stdout
   IO.sleep 1500
   let bgOut ← try IO.FS.readFile bgf catch _ => pure ""

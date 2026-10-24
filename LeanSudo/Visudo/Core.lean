@@ -12,10 +12,10 @@ an "OK" edit could lock the administrator out. Hence, compared with sudo.ws's vi
 
 * undefined alias references and alias cycles are always errors (sudo.ws only warns
   unless `-s`); `-s` is accepted and changes nothing,
-* `Defaults` values are checked with the same `applySetting` the policy uses, so
-  options lean-sudo refuses (`noexec`, `intercept`, ...) are errors; names unknown to
-  sudo.ws too are errors as in sudo.ws; options sudo.ws knows but lean-sudo ignores
-  are accepted (with a warning unless they are in `ignoredOptions`),
+* `Defaults` names and values use the same complete typed table as runtime sudo.
+  Unknown names are diagnosed and make check mode fail, as in sudo.ws. Recognised
+  options are accepted independently of whether an execution request needs an
+  unavailable runtime facility; that refusal belongs to the decision core,
 * `Policy.validate` runs last as the authoritative check.
 
 Diagnostics carry `file:line` (the AST records no column for entries).
@@ -204,59 +204,20 @@ def cycleErrors (es : List Located) : List String :=
      ("Cmnd_Alias", firstCycle al.cmnd cmndAliasRefs)]
   cycles.filterMap fun (k, c) => c.map fun n => s!"{at_ k n}: cycle in {k} \"{n}\""
 
-/-- Every `Defaults` option name sudo.ws 1.9.17p2 knows (from its sudoers plugin). -/
-def sudoOptionNames : List String :=
-  ["admin_flag", "always_query_group_plugin", "always_set_home", "apparmor_profile",
-   "authenticate", "authfail_message", "badpass_message", "case_insensitive_group",
-   "case_insensitive_user", "closefrom", "closefrom_override", "cmddenial_message",
-   "command_timeout", "compress_io", "editor", "env_check", "env_delete", "env_editor",
-   "env_file", "env_keep", "env_reset", "exec_background", "exempt_group", "fast_glob",
-   "fdexec", "fqdn", "group_plugin", "ignore_audit_errors", "ignore_dot",
-   "ignore_iolog_errors", "ignore_local_sudoers", "ignore_logfile_errors",
-   "ignore_unknown_defaults", "insults", "intercept", "intercept_allow_setid",
-   "intercept_authenticate", "intercept_type", "intercept_verify", "iolog_dir", "iolog_file",
-   "iolog_flush", "iolog_group", "iolog_mode", "iolog_user", "lecture", "lecture_file",
-   "lecture_status_dir", "limitprivs", "listpw", "log_allowed", "log_denied",
-   "log_exit_status", "logfile", "log_format", "log_host", "log_input", "loglinelen",
-   "log_output", "log_passwords", "log_server_cabundle", "log_server_keepalive",
-   "log_server_peer_cert", "log_server_peer_key", "log_servers", "log_server_timeout",
-   "log_server_verify", "log_stderr", "log_stdin", "log_stdout", "log_subcmds", "log_ttyin",
-   "log_ttyout", "log_year", "long_otp_prompt", "mail_all_cmnds", "mail_always",
-   "mail_badpass", "mailerflags", "mailerpath", "mailfrom", "mail_no_host", "mail_no_perms",
-   "mail_no_user", "mailsub", "mailto", "match_group_by_gid", "maxseq", "netgroup_tuple",
-   "noexec", "noninteractive_auth", "pam_acct_mgmt", "pam_askpass_service",
-   "pam_login_service", "pam_rhost", "pam_ruser", "pam_service", "pam_session", "pam_setcred",
-   "pam_silent", "passprompt", "passprompt_override", "passprompt_regex", "passwd_timeout",
-   "passwd_tries", "path_info", "preserve_groups", "privs", "pwfeedback", "requiretty",
-   "restricted_env_file", "rlimit_as", "rlimit_core", "rlimit_cpu", "rlimit_data",
-   "rlimit_fsize", "rlimit_locks", "rlimit_memlock", "rlimit_nofile", "rlimit_nproc",
-   "rlimit_rss", "rlimit_stack", "role", "rootpw", "root_sudo", "runas_allow_unknown_id",
-   "runas_check_shell", "runas_default", "runaspw", "runchroot", "runcwd", "secure_path",
-   "selinux", "setenv", "set_home", "set_logname", "set_utmp", "shell_noargs", "stay_setuid",
-   "sudoedit_checkdir", "sudoedit_follow", "sudoers_locale", "syslog", "syslog_badpri",
-   "syslog_goodpri", "syslog_maxlen", "syslog_pid", "targetpw", "timestampdir",
-   "timestampowner", "timestamp_timeout", "timestamp_type", "tty_tickets", "type", "umask",
-   "umask_override", "use_loginclass", "use_netgroups", "use_pty", "user_command_timeouts",
-   "utmp_runas", "verifypw", "visiblepw"]
+/-- Share the runtime's authoritative sudo 1.9.17p2 option table. -/
+def sudoOptionNames : List String := defaultOptionNames
 
 inductive SettingCheck where
   | ok
   | warn (msg : String)
   | err (msg : String)
 
-/-- One `Defaults` setting, checked with the policy's own `applySetting`: its errors
-(bad values, options lean-sudo refuses) are errors, and so are names sudo.ws does not
-know either. Options sudo.ws knows that lean-sudo neither implements nor deliberately
-ignores only warrant a warning (lean-sudo's `sudo` ignores them too). -/
+/-- Check syntax and types without requiring runtime support for the option's action. -/
 def checkSetting (d : DefaultsSetting) : SettingCheck :=
-  match applySetting {} d with
+  match applySetting {} d false with
   | .error e => .err e
   | .ok (_, none) => .ok
-  | .ok (_, some w) =>
-    if ignoredOptions.contains d.name then .ok
-    else if sudoOptionNames.contains d.name then
-      .warn s!"defaults entry \"{d.name}\" is not supported by lean-sudo and is ignored"
-    else .err w
+  | .ok (_, some w) => .err w
 
 def defaultsChecks (es : List Located) : List (Located × SettingCheck) :=
   es.flatMap fun l =>

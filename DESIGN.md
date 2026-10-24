@@ -31,6 +31,7 @@ getpw*/getgr*  ├─► IO shell (Main.lean) ──► pure core (LeanSudo.Core
 | `LeanSudo/Policy/Types.lean` | `Principal`, `Request`, `Command`, `Settings`, `Judgement` (contract, frozen) |
 | `LeanSudo/Sudoers/Parser.lean` | `parse : (file : String) → (text : String) → Except ParseError (List Located)` |
 | `LeanSudo/Util/Glob.lean` | `fnmatch (pattern s : String) (pathname : Bool) : Bool` + proofs |
+| `LeanSudo/Util/Sha2.lean` | pure SHA-224/256/384/512 over `ByteArray`, digest dispatch and output-length proofs; NIST known-answer tests in `Tests.Sha2` |
 | `LeanSudo/Policy/Defaults.lean` | `resolveDefaults` (Defaults → `Settings`) |
 | `LeanSudo/Policy/Eval.lean` | `evaluate : Sudoers → Settings → Request → Judgement`, matching |
 | `LeanSudo/Policy/List.lean` | `sudo -l` rendering |
@@ -39,10 +40,12 @@ getpw*/getgr*  ├─► IO shell (Main.lean) ──► pure core (LeanSudo.Core
 | `LeanSudo/Env.lean` | `buildEnv` (command environment) + proofs |
 | `LeanSudo/Prompt.lean` | `%u %U %h %H %p %%` prompt expansion |
 | `LeanSudo/Timestamp.lean` | pure timestamp records, (de)serialisation, validity + proofs |
+| `LeanSudo/IoLog.lean` | pure I/O stream plans (`plan_enabled`), sudo path escapes, base-36 sequence paths, legacy/JSON metadata and timing records |
 | `LeanSudo/Sys/Core.lean` + `c/core.c` | users/groups/host/tty/stat/realpath/secure read/environ/syslog |
 | `LeanSudo/Sys/Pam.lean` (+ `c/core.c`) | PAM handle + conversation (tty / `-S` stdin / `-n`) |
 | `LeanSudo/Sys/Exec.lean` + `c/exec.c` | privilege drop, fork/execve/wait, signal relay, pty |
 | `LeanSudo/Sys/Timestamp.lean` + `c/ts.c` | timestamp file storage, boot clock, session/process identity |
+| `LeanSudo/Sys/IoLog.lean` + `c/iolog.c` | fail-closed session creation, locked sequence allocation, owner/mode enforcement, plain/gzip streams, password-prompt filtering; pty and pipe relay hooks in `c/exec.c` |
 | `LeanSudo/Core/Types.lean` | decision-core contract: `Context`, `Decision`, `ExecPlan`, `EditPlan`, `Action` |
 | `LeanSudo/Core.lean`, `LeanSudo/CoreProofs.lean` | pure decision core (`decide`) + end-to-end theorems |
 | `LeanSudo/Sudoers/Load.lean` | include resolution + file ownership/mode checks |

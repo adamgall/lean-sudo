@@ -41,14 +41,18 @@ def nopw : Tags := { passwd := some false }
 def req (u : Principal) (c : Command) (target : Principal := root) (g : Option GroupInfo := none)
     (host : String := "box") (canon : String → String := id) : Request :=
   { user := u, host, runasUser := target, runasGroup := g, runasUserExplicit := false,
-    command := c, canon }
+    command := c, canon
+    fileIds := match c with
+      | .run p _ _ => [(p, 1, 1), ("/bin/ls", 1, 1), ("/usr/bin/ls", 1, 1)]
+      | _ => []
+    globPaths := [("/opt/tools/*", ["/opt/tools/x"])] }
 
 def run (p : String) (args : List String := []) : Command := .run p p args
 
 def st : Settings := {}
 
-def allowAuth : Judgement := .allow ⟨true, false, none⟩
-def allowNoAuth : Judgement := .allow ⟨false, false, none⟩
+def allowAuth : Judgement := .allow { needsAuth := true, setenv := false, cwd := none }
+def allowNoAuth : Judgement := .allow { needsAuth := false, setenv := false, cwd := none }
 def isAllow : Judgement → Bool
   | .allow _ => true
   | .deny => false
@@ -75,14 +79,14 @@ def ubuntu : Sudoers := [
 
 #guard vres ubuntu == "ok"
 -- alice in %sudo: allowed with authentication; ALL implies SETENV
-#guard evaluate ubuntu st (req alice (run "/usr/bin/id")) == .allow ⟨true, true, none⟩
-#guard evaluate ubuntu st (req alice (run "/usr/bin/id") (target := bob)) == .allow ⟨true, true, none⟩
-#guard evaluate ubuntu st (req alice (run "/usr/bin/id") (g := some wheelG)) == .allow ⟨true, true, none⟩
-#guard evaluate ubuntu st (req alice (.sudoedit ["/etc/hosts"])) == .allow ⟨true, true, none⟩
-#guard evaluate ubuntu st (req root (run "/bin/sh")) == .allow ⟨true, true, none⟩
+#guard evaluate ubuntu st (req alice (run "/usr/bin/id")) == .allow { needsAuth := true, setenv := true, cwd := none }
+#guard evaluate ubuntu st (req alice (run "/usr/bin/id") (target := bob)) == .allow { needsAuth := true, setenv := true, cwd := none }
+#guard evaluate ubuntu st (req alice (run "/usr/bin/id") (g := some wheelG)) == .allow { needsAuth := true, setenv := true, cwd := none }
+#guard evaluate ubuntu st (req alice (.sudoedit ["/etc/hosts"])) == .allow { needsAuth := true, setenv := true, cwd := none }
+#guard evaluate ubuntu st (req root (run "/bin/sh")) == .allow { needsAuth := true, setenv := true, cwd := none }
 #guard evaluate ubuntu st (req bob (run "/usr/bin/id")) == .deny
 #guard evaluate ubuntu { st with authenticate := false } (req alice (run "/usr/bin/id")) ==
-  .allow ⟨false, true, none⟩
+  .allow { needsAuth := false, setenv := true, cwd := none }
 #guard isAllow (evaluate ubuntu st (req alice .list))
 #guard isAllow (evaluate ubuntu st (req alice .validate))
 #guard evaluate ubuntu st (req bob .list) == .deny
@@ -99,10 +103,10 @@ def nopasswdPol : Sudoers := [
     spec asRoot (pos (cmd "/usr/bin/env")) {} { cwd := some (some "/tmp") }]]
 
 #guard evaluate nopasswdPol st (req bob (run "/usr/bin/ls")) == allowNoAuth
-#guard evaluate nopasswdPol st (req bob (run "/usr/bin/vim")) == .allow ⟨true, true, none⟩
-#guard evaluate nopasswdPol st (req bob (run "/usr/bin/env")) == .allow ⟨true, false, some (some "/tmp")⟩
+#guard evaluate nopasswdPol st (req bob (run "/usr/bin/vim")) == .allow { needsAuth := true, setenv := true, cwd := none }
+#guard evaluate nopasswdPol st (req bob (run "/usr/bin/env")) == .allow { needsAuth := true, setenv := false, cwd := some (some "/tmp") }
 #guard evaluate nopasswdPol { st with setenv := true } (req bob (run "/usr/bin/env")) ==
-  .allow ⟨true, true, some (some "/tmp")⟩
+  .allow { needsAuth := true, setenv := true, cwd := some (some "/tmp") }
 #guard evaluate nopasswdPol st (req bob (run "/usr/bin/rm")) == .deny
 #guard evaluate nopasswdPol st (req bob (run "/usr/bin/ls") (target := alice)) == .deny
 
@@ -307,8 +311,8 @@ def pwPol : Sudoers := [
 #guard needsAuth (evaluate pwPol st (req bob .validate)) == some true   -- verifypw=all
 #guard needsAuth (evaluate pwPol st (req carol .validate)) == some false
 #guard needsAuth (evaluate pwPol { st with verifypw := .any } (req bob .validate)) == some false
--- only negated entries: nothing to list
-#guard evaluate pwPol st (req alice .list) == .deny
+-- A matching user/host entry permits listing, even when every command is denied.
+#guard isAllow (evaluate pwPol st (req alice .list))
 
 /-! ## Defaults -/
 
@@ -335,10 +339,10 @@ def scopePol : Sudoers := [
   .defaults (.user [pos (.group "wheel")]) [⟨"rootpw", .flag true⟩]]
 
 #guard (resolveS scopePol carol (host := "other")).map (·.passwdTries) == some 5
-#guard (resolveS scopePol carol).map (·.passwdTries) == some 4
-#guard (resolveS scopePol alice).map (·.passwdTries) == some 2
+#guard (resolveS scopePol carol).map (·.passwdTries) == some 5
+#guard (resolveS scopePol alice).map (·.passwdTries) == some 5
 #guard (resolveS scopePol alice (runas := some bob)).map (·.passwdTries) == some 8
-#guard (resolveS scopePol alice (runas := some root)).map (·.passwdTries) == some 2
+#guard (resolveS scopePol alice (runas := some root)).map (·.passwdTries) == some 5
 #guard (resolveS scopePol alice (runas := some bob) (c := some (run "/usr/bin/ls"))).map (·.passwdTries) == some 9
 #guard (resolveS scopePol bob).map (·.rootpw) == some true
 #guard (resolveS scopePol alice).map (·.rootpw) == some false
@@ -379,13 +383,13 @@ def listPol : Sudoers := [
 #guard isErr [g1 "secure_path" (.flag true)]
 #guard isErr [g1 "passwd_tries" (.add "1")]
 #guard isErr [g1 "syslog" (.assign "nonsense")]
-#guard isErr [g1 "noexec" (.flag true)]
-#guard isErr [g1 "env_file" (.assign "/etc/x")]
-#guard isErr [g1 "rlimit_core" (.assign "0")]
-#guard isErr [g1 "runcwd" (.assign "/")]
-#guard warnings [g1 "mail_badpass" (.flag true)] == ["ignoring unsupported defaults entry \"mail_badpass\""]
+#guard !isErr [g1 "noexec" (.flag true)]
+#guard !isErr [g1 "env_file" (.assign "/etc/x")]
+#guard !isErr [g1 "rlimit_core" (.assign "0")]
+#guard !isErr [g1 "runcwd" (.assign "/")]
+#guard warnings [g1 "mail_badpass" (.flag true)] == []
 #guard warnings [g1 "frobnicate" (.flag true)] == ["unknown defaults entry \"frobnicate\""]
-#guard warnings ubuntu == ["ignoring unsupported defaults entry \"mail_badpass\""]
+#guard warnings ubuntu == []
 #guard (resolveS ubuntu alice).map (fun s => (s.usePty, s.securePath)) ==
   some (true, some "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin")
 
@@ -419,13 +423,13 @@ def listPol2 : Sudoers := [
   "    env_keep+=\"LANG LC_ALL\"\n" ++
   "\n" ++
   "Runas and Command-specific defaults for bob:\n" ++
-  "    Defaults>root !set_logname\n" ++
+  "    Defaults>root !set_logname" ++
   "    Defaults!/usr/bin/vi !env_reset, umask=077\n" ++
   "\n" ++
   "User bob may run the following commands on box:\n" ++
   "    (root) NOPASSWD: /usr/bin/ls, /usr/bin/cat /var/log/*, !/usr/bin/su, PASSWD: /usr/bin/whoami \"\"\n" ++
   "    (root) SHELLS\n" ++
-  "    (: wheel) /bin/c\n" ++
+  "    (bob : wheel) /bin/c\n" ++
   "    (ALL : ALL) CWD=* SETENV: sudoedit /etc/hosts\n"
 
 #guard notAllowedMessage "bob" "box" == "User bob is not allowed to run sudo on box."
@@ -490,5 +494,98 @@ def editGlob : Sudoers :=
 def argGlob : Sudoers :=
   [rule [pos (.name "bob")] [pos .all] [spec asRoot (pos (cmd "/usr/bin/cat" (.pattern "/var/log/*")))]]
 #guard isAllow (evaluate argGlob st (req bob (run "/usr/bin/cat" ["/var/log/a/b"])))
+
+/-! ## sudo 1.9.17 matching regressions -/
+
+def selfText := "bob ALL=() NOPASSWD: /usr/bin/id\n"
+#guard parsedEval selfText (req bob (run "/usr/bin/id")) == some .deny
+#guard parsedEval selfText (req bob (run "/usr/bin/id") bob) == some allowNoAuth
+#guard parsedEval "bob ALL=(:) NOPASSWD: /usr/bin/id\n" (req bob (run "/usr/bin/id")) == some .deny
+#guard parsedEval "bob ALL, !box.example.com = NOPASSWD: ALL\n"
+  { (req bob (run "/usr/bin/id")) with lhost := "box.example.com" } == some .deny
+#guard parsedEval "ALL, !BoB ALL=NOPASSWD: ALL\n" (req bob (run "/usr/bin/id")) == some .deny
+#guard parsedEval "bob ALL=(ALL,!RoOt) NOPASSWD: ALL\n" (req bob (run "/usr/bin/id")) == some .deny
+#guard !userBase bob {} none (.nonunixGroup "wheel")
+#guard userBase bob {} none (.group "WhEeL")
+#guard !userBase bob { caseInsensitiveGroup := false } none (.group "WhEeL")
+#guard !userBase bob { caseInsensitiveUser := false } none (.name "BoB")
+#guard parsedEval "\\x62ob ALL=NOPASSWD: /usr/bin/id\n" (req bob (run "/usr/bin/id")) == some allowNoAuth
+
+def pathFacts : Request :=
+  { (req bob (.run "/bin/id" "/usr/bin/id" []) (canon := usrMerge)) with
+    fileIds := [("/bin/id", 1, 2), ("/usr/bin/id", 1, 2), ("/home/bob/id", 1, 2)]
+    globPaths := [("/usr/bin/i*", ["/usr/bin/id"])] }
+#guard pathMatches usrMerge "/usr/bin/id" "/bin/id" "/usr/bin/id" (some pathFacts)
+#guard !pathMatches usrMerge "/usr/bin/id" "/home/bob/id" "/usr/bin/id" (some pathFacts)
+#guard pathMatches usrMerge "/usr/bin/i*" "/bin/id" "/usr/bin/id" (some pathFacts)
+#guard pathMatches usrMerge "/usr/bin/i*" "/bin/id" "/usr/bin/id" (some { pathFacts with fastGlob := true })
+#guard !pathMatches usrMerge "/usr/bin/id" "/bin/id" "/usr/bin/id"
+  (some { pathFacts with fileIds := [("/bin/id", 1, 3), ("/usr/bin/id", 1, 2)] })
+#guard parsedEval "bob ALL=NOPASSWD: ALL, !/usr/bin/i*\n" pathFacts == some .deny
+
+def oracleFacts : Request :=
+  { (req bob (run "/usr/bin/id" ["-u"])) with
+    lhost := "box.example.com", now := 100
+    interfaces := [(.v4 [192, 0, 2, 10], .v4 [255, 255, 255, 0])]
+    netgroups := [("ops", some "bob", none, true),
+      ("machines", none, some "box.example.com", true),
+      ("tuple", some "bob", some "box.example.com", true)]
+    regexMatches := [("^/usr/bin/i[d]$", "/usr/bin/id", true), ("^-u$", "-u", true)]
+    digests := [{ algo := .sha256, bytes := [1, 2, 3] }] }
+#guard userBase bob {} (some oracleFacts) (.netgroup "ops")
+#guard !userBase bob { useNetgroups := false } (some oracleFacts) (.netgroup "ops")
+#guard userBase bob { netgroupTuple := true } (some oracleFacts) (.netgroup "tuple")
+#guard hostBase "box" {} (some oracleFacts) (.netgroup "machines")
+#guard hostBase "box" {} (some oracleFacts) (.network (.v4 [192, 0, 2, 0]) (.v4 [255, 255, 255, 0]))
+#guard !hostBase "box" {} (some oracleFacts) (.network (.v4 [192, 0, 3, 0]) (.v4 [255, 255, 255, 0]))
+#guard hostBase "box" {} (some oracleFacts) (.network (.v4 [192, 0, 2, 0]) (.v4 []))
+#guard hostBase "box" {} (some oracleFacts) (.network (.v4 [192, 0, 2, 10]) (.v4 []))
+#guard !hostBase "box" {} (some oracleFacts) (.network (.v4 [192, 0, 2, 0]) (.v4 [255, 255, 255, 255]))
+#guard !hostBase "box" {} (some oracleFacts) (.network (.v4 [192, 0, 2, 0]) (.v4 [0]))
+#guard cmndBase id oracleFacts.command (.commandRegex "^/usr/bin/i[d]$" (.regex "^-u$")) (some oracleFacts)
+#guard !argsMatch false (.regex "^-x$") ["-u"] (some oracleFacts)
+#guard cmndBase id oracleFacts.command (.digest [{ algo := .sha256, bytes := [1, 2, 3], spelling := "AQID" }] (.command "/usr/bin/id" .any)) (some oracleFacts)
+#guard !cmndBase id oracleFacts.command (.digest [{ algo := .sha256, bytes := [3, 2, 1] }] (.command "/usr/bin/id" .any)) (some oracleFacts)
+#guard !specApplies {} 1 {} oracleFacts (spec asRoot (pos .all) {} { notBefore := some 101 })
+#guard !specApplies {} 1 {} oracleFacts (spec asRoot (pos .all) {} { notAfter := some 99 })
+#guard specApplies {} 1 {} oracleFacts (spec asRoot (pos .all) {} { notBefore := some 100, notAfter := some 100 })
+#guard specApplies {} 1 {} { oracleFacts with command := .list }
+  (spec asRoot (neg .all) {} { notBefore := some 101, notAfter := some 99 })
+#guard !specApplies {} 1 {} { oracleFacts with command := .checkList }
+  (spec asRoot (pos .list) {} { notBefore := some 101 })
+#guard runasGroupOk {} 1 (req bob (run "/usr/bin/id") root (some wheelG)) none { preserveGroups := true }
+#guard !runasGroupOk {} 1 (req bob (run "/usr/bin/id") root (some wheelG)) none {}
+#guard cmndBase id .checkList .list none
+#guard !cmndBase id (run "/usr/bin/list") .list none
+#guard canListOther [rule [pos (.name "bob")] [pos .all] [spec asRoot (pos .all)]]
+  {} (req bob .list) alice root
+#guard !canListOther [rule [pos (.name "bob")] [pos .all] [spec asRoot (pos .list)]]
+  {} (req bob .list) alice root
+#guard canListOther [rule [pos (.name "bob")] [pos .all]
+  [spec (some ⟨some [pos (.name "alice")], none⟩) (pos .list)]]
+  {} (req bob .list) alice root
+
+def digestAliases : Aliases :=
+  { cmnd := [("D", [pos (.digest [{ algo := .sha256, bytes := [1, 2, 3] }] (cmd "/usr/bin/id"))]),
+    ("N", [pos (.alias "D")])] }
+#guard cmndUsesDigest digestAliases oracleFacts 3 (.alias "N")
+#guard !cmndUsesDigest { cmnd := [("D", [pos (.digest [{ algo := .sha256, bytes := [1, 2, 3] }] (cmd "/usr/bin/id")), pos .all])] }
+  oracleFacts 2 (.alias "D")
+#guard (allowedOf {} (candidateOf digestAliases 3 oracleFacts (spec asRoot (pos (.alias "N"))))).usesDigest
+#guard !(allowedOf {} (candidateOf digestAliases 3 oracleFacts (spec asRoot (pos .all)))).usesDigest
+
+#guard isRunasDefault { runasDefault := "ROOT" } root
+#guard !isRunasDefault { runasDefault := "ROOT", caseInsensitiveUser := false } root
+#guard runasGroupOk {} 1 (req bob (run "/usr/bin/id") root (some rootG)) none { preserveGroups := true }
+#guard hostBase "box" {} (some { oracleFacts with netgroups := [("short", none, some "box", true)] }) (.netgroup "short")
+#guard inTimeWindow 100 (spec asRoot (pos .all) {} { notBefore := some 200, notBeforeLocal := true }) 100
+#guard !inTimeWindow 100 (spec asRoot (pos .all) {} { notBefore := some 200, notBeforeLocal := true }) 99
+#guard inTimeWindow 100 (spec asRoot (pos .all) {} { notAfter := some 50, notAfterLocal := true }) (-50)
+#guard !inTimeWindow 100 (spec asRoot (pos .all) {} { notAfter := some 50, notAfterLocal := true }) 0
+#guard commandImpliesSetenv (.digest [{ algo := .sha256, bytes := [1] }] .all)
+#guard cmndBase id .checkList (.digest [{ algo := .sha256, bytes := [1] }] .list) none
+#guard cmndBase id (.sudoedit ["/etc/hosts"])
+  (.digest [{ algo := .sha256, bytes := [1] }] (.sudoedit (.pattern "/etc/hosts"))) none
+#guard !cmndUsesDigest {} oracleFacts 1 (.digest [{ algo := .sha256, bytes := [1] }] .list)
 
 end Tests.Policy

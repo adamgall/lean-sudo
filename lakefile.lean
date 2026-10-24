@@ -6,7 +6,7 @@ package «lean-sudo» where
   moreLinkArgs := #["-ldl", "-lutil"]
 
 /-- C shim translation units (each owned by one Lean `LeanSudo.Sys.*` module). -/
-def shimSources : Array String := #["core", "exec", "ts", "visudo", "edit"]
+def shimSources : Array String := #["core", "exec", "ts", "visudo", "edit", "sys", "iolog"]
 
 def shimCFlags : Array String :=
   #["-fPIC", "-O2", "-Wall", "-Wextra", "-Werror", "-D_GNU_SOURCE",

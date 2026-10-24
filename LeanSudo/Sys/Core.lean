@@ -134,6 +134,9 @@ file`, `<path>: file too large` (cap 16 MiB), `unable to read <path>: <strerror>
 `<path>: file is not valid UTF-8`. -/
 @[extern "lean_sudo_read_file_nofollow"] opaque readFileNoFollow (path : @& String) : IO (FileStat × String)
 
+/-- Follow symlinks, then inspect and read the opened regular file. -/
+@[extern "lean_sudo_read_file_follow"] opaque readFileFollow (path : @& String) : IO (FileStat × String)
+
 @[extern "lean_sudo_list_dir"] private opaque listDirRaw (path : @& String) : IO (Array String)
 
 /-- Entry names of a directory, excluding `.` and `..`, in `readdir` order (unsorted).
@@ -145,6 +148,9 @@ Facilities: `authpriv auth daemon user local0`…`local7`; priorities:
 `alert crit err warning notice info debug`. Unknown names are errors. -/
 @[extern "lean_sudo_syslog"] opaque syslog (facility : @& String) (priority : @& String) (msg : @& String) : IO Unit
 
+@[extern "lean_sudo_syslog_bytes"] opaque syslogBytes (facility priority : @& String)
+    (msg : @& ByteArray) (pid : Bool) : IO Unit
+
 @[extern "lean_sudo_getcwd"] opaque getcwd : IO String
 
 /-- Unbuffered write of the whole string to fd 2. -/
@@ -153,5 +159,28 @@ Facilities: `authpriv auth daemon user local0`…`local7`; priorities:
 /-- `umask(2)`: sets the file mode creation mask to `mask &&& 0o7777` and returns the
 previous mask. -/
 @[extern "lean_sudo_umask"] opaque umask (mask : UInt32) : IO UInt32
+
+@[extern "lean_sudo_unix_time"] opaque unixTime : IO Nat
+@[extern "lean_sudo_no_new_privs"] opaque noNewPrivs : IO Bool
+@[extern "lean_sudo_terminal_columns"] opaque terminalColumns (fd : UInt32) : IO Nat
+@[extern "lean_sudo_utc_offset"] opaque utcOffset : IO Int
+@[extern "lean_sudo_architecture"] opaque architecture : IO String
+
+/-- Pin the executable and inspect that descriptor, not a second pathname lookup. -/
+@[extern "lean_sudo_open_command"] opaque openCommand (path : @& String) : IO (Nat × FileStat)
+@[extern "lean_sudo_close_command"] opaque closeCommand (fd : UInt32) : IO Unit
+
+@[extern "lean_sudo_admin_flag"] private opaque adminFlagRaw (path : @& String)
+    (uid gid : UInt32) (groups : @& Array Nat) : IO Unit
+
+def createAdminFlag (path : String) (uid gid : Nat) (groups : List Nat) : IO Unit := do
+  let some u := toId? uid | throw (IO.userError "invalid admin flag uid")
+  let some g := toId? gid | throw (IO.userError "invalid admin flag gid")
+  adminFlagRaw path u g groups.toArray
+
+@[extern "lean_sudo_log_time"] opaque logTime (year : Bool) : IO String
+@[extern "lean_sudo_append_log"] opaque appendLog (path text : @& String) : IO Unit
+@[extern "lean_sudo_send_mail"] opaque sendMail (path : @& String)
+    (args : @& Array String) (body : @& String) : IO Unit
 
 end LeanSudo.Sys

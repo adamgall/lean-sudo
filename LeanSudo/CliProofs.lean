@@ -159,22 +159,15 @@ theorem check_none {r : Raw} {ops : List String} (h : r.check ops = none) :
     ((ops.isEmpty && r.effMode ops == .edit) ||
       (!ops.isEmpty && !(r.effMode ops == .run || r.effMode ops == .edit ||
         r.effMode ops == .list))) = false ∧
-    (ops.isEmpty && r.effMode ops == .run && !(r.shell || r.login)) = false := by
+    (ops.isEmpty && r.effMode ops == .run && !(r.shell || r.login)) =
+      (r.build ops).impliedShell := by
   have hall := check_none_rules h
-  have g : ∀ (b : Bool) (s : String), (b, s) ∈ r.rules ops → b = false :=
-    fun b s hm => hall (b, s) hm
-  unfold Raw.rules at g
-  simp only [List.mem_cons, List.not_mem_nil, or_false] at g
-  refine ⟨g _ _ (Or.inl rfl), g _ _ (Or.inr (Or.inl rfl)),
-    g _ _ (Or.inr (Or.inr (Or.inr (Or.inl rfl)))),
-    g _ _ (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl))))),
-    g _ _ (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl)))))),
-    g _ _ (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl)))))))),
-    g _ _ (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl))))))))),
-    g _ _ (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr
-      (Or.inl rfl)))))))))),
-    g _ _ (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr
-      (Or.inr rfl))))))))))⟩
+  simp only [Raw.rules, List.mem_cons, List.not_mem_nil, or_false,
+    forall_eq_or_imp, forall_eq] at hall
+  obtain ⟨h1, h2, hf, h4, _, h6, h7, h8⟩ := hall
+  refine ⟨h1, h2, ?_, h4, hf, h6, h7, h8, ?_⟩
+  · cases hm : r.effMode ops <;> simp_all [Raw.flagsValid]
+  · simp [Raw.build, Bool.and_comm]
 
 theorem build_preserveEnv_all (r : Raw) (ops : List String) :
     (r.build ops).preserveEnv = .all ↔ r.preserveAll = true := by
@@ -188,7 +181,8 @@ theorem parseArgs_login_shell {p : String} {args : List String} {o : Options}
   have c := (check_none hc).1
   rintro ⟨hl, hs⟩
   simp only [Raw.build] at hl hs
-  simp [hl, hs] at c
+  simp [hl] at c hs
+  simp [c] at hs
 
 /-- `-i` and `-E` are mutually exclusive. -/
 theorem parseArgs_login_preserve {p : String} {args : List String} {o : Options}
@@ -215,6 +209,7 @@ theorem parseArgs_run_flags {p : String} {args : List String} {o : Options}
   | _ =>
     rw [hm] at c
     simp only [Raw.flagsValid, Bool.not_not] at c
+    simp [hm] at hf
     rcases hf with hf | hf | hf | hf | hf | hf <;> simp [hf] at c
 
 /-- `-U` requires `-l`. -/
@@ -249,15 +244,12 @@ theorem parseArgs_edit {p : String} {args : List String} {o : Options}
   · cases hv : r.preserveVars.isEmpty <;> cases hn : r.envVars.isEmpty <;> simp_all
   · cases hv : r.preserveVars.isEmpty <;> cases hn : r.envVars.isEmpty <;> simp_all
 
-/-- Run mode always has a command or an explicit shell (`-s`/`-i`). -/
+/-- Run mode always has a command or an explicit/implied shell. -/
 theorem parseArgs_run {p : String} {args : List String} {o : Options}
     (h : parseArgs p args = .ok o) (hr : o.mode = .run) :
     o.command ≠ [] ∨ o.shell = true ∨ o.login = true := by
   obtain ⟨r, ops, -, hc, rfl⟩ := parseArgs_eq h
-  have c := (check_none hc).2.2.2.2.2.2.2.2
   simp only [Raw.build] at hr ⊢
-  clear h hc
-  rw [hr] at c
   cases hs : r.shell <;> cases hl : r.login <;> cases ho : ops <;> simp_all
 
 /-- Only run, edit and list (check) modes take operands. -/

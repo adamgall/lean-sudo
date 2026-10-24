@@ -45,7 +45,8 @@ bad:
 }
 struct reply { int err; int value; char name[PATH_MAX]; };
 /* op: 0 directory, 1 read regular (ENOENT is optional), 2 write regular,
- * 3 W_OK directory, 4 mkstemp, 5 unlink, 6 executable regular (follows links).
+ * 3 W_OK directory, 4 mkstemp, 5 unlink, 6 executable regular (follows links),
+ * 7 directory following links, 8 read regular following links, 9 write following links.
  * SCM_RIGHTS transfers opened descriptors, never numeric child-local handles. */
 static int worker(uint32_t op, int dir, const char *path, uid_t uid, gid_t gid,
                   b_lean_obj_arg gs, mode_t mask, struct reply *out) {
@@ -71,16 +72,16 @@ static int worker(uint32_t op, int dir, const char *path, uid_t uid, gid_t gid,
         else {
             umask(mask);
             switch (op) {
-            case 0:
-                fd = openat(dir, path, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            case 0: case 7:
+                fd = openat(dir, path, O_PATH | O_DIRECTORY | O_CLOEXEC | (op == 0 ? O_NOFOLLOW : 0));
                 if (fd < 0) result.err = errno;
                 break;
-            case 1: case 2: case 6: {
-                int flags = op == 6 ? O_PATH : (op == 2 ? O_WRONLY | O_CREAT : O_RDONLY);
-                if (op != 6) flags |= O_NOFOLLOW;
+            case 1: case 2: case 6: case 8: case 9: {
+                int flags = op == 6 ? O_PATH : ((op == 2 || op == 9) ? O_WRONLY | O_CREAT : O_RDONLY);
+                if (op == 1 || op == 2) flags |= O_NOFOLLOW;
                 fd = openat(dir, path, flags | O_NONBLOCK | O_NOCTTY | O_CLOEXEC, 0644);
                 if (fd < 0) {
-                    if (op == 1 && errno == ENOENT) result.value = 1;
+                    if ((op == 1 || op == 8) && errno == ENOENT) result.value = 1;
                     else result.err = errno;
                 } else {
                     struct stat st;

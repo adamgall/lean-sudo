@@ -132,6 +132,50 @@ static int ts_open_dir(int dirfd, const char *name, const char *display, mode_t 
     return fd;
 }
 
+/* Persistent per-user marker, separate from authentication timestamps. */
+LEAN_EXPORT lean_obj_res lean_sudo_state_marker(b_lean_obj_arg path, uint32_t uid,
+        uint8_t create, lean_obj_arg w) {
+    (void)w;
+    const char *p = lean_string_cstr(path);
+    if (strlen(p) != lean_string_size(path) - 1 || p[0] != '/')
+        return ts_user_error("invalid state directory");
+    char *copy = strdup(p);
+    if (!copy) return ts_errno_error("state directory", ENOMEM);
+    int dir = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir < 0) { free(copy); return ts_errno_error("/", errno); }
+    char err[4608], *save = NULL;
+    for (char *name = strtok_r(copy, "/", &save); name; name = strtok_r(NULL, "/", &save)) {
+        if (!strcmp(name, ".") || !strcmp(name, "..")) {
+            close(dir); free(copy); return ts_user_error("invalid state directory component");
+        }
+        int next = ts_open_dir(dir, name, p, 0700, create, err, sizeof(err));
+        close(dir);
+        if (next < 0) {
+            free(copy);
+            if (!create && errno == ENOENT) return lean_io_result_mk_ok(lean_box(0));
+            return ts_user_error(err);
+        }
+        dir = next;
+    }
+    free(copy);
+    char name[16];
+    ts_fmt(name, sizeof(name), "%u", (unsigned)uid);
+    int fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK |
+        (create ? O_CREAT : 0), 0600);
+    int saved = errno;
+    close(dir);
+    if (fd < 0) {
+        if (!create && saved == ENOENT) return lean_io_result_mk_ok(lean_box(0));
+        return ts_errno_error("state marker", saved);
+    }
+    struct stat st;
+    bool valid = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+        st.st_uid == 0 && !(st.st_mode & 022);
+    close(fd);
+    if (!valid) return ts_user_error("unsafe state marker");
+    return lean_io_result_mk_ok(lean_box(1));
+}
+
 /* Open and verify `<base>` and `<base>/ts`. Returns the ts dir fd or -1. */
 static int ts_open_tsdir(const char *base, bool create, char *err, size_t errlen) {
     if (geteuid() != 0) {

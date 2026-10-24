@@ -3,7 +3,7 @@ import LeanSudo.Policy.Defaults
 /-!
 # `sudo -l` rendering
 
-`listPrivileges` renders sudo 1.9's short `sudo -l` format:
+`listPrivileges` renders sudo 1.9.17p2's short and verbose listing formats:
 
 ```
 Matching Defaults entries for alice on host:
@@ -22,14 +22,14 @@ User alice may run the following commands on host:
 * "Runas and Command-specific defaults": every `Defaults>…` then every `Defaults!…`
   entry (sudo prints them without matching); omitted when empty.
 * Privileges: every command spec of every user spec whose user list matches `user`
-  and whose host list matches `host`. Consecutive specs with the same run-as spec are
-  joined with `, ` on one line; options and tags are printed when set and different
-  from the previous spec on the line (sudo's `TAG_CHANGED`). A spec without run-as
-  is shown as `(<runas_default>)`.
+  and whose host list matches `host`. Inherited run-as specs join on a line; an
+  explicit run-as spec starts a new line even if its value is unchanged. Aliases
+  expand with negation composition. Verbose entries retain source filenames.
 * No privileges ⇒ only `User <u> is not allowed to run sudo on <h>.`
+* Output folding follows `sudo_lbuf_print`, using separate Defaults and privilege
+  continuation indents; a zero column count denotes unwrapped pipe output.
 
-The result ends with a newline. Long lines are not folded (sudo folds at the terminal
-width).
+The result ends with a newline.
 -/
 
 namespace LeanSudo.Policy
@@ -71,7 +71,7 @@ def renderHostAtom : HostAtom → String
 def renderArgs : CmndArgs → String
   | .any => ""
   | .none => " \"\""
-  | .pattern q => " " ++ escapeChars [',', ':', '=', '\\'] q
+  | .pattern q => " " ++ escapeChars [',', ':', '=', '#'] q
   | .regex re => " " ++ re
 
 def renderDigestAlgo : DigestAlgo → String
@@ -81,12 +81,13 @@ def renderDigest (d : Digest) : String :=
   let hex2 (b : UInt8) : String :=
     let s := String.ofList (Nat.toDigits 16 b.toNat)
     if s.length < 2 then "0" ++ s else s
-  renderDigestAlgo d.algo ++ ":" ++ String.join (d.bytes.map hex2)
+  renderDigestAlgo d.algo ++ ":" ++
+    (if d.spelling.isEmpty then String.join (d.bytes.map hex2) else d.spelling)
 
 def renderCmndAtom : CmndAtom → String
   | .all => "ALL"
   | .alias n => n
-  | .command p a => p ++ renderArgs a
+  | .command p a => escapeChars [':', ',', '=', ' ', '\t', '#'] p ++ renderArgs a
   | .commandRegex re a => re ++ renderArgs a
   | .sudoedit a => "sudoedit" ++ renderArgs a
   | .list => "list"
@@ -98,10 +99,34 @@ def renderMember {α : Type} (f : α → String) (m : Member α) : String :=
 def renderMembers {α : Type} (f : α → String) (l : List (Member α)) : String :=
   ", ".intercalate (l.map (renderMember f))
 
+private def renderCommandMember (m : Member CmndAtom) : String :=
+  go m.atom
+where
+  go : CmndAtom → String
+    | .digest ds c => ", ".intercalate (ds.map renderDigest) ++ " " ++ go c
+    | c => (if m.negated then "!" else "") ++ renderCmndAtom c
+
+private def renderUserMember (user : String) (m : Member UserAtom) : String :=
+  let neg := if m.negated then "!" else ""
+  let word (s : String) :=
+    if s.toList.any (fun c => c == ' ' || c == '\t') then neg ++ "\"" ++ escapeChars ['"'] s ++ "\""
+    else if s.startsWith "#" && (s.drop 1).toString.toList.all Char.isDigit then neg ++ s
+    else neg ++ escapeChars [':', ',', '=', '#', '"'] s
+  let group (marker name : String) :=
+    if name.toList.any (fun c => c == ' ' || c == '\t') then word (marker ++ name)
+    else marker ++ word name
+  match m.atom with
+  | .group name => group "%" name
+  | .gid gid => group "%" s!"#{gid}"
+  | .nonunixGroup name => group "%:" name
+  | .nonunixGid gid => group "%:" s!"#{gid}"
+  | .myself => neg ++ user
+  | a => word (renderUserAtom a)
+
 /-- sudo quotes values containing blanks and escapes sudoers metacharacters otherwise. -/
 def renderDefaultsValue (v : String) : String :=
   if v.toList.any (fun c => c == ' ' || c == '\t') then "\"" ++ escapeChars ['"'] v ++ "\""
-  else escapeChars [':', '\\', ',', '=', '#', '"'] v
+  else escapeChars [':', ',', '=', '#', '"'] v
 
 def renderSetting (d : DefaultsSetting) : String :=
   match d.op with
@@ -111,87 +136,230 @@ def renderSetting (d : DefaultsSetting) : String :=
   | .add v => d.name ++ "+=" ++ renderDefaultsValue v
   | .remove v => d.name ++ "-=" ++ renderDefaultsValue v
 
-def renderRunas (st : Settings) : Option RunasSpec → String
-  | none | some ⟨none, none⟩ => s!"({st.runasDefault})"
-  | some ⟨some us, none⟩ => s!"({renderMembers renderUserAtom us})"
-  | some ⟨some us, some gs⟩ =>
-    s!"({renderMembers renderUserAtom us} : {renderMembers renderUserAtom gs})"
-  | some ⟨none, some gs⟩ => s!"(: {renderMembers renderUserAtom gs})"
+/-- Expand aliases without losing the polarity inherited from enclosing aliases. -/
+def expandMembers {α : Type} (aliasName : α → Option String)
+    (defs : List (String × List (Member α))) : Nat → Bool → List (Member α) → List (Member α)
+  | 0, neg, ms => ms.map fun m => { m with negated := m.negated != neg }
+  | fuel + 1, neg, ms => ms.flatMap fun m =>
+    let flipped := m.negated != neg
+    match (aliasName m.atom).bind (lookupAlias defs) with
+    | some children => expandMembers aliasName defs fuel flipped children
+    | none => [{ m with negated := flipped }]
 
-/-- Options and tags of `cs`, printed when set and changed w.r.t. the previous spec. -/
+theorem expandMembers_zero_negation {α : Type} (name : α → Option String)
+    (defs : List (String × List (Member α))) (m : Member α) :
+    expandMembers name defs 0 true [m] = [{ m with negated := !m.negated }] := by
+  cases m with
+  | mk neg atom => cases neg <;> rfl
+
+private def expandedUsers (al : Aliases) (user : String) (ms : List (Member UserAtom)) : String :=
+  ", ".intercalate ((expandMembers UserAtom.aliasName al.runas al.fuel false ms).map
+    (renderUserMember user))
+
+private def expandedCommands (al : Aliases) (separator : String) (m : Member CmndAtom) : String :=
+  separator.intercalate ((expandMembers CmndAtom.aliasName al.cmnd al.fuel false [m]).map
+    renderCommandMember)
+
+private def runasUsers (al : Aliases) (st : Settings) (user : String) : Option RunasSpec → String
+  | none | some ⟨none, none⟩ => st.runasDefault
+  | some ⟨some us, _⟩ => expandedUsers al user us
+  | some ⟨none, some _⟩ => user
+
+def renderRunas (st : Settings) (rs : Option RunasSpec) (al : Aliases := {})
+    (user : String := "") : String :=
+  let groups := (rs.bind (·.groups)).map fun gs => " : " ++ expandedUsers al user gs
+  "(" ++ runasUsers al st user rs ++ groups.getD "" ++ ")"
+
+/-- UTC generalized time, the format sudo uses when displaying time restrictions. -/
+def renderGeneralizedTime (seconds : Nat) : String :=
+  let days := seconds / 86400
+  let leap (y : Nat) := y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+  let start := 1970 + days / 146097 * 400
+  let (year, day) := (List.range 400).foldl (fun (y, d) _ =>
+    let size := if leap y then 366 else 365
+    if d ≥ size then (y + 1, d - size) else (y, d)) (start, days % 146097)
+  let months := [31, if leap year then 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+  let (month, day, _) := months.foldl (fun (m, d, done_) size =>
+    if done_ || d < size then (m, d, true) else (m + 1, d - size, false)) (1, day, false)
+  let pad (n width : Nat) :=
+    let text := toString n
+    String.ofList (List.replicate (width - text.length) '0') ++ text
+  pad year 4 ++ pad month 2 ++ pad (day + 1) 2 ++
+    pad (seconds / 3600 % 24) 2 ++ pad (seconds / 60 % 60) 2 ++ pad (seconds % 60) 2 ++ "Z"
+
+/-- Changed options precede tags, in fmtsudoers.c's order. -/
 def renderOptsTags (prev : Option CmndSpec) (cs : CmndSpec) : String :=
   let changed {β : Type} [BEq β] (get : CmndSpec → Option β) : Option β :=
     match get cs with
     | some v => if prev.map get == some (some v) then none else some v
     | none => none
-  let cwd := match changed (·.options.cwd) with
-    | some (some p) => s!"CWD={p} "
-    | some none => "CWD=* "
-    | none => ""
-  let pw := match changed (·.tags.passwd) with
-    | some true => "PASSWD: "
-    | some false => "NOPASSWD: "
-    | none => ""
-  let se := match changed (·.tags.setenv) with
-    | some true => "SETENV: "
-    | some false => "NOSETENV: "
-    | none => ""
-  cwd ++ pw ++ se
+  let written {β : Type} [BEq β] (name : String) (get : CmndSpec → Option β) : Option β :=
+    if cs.optionsExplicit.contains name then get cs else changed get
+  let option (label : String) (v : Option String) := (v.map fun s => label ++ "=" ++ s ++ " ").getD ""
+  let tag (yes no : String) (v : Option Bool) := (v.map fun b => (if b then yes else no) ++ ": ").getD ""
+  option "PRIVS" ((written "PRIVS" (·.options.privs)).map fun s => "\"" ++ s ++ "\"") ++
+  option "LIMITPRIVS" ((written "LIMITPRIVS" (·.options.limitprivs)).map fun s => "\"" ++ s ++ "\"") ++
+  option "ROLE" (written "ROLE" (·.options.role)) ++
+  option "TYPE" (written "TYPE" (·.options.type)) ++
+  option "APPARMOR_PROFILE" (written "APPARMOR_PROFILE" (·.options.apparmorProfile)) ++
+  option "CHROOT" (written "CHROOT" (·.options.chroot)) ++
+  option "CWD" ((written "CWD" (·.options.cwd)).map (·.getD "*")) ++
+  option "TIMEOUT" (((changed (·.options.timeout)).filter (· > 0)).map toString) ++
+  option "NOTBEFORE" ((changed (·.options.notBefore)).map renderGeneralizedTime) ++
+  option "NOTAFTER" ((changed (·.options.notAfter)).map renderGeneralizedTime) ++
+  tag "SETENV" "NOSETENV" (changed (·.tags.setenv)) ++
+  tag "INTERCEPT" "NOINTERCEPT" (changed (·.tags.intercept)) ++
+  tag "NOEXEC" "EXEC" (changed (·.tags.noexec)) ++
+  tag "PASSWD" "NOPASSWD" (changed (·.tags.passwd)) ++
+  tag "LOG_INPUT" "NOLOG_INPUT" (changed (·.tags.logInput)) ++
+  tag "LOG_OUTPUT" "NOLOG_OUTPUT" (changed (·.tags.logOutput)) ++
+  tag "MAIL" "NOMAIL" (changed (·.tags.mail)) ++
+  tag "FOLLOW" "NOFOLLOW" (changed (·.tags.follow))
 
-/-- Lines (without the leading indentation's newline) for one `Host_List = Cmnd_Spec_List`. -/
-def renderCmndSpecs (st : Settings) (cmnds : List CmndSpec) : List String :=
+def renderCmndSpecs (st : Settings) (cmnds : List CmndSpec) (al : Aliases := {})
+    (user : String := "") : List String :=
   go none "" cmnds
 where
   go : Option CmndSpec → String → List CmndSpec → List String
     | none, _, [] => []
     | some _, cur, [] => [cur]
     | prev, cur, cs :: rest =>
-      let body := renderOptsTags prev cs ++ renderMember renderCmndAtom cs.cmnd
-      match prev with
-      | some p =>
-        if p.runas == cs.runas then go (some cs) (cur ++ ", " ++ body) rest
-        else cur :: go (some cs) ("    " ++ renderRunas st cs.runas ++ " " ++ body) rest
-      | none => go (some cs) ("    " ++ renderRunas st cs.runas ++ " " ++ body) rest
+      let same := prev.any fun p => !cs.runasExplicit && p.runas == cs.runas
+      let body := renderOptsTags (if same then prev else none) cs ++ expandedCommands al ", " cs.cmnd
+      if same then go (some cs) (cur ++ ", " ++ body) rest
+      else
+        let line := "    " ++ renderRunas st cs.runas al user ++ " " ++ body
+        (if prev.isSome then [cur] else []) ++ go (some cs) line rest
 
-/-- The message for a user without any privileges on `host`. -/
+private def longHeader (al : Aliases) (st : Settings) (user file : String) (cs : CmndSpec) : String :=
+  let option (name : String) (v : Option Bool) :=
+    v.map fun b => (if b then "" else "!") ++ name
+  let options := [option "setenv" cs.tags.setenv, option "noexec" cs.tags.noexec,
+    option "intercept" cs.tags.intercept, option "authenticate" cs.tags.passwd,
+    option "log_input" cs.tags.logInput, option "log_output" cs.tags.logOutput].filterMap id
+  let field (name : String) (v : Option String) :=
+    (v.map fun text => "    " ++ name ++ ": " ++ text ++ "\n").getD ""
+  s!"Sudoers entry: {file}\n    RunAsUsers: {runasUsers al st user cs.runas}\n" ++
+  field "RunAsGroups" ((cs.runas.bind (·.groups)).map (expandedUsers al user)) ++
+  (if options.isEmpty then "" else "    Options: " ++ ", ".intercalate options ++ "\n") ++
+  field "ApparmorProfile" cs.options.apparmorProfile ++
+  field "Privs" cs.options.privs ++ field "Limitprivs" cs.options.limitprivs ++
+  field "Role" cs.options.role ++ field "Type" cs.options.type ++
+  field "Chroot" cs.options.chroot ++ field "Cwd" (cs.options.cwd.map (·.getD "*")) ++
+  field "Timeout" ((cs.options.timeout.filter (· > 0)).map toString) ++
+  field "NotBefore" (cs.options.notBefore.map renderGeneralizedTime) ++
+  field "NotAfter" (cs.options.notAfter.map renderGeneralizedTime) ++ "    Commands:\n"
+
+def renderLongSpecs (al : Aliases) (st : Settings) (user file : String)
+    (cmnds : List CmndSpec) : String :=
+  (cmnds.foldl (fun (prev, output) cs =>
+    let same := prev.any fun p => !cs.runasExplicit && p.runas == cs.runas &&
+      p.tags == cs.tags && p.options == cs.options
+    let header := if same then "" else "\n" ++ longHeader al st user file cs
+    (some cs, output ++ header ++ "\t" ++ expandedCommands al "\n\t" cs.cmnd ++ "\n"))
+    (none, "")).2
+
 def notAllowedMessage (user host : String) : String :=
   s!"User {user} is not allowed to run sudo on {host}."
 
-/-- `sudo -l` output (see the module doc). -/
+private def sources (s : Sudoers) (located : List Located) : List Located :=
+  if located.isEmpty then s.map fun e => ⟨"/etc/sudoers", 1, e⟩ else located
+
+/-- sudo_lbuf wrapping is byte-counted and splits only at ASCII spaces. -/
+def wrapListing (text : String) (columns indent : Nat) : String :=
+  if columns ≤ indent + 20 then text else
+    "\n".intercalate ((text.splitOn "\n").map fun line =>
+      wrapLine (line.utf8ByteSize + 1) line columns false)
+where
+  wrapLine : Nat → String → Nat → Bool → String
+    | 0, line, _, continued => (if continued then padding else "") ++ line
+    | fuel + 1, line, available, continued =>
+      let lead := if continued then padding else ""
+      let bytes := line.toUTF8
+      if bytes.size ≤ available then lead ++ line else Id.run do
+        let mut before : Option Nat := none
+        let mut after : Option Nat := none
+        for i in [:bytes.size] do
+          if bytes[i]! == 32 then
+            if i < available then before := some i
+            else if after.isNone then after := some i
+        let some split := before.or after | return lead ++ line
+        let mut next := split
+        for i in [split:bytes.size] do
+          if next == i && (bytes[i]! == 32 || bytes[i]! == 9) then next := i + 1
+        let first := String.fromUTF8! (bytes.extract 0 split)
+        if next == bytes.size then return lead ++ first
+        let rest := String.fromUTF8! (bytes.extract next bytes.size)
+        return lead ++ first ++ "\n" ++ wrapLine fuel rest (columns - indent) true
+  padding := String.ofList (List.replicate indent ' ')
+
+private def displaySpec (utcOffset : Int) (cs : CmndSpec) : CmndSpec :=
+  let utc (localTime : Bool) (t : Nat) :=
+    if localTime then (Int.ofNat t - utcOffset).toNat else t
+  { cs with options := { cs.options with
+      notBefore := cs.options.notBefore.map (utc cs.options.notBeforeLocal)
+      notAfter := cs.options.notAfter.map (utc cs.options.notAfterLocal) } }
+
+/-- Short or verbose privileges. Locations preserve the source filename for `-ll`. -/
 def listPrivileges (s : Sudoers) (st : Settings) (user : Principal) (host : String)
-    (canon : String → String := id) : String :=
-  let _ := canon -- command matching is not needed for listing
+    (canon : String → String := id) (verbose : Bool := false) (located : List Located := [])
+    (facts : Option Request := none) (columns : Nat := 0) : String :=
+  let _ := canon
   let al := aliasesOf s
   let f := al.fuel
   let ds := defaultsOf s
   let matching := ds.flatMap fun
     | (.global, ss) => ss
-    | (.host hs, ss) => if hostListOk al f host hs then ss else []
-    | (.user us, ss) => if userListOk al f user us then ss else []
+    | (.host hs, ss) => if hostListOk al f host hs st facts then ss else []
+    | (.user us, ss) => if userListOk al f user us st facts then ss else []
     | _ => []
-  let bound :=
-    (ds.filterMap fun
-      | (.runas rs, ss) => some s!"    Defaults>{renderMembers renderUserAtom rs} {", ".intercalate (ss.map renderSetting)}"
-      | _ => none) ++
-    (ds.filterMap fun
-      | (.cmnd cs, ss) => some s!"    Defaults!{renderMembers renderCmndAtom cs} {", ".intercalate (ss.map renderSetting)}"
-      | _ => none)
-  let privs := (specsOf s).flatMap fun us =>
-    if userListOk al f user us.users then
-      us.entries.flatMap fun hc =>
-        if hostListOk al f host hc.hosts then renderCmndSpecs st hc.cmnds else []
-    else []
-  if privs.isEmpty then notAllowedMessage user.name host ++ "\n"
+  let runasBound := ds.filterMap fun
+    | (.runas rs, ss) => some s!"    Defaults>{expandedUsers al user.name rs} {", ".intercalate (ss.map renderSetting)}"
+    | _ => none
+  let commandBound := ds.filterMap fun
+    | (.cmnd cs, ss) => some s!"    Defaults!{", ".intercalate (cs.map (expandedCommands al ", "))} {", ".intercalate (ss.map renderSetting)}"
+    | _ => none
+  -- display_bound_defaults_by_type does not insert a newline between the two types.
+  let bound := "\n".intercalate runasBound ++ "\n".intercalate commandBound
+  let privs := (sources s located).flatMap fun l =>
+    match l.entry with
+    | .userSpec us =>
+      if userListOk al f user us.users st facts then
+        us.entries.filterMap fun hc =>
+          if hostListOk al f host hc.hosts st facts then
+            let cmnds := hc.cmnds.map (displaySpec ((facts.map (·.utcOffset)).getD 0))
+            some (if verbose then renderLongSpecs al st user.name l.file cmnds
+              else String.join ((renderCmndSpecs st cmnds al user.name).map (· ++ "\n")))
+          else none
+      else []
+    | _ => []
+  if privs.isEmpty then wrapListing (notAllowedMessage user.name host ++ "\n") columns 8
   else
-    let defsSec :=
-      if matching.isEmpty then ""
-      else s!"Matching Defaults entries for {user.name} on {host}:\n    " ++
+    let defsSec := if matching.isEmpty then "" else
+      s!"Matching Defaults entries for {user.name} on {host}:\n    " ++
         ", ".intercalate (matching.map renderSetting) ++ "\n\n"
-    let boundSec :=
-      if bound.isEmpty then ""
-      else s!"Runas and Command-specific defaults for {user.name}:\n" ++
-        String.join (bound.map (· ++ "\n")) ++ "\n"
-    defsSec ++ boundSec ++ s!"User {user.name} may run the following commands on {host}:\n" ++
-      String.join (privs.map (· ++ "\n"))
+    let boundSec := if bound.isEmpty then "" else
+      s!"Runas and Command-specific defaults for {user.name}:\n" ++ bound ++ "\n\n"
+    wrapListing (defsSec ++ boundSec) columns 4 ++
+      wrapListing (s!"User {user.name} may run the following commands on {host}:\n" ++ String.join privs) columns 8
+
+/-- Display the exact last matching command specification for `sudo -ll command`. -/
+def listCommand (s : Sudoers) (st : Settings) (r : Request) (located : List Located := [])
+    (verbose : Bool := false) : String :=
+  let al := aliasesOf s
+  let matchingSpecs := (sources s located).flatMap fun l =>
+    match l.entry with
+    | .userSpec us => (usCandidates al al.fuel st r us).map (l.file, ·)
+    | _ => []
+  match matchingSpecs.getLast? with
+  | some (file, candidate) =>
+    if !candidate.allow then "" else
+    let cmd := match r.command with
+      | .run path _ args => " ".intercalate (path :: args)
+      | .sudoedit files => " ".intercalate ("sudoedit" :: files)
+      | _ => "list"
+    (if verbose then longHeader al st r.user.name file (displaySpec r.utcOffset candidate.spec) ++ "\t" ++
+      expandedCommands al "\n\t" candidate.spec.cmnd ++ "\n    Matched: " else "") ++ cmd ++ "\n"
+  | none => ""
 
 end LeanSudo.Policy

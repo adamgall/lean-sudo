@@ -45,7 +45,7 @@ def addError (e : String) : LoadM Unit := modify fun s => { s with errors := s.e
 def addWarning (w : String) : LoadM Unit := modify fun s => { s with warnings := s.warnings.push w }
 
 def readSudoers (path : String) : IO (Except String String) := do
-  match ← (readFileNoFollow path).toBaseIO with
+  match ← (readFileFollow path).toBaseIO with
   | .ok (_, text) => pure (.ok text)
   | .error e => pure (.error (toString e))
 
@@ -71,7 +71,7 @@ partial def includeFile (host : String) (depth : Nat) (path : String) : LoadM Un
 
 partial def includeDir (host : String) (depth : Nat) (dir : String) : LoadM Unit := do
   -- A missing directory is ignored; an insecure one is skipped (as sudo does).
-  let some st ← lstat dir | return
+  let some st ← stat dir | return
   match checkDirPerms dir st with
   | .error msg => addWarning s!"visudo: {msg}"
   | .ok () =>
@@ -80,6 +80,8 @@ partial def includeDir (host : String) (depth : Nat) (dir : String) : LoadM Unit
     | .ok names =>
       for name in sortNames (names.filter includeDirEntryOk) do
         let path := dir ++ "/" ++ name
+        let some st ← stat path | continue
+        if !st.isReg then continue
         if depth > maxDepth then
           addError s!"{path}: too many levels of includes"
         else

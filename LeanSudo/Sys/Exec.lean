@@ -17,6 +17,19 @@ Before anything reaches C, this module checks the arguments and fails closed:
 ids must fit in `uid_t`/`gid_t` and must not be `(uid_t)-1` (which `setresuid`
 treats as "unchanged"), strings must not contain NUL (C would truncate them),
 `path` must be absolute, `argv` non-empty, `umask ≤ 0o777`, `closeFrom ≥ 3`.
+
+The shell calls `initializeProcess` before privileged file access. Child execution
+restores the saved dump settings and applies policy resource limits (core defaults
+to 0,0); login cwd failures warn, while required cwd failures abort. NOEXEC loads
+the configured sudo noexec DSO and refuses an absent library. AppArmor profiles
+are ignored when the kernel module is disabled; enabled transitions fail closed.
+Both execution modes enforce command deadlines with
+HUP/TERM followed by KILL after two seconds. Backgrounding forks the supervisor,
+not just the command, so PAM cleanup occurs only after completion.
+
+CHROOT is deliberately not an execution option: the deprecated interface remains
+refused by the deciding core, avoiding NSS and command-resolution exposure inside
+an attacker-controlled root (CVE-2025-32463).
 -/
 
 namespace LeanSudo.Sys
@@ -40,6 +53,14 @@ structure ExecSpec where
   /-- `-b` -/
   background : Bool
   closeFrom : Nat := 3
+  cwdOptional : Bool := false
+  timeout : Nat := 0
+  noexecFile : Option String := none
+  apparmorProfile : Option String := none
+  rlimits : Array (String × String) := #[("rlimit_core", "0,0")]
+  utmpUser : Option String := none
+  execFd : Option Nat := none
+  execBackground : Bool := false
   deriving Repr, Inhabited
 
 inductive ExitStatus where
@@ -106,6 +127,26 @@ theorem decodeStatus_signaled (s : Nat) (h : s < 0x10000) :
 /-- Strings handed to C must not contain NUL. -/
 def cSafe (s : String) : Bool := !s.contains '\x00'
 
+/-- Only private descriptors represent pinned executables; never permit a
+standard descriptor or the sentinel used to select pathname execution. -/
+def validExecFd : Option Nat → Bool
+  | none => true
+  | some fd => decide (3 ≤ fd ∧ fd ≤ 0x7FFFFFFF)
+
+theorem validExecFd_some {fd : Nat} (h : validExecFd (some fd) = true) :
+    3 ≤ fd ∧ fd ≤ 0x7FFFFFFF := by
+  simpa [validExecFd] using h
+
+theorem validExecFd_exact {fd : Nat} (h : validExecFd (some fd) = true) :
+    fd.toUInt32.toNat = fd ∧ fd.toUInt32 ≠ 0xFFFFFFFF := by
+  have hb := validExecFd_some h
+  have he := toUInt32_toNat_of_lt (n := fd) (by omega)
+  refine ⟨he, ?_⟩
+  intro hs
+  rw [hs] at he
+  simp at he
+  omega
+
 /-- Validated, C-ready form of an `ExecSpec`. -/
 structure Checked where
   uid : UInt32
@@ -118,7 +159,10 @@ structure Checked where
 def check (s : ExecSpec) : Except String Checked := do
   unless s.path.startsWith "/" do
     throw s!"unable to execute {s.path}: path is not absolute"
-  unless cSafe s.path && s.argv.all cSafe && s.env.all cSafe && (s.cwd.map cSafe).getD true do
+  unless cSafe s.path && s.argv.all cSafe && s.env.all cSafe &&
+      (s.cwd.map cSafe).getD true && (s.noexecFile.map cSafe).getD true &&
+      (s.apparmorProfile.map cSafe).getD true && (s.utmpUser.map cSafe).getD true &&
+      s.rlimits.all (fun (k, v) => cSafe k && cSafe v) do
     throw s!"unable to execute {s.path}: argument contains a NUL byte"
   if s.argv.isEmpty then
     throw s!"unable to execute {s.path}: empty argument vector"
@@ -132,12 +176,18 @@ def check (s : ExecSpec) : Except String Checked := do
     throw s!"invalid umask {s.umask}"
   unless 3 ≤ s.closeFrom ∧ s.closeFrom ≤ 0x7FFFFFFF do
     throw s!"invalid closefrom value {s.closeFrom}"
+  unless s.timeout ≤ 0x7FFFFFFF do
+    throw "invalid command timeout"
+  unless validExecFd s.execFd do
+    throw "invalid executable descriptor"
   pure { uid, gid, groups, umask := s.umask.toUInt32, closeFrom := s.closeFrom.toUInt32 }
 
 @[extern "leansudo_exec_run"]
 opaque runRaw (path : @& String) (argv : @& Array String) (env : @& Array String)
     (uid gid : UInt32) (groups : @& Array UInt32) (cwd : @& Option String) (umask : UInt32)
-    (usePty background : Bool) (closeFrom : UInt32) : IO UInt32
+    (usePty background : Bool) (closeFrom : UInt32) (cwdOptional : Bool) (timeout : UInt32)
+    (noexecFile apparmorProfile : @& Option String) (rlimits : @& Array (String × String))
+    (utmpUser : @& Option String) (execFd : UInt32) (execBackground : Bool) : IO UInt32
 
 @[extern "leansudo_exec_exit"]
 opaque exitRaw (isSignal : Bool) (n : UInt32) : IO Unit
@@ -149,19 +199,26 @@ def flushStd : IO Unit := do
 
 end Exec
 
+/-- Repair standard descriptors before opening privileged files, and optionally
+disable core dumps for the privileged process (restored only in the exec child). -/
+@[extern "leansudo_exec_initialize"]
+opaque initializeProcess (disableCoredump : Bool := true) : IO Unit
+
 /-- fork, drop privileges in the child in the order setgroups → setresgid → setresuid,
 verify the drop with getres[ug]id (abort if it did not take), chdir, umask, close fds,
 execve. The parent relays signals, waits, and returns the child's status. A failed
 execve is reported back through a CLOEXEC pipe as an `IO.userError`.
-With `background` the command is not waited for and `.exited 0` is returned once it
-has been exec'd. -/
+With `background`, the original process exits immediately; a background supervisor
+waits and returns here, keeping the caller's PAM session alive until completion. -/
 def runCommand (s : ExecSpec) : IO ExitStatus := do
   let c ← match Exec.check s with
     | .ok c => pure c
     | .error e => throw (IO.userError e)
   Exec.flushStd
   let r ← Exec.runRaw s.path s.argv s.env c.uid c.gid c.groups s.cwd c.umask
-    s.usePty s.background c.closeFrom
+    s.usePty s.background c.closeFrom s.cwdOptional s.timeout.toUInt32
+    s.noexecFile s.apparmorProfile s.rlimits s.utmpUser
+    (s.execFd.map Nat.toUInt32 |>.getD 0xFFFFFFFF) s.execBackground
   pure (Exec.decodeStatus r)
 
 /-- exit(code) or re-raise the signal on ourselves with default disposition

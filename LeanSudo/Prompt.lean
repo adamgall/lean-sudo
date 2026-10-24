@@ -12,7 +12,7 @@ def expandPromptL (u U h p : List Char) : List Char → List Char
   | [] => []
   | '%' :: 'u' :: r => u ++ expandPromptL u U h p r
   | '%' :: 'U' :: r => U ++ expandPromptL u U h p r
-  | '%' :: 'h' :: r => h ++ expandPromptL u U h p r
+  | '%' :: 'h' :: r => h.takeWhile (· != '.') ++ expandPromptL u U h p r
   | '%' :: 'H' :: r => h ++ expandPromptL u U h p r
   | '%' :: 'p' :: r => p ++ expandPromptL u U h p r
   | '%' :: '%' :: r => '%' :: expandPromptL u U h p r

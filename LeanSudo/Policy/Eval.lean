@@ -28,8 +28,8 @@ depend on this: soundness is stated in terms of the same matching functions.
 `Candidate` per command spec whose user list, host list, run-as spec and command
 member all match (for `-l`/`-v` only user and host lists are checked). For running a
 command the last candidate decides (`judge`); no candidate ⇒ `.deny`.
-For `-l`/`-v`, every spec of a matching user/host entry remains a candidate,
-with `allow := !cs.cmnd.negated`: listing does not evaluate command aliases or run-as.
+For own `-l`/`-v`, every spec of a matching user/host entry is allowing:
+listing ignores validity windows and command negation because it executes no command.
 -/
 
 namespace LeanSudo.Policy
@@ -105,49 +105,88 @@ def atomMatches {α : Type} (aliasName : α → Option String)
 
 /-! ## Users, groups, hosts -/
 
-/-- A user-list atom against a principal (`%group`/`%#gid` = membership, including the
-primary group). Alias atoms are handled by `atomMatches`. -/
-def userBase (p : Principal) : UserAtom → Bool
+/-- sudo's case-insensitive account comparisons (enabled by default). -/
+def nameEq (foldCase : Bool) (a b : String) : Bool :=
+  if foldCase then a.toLower == b.toLower else a == b
+
+def netgroupMatch (st : Settings) (facts : Option Request) (n : String)
+    (user host : Option String) : Bool :=
+  st.useNetgroups && (facts.any fun r =>
+    r.netgroups.any fun (ng, u, h, yes) =>
+      ng == n && u == user && (h == host || (host.isSome && h == some r.host)) && yes)
+
+def userBase (p : Principal) (st : Settings) (facts : Option Request) : UserAtom → Bool
   | .all => true
-  | .name n => n == p.name
+  | .name n => nameEq st.caseInsensitiveUser n p.name
   | .id n => n == p.uid
-  | .group n => p.groups.any (·.1 == n)
+  | .group n => p.groups.any (fun g => nameEq st.caseInsensitiveGroup n g.1)
   | .gid n => n == p.gid || p.groups.any (·.2 == n)
+  | .netgroup n => netgroupMatch st facts n (some p.name)
+      (if st.netgroupTuple then facts.map (fun r => if r.lhost.isEmpty then r.host else r.lhost) else none)
   | _ => false
 
-/-- A run-as *group* list atom against a group (`name` = group name, `id` = gid). -/
-def groupBase (g : GroupInfo) : UserAtom → Bool
+def groupBase (g : GroupInfo) (st : Settings) : UserAtom → Bool
   | .all => true
-  | .name n => n == g.name
+  | .name n => nameEq st.caseInsensitiveGroup n g.name
   | .id n => n == g.gid
   | _ => false
 
-/-- ASCII case-insensitive host comparison, or case-insensitive glob. -/
-def hostBase (host : String) : HostAtom → Bool
+def maskedEq (a b mask : IpAddr) : Bool :=
+  match a, b, mask with
+  | .v4 a, .v4 b, .v4 m | .v6 a, .v6 b, .v6 m =>
+    a.length == b.length && a.length == m.length &&
+      ((a.zip b).zip m).all (fun ((x, y), z) => x &&& z == y &&& z)
+  | _, _, _ => false
+
+def maskedAddress (ip mask : IpAddr) : Option IpAddr :=
+  match ip, mask with
+  | .v4 a, .v4 m => if a.length == 4 && m.length == 4 then
+      some (.v4 ((a.zip m).map (fun (x, y) => x &&& y))) else none
+  | .v6 a, .v6 m => if a.length == 16 && m.length == 16 then
+      some (.v6 ((a.zip m).map (fun (x, y) => x &&& y))) else none
+  | _, _ => none
+
+def networkMatches (interfaces : List (IpAddr × IpAddr)) (addr mask : IpAddr) : Bool :=
+  let implicitMask := match mask with
+    | .v4 [] | .v6 [] => true
+    | _ => false
+  interfaces.any fun (ip, localMask) =>
+    if implicitMask then ip == addr || maskedAddress ip localMask == some addr
+    else maskedEq ip addr mask
+
+def hostBase (host : String) (st : Settings) (facts : Option Request) : HostAtom → Bool
   | .all => true
-  | .name n => if hasGlob n then fnmatch n host false true else n.toLower == host.toLower
+  | .name n =>
+    let h := if n.contains '.' then
+      (facts.map (fun r => if r.lhost.isEmpty then host else r.lhost)).getD host else host
+    if hasGlob n then fnmatch n h false true else n.toLower == h.toLower
+  | .netgroup n => netgroupMatch st facts n
+      (if st.netgroupTuple then facts.map (·.user.name) else none)
+      (some ((facts.map (fun r => if r.lhost.isEmpty then host else r.lhost)).getD host))
+  | .network addr mask => facts.any fun r => networkMatches r.interfaces addr mask
   | _ => false
 
-/-- Result of a user list (with `User_Alias`es) for the invoking user. -/
-def userListResult (al : Aliases) (fuel : Nat) (p : Principal) (l : List (Member UserAtom)) :
-    Option Bool :=
-  matchList (atomMatches UserAtom.aliasName al.user (userBase p) fuel) l
+def userListResult (al : Aliases) (fuel : Nat) (p : Principal) (l : List (Member UserAtom))
+    (st : Settings) (facts : Option Request) : Option Bool :=
+  matchList (atomMatches UserAtom.aliasName al.user (userBase p st facts) fuel) l
 
-def userListOk (al : Aliases) (fuel : Nat) (p : Principal) (l : List (Member UserAtom)) : Bool :=
-  userListResult al fuel p l == some true
+def userListOk (al : Aliases) (fuel : Nat) (p : Principal) (l : List (Member UserAtom))
+    (st : Settings) (facts : Option Request) : Bool :=
+  userListResult al fuel p l st facts == some true
 
-def hostListOk (al : Aliases) (fuel : Nat) (host : String) (l : List (Member HostAtom)) : Bool :=
-  matchList (atomMatches HostAtom.aliasName al.host (hostBase host) fuel) l == some true
+def hostListOk (al : Aliases) (fuel : Nat) (host : String) (l : List (Member HostAtom))
+    (st : Settings) (facts : Option Request) : Bool :=
+  matchList (atomMatches HostAtom.aliasName al.host (hostBase host st facts) fuel) l == some true
 
-/-- Result of a run-as user list (with `Runas_Alias`es) for the target user. -/
-def runasUserResult (al : Aliases) (fuel : Nat) (t : Principal) (l : List (Member UserAtom)) :
-    Option Bool :=
-  matchList (atomMatches UserAtom.aliasName al.runas (userBase t) fuel) l
+def runasUserResult (al : Aliases) (fuel : Nat) (t : Principal) (l : List (Member UserAtom))
+    (st : Settings) (facts : Option Request) : Option Bool :=
+  matchList (atomMatches UserAtom.aliasName al.runas (fun a =>
+    if a == .myself then facts.any (fun r => t.name == r.user.name)
+    else userBase t st facts a) fuel) l
 
-/-- Result of a run-as group list (with `Runas_Alias`es) for the requested group. -/
-def runasGroupResult (al : Aliases) (fuel : Nat) (g : GroupInfo) (l : List (Member UserAtom)) :
-    Option Bool :=
-  matchList (atomMatches UserAtom.aliasName al.runas (groupBase g) fuel) l
+def runasGroupResult (al : Aliases) (fuel : Nat) (g : GroupInfo) (l : List (Member UserAtom))
+    (st : Settings) : Option Bool :=
+  matchList (atomMatches UserAtom.aliasName al.runas (groupBase g st) fuel) l
 
 /-! ## Run-as -/
 
@@ -158,18 +197,19 @@ def isRunasDefault (st : Settings) (t : Principal) : Bool :=
     match (String.ofList ds).toNat? with
     | some n => n == t.uid
     | none => false
-  | _ => st.runasDefault == t.name
+  | _ => nameEq st.caseInsensitiveUser st.runasDefault t.name
 
 /-- Group half when the run-as user matched ALLOW. No `-g` ⇒ fine.
 As in sudoers `runas_grouplist_matches`, an unspecified group result falls
 back to the target's primary/supplementary groups, including inside aliases.
 Callers with an unmatched user must use `runasGroupResult` without this fallback. -/
-def runasGroupOk (al : Aliases) (fuel : Nat) (r : Request) (gs : Option (List (Member UserAtom))) :
-    Bool :=
+def runasGroupOk (al : Aliases) (fuel : Nat) (r : Request) (gs : Option (List (Member UserAtom)))
+    (st : Settings) : Bool :=
   match r.runasGroup with
   | none => true
   | some g =>
-    let fallback := g.gid == r.runasUser.gid || r.runasUser.groups.any (·.2 == g.gid)
+    let p := if st.preserveGroups then r.user else r.runasUser
+    let fallback := g.gid == r.runasUser.gid || p.groups.any (·.2 == g.gid)
     let result := gs.bind (groupResult g fallback fuel)
     result.getD fallback
 where
@@ -181,7 +221,7 @@ where
           match fuel with
           | 0 => none
           | f + 1 => (lookupAlias al.runas n).bind (groupResult g fallback f)
-        | _ => if groupBase g a then some true else none) ms
+        | _ => if groupBase g st a then some true else none) ms
       result.orElse (fun _ => if fallback then some true else none)
 
 /-- sudoers `runaslist_matches`: group fallback requires a matched user;
@@ -189,27 +229,27 @@ an unspecified user can be rescued only by an explicitly allowed `-g` and
 the invoking user's own name. An explicit user DENY is never rescued. -/
 def runasOk (al : Aliases) (fuel : Nat) (st : Settings) (r : Request) (rs : Option RunasSpec) : Bool :=
   let (userResult, gs) := match rs with
-    | none | some ⟨none, none⟩ =>
+    | none =>
       (if isRunasDefault st r.runasUser then some true else none, none)
-    | some ⟨some us, gs⟩ => (runasUserResult al fuel r.runasUser us, gs)
-    | some ⟨none, some gs⟩ =>
-      (if (!r.runasUserExplicit && r.runasGroup.isSome) || r.runasUser.name == r.user.name
-        then some true else none, some gs)
+    | some ⟨some us, gs⟩ => (runasUserResult al fuel r.runasUser us st (some r), gs)
+    | some ⟨none, gs⟩ =>
+      (if r.runasUser.name == r.user.name then some true else none, gs)
   match userResult with
-  | some true => runasGroupOk al fuel r gs
+  | some true => runasGroupOk al fuel r gs st
   | some false => false
   | none =>
     match r.runasGroup with
     | none => false
     | some g =>
       r.runasUser.name == r.user.name &&
-        (gs.bind (runasGroupResult al fuel g) == some true)
+        (gs.bind (fun ms => runasGroupResult al fuel g ms st) == some true)
 
 /-! ## Commands -/
 
 /-- Directory part of a path, without the trailing slash (`/usr/bin/ls` ↦ `/usr/bin`). -/
 def dirOf (s : String) : String :=
-  String.ofList ((s.toList.reverse.dropWhile (· != '/')).drop 1).reverse
+  let d := String.ofList ((s.toList.reverse.dropWhile (· != '/')).drop 1).reverse
+  if d.isEmpty && s.startsWith "/" then "/" else d
 
 def endsWithSlash (p : String) : Bool := p.toList.getLast? == some '/'
 
@@ -221,84 +261,144 @@ def baseOf (s : String) : String :=
 
 /-- Argument constraint. `pathname`: `*`/`?` do not match `/` (sudo uses `FNM_PATHNAME`
 for `sudoedit` arguments, `command_args_match` in match_command.c). -/
-def argsMatch (pathname : Bool) : CmndArgs → List String → Bool
-  | .any, _ => true
-  | .none, as => as.isEmpty
-  | .pattern q, as =>
-    let j := " ".intercalate as
-    if hasGlob q then fnmatch q j pathname else q == j
-  | .regex _, _ => false
+def regexMatch (facts : Option Request) (pattern subject : String) : Bool :=
+  facts.any fun r => r.regexMatches.any fun (p, s, yes) => p == pattern && s == subject && yes
 
-/-- Path part of a command atom against the requested `path` (as found by PATH lookup)
-and its `canonical` realpath. `canon` is the realpath oracle for sudoers paths.
+def argsMatch (pathname : Bool) (a : CmndArgs) (args : List String)
+    (facts : Option Request) : Bool :=
+  match a with
+  | .any => true
+  | .none => args.isEmpty
+  | .pattern q => fnmatch q (" ".intercalate args) pathname
+  | .regex q => regexMatch facts q (" ".intercalate args)
 
-* directory `d/`: `path` lies directly in `d`, or the canonical directory of `path`
-  equals the canonical `d` (usr-merge: `/bin/` vs `/usr/bin/`);
-* glob: matched against `path` only;
-* literal: `p == path`, or the basenames agree and `p` resolves to `canonical`.
+/-- Device/inode comparison. Missing facts never authorize an IO-backed request. -/
+def sameFile (facts : Option Request) (p path : String) : Bool :=
+  match facts with
+  | none => p == path
+  | some r =>
+    match r.fileIds.find? (·.1 == p), r.fileIds.find? (·.1 == path) with
+    | some (_, d, i), some (_, d', i') => d == d' && i == i'
+    | _, _ => false
 
-Like sudo, a realpath/inode comparison is only made between files with the same
-basename: on multicall systems (`/usr/bin/id` and `/usr/bin/rm` both symlinks to one
-binary) a rule for `id` must not permit `rm`. The canonical target of the requested
-file itself is never compared against a directory rule for the same reason. -/
-def pathMatches (canon : String → String) (p path canonical : String) : Bool :=
-  if endsWithSlash p then
-    let pd := dropLastChar p
-    dirOf path == pd || canon (dirOf path) == canon pd
-  else if hasGlob p then
-    fnmatch p path true
-  else
-    p == path || (baseOf p == baseOf path && canon p == canonical)
+/-- Literal matching compares the basename, canonical PARENT directory and inode.
+The realpath of the file itself is deliberately not used. -/
+def literalPathMatches (canon : String → String) (facts : Option Request) (p path : String) : Bool :=
+  baseOf p == baseOf path && canon (dirOf p) == canon (dirOf path) && sameFile facts p path
 
-/-- A command atom against the requested command (aliases via `atomMatches`). -/
-def cmndBase (canon : String → String) : Command → CmndAtom → Bool
-  | .run _ _ _, .all => true
-  | .sudoedit _, .all => true
-  | .run path canonical args, .command p a => pathMatches canon p path canonical && argsMatch false a args
-  | .sudoedit files, .sudoedit a => argsMatch true a files
-  | _, _ => false
+def directoryMatches (canon : String → String) (facts : Option Request) (p path : String) : Bool :=
+  canon (if p == "/" then "/" else dropLastChar p) == canon (dirOf path) &&
+    sameFile facts (p ++ baseOf path) path
+
+def pathMatches (canon : String → String) (p path _canonical : String)
+    (facts : Option Request) : Bool :=
+  if hasGlob p then
+    if facts.any (·.fastGlob) then
+      (fnmatch p path true || fnmatch p (canon (dirOf path) ++ "/" ++ baseOf path) true) &&
+        sameFile facts path path
+    else
+      facts.any fun r =>
+        ((r.globPaths.find? (·.1 == p)).map (·.2)).getD [] |>.any fun q =>
+          if endsWithSlash q then directoryMatches canon facts q path
+          else literalPathMatches canon facts q path
+  else if endsWithSlash p then directoryMatches canon facts p path
+  else literalPathMatches canon facts p path
+
+/-- Digest spelling is presentation-only: compare the decoded algorithm and bytes. -/
+def digestMatches (a b : Digest) : Bool := a.algo == b.algo && a.bytes == b.bytes
+
+/-- sudo's pseudo-command branch does not inspect file digests. -/
+def isPseudoAtom : CmndAtom → Bool
+  | .list | .sudoedit _ => true
+  | _ => false
+
+def cmndBase (canon : String → String) (cmd : Command) (atom : CmndAtom)
+    (facts : Option Request) : Bool :=
+  match atom with
+  | .digest ds atom =>
+      (isPseudoAtom atom || ds.any (fun d => facts.any (fun r => r.digests.any (digestMatches d)))) &&
+        cmndBase canon cmd atom facts
+  | .all => match cmd with
+    | .run _ _ _ | .sudoedit _ | .checkList => true
+    | _ => false
+  | .list => cmd == .checkList
+  | .command p a => match cmd with
+    | .run path canonical args => pathMatches canon p path canonical facts && argsMatch false a args facts
+    | _ => false
+  | .commandRegex re a => match cmd with
+    | .run path _ args =>
+      (regexMatch facts re path ||
+        regexMatch facts re (canon (dirOf path) ++ "/" ++ baseOf path)) &&
+        sameFile facts path path && argsMatch false a args facts
+    | _ => false
+  | .sudoedit a => match cmd with
+    | .sudoedit files => argsMatch true a files facts
+    | _ => false
+  | .alias _ => false
 
 def cmndListResult (al : Aliases) (fuel : Nat) (canon : String → String) (cmd : Command)
-    (l : List (Member CmndAtom)) : Option Bool :=
-  matchList (atomMatches CmndAtom.aliasName al.cmnd (cmndBase canon cmd) fuel) l
+    (l : List (Member CmndAtom)) (facts : Option Request) : Option Bool :=
+  matchList (atomMatches CmndAtom.aliasName al.cmnd (fun a => cmndBase canon cmd a facts) fuel) l
 
 def cmndMemberResult (al : Aliases) (fuel : Nat) (canon : String → String) (cmd : Command)
-    (m : Member CmndAtom) : Option Bool :=
-  cmndListResult al fuel canon cmd [m]
+    (m : Member CmndAtom) (facts : Option Request) : Option Bool :=
+  cmndListResult al fuel canon cmd [m] facts
+
+/-- Whether the last matching member inside an alias is digest-constrained. -/
+def cmndUsesDigest (al : Aliases) (r : Request) : Nat → CmndAtom → Bool
+  | _, .digest _ atom => !isPseudoAtom atom
+  | 0, _ => false
+  | fuel + 1, .alias name =>
+    let members := (lookupAlias al.cmnd name).getD []
+    let last := members.reverse.find? fun m =>
+      (cmndMemberResult al fuel r.canon r.command m (some r)).isSome
+    last.any (fun m => cmndUsesDigest al r fuel m.atom)
+  | _ + 1, _ => false
 
 /-! ## Decision -/
 
 /-- Running a command or sudoedit (as opposed to `-l` / `-v`). -/
 def isRunCmd : Command → Bool
-  | .run _ _ _ | .sudoedit _ => true
+  | .run _ _ _ | .sudoedit _ | .checkList => true
   | .list | .validate => false
 
 /-- A matching command spec, retaining its command member's ALLOW or DENY result. -/
 structure Candidate where
   spec : CmndSpec
   allow : Bool
+  usesDigest : Bool := false
   deriving Repr, BEq, Inhabited
+
+def inTimeWindow (now : Nat) (cs : CmndSpec) (utcOffset : Int) : Bool :=
+  cs.options.notBefore.all (fun n =>
+    (n : Int) ≤ (now : Int) + if cs.options.notBeforeLocal then utcOffset else 0) &&
+  cs.options.notAfter.all (fun n =>
+    (now : Int) + (if cs.options.notAfterLocal then utcOffset else 0) ≤ (n : Int))
 
 /-- Does a command spec apply to the request? For `-l`/`-v` every spec does (only the
 user and host lists are relevant); otherwise run-as and the command member must match. -/
 def specApplies (al : Aliases) (fuel : Nat) (st : Settings) (r : Request) (cs : CmndSpec) : Bool :=
-  !isRunCmd r.command ||
-    (runasOk al fuel st r cs.runas && (cmndMemberResult al fuel r.canon r.command cs.cmnd).isSome)
+  !isRunCmd r.command || (inTimeWindow r.now cs r.utcOffset &&
+    (runasOk al fuel st r cs.runas && (cmndMemberResult al fuel r.canon r.command cs.cmnd (some r)).isSome))
 
-/-- Listing retains syntactic negation; run requests retain the tri-state result. -/
+/-- Listing/validation are authorized by any applicable user/host entry, even
+one containing only negated commands; execution retains the tri-state result. -/
 def specAllow (al : Aliases) (fuel : Nat) (r : Request) (cs : CmndSpec) : Bool :=
-  if isRunCmd r.command then (cmndMemberResult al fuel r.canon r.command cs.cmnd).getD false
-  else !cs.cmnd.negated
+  if isRunCmd r.command then (cmndMemberResult al fuel r.canon r.command cs.cmnd (some r)).getD false
+  else true
+
+def candidateOf (al : Aliases) (fuel : Nat) (r : Request) (cs : CmndSpec) : Candidate :=
+  ⟨cs, specAllow al fuel r cs, isRunCmd r.command && cmndUsesDigest al r fuel cs.cmnd.atom⟩
 
 def hcCandidates (al : Aliases) (fuel : Nat) (st : Settings) (r : Request) (hc : HostCmnds) :
     List Candidate :=
-  if hostListOk al fuel r.host hc.hosts then
-    (hc.cmnds.filter (specApplies al fuel st r)).map fun cs => ⟨cs, specAllow al fuel r cs⟩
+  if hostListOk al fuel r.host hc.hosts st (some r) then
+    (hc.cmnds.filter (specApplies al fuel st r)).map (candidateOf al fuel r)
   else []
 
 def usCandidates (al : Aliases) (fuel : Nat) (st : Settings) (r : Request) (us : UserSpec) :
     List Candidate :=
-  if userListOk al fuel r.user us.users then us.entries.flatMap (hcCandidates al fuel st r) else []
+  if userListOk al fuel r.user us.users st (some r) then us.entries.flatMap (hcCandidates al fuel st r) else []
 
 def candidatesCore (al : Aliases) (specs : List UserSpec) (st : Settings) (r : Request) :
     List Candidate :=
@@ -311,11 +411,30 @@ def candidates (s : Sudoers) (st : Settings) (r : Request) : List Candidate :=
 /-- Does a spec require authentication (PASSWD/NOPASSWD tag, else `authenticate`)? -/
 def specNeedsAuth (st : Settings) (cs : CmndSpec) : Bool := cs.tags.passwd.getD st.authenticate
 
+def commandImpliesSetenv : CmndAtom → Bool
+  | .all => true
+  | .digest _ atom => commandImpliesSetenv atom
+  | _ => false
+
 def allowedOf (st : Settings) (c : Candidate) : Allowed :=
   { needsAuth := specNeedsAuth st c.spec
     -- `ALL` (written directly in the spec) implies SETENV, like sudo's parser does
-    setenv := c.spec.tags.setenv.getD (st.setenv || c.spec.cmnd.atom == .all)
-    cwd := c.spec.options.cwd }
+    setenv := c.spec.tags.setenv.getD (st.setenv || commandImpliesSetenv c.spec.cmnd.atom)
+    cwd := c.spec.options.cwd
+    noexec := c.spec.tags.noexec
+    intercept := c.spec.tags.intercept
+    logInput := c.spec.tags.logInput
+    logOutput := c.spec.tags.logOutput
+    mail := c.spec.tags.mail
+    follow := c.spec.tags.follow
+    chroot := c.spec.options.chroot
+    timeout := c.spec.options.timeout
+    role := c.spec.options.role
+    type := c.spec.options.type
+    apparmorProfile := c.spec.options.apparmorProfile
+    privs := c.spec.options.privs
+    limitprivs := c.spec.options.limitprivs
+    usesDigest := c.usesDigest }
 
 /-- `listpw`/`verifypw` over the allowing specs. -/
 def pwNeedsAuth (pol : PwPolicy) (st : Settings) (ok : List Candidate) : Bool :=
@@ -348,6 +467,37 @@ def judge (st : Settings) (cmd : Command) (cands : List Candidate) : Judgement :
 /-- Decide a request. Callers must have checked the policy with `validate`. -/
 def evaluate (s : Sudoers) (st : Settings) (r : Request) : Judgement :=
   judge st r.command (candidates s st r)
+
+/-- Pseudo-command lookup ignores the requested run-as group, as lookup.c does. -/
+def listingRunasResult (al : Aliases) (st : Settings) (r : Request) (p : Principal)
+    (cs : CmndSpec) : Option Bool :=
+  match cs.runas with
+  | some ⟨some us, _⟩ =>
+    matchList (atomMatches UserAtom.aliasName al.runas (userBase p st (some r)) al.fuel) us
+  | none | some ⟨none, none⟩ => if isRunasDefault st p then some true else none
+  | _ => none
+
+/-- `sudo -l -U other`: list/ALL for that user, or ALL as root. An explicit
+target-user denial is never rescued by the root fallback. -/
+def canListOther (s : Sudoers) (st : Settings) (r : Request) (other root : Principal) : Bool :=
+  if r.user.uid == 0 || r.user.uid == other.uid then true else
+  let al := aliasesOf s
+  let specs := (specsOf s).flatMap fun us =>
+    if userListOk al al.fuel r.user us.users st (some r) then
+      us.entries.flatMap fun hc =>
+        if hostListOk al al.fuel r.host hc.hosts st (some r) then hc.cmnds else []
+    else []
+  let results := specs.filterMap fun cs =>
+    if !inTimeWindow r.now cs r.utcOffset then none else
+    let base := match listingRunasResult al st r other cs with
+      | some true => some (fun a => cmndBase r.canon .checkList a (some r))
+      | some false => none
+      | none => if listingRunasResult al st r root cs == some true then
+          some (fun a => a == CmndAtom.all)
+        else none
+    base.bind fun base =>
+      matchList (atomMatches CmndAtom.aliasName al.cmnd base al.fuel) [cs.cmnd]
+  results.getLast?.getD false
 
 /-! ## Static checks -/
 

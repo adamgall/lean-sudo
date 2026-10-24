@@ -9,10 +9,10 @@ import LeanSudo.Sudoedit.Check
 Editor selection and copyback gates are pure and proved in `Check`. Filesystem
 operations use pinned directory descriptors and permanently dropped forked workers
 (`Sys.Edit`): the privileged Lean process never temporarily adopts a user's ids.
-All parent components are checked using the invoking user's actual access rights,
-including ACLs. Unlike sudo, intermediate directory symlinks and `.`/`..` are
-refused (fail closed). Temporary contents are compared byte-for-byte, not merely
-by size/mtime; original size/mtime and inode are retained to detect concurrent edits.
+Parent descriptors pin kernel path resolution, including dot/parent components.
+As in sudo, links in writable ancestors are refused and the final directory must
+not be writable (unless sudoedit_checkdir is disabled); FOLLOW controls final links.
+Temporary contents are compared byte-for-byte; original inode metadata detects concurrent edits.
 Copy errors preserve the temporary file and attempt to restore the original bytes.
 The original inode is retained, so owner/mode and existing hard links survive.
 -/
@@ -27,28 +27,22 @@ private def fileError (path : String) (e : IO.Error) : IO.Error :=
   else if text == "Invalid argument" then s!"{path}: not a regular file"
   else s!"{path}: {text}"
 
-private def checkedDir (invoker target : Sys.Edit.Identity) (parent : UInt32)
-    (name file : String) : IO UInt32 := do
-  let fd := (← Sys.Edit.operation target 0 parent name).value
-  try
-    if invoker.uid != 0 then
-      let st ← Sys.Edit.stat fd
-      -- Ownership implies the ability to chmod, even when W_OK is currently false.
-      if st[1]! == invoker.uid.toNat || (← Sys.Edit.operation invoker 3 fd).value == 1 then
-        throw (IO.userError s!"{file}: editing files in a writable directory is not permitted")
-    return fd
-  catch e =>
-    Sys.Edit.close fd
-    throw e
+private def writableDir (invoker : Sys.Edit.Identity) (fd : UInt32) : IO Bool := do
+  let st ← Sys.Edit.stat fd
+  return st[1]! == invoker.uid.toNat || (← Sys.Edit.operation invoker 3 fd).value == 1
 
-private def parentDir (invoker target : Sys.Edit.Identity) (dirs : List String)
-    (file : String) : IO UInt32 := do
-  let mut fd ← checkedDir invoker target Sys.Edit.noneFd "/" file
+private def parentDir (invoker target : Sys.Edit.Identity) (checkdir : Bool)
+    (dirs : List String) (file : String) : IO UInt32 := do
+  let mut fd := (← Sys.Edit.operation target 7 Sys.Edit.noneFd "/").value
+  let check := checkdir && invoker.uid != 0
   try
     for dir in dirs do
-      let next ← checkedDir invoker target fd dir file
+      let nofollow := check && (← writableDir invoker fd)
+      let next := (← Sys.Edit.operation target (if nofollow then 0 else 7) fd dir).value
       Sys.Edit.close fd
       fd := next
+    if check && (← writableDir invoker fd) then
+      throw (IO.userError s!"{file}: editing files in a writable directory is not permitted")
     return fd
   catch e =>
     Sys.Edit.close fd
@@ -86,13 +80,13 @@ private structure Session where
 private def removeTemp (who : Sys.Edit.Identity) (path : String) : IO Unit := do
   let _ ← Sys.Edit.operation who 5 Sys.Edit.noneFd path
 
-private def prepare (invoker target : Sys.Edit.Identity) (file : String) : IO Session := do
+private def prepare (invoker target : Sys.Edit.Identity) (follow checkdir : Bool) (file : String) : IO Session := do
   let some (dirs, name) := pathParts file
     | throw (IO.userError s!"{file}: unsafe edit path")
-  let parent ← parentDir invoker target dirs file
+  let parent ← parentDir invoker target checkdir dirs file
   let mut temp := ""
   try
-    let fd ← try pure (← Sys.Edit.operation target 1 parent name).value
+    let fd ← try pure (← Sys.Edit.operation target (if follow then 8 else 1) parent name).value
       catch e => throw (fileError file e)
     let (original, originalStat) ← if fd == Sys.Edit.noneFd then pure (ByteArray.empty, #[])
       else try pure (← Sys.Edit.read fd, ← Sys.Edit.stat fd) finally Sys.Edit.close fd
@@ -108,7 +102,7 @@ private def prepare (invoker target : Sys.Edit.Identity) (file : String) : IO Se
     throw e
 
 private def copyBack (invoker target : Sys.Edit.Identity) (mask : Nat)
-    (s : Session) : IO Bool := do
+    (follow checkdir : Bool) (s : Session) : IO Bool := do
   try
     let fd ← try pure (← Sys.Edit.operation invoker 1 Sys.Edit.noneFd s.temp).value
       catch e => throw (fileError s.temp e)
@@ -125,14 +119,14 @@ private def copyBack (invoker target : Sys.Edit.Identity) (mask : Nat)
       -- Recheck all ancestors as well as the pinned parent: permissions may have
       -- changed while the editor was running. Require the same parent inode.
       let some (dirs, _) := pathParts s.file | throw (IO.userError "unsafe edit path")
-      let current ← parentDir invoker target dirs s.file
+      let current ← parentDir invoker target checkdir dirs s.file
       try
         let now ← Sys.Edit.stat current
         let pinned ← Sys.Edit.stat s.parent
         unless now[7]! == pinned[7]! && now[8]! == pinned[8]! do
           throw (IO.userError s!"{s.file}: directory changed during editing")
       finally Sys.Edit.close current
-      let out ← try pure (← Sys.Edit.operation target 2 s.parent s.name mask).value
+      let out ← try pure (← Sys.Edit.operation target (if follow then 9 else 2) s.parent s.name mask).value
         catch e => throw (fileError s.file e)
       try
         let st ← Sys.Edit.stat out
@@ -169,7 +163,7 @@ def run (plan : Core.EditPlan) (env : Array String) : IO Sys.ExitStatus := do
       | throw (IO.userError s!"no editor found (editor path = {String.intercalate ":" (plan.editors.map (String.intercalate " "))})")
     let mut failed := false
     for file in plan.files do
-      try sessions := sessions.push (← prepare invoker target file)
+      try sessions := sessions.push (← prepare invoker target plan.follow plan.checkdir file)
       catch e => warn e.toString; failed := true
     if sessions.isEmpty then return .exited 1
     let status ← try
@@ -189,7 +183,7 @@ def run (plan : Core.EditPlan) (env : Array String) : IO Sys.ExitStatus := do
           warn s!"contents of edit session left in {s.temp}"
         throw e
     for s in sessions do
-      unless ← copyBack invoker target plan.umask s do failed := true
+      unless ← copyBack invoker target plan.umask plan.follow plan.checkdir s do failed := true
     return if failed && status == .exited 0 then .exited 1 else status
   catch e =>
     warn e.toString

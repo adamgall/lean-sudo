@@ -44,12 +44,120 @@
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/prctl.h>
+#include <time.h>
+#include <utmpx.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+
+extern int ls_iolog_active(void);
+extern int ls_iolog_stream(int);
+extern int ls_iolog_write(int, const void *, size_t);
+extern int ls_iolog_winsize(unsigned, unsigned);
+extern int ls_iolog_suspend(int);
+extern int ls_iolog_close(int, int);
+extern void ls_iolog_child_close(void);
+
+struct io_channel {
+  int parent, child, enabled;
+  char pending[8192];
+  size_t off, len;
+};
+static struct io_channel io_channels[3];
+
+static void io_channels_close(void) {
+  for (int i = 0; i < 3; i++) {
+    if (io_channels[i].parent >= 0) close(io_channels[i].parent);
+    if (io_channels[i].child >= 0) close(io_channels[i].child);
+    io_channels[i].parent = io_channels[i].child = -1;
+  }
+}
+
+static int io_channels_open(int ttymask) {
+  for (int i = 0; i < 3; i++) {
+    memset(&io_channels[i], 0, sizeof io_channels[i]);
+    io_channels[i].parent = io_channels[i].child = -1;
+  }
+  for (int i = 0; i < 3; i++) {
+    if ((ttymask & (1 << i)) || !ls_iolog_stream(i)) continue;
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC)) { io_channels_close(); return -1; }
+    io_channels[i].parent = fds[i == 0 ? 1 : 0];
+    io_channels[i].child = fds[i == 0 ? 0 : 1];
+    io_channels[i].enabled = 1;
+    if (fcntl(io_channels[i].parent, F_SETFL, O_NONBLOCK)) {
+      io_channels_close(); return -1;
+    }
+  }
+  return 0;
+}
+
+static void io_channel_poll(struct pollfd *p) {
+  for (int i = 0; i < 3; i++) {
+    struct io_channel *c = &io_channels[i];
+    int fd = c->parent;
+    short events = POLLIN;
+    if (i == 0 && fd >= 0) {
+      if (c->len) events = POLLOUT;
+      else fd = STDIN_FILENO;
+    }
+    p[i] = (struct pollfd){.fd = fd, .events = events};
+  }
+}
+
+static int io_channel_pump(struct pollfd *p) {
+  for (int i = 0; i < 3; i++) {
+    struct io_channel *c = &io_channels[i];
+    if (c->parent < 0 || !p[i].revents) continue;
+    if (i == 0 && c->len) {
+      ssize_t n = write(c->parent, c->pending + c->off, c->len - c->off);
+      if (n > 0) {
+        c->off += (size_t)n;
+        if (c->off == c->len) c->off = c->len = 0;
+      } else if (n < 0 && errno != EINTR && errno != EAGAIN) {
+        close(c->parent); c->parent = -1;
+      }
+      continue;
+    }
+    ssize_t n = read(i == 0 ? STDIN_FILENO : c->parent, c->pending, sizeof c->pending);
+    if (n > 0) {
+      if (ls_iolog_write(i, c->pending, (size_t)n)) return -1;
+      if (i == 0) { c->len = (size_t)n; c->off = 0; }
+      else {
+        size_t off = 0;
+        while (off < (size_t)n) {
+          ssize_t written = write(i, c->pending + off, (size_t)n - off);
+          if (written < 0 && errno == EINTR) continue;
+          if (written <= 0) break;
+          off += (size_t)written;
+        }
+      }
+    } else if (!n || (errno != EINTR && errno != EAGAIN)) {
+      close(c->parent); c->parent = -1;
+    }
+  }
+  return 0;
+}
+
+static int io_channels_drain(void) {
+  if (io_channels[0].parent >= 0) {
+    close(io_channels[0].parent); io_channels[0].parent = -1;
+  }
+  while (io_channels[1].parent >= 0 || io_channels[2].parent >= 0) {
+    struct pollfd p[3];
+    io_channel_poll(p);
+    int n = poll(p, 3, 100);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) break;
+    if (io_channel_pump(p)) return -1;
+  }
+  return 0;
+}
 
 #ifndef CLOSE_RANGE_CLOEXEC
 #define CLOSE_RANGE_CLOEXEC (1U << 2)
@@ -64,9 +172,16 @@
  * an ignored/default SIGPIPE) rather than whatever the runtime changed. */
 static unsigned char g_startup_ignored[NSIG];
 static sigset_t g_startup_mask;
+static struct rlimit g_core_limit;
+static int g_core_saved;
+static int g_dumpable = -1;
+static struct rlimit g_user_limits[RLIM_NLIMITS];
+static unsigned char g_user_limit_saved[RLIM_NLIMITS];
 
 __attribute__((constructor)) static void leansudo_exec_save_signals(void) {
   struct sigaction sa;
+  for (int i = 0; i < RLIM_NLIMITS; i++)
+    g_user_limit_saved[i] = getrlimit(i, &g_user_limits[i]) == 0;
   for (int sig = 1; sig < NSIG; sig++) {
     if (sigaction(sig, NULL, &sa) == 0)
       g_startup_ignored[sig] = (sa.sa_handler == SIG_IGN);
@@ -313,6 +428,7 @@ enum stage {
   ST_CTTY,
   ST_DUP,
   ST_FORK,
+  ST_APPARMOR,
 };
 
 struct child_err {
@@ -337,7 +453,38 @@ struct exec_req {
   mode_t umask;
   unsigned closefrom;
   int errfd; /* write end of the CLOEXEC error pipe */
+  int cwd_optional;
+  unsigned timeout;
+  const char *apparmor;
+  char *preload;
+  const char *utmp_user;
+  int execfd;
+  int exec_background;
+  struct rlimit limits[RLIM_NLIMITS];
+  unsigned char limit_set[RLIM_NLIMITS];
 };
+static const struct { const char *name; int resource; } names[] = {
+  {"rlimit_as", RLIMIT_AS}, {"rlimit_core", RLIMIT_CORE},
+  {"rlimit_cpu", RLIMIT_CPU}, {"rlimit_data", RLIMIT_DATA},
+  {"rlimit_fsize", RLIMIT_FSIZE}, {"rlimit_locks", RLIMIT_LOCKS},
+  {"rlimit_memlock", RLIMIT_MEMLOCK}, {"rlimit_nofile", RLIMIT_NOFILE},
+  {"rlimit_nproc", RLIMIT_NPROC}, {"rlimit_rss", RLIMIT_RSS},
+  {"rlimit_stack", RLIMIT_STACK}
+};
+
+static void warn_limit(int resource) {
+  const char *name = "unknown";
+  const char *error = strerror(errno);
+  for (size_t j = 0; j < sizeof names / sizeof names[0]; j++)
+    if (names[j].resource == resource) name = names[j].name;
+  struct iovec parts[] = {
+    {(void *)"sudo: setrlimit(", sizeof("sudo: setrlimit(") - 1},
+    {(void *)name, strlen(name)}, {(void *)"): ", 3},
+    {(void *)error, strlen(error)}, {(void *)"\n", 1}
+  };
+  ssize_t ignored = writev(2, parts, 5);
+  (void)ignored;
+}
 
 __attribute__((noreturn)) static void child_fail(int errfd, int stage, int err, long a, long b) {
   struct child_err ce;
@@ -382,8 +529,18 @@ static void drop_privileges(const struct exec_req *r) {
     child_fail(r->errfd, ST_SETGROUPS, errno, 0, 0);
   if (setresgid(r->gid, r->gid, r->gid) != 0)
     child_fail(r->errfd, ST_SETGID, errno, 0, 0);
+  struct rlimit nproc, unlimited;
+  int saved_nproc = getrlimit(RLIMIT_NPROC, &nproc) == 0;
+  if (saved_nproc) {
+    unlimited = (struct rlimit){RLIM_INFINITY, RLIM_INFINITY};
+    if (setrlimit(RLIMIT_NPROC, &unlimited) != 0) {
+      unlimited.rlim_cur = unlimited.rlim_max = nproc.rlim_max;
+      if (setrlimit(RLIMIT_NPROC, &unlimited) != 0) warn_limit(RLIMIT_NPROC);
+    }
+  }
   if (setresuid(r->uid, r->uid, r->uid) != 0)
     child_fail(r->errfd, ST_SETUID, errno, 0, 0);
+  if (saved_nproc) (void)setrlimit(RLIMIT_NPROC, &nproc);
 
   /* Verification: never trust the return codes alone. */
   uid_t ru, eu, su;
@@ -422,15 +579,81 @@ static void cloexec_from(unsigned from) {
 
 /* Final part of every command child. Signals must still be blocked on entry. */
 __attribute__((noreturn)) static void child_exec(const struct exec_req *r) {
+  ls_iolog_child_close();
   if (restore_startup_signals() != 0)
     child_fail(r->errfd, ST_SIGNALS, errno, 0, 0);
+  /* Like sudo, restoration is best-effort: PAM may have lowered the hard
+   * limit, and Linux will not accept PR_SET_DUMPABLE=2. exec resets dumpability. */
+  if (g_core_saved) (void)setrlimit(RLIMIT_CORE, &g_core_limit);
+  if (g_dumpable >= 0) (void)prctl(PR_SET_DUMPABLE, g_dumpable);
+  for (int i = 0; i < RLIM_NLIMITS; i++) {
+    if (!r->limit_set[i]) continue;
+    struct rlimit lim = r->limits[i];
+    if (setrlimit(i, &lim) == 0) continue;
+    /* Containers may lack CAP_SYS_RESOURCE: sudo clamps requested increases
+     * to the invoking user's hard limit and then retries. */
+    if (g_user_limit_saved[i]) {
+      if (lim.rlim_cur > g_user_limits[i].rlim_max) lim.rlim_cur = g_user_limits[i].rlim_max;
+      if (lim.rlim_max > g_user_limits[i].rlim_max) lim.rlim_max = g_user_limits[i].rlim_max;
+    }
+    if (setrlimit(i, &lim) != 0)
+      warn_limit(i);
+  }
+  if (r->apparmor != NULL) {
+    int current = open("/proc/self/attr/apparmor/current", O_RDONLY | O_CLOEXEC);
+    if (current < 0 && errno == ENOENT)
+      current = open("/proc/self/attr/current", O_RDONLY | O_CLOEXEC);
+    char label;
+    if (current < 0)
+      child_fail(r->errfd, ST_APPARMOR, errno, 1, 0);
+    ssize_t got = read(current, &label, 1);
+    int readerr = errno;
+    close(current);
+    if (got != 1)
+      child_fail(r->errfd, ST_APPARMOR, got < 0 ? readerr : EINVAL, 1, 0);
+    int fd = open("/proc/self/attr/apparmor/exec", O_WRONLY | O_CLOEXEC);
+    if (fd < 0 && errno == ENOENT)
+      fd = open("/proc/self/attr/exec", O_WRONLY | O_CLOEXEC);
+    if (fd < 0)
+      child_fail(r->errfd, ST_APPARMOR, errno, 0, 0);
+    size_t len = strlen(r->apparmor);
+    ssize_t n = write(fd, r->apparmor, len);
+    int e = errno;
+    close(fd);
+    if (n != (ssize_t)len)
+      child_fail(r->errfd, ST_APPARMOR, n < 0 ? e : EIO, 0, 0);
+  }
   drop_privileges(r);
-  if (r->cwd != NULL && chdir(r->cwd) != 0)
-    child_fail(r->errfd, ST_CHDIR, errno, 0, 0);
+  if (r->cwd != NULL && chdir(r->cwd) != 0) {
+    if (!r->cwd_optional)
+      child_fail(r->errfd, ST_CHDIR, errno, 0, 0);
+    /* Warning only for login shells, as sudo's CD_CWD_OPTIONAL. */
+    const char *es = strerror(errno);
+    struct iovec parts[] = {
+      {(void *)"sudo: unable to change directory to ", sizeof("sudo: unable to change directory to ") - 1},
+      {(void *)r->cwd, strlen(r->cwd)}, {(void *)": ", 2},
+      {(void *)es, strlen(es)}, {(void *)"\n", 1}
+    };
+    ssize_t ignored = writev(2, parts, 5);
+    (void)ignored;
+  }
   umask(r->umask);
   cloexec_from(r->closefrom);
-  execve(r->path, r->argv, r->envp);
-  if (errno == ENOEXEC) {
+  if (r->execfd >= 0) {
+    /* Keep binary descriptors close-on-exec. Linux script interpreters need
+     * /dev/fd/N after exec; ENOENT is the kernel's CLOEXEC-script indication. */
+    if (fcntl(r->execfd, F_SETFD, FD_CLOEXEC) != 0)
+      child_fail(r->errfd, ST_EXEC, errno, 0, 0);
+    fexecve(r->execfd, r->argv, r->envp);
+    if (errno == ENOENT) {
+      if (fcntl(r->execfd, F_SETFD, 0) != 0)
+        child_fail(r->errfd, ST_EXEC, errno, 0, 0);
+      fexecve(r->execfd, r->argv, r->envp);
+    }
+  } else {
+    execve(r->path, r->argv, r->envp);
+  }
+  if (r->execfd < 0 && errno == ENOEXEC) {
     /* Like sudo (and execvp): a file without a recognised header is a shell script. */
     execve("/bin/sh", r->shargv, r->envp);
   }
@@ -504,6 +727,12 @@ static void describe_child_err(const struct exec_req *r, const struct child_err 
     break;
   case ST_FORK:
     snprintf(buf, len, "unable to fork: %s", es);
+    break;
+  case ST_APPARMOR:
+    if (ce->a)
+      snprintf(buf, len, "failed to determine AppArmor confinement: %s", es);
+    else
+      snprintf(buf, len, "unable to change AppArmor profile to %s: %s", r->apparmor + 5, es);
     break;
   default:
     snprintf(buf, len, "unable to execute %s: unknown error", r->path);
@@ -600,7 +829,9 @@ static void nopty_child_stopped(pid_t child, int sig) {
     if (saved == getpgrp())
       saved = -1;
   }
+  if (ls_iolog_suspend(sig)) { kill(child, SIGKILL); return; }
   stop_self(sig, 0);
+  if (ls_iolog_suspend(SIGCONT)) { kill(child, SIGKILL); return; }
   if (ttyfd >= 0) {
     if (saved != -1)
       tcsetpgrp_nostop(ttyfd, saved);
@@ -627,17 +858,55 @@ static int nopty_reap(pid_t child, int *status) {
   }
 }
 
-static lean_obj_res nopty_wait(struct sigstate *ss, pid_t child) {
+struct command_timer { int64_t deadline; int terminating; };
+
+static int64_t monotonic_ms(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* sudo terminates timed-out commands with HUP then TERM, followed by KILL
+ * after a two-second grace period. Never signal sudo's own process group. */
+static int timeout_poll(struct command_timer *t, pid_t child, int group) {
+  if (!t->deadline) return -1;
+  int64_t remaining = t->deadline - monotonic_ms();
+  if (remaining <= 0) {
+    pid_t target = group ? -child : child;
+    if (!t->terminating) {
+      kill(target, SIGHUP);
+      kill(target, SIGTERM);
+      t->terminating = 1;
+      t->deadline = monotonic_ms() + 2000;
+      return 2000;
+    }
+    kill(target, SIGKILL);
+    t->deadline = 0;
+    return -1;
+  }
+  return remaining > INT32_MAX ? INT32_MAX : (int)remaining;
+}
+
+static lean_obj_res nopty_wait(struct sigstate *ss, pid_t child, unsigned timeout) {
   int status = 0;
+  struct command_timer timer = {timeout ? monotonic_ms() + (int64_t)timeout * 1000 : 0, 0};
   for (;;) {
     int r = nopty_reap(child, &status);
     if (r < 0)
       return io_errno("waitpid", errno);
     if (r == 1)
       break;
-    struct pollfd pfd = {.fd = ss->pipe_rd, .events = POLLIN, .revents = 0};
-    if (poll(&pfd, 1, -1) < 0 && errno != EINTR)
+    struct pollfd pfds[4];
+    pfds[0] = (struct pollfd){.fd = ss->pipe_rd, .events = POLLIN};
+    io_channel_poll(pfds + 1);
+    if (poll(pfds, 4, timeout_poll(&timer, child, 0)) < 0 && errno != EINTR)
       return io_errno("poll", errno);
+    if (io_channel_pump(pfds + 1)) {
+      int e = errno;
+      kill(child, SIGKILL);
+      waitpid_retry(child, &status, 0);
+      return io_errno("unable to write I/O log", e);
+    }
     struct sigrec rec;
     while (sigpipe_next(ss->pipe_rd, &rec)) {
       if (rec.signo == SIGCHLD || rec.signo == SIGCONT)
@@ -646,6 +915,7 @@ static lean_obj_res nopty_wait(struct sigstate *ss, pid_t child) {
         kill(child, rec.signo);
     }
   }
+  if (io_channels_drain()) return io_errno("unable to write I/O log", errno);
   return lean_io_result_mk_ok(lean_box_uint32(encode_status(status)));
 }
 
@@ -783,6 +1053,50 @@ static void write_all(int fd, const char *buf, size_t len) {
   }
 }
 
+static void utmp_text(char *dest, size_t cap, const char *src) {
+  size_t n = strlen(src);
+  memset(dest, 0, cap);
+  memcpy(dest, src, n < cap ? n : cap);
+}
+
+static int utmp_begin(int fromfd, int tofd, const char *user, struct utmpx *entry) {
+  char from[128], to[128];
+  if (!user || ttyname_r(tofd, to, sizeof to) != 0) return 0;
+  memset(entry, 0, sizeof *entry);
+  setutxent();
+  if (ttyname_r(fromfd, from, sizeof from) == 0) {
+    struct utmpx key = {0};
+    utmp_text(key.ut_line, sizeof key.ut_line, strncmp(from, "/dev/", 5) == 0 ? from + 5 : from);
+    struct utmpx *old = getutxline(&key);
+    if (old) *entry = *old;
+    setutxent();
+  }
+  const char *line = strncmp(to, "/dev/", 5) == 0 ? to + 5 : to;
+  utmp_text(entry->ut_line, sizeof entry->ut_line, line);
+  size_t len = strlen(line);
+  utmp_text(entry->ut_id, sizeof entry->ut_id,
+      len > sizeof entry->ut_id ? line + len - sizeof entry->ut_id : line);
+  utmp_text(entry->ut_user, sizeof entry->ut_user, user);
+  entry->ut_type = USER_PROCESS;
+  entry->ut_pid = getpid();
+  entry->ut_tv.tv_sec = time(NULL);
+  entry->ut_tv.tv_usec = 0;
+  int ok = pututxline(entry) != NULL;
+  endutxent();
+  return ok;
+}
+
+static void utmp_finish(struct utmpx *entry, int status) {
+  memset(entry->ut_user, 0, sizeof entry->ut_user);
+  entry->ut_type = DEAD_PROCESS;
+  entry->ut_exit.e_termination = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+  entry->ut_exit.e_exit = WIFEXITED(status) ? WEXITSTATUS(status) : 0;
+  entry->ut_tv.tv_sec = time(NULL);
+  setutxent();
+  (void)pututxline(entry);
+  endutxent();
+}
+
 /* Monitor process: session leader of the pty. Never returns. Signals are blocked
  * on entry (inherited from sudo's fork). */
 __attribute__((noreturn)) static void monitor_main(struct pty_ctx *p, int sock, int parent_sigrd, int parent_sigwr,
@@ -828,7 +1142,7 @@ __attribute__((noreturn)) static void monitor_main(struct pty_ctx *p, int sock, 
     close(mp[0]);
     close(mp[1]);
     setpgid(0, 0);
-    if (p->fg)
+    if (p->fg && !r->exec_background)
       (void)tcsetpgrp(p->slave, getpid()); /* SIGTTOU ignored+blocked here */
     for (int fd = 0; fd <= 2; fd++)
       if ((p->ttymask & (1 << fd)) && dup2(p->slave, fd) < 0)
@@ -836,9 +1150,12 @@ __attribute__((noreturn)) static void monitor_main(struct pty_ctx *p, int sock, 
     close(p->slave);
     child_exec(r);
   }
+  ls_iolog_child_close();
+  for (int fd = 0; fd < 3; fd++)
+    if (io_channels[fd].enabled) close(fd);
   /* Both sides call setpgid/tcsetpgrp so there is no window either way. */
   setpgid(cmd, cmd);
-  if (p->fg)
+  if (p->fg && !r->exec_background)
     (void)tcsetpgrp(p->slave, cmd);
   close(r->errfd);
 
@@ -849,6 +1166,7 @@ __attribute__((noreturn)) static void monitor_main(struct pty_ctx *p, int sock, 
 
   pid_t saved_fg = -1; /* pty foreground pgrp when the command stopped */
   int sock_open = 1;
+  struct command_timer timer = {r->timeout ? monotonic_ms() + (int64_t)r->timeout * 1000 : 0, 0};
   for (;;) {
     /* Reap first: SIGCHLD may predate the handler being unblocked. */
     int st;
@@ -872,7 +1190,7 @@ __attribute__((noreturn)) static void monitor_main(struct pty_ctx *p, int sock, 
 
     struct pollfd pfds[2] = {{.fd = mp[0], .events = POLLIN, .revents = 0},
                              {.fd = sock_open ? sock : -1, .events = POLLIN, .revents = 0}};
-    if (poll(pfds, 2, -1) < 0 && errno != EINTR)
+    if (poll(pfds, 2, timeout_poll(&timer, cmd, 1)) < 0 && errno != EINTR)
       _exit(1);
     struct sigrec rec;
     while (sigpipe_next(mp[0], &rec))
@@ -922,6 +1240,7 @@ struct pty_loop {
   size_t in_len, in_off;
   int tty_in_ok;   /* user tty still readable */
   int master_open; /* pty master still readable */
+  int log_error;
 };
 
 /* The command stopped with `sig` inside the pty. */
@@ -937,7 +1256,9 @@ static void pty_cmd_stopped(struct pty_loop *L, int sig) {
     }
   }
   tty_restore(p);
+  if (ls_iolog_suspend(sig)) { L->log_error = 1; return; }
   stop_self(sig, 1);
+  if (ls_iolog_suspend(SIGCONT)) { L->log_error = 1; return; }
   /* Resumed: the command follows us into the foreground or background. */
   check_fg(p);
   if (p->fg) {
@@ -953,6 +1274,7 @@ static void pty_pump_master(struct pty_loop *L) {
   for (;;) {
     ssize_t n = read(L->p->master, buf, sizeof buf);
     if (n > 0) {
+      if (ls_iolog_write(4, buf, (size_t)n)) { L->log_error = 1; return; }
       write_all(L->p->ttyfd, buf, (size_t)n);
       continue;
     }
@@ -989,7 +1311,7 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
   int sock_open = 1;
   tty_set_raw(p);
   while (!have_status && sock_open) {
-    struct pollfd pfds[4];
+    struct pollfd pfds[7];
     pfds[0] = (struct pollfd){.fd = ss->pipe_rd, .events = POLLIN, .revents = 0};
     pfds[1] = (struct pollfd){.fd = L->sock, .events = POLLIN, .revents = 0};
     short mev = 0;
@@ -1001,18 +1323,22 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
     /* Read the user's terminal only while we are its foreground job. */
     int want_tty = L->tty_in_ok && p->fg && L->in_len == 0;
     pfds[3] = (struct pollfd){.fd = want_tty ? p->ttyfd : -1, .events = POLLIN, .revents = 0};
-    if (poll(pfds, 4, -1) < 0) {
+    io_channel_poll(pfds + 4);
+    if (poll(pfds, 7, -1) < 0) {
       if (errno == EINTR)
         continue;
       return -1;
     }
+    if (io_channel_pump(pfds + 4)) return -1;
     if (pfds[2].revents & (POLLIN | POLLHUP | POLLERR))
       pty_pump_master(L);
+    if (L->log_error) return -1;
     if (pfds[2].revents & POLLOUT)
       pty_flush_input(L);
     if (pfds[3].revents & (POLLIN | POLLHUP | POLLERR)) {
       ssize_t n = read(p->ttyfd, L->in, sizeof L->in);
       if (n > 0) {
+        if (ls_iolog_write(3, L->in, (size_t)n)) return -1;
         L->in_len = (size_t)n;
         L->in_off = 0;
         pty_flush_input(L);
@@ -1030,8 +1356,10 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
         break; /* the monitor reports through the backchannel */
       case SIGWINCH: {
         struct winsize ws;
-        if (ioctl(p->ttyfd, TIOCGWINSZ, &ws) == 0)
+        if (ioctl(p->ttyfd, TIOCGWINSZ, &ws) == 0) {
+          if (ls_iolog_winsize(ws.ws_row, ws.ws_col)) return -1;
           (void)ioctl(p->master, TIOCSWINSZ, &ws);
+        }
         break;
       }
       case SIGCONT: {
@@ -1058,6 +1386,7 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
       while ((got = bc_recv(L->sock, &m)) == 1) {
         if (m.type == MSG_STOPPED) {
           pty_cmd_stopped(L, m.val);
+          if (L->log_error) return -1;
         } else if (m.type == MSG_EXITED) {
           *status = m.val;
           have_status = 1;
@@ -1078,7 +1407,9 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
     if (n <= 0)
       break;
     pty_pump_master(L);
+    if (L->log_error) return -1;
   }
+  if (io_channels_drain()) return -1;
   tty_restore(p);
   return have_status;
 }
@@ -1094,6 +1425,8 @@ static void free_req(struct exec_req *r) {
   free(r->groups);
   free(r->groups_sort);
   free(r->scratch);
+  free(r->preload);
+  free((void *)r->apparmor);
 }
 
 static int cmp_gid(const void *a, const void *b) {
@@ -1113,6 +1446,131 @@ static char **string_array(b_lean_obj_arg arr, size_t extra_front) {
 
 static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background);
 
+/* Parse policy limits before forking, in setrlimit's native units. */
+static int limit_number(const char *s, char **end, rlim_t *value) {
+  if (strncmp(s, "infinity", 8) == 0) {
+    *end = (char *)s + 8; *value = RLIM_INFINITY; return 1;
+  }
+  if (*s < '0' || *s > '9') return 0;
+  rlim_t n = 0;
+  while (*s >= '0' && *s <= '9') {
+    unsigned digit = (unsigned)(*s - '0');
+    if (n > ((rlim_t)-1 - digit) / 10) return 0;
+    n = n * 10 + digit;
+    s++;
+  }
+  *end = (char *)s;
+  *value = n;
+  return 1;
+}
+
+static int prepare_options(struct exec_req *r, b_lean_obj_arg noexec,
+    b_lean_obj_arg apparmor, b_lean_obj_arg limits) {
+  for (size_t i = 0; i < lean_array_size(limits); i++) {
+    b_lean_obj_arg pair = lean_array_get_core(limits, i);
+    const char *name = lean_string_cstr(lean_ctor_get(pair, 0));
+    const char *value = lean_string_cstr(lean_ctor_get(pair, 1));
+    int resource = -1;
+    for (size_t j = 0; j < sizeof names / sizeof names[0]; j++)
+      if (strcmp(name, names[j].name) == 0) resource = names[j].resource;
+    if (resource < 0) { errno = EINVAL; return 0; }
+    if (strcmp(value, "default") == 0) { r->limit_set[resource] = 0; continue; }
+    struct rlimit lim;
+    if (strcmp(value, "user") == 0) {
+      if (g_user_limit_saved[resource]) lim = g_user_limits[resource];
+      else if (getrlimit(resource, &lim) != 0) return 0;
+    } else {
+      char *end;
+      if (!limit_number(value, &end, &lim.rlim_cur)) { errno = EINVAL; return 0; }
+      lim.rlim_max = lim.rlim_cur;
+      if (*end == ',') {
+        if (!limit_number(end + 1, &end, &lim.rlim_max)) { errno = EINVAL; return 0; }
+      }
+      if (*end || lim.rlim_cur > lim.rlim_max) { errno = EINVAL; return 0; }
+    }
+    r->limit_set[resource] = 1;
+    r->limits[resource] = lim;
+  }
+  if (!lean_is_scalar(apparmor)) {
+    /* sudo's apparmor_is_enabled deliberately checks only this module flag,
+     * not securityfs (which is commonly unavailable inside containers). */
+    int fd = open("/sys/module/apparmor/parameters/enabled", O_RDONLY | O_CLOEXEC);
+    char enabled = 0;
+    if (fd >= 0) {
+      ssize_t n = read(fd, &enabled, 1);
+      close(fd);
+      if (n != 1) enabled = 0;
+    }
+    if (enabled == 'Y') {
+      const char *profile = lean_string_cstr(lean_ctor_get(apparmor, 0));
+      char *text;
+      if (asprintf(&text, "exec %s", profile) < 0) return 0;
+      r->apparmor = text;
+    }
+  }
+  if (!lean_is_scalar(noexec)) {
+    const char *file = lean_string_cstr(lean_ctor_get(noexec, 0));
+    struct stat st;
+    if (stat(file, &st) != 0) return 0;
+    if (!S_ISREG(st.st_mode) || access(file, R_OK) != 0) { errno = EACCES; return 0; }
+    size_t n = 0, slot = 0;
+    const char *old = NULL;
+    for (size_t i = 0; r->envp[i]; i++) {
+      if (strncmp(r->envp[i], "LD_PRELOAD=", 11) == 0) {
+        if (old) continue;
+        old = r->envp[i] + 11;
+        slot = n;
+      }
+      r->envp[n++] = r->envp[i];
+    }
+    r->envp[n] = NULL;
+    size_t filelen = strlen(file);
+    if (old && strncmp(old, file, filelen) == 0 &&
+        (old[filelen] == 0 || old[filelen] == ':'))
+      return 1;
+    /* The policy DSO must be first, ahead of any user-supplied preload. */
+    if (asprintf(&r->preload, "LD_PRELOAD=%s%s%s", file,
+        old && *old ? ":" : "", old ? old : "") < 0) return 0;
+    if (!old) {
+      char **envp = realloc(r->envp, (n + 2) * sizeof(char *));
+      if (!envp) return 0;
+      r->envp = envp;
+      slot = n;
+      r->envp[n + 1] = NULL;
+    }
+    r->envp[slot] = r->preload;
+  }
+  return 1;
+}
+
+LEAN_EXPORT lean_obj_res leansudo_exec_initialize(uint8_t disable_core, lean_obj_arg world) {
+  (void)world;
+  for (int fd = 0; fd < 3; fd++) {
+    if (fcntl(fd, F_GETFD) >= 0 || errno != EBADF) continue;
+    int nullfd = open("/dev/null", O_RDWR);
+    if (nullfd < 0) return io_errno("unable to open /dev/null", errno);
+    if (nullfd != fd) {
+      if (dup2(nullfd, fd) < 0) {
+        int e = errno; close(nullfd);
+        return io_errno("unable to repair standard descriptor", e);
+      }
+      close(nullfd);
+    }
+  }
+  if (disable_core && !g_core_saved) {
+    if (getrlimit(RLIMIT_CORE, &g_core_limit) != 0)
+      return io_errno("unable to read core dump limit", errno);
+    struct rlimit disabled = g_core_limit;
+    disabled.rlim_cur = 0;
+    if (setrlimit(RLIMIT_CORE, &disabled) != 0)
+      return io_errno("unable to disable core dumps", errno);
+    g_core_saved = 1;
+    g_dumpable = prctl(PR_GET_DUMPABLE);
+    if (prctl(PR_SET_DUMPABLE, 0) != 0)
+      return io_errno("unable to disable core dumps", errno);
+  }
+  return lean_io_result_mk_ok(lean_box(0));
+}
 /* runRaw : (path : @& String) → (argv env : @& Array String) → (uid gid : UInt32) →
  *   (groups : @& Array UInt32) → (cwd : @& Option String) → (umask : UInt32) →
  *   (usePty background : Bool) → (closeFrom : UInt32) → IO UInt32
@@ -1121,6 +1579,10 @@ static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background
 LEAN_EXPORT lean_obj_res leansudo_exec_run(b_lean_obj_arg path, b_lean_obj_arg argv, b_lean_obj_arg env, uint32_t uid,
                                            uint32_t gid, b_lean_obj_arg groups, b_lean_obj_arg cwd, uint32_t umask_,
                                            uint8_t use_pty, uint8_t background, uint32_t closefrom,
+                                           uint8_t cwd_optional, uint32_t timeout,
+                                           b_lean_obj_arg noexec, b_lean_obj_arg apparmor,
+                                           b_lean_obj_arg limits, b_lean_obj_arg utmp_user,
+                                           uint32_t execfd, uint8_t exec_background,
                                            lean_obj_arg world) {
   (void)world;
   struct exec_req r;
@@ -1132,6 +1594,11 @@ LEAN_EXPORT lean_obj_res leansudo_exec_run(b_lean_obj_arg path, b_lean_obj_arg a
   r.closefrom = closefrom < 3 ? 3 : closefrom;
   r.cwd = lean_is_scalar(cwd) ? NULL : lean_string_cstr(lean_ctor_get(cwd, 0));
   r.errfd = -1;
+  r.cwd_optional = cwd_optional;
+  r.timeout = timeout;
+  r.utmp_user = lean_is_scalar(utmp_user) ? NULL : lean_string_cstr(lean_ctor_get(utmp_user, 0));
+  r.execfd = execfd == UINT32_MAX ? -1 : (int)execfd;
+  r.exec_background = exec_background;
 
   size_t argc = lean_array_size(argv);
   r.ngroups = lean_array_size(groups);
@@ -1158,8 +1625,17 @@ LEAN_EXPORT lean_obj_res leansudo_exec_run(b_lean_obj_arg path, b_lean_obj_arg a
     r.groups_sort[i] = r.groups[i];
   }
   qsort(r.groups_sort, r.ngroups, sizeof(gid_t), cmp_gid);
+  if (!prepare_options(&r, noexec, apparmor, limits)) {
+    int e = errno;
+    free_req(&r);
+    return io_errno("unable to configure command execution", e);
+  }
 
   lean_obj_res res = run_with_req(&r, use_pty, background);
+  if (ls_iolog_close(0, 0)) {
+    lean_dec(res);
+    res = io_errno("unable to close I/O log", errno);
+  }
   free_req(&r);
   return res;
 }
@@ -1171,6 +1647,17 @@ static lean_obj_res child_error_result(const struct exec_req *r, const struct ch
 }
 
 static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background) {
+  if (background) {
+    /* The original process must not unwind PAM. The forked supervisor returns
+     * through Lean after waiting, and is the sole owner of session cleanup. */
+    pid_t bg = fork();
+    if (bg < 0)
+      return io_errno("unable to fork", errno);
+    if (bg > 0)
+      _exit(0);
+    if (setpgid(0, 0) != 0)
+      return io_errno("unable to create background process group", errno);
+  }
   int errp[2];
   if (make_pipe(errp, 0) != 0)
     return io_errno("unable to create pipe", errno);
@@ -1181,7 +1668,7 @@ static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background
   memset(&pc, 0, sizeof pc);
   pc.ttyfd = pc.master = pc.slave = -1;
   int sv[2] = {-1, -1};
-  int pty = use_pty && any_tty && !background;
+  int pty = ((use_pty && !background) || ls_iolog_active()) && any_tty;
   if (pty) {
     int perr = 0;
     if (pty_setup(&pc) != 0) {
@@ -1198,43 +1685,52 @@ static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background
       pty = 0;
     }
   }
+  if (io_channels_open(pty ? pc.ttymask : 0)) {
+    int e = errno;
+    close(errp[0]); close(errp[1]);
+    if (pty) { close_pty_ctx(&pc); close(sv[0]); close(sv[1]); }
+    return io_errno("unable to create I/O logging pipes", e);
+  }
 
   struct sigstate ss;
   memset(&ss, 0, sizeof ss);
-  if (!background) {
-    if (sigstate_install(&ss, pty) != 0) {
-      int e = errno;
-      close(errp[0]);
-      close(errp[1]);
-      if (pty) {
-        close_pty_ctx(&pc);
-        close(sv[0]);
-        close(sv[1]);
-      }
-      return io_errno("unable to set up signal handlers", e);
+  if (sigstate_install(&ss, pty) != 0) {
+    int e = errno;
+    io_channels_close();
+    close(errp[0]);
+    close(errp[1]);
+    if (pty) {
+      close_pty_ctx(&pc);
+      close(sv[0]);
+      close(sv[1]);
     }
-  } else {
-    /* No handlers, but block anyway so the child starts with a known mask state. */
-    sigset_t block;
-    relay_block_set(&block);
-    sigprocmask(SIG_BLOCK, &block, &ss.old_mask);
+    return io_errno("unable to set up signal handlers", e);
   }
+  struct utmpx utmp;
+  int utmp_active = pty && utmp_begin(pc.ttyfd, pc.slave, r->utmp_user, &utmp);
 
   pid_t child = fork();
   if (child == 0) {
     close(errp[0]);
+    for (int fd = 0; fd < 3; fd++) {
+      if (io_channels[fd].child >= 0 && dup2(io_channels[fd].child, fd) < 0)
+        child_fail(r->errfd, ST_DUP, errno, 0, 0);
+    }
+    io_channels_close();
     if (pty) {
       close(sv[0]);
       monitor_main(&pc, sv[1], ss.pipe_rd, ss.pipe_wr, r);
     }
-    if (!background) {
-      g_sigpipe_wr = -1;
-      close(ss.pipe_rd);
-      close(ss.pipe_wr);
-    }
+    g_sigpipe_wr = -1;
+    close(ss.pipe_rd);
+    close(ss.pipe_wr);
     child_exec(r);
   }
   int fork_err = errno;
+  for (int fd = 0; fd < 3; fd++) {
+    if (io_channels[fd].child >= 0) close(io_channels[fd].child);
+    io_channels[fd].child = -1;
+  }
   close(errp[1]);
   r->errfd = -1;
   if (pty) {
@@ -1242,10 +1738,7 @@ static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background
     close(pc.slave);
     pc.slave = -1;
   }
-  if (background)
-    sigprocmask(SIG_SETMASK, &ss.old_mask, NULL);
-  else
-    sigstate_unblock(&ss);
+  sigstate_unblock(&ss);
 
   lean_obj_res res;
   if (child < 0) {
@@ -1265,14 +1758,8 @@ static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background
     goto out;
   }
 
-  if (background) {
-    /* `-b`: don't wait; the child is reaped by init once we exit. */
-    res = lean_io_result_mk_ok(lean_box_uint32(0));
-    goto out;
-  }
-
   if (!pty) {
-    res = nopty_wait(&ss, child);
+    res = nopty_wait(&ss, child, r->timeout);
     goto out;
   }
 
@@ -1286,6 +1773,8 @@ static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background
     L.master_open = 1;
     int status = 0;
     int got = pty_relay(&ss, &L, &status);
+    int relay_errno = errno;
+    if (got < 0) bc_send(sv[0], MSG_SIGNAL, SIGKILL);
     int mst;
     waitpid_retry(child, &mst, 0);
     if (got == 1)
@@ -1293,17 +1782,22 @@ static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background
     else if (got == 0)
       res = io_error("command monitor exited unexpectedly");
     else
-      res = io_errno("poll", errno);
+      res = io_errno("I/O relay", relay_errno);
   }
 
 out:
+  if (utmp_active) {
+    uint32_t code = lean_io_result_is_ok(res) ? lean_unbox_uint32(lean_io_result_get_value(res)) : 1;
+    int status = code >= 0x10000 ? (int)(code - 0x10000) : (int)(code << 8);
+    utmp_finish(&utmp, status);
+  }
+  io_channels_close();
   if (pty) {
     tty_restore(&pc);
     close_pty_ctx(&pc);
     close(sv[0]);
   }
-  if (!background)
-    sigstate_restore(&ss);
+  sigstate_restore(&ss);
   return res;
 }
 

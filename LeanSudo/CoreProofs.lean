@@ -16,7 +16,7 @@ private theorem denied_safe (ctx : Context) :
     (∀ p, deniedAction ctx ≠ .exec p) ∧ (∀ p, deniedAction ctx ≠ .edit p) := by
   unfold deniedAction
   repeat' split
-  all_goals simp [notFound]
+  all_goals constructor <;> intro p h <;> cases h
 
 /-- Every executable plan comes from an allowed resolved run with a checked environment. -/
 theorem exec_origin (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .exec p) :
@@ -24,7 +24,7 @@ theorem exec_origin (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .e
       ctx.opts.mode = .run ∧ ctx.command = some rc ∧ p = execPlan ctx a rc ∧
       (∃ env, buildEnv (environment ctx a) = .ok env) ∧
       decide ctx = policyDecision ctx (.allow a) ∧
-      (request ctx).command = .run rc.path p.path rc.args ∧ p.argv.tail = rc.args := by
+      (request ctx).command = .run rc.path rc.canonical (policyArgs ctx rc) ∧ p.argv.tail = rc.args := by
   unfold decide at h ⊢
   cases he : earlyAction ctx with
   | some act => simp only [he] at h; exact False.elim ((early_safe ctx act he).1 p h)
@@ -38,12 +38,14 @@ theorem exec_origin (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .e
       split at h
       · rename_i hm
         cases hc : ctx.command with
-        | none => simp [hc, notFound] at h
+        | none => simp only [hc, notFound, reduceCtorEq] at h
         | some rc =>
           simp only [hc] at h
           split at h
           · cases h
-          · cases hb : buildEnv (environment ctx a) with
+          · split at h
+            · cases h
+            cases hb : buildEnv (environment ctx a) with
             | error e => simp [hb] at h
             | ok env =>
               simp only [hb, Action.exec.injEq] at h
@@ -73,7 +75,9 @@ theorem edit_origin (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .e
       · rename_i hm
         split at h
         · cases h
-        · cases hb : buildEnv (environment ctx a) with
+        · split at h
+          · cases h
+          cases hb : buildEnv (environment ctx a) with
           | error e => simp [hb] at h
           | ok env =>
             simp only [hb, Action.edit.injEq] at h
@@ -81,30 +85,33 @@ theorem edit_origin (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .e
       all_goals repeat' first | split at h | cases h
 
 theorem exec_allowed (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .exec p) :
-    ∃ a path args, evaluate ctx.sudoers ctx.settings (request ctx) = .allow a ∧
-      (request ctx).command = .run path p.path args ∧ p.argv.tail = args := by
-  obtain ⟨a, rc, ha, _, _, _, _, _, hr, ht⟩ := exec_origin ctx p h
-  exact ⟨a, rc.path, rc.args, ha, hr, ht⟩
+    ∃ a rc, evaluate ctx.sudoers ctx.settings (request ctx) = .allow a ∧
+      ctx.command = some rc ∧
+      (request ctx).command = .run rc.path rc.canonical (policyArgs ctx rc) ∧
+      p.path = executionPath ctx rc ∧ p.argv = rc.argv0 :: rc.args := by
+  obtain ⟨a, rc, ha, _, hc, hp, _, _, hr, _⟩ := exec_origin ctx p h
+  exact ⟨a, rc, ha, hc, hr, by simp [hp, execPlan], by simp [hp, execPlan]⟩
 
-/-- Execution uses the lookup-time realpath, never the user-controlled lookup alias. -/
+/-- Execution combines exactly the matched canonical parent and requested basename. -/
 theorem exec_path_is_canonical (ctx : Context) (p : ExecPlan)
     (h : (decide ctx).action = .exec p) :
-    ∃ rc, ctx.command = some rc ∧ p.path = rc.canonical := by
+    ∃ rc, ctx.command = some rc ∧
+      p.path = ctx.canon (dirOf rc.path) ++
+        (if (ctx.canon (dirOf rc.path)).endsWith "/" then "" else "/") ++ baseOf rc.path := by
   obtain ⟨a, rc, _, _, hc, rfl, _⟩ := exec_origin ctx p h
   exact ⟨rc, hc, rfl⟩
 
 theorem edit_allowed (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .edit p) :
     ∃ a, evaluate ctx.sudoers ctx.settings (request ctx) = .allow a ∧
-      (request ctx).command = .sudoedit p.files := by
+      (request ctx).command = .sudoedit p.policyFiles := by
   obtain ⟨a, ha, hm, rfl, _, _⟩ := edit_origin ctx p h
   exact ⟨a, ha, by simp [request, hm, editPlan]⟩
 
-/-- Every edit path is absolute, with no empty, dot or parent-directory components. -/
+/-- Runtime traversal receives absolute, NUL-free paths, without changing the
+policy's original operands or lexically folding symlink-sensitive parent components. -/
 theorem edit_files_normalized (ctx : Context) (p : EditPlan)
     (h : (decide ctx).action = .edit p) :
-    ∀ file ∈ p.files, file.startsWith "/" = true ∧
-      ∀ component ∈ (file.splitOn "/").tail,
-        component ≠ "" ∧ component ≠ "." ∧ component ≠ ".." := by
+    ∀ file ∈ p.files, file.startsWith "/" = true ∧ file.contains '\x00' = false := by
   have he : earlyAction ctx = none := by
     cases hx : earlyAction ctx with
     | none => rfl
@@ -115,9 +122,32 @@ theorem edit_files_normalized (ctx : Context) (p : EditPlan)
   have hb : invalidEditFile ctx = none := by
     cases hx : invalidEditFile ctx with
     | none => rfl
-    | some bad => simp [earlyAction, hm, hx] at he
+    | some bad =>
+      simp [earlyAction, hm, hx] at he
+      split at he <;> contradiction
   simp only [invalidEditFile, List.find?_eq_none] at hb
   simpa [editPlan, normalizedEditFile] using hb
+
+/-- The runtime file list is precisely the policy operands resolved against the
+invoking directory, not a second independently selected list. -/
+theorem edit_files_match_policy (ctx : Context) (p : EditPlan)
+    (h : (decide ctx).action = .edit p) :
+    (request ctx).command = .sudoedit p.policyFiles ∧
+    p.files = p.policyFiles.map (fun f => if f.startsWith "/" then f
+      else ctx.cwd ++ (if ctx.cwd.endsWith "/" then "" else "/") ++ f) := by
+  obtain ⟨a, _, hm, rfl, _, _⟩ := edit_origin ctx p h
+  simp [editPlan, request, hm, files]
+
+theorem commandTimeout_policy_bound (ctx : Context) (a : Allowed)
+    (h : a.timeout.getD ctx.settings.commandTimeout ≠ 0) :
+    commandTimeout ctx a ≤ a.timeout.getD ctx.settings.commandTimeout := by
+  unfold commandTimeout
+  split
+  · exact Nat.le_refl _
+  · split
+    · exact Nat.le_refl _
+    · simp only [h, beq_iff_eq, ↓reduceIte]
+      exact Nat.min_le_right _ _
 
 theorem exec_identity (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .exec p) :
     p.uid = ctx.target.uid ∧ p.gid = (ctx.targetGroup.map (·.gid)).getD ctx.target.gid ∧
@@ -127,9 +157,9 @@ theorem exec_identity (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = 
   exact ⟨rfl, rfl, rfl⟩
 
 theorem edit_identity (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .edit p) :
-    p.fileUid = ctx.target.uid ∧ p.editUid = ctx.invoking.uid ∧
+    p.fileUid = ctx.target.uid ∧ p.editUid = (displayUser ctx).uid ∧
     p.fileGid = targetGid ctx ∧ p.fileGroups = targetGroups ctx ∧
-    p.editGid = ctx.invoking.gid ∧ p.editGroups = ctx.invoking.groups.map (·.2) := by
+    p.editGid = (displayUser ctx).gid ∧ p.editGroups = (displayUser ctx).groups.map (·.2) := by
   obtain ⟨a, _, _, rfl, _, _⟩ := edit_origin ctx p h
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
@@ -185,7 +215,7 @@ theorem deny_no_execution (ctx : Context)
     (h : evaluate ctx.sudoers ctx.settings (request ctx) = .deny) :
     (∀ p, (decide ctx).action ≠ .exec p) ∧ (∀ p, (decide ctx).action ≠ .edit p) := by
   constructor
-  · intro p hp; obtain ⟨a, _, _, ha, _⟩ := exec_allowed ctx p hp; rw [h] at ha; cases ha
+  · intro p hp; obtain ⟨a, _, ha, _⟩ := exec_allowed ctx p hp; rw [h] at ha; cases ha
   · intro p hp; obtain ⟨a, ha, _⟩ := edit_allowed ctx p hp; rw [h] at ha; cases ha
 
 theorem command_not_found_no_exec (ctx : Context) (h : ctx.command = none) :
@@ -256,5 +286,40 @@ theorem administrative_modes_no_auth_or_update (ctx : Context)
       ctx.opts.mode = .resetTimestamp ∨ ctx.opts.mode = .removeTimestamp) :
     (decide ctx).auth = .none ∧ (decide ctx).updateTimestamp = false := by
   rcases hm with h | h | h | h <;> simp [decide, earlyAction, h]
+
+/-- The descriptor pinned before policy/authentication is passed unchanged to exec. -/
+theorem exec_fd_is_pinned (ctx : Context) (p : ExecPlan)
+    (h : (decide ctx).action = .exec p) {fd : Nat} (hf : p.execFd = some fd) :
+    ctx.execFd = some fd := by
+  obtain ⟨a, rc, _, _, _, rfl, _⟩ := exec_origin ctx p h
+  simp only [execPlan] at hf
+  split at hf
+  · exact hf
+  · cases hf
+
+/-- An unsupported deciding restriction cannot authorize execution. -/
+theorem enforcement_error_no_exec (ctx : Context) (a : Allowed)
+    (ha : evaluate ctx.sudoers ctx.settings (request ctx) = .allow a)
+    (he : (enforcementError ctx a).isSome = true) :
+    ∀ p, (decide ctx).action ≠ .exec p := by
+  intro p hp
+  obtain ⟨b, rc, hb, hm, hc, _, _, hd, _⟩ := exec_origin ctx p hp
+  rw [ha] at hb
+  cases hb
+  rw [hd] at hp
+  simp [policyDecision, allowedAction, hm, hc, he] at hp
+
+theorem intercept_no_exec (ctx : Context) (a : Allowed)
+    (ha : evaluate ctx.sudoers ctx.settings (request ctx) = .allow a)
+    (hi : a.intercept.getD ctx.settings.intercept = true) :
+    ∀ p, (decide ctx).action ≠ .exec p :=
+  enforcement_error_no_exec ctx a ha (by simp [enforcementError, hi])
+
+/-- An unsupported external group provider must never be silently bypassed. -/
+theorem group_plugin_no_execution (ctx : Context)
+    (h : ctx.settings.groupPlugin.isSome = true) :
+    (∀ p, (decide ctx).action ≠ .exec p) ∧
+    (∀ p, (decide ctx).action ≠ .edit p) := by
+  cases hm : ctx.opts.mode <;> simp [decide, earlyAction, hm, h]
 
 end LeanSudo.Core

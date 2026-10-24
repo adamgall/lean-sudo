@@ -49,6 +49,9 @@ structure EnvInput where
   pamEnv : EnvList
   /-- `-s` (keeps the user's `SHELL` in reset mode; enables the `set_home` default) -/
   shellMode : Bool := false
+  ttyName : Option String := none
+  envFile : EnvList := []
+  restrictedEnvFile : EnvList := []
 
 /-! ## Primitive list operations -/
 
@@ -143,7 +146,7 @@ def userPass (i : EnvInput) (reset : Bool) (k v : String) : Bool :=
 
 /-- A PAM variable is merged (only when its name is not already set). -/
 def pamPass (i : EnvInput) (k v : String) : Bool :=
-  entryOk k v && !matchesAny i.settings.envDelete k
+  entryOk k v && !matchesAny i.settings.envDelete k && k != "SUDO_TTY"
 
 /-- A `VAR=value` / `--preserve-env=VAR` variable may be set (sudo's
 `validate_env_vars`; with SETENV anything but a bash function is allowed). -/
@@ -186,19 +189,20 @@ def lognameReset (i : EnvInput) (e : EnvList) : EnvList :=
 def defaultsReset (i : EnvInput) (e : EnvList) : EnvList :=
   let e1 := if i.loginShell then
       setVar (setVar (setVar e "SHELL" i.target.shell) "LOGNAME" i.target.name) "USER" i.target.name
-    else lognameReset i e
+    else if i.settings.setLogname then lognameReset i e
+    else setDefault (setDefault e "LOGNAME" i.invoking.name) "USER" i.invoking.name
   let e2 := if i.loginShell || !hasKey e "MAIL" then setVar e1 "MAIL" ("/var/mail/" ++ i.target.name)
     else e1
   if resetHome i || !hasKey e "HOME" then setVar e2 "HOME" i.target.home else e2
 
 def defaultsCopy (i : EnvInput) (e : EnvList) : EnvList :=
-  let e1 := setVar (setVar e "LOGNAME" i.target.name) "USER" i.target.name
+  let e1 := if i.settings.setLogname then setVar (setVar e "LOGNAME" i.target.name) "USER" i.target.name else e
   if resetHome i then setVar e1 "HOME" i.target.home else e1
 
 def commonDefaults (i : EnvInput) (e : EnvList) : EnvList :=
   let e1 := setDefault e "SHELL" i.target.shell
   let e2 := setDefault e1 "TERM" "unknown"
-  let e3 := if i.loginShell then setVar e2 "PATH" loginPath else setDefault e2 "PATH" stdPath
+  let e3 := setDefault e2 "PATH" stdPath
   match lookup (i.userEnv.filter fun kv => entryOk kv.1 kv.2) "SUDO_PS1" with
   | some ps1 => setVar e3 "PS1" ps1
   | none => e3
@@ -209,10 +213,19 @@ def applySecurePath (i : EnvInput) (e : EnvList) : EnvList :=
   | none => e
 
 def sudoVars (i : EnvInput) (e : EnvList) : EnvList :=
+  let e := setVar e "SUDO_HOME" i.invoking.home
+  let e := match i.ttyName with
+    | some tty => setVar e "SUDO_TTY" tty
+    | none => e.filter (fun kv => kv.1 != "SUDO_TTY")
   setVar (setVar (setVar (setVar e "SUDO_COMMAND" i.command) "SUDO_USER" i.invoking.name)
     "SUDO_UID" (toString i.invoking.uid)) "SUDO_GID" (toString i.invoking.gid)
 
 def pamVars (i : EnvInput) : EnvList := i.pamEnv.filter fun kv => pamPass i kv.1 kv.2
+
+/-- Administrator-supplied files do not overwrite existing environment entries. -/
+def fileVars (i : EnvInput) : EnvList :=
+  ((i.restrictedEnvFile.filter fun kv => userPass i (resetMode i) kv.1 kv.2) ++
+    (i.envFile.filter fun kv => entryOk kv.1 kv.2)).filter (fun kv => kv.1 != "SUDO_TTY")
 
 def assemble (i : EnvInput) (reset : Bool) (extra : EnvList) : EnvList :=
   let e0 := baseEnv i reset
@@ -221,7 +234,7 @@ def assemble (i : EnvInput) (reset : Bool) (extra : EnvList) : EnvList :=
   let e3 := setAll e2 extra
   let e4 := applySecurePath i e3
   let e5 := sudoVars i e4
-  addDefaults e5 (pamVars i)
+  addDefaults (addDefaults e5 (pamVars i)) (fileVars i)
 
 def preserveDeniedMsg : String := "sorry, you are not allowed to preserve the environment"
 
@@ -242,6 +255,6 @@ def envToArray (e : EnvList) : Array String := (e.map fun kv => kv.1 ++ "=" ++ k
 /-- Keys sudo itself may set. -/
 def sudoKeys : List String :=
   ["HOME", "LOGNAME", "USER", "MAIL", "SHELL", "TERM", "PATH", "PS1",
-   "SUDO_COMMAND", "SUDO_USER", "SUDO_UID", "SUDO_GID"]
+   "SUDO_COMMAND", "SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_HOME", "SUDO_TTY"]
 
 end LeanSudo

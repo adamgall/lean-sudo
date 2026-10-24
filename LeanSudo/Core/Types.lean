@@ -2,6 +2,7 @@ import LeanSudo.Policy.Types
 import LeanSudo.Cli
 import LeanSudo.Env
 import LeanSudo.Timestamp
+import LeanSudo.IoLog
 
 /-!
 # Decision-core contract (frozen)
@@ -81,6 +82,25 @@ structure Context where
   tsScope : Timestamp.Scope
   /-- records of the invoking uid's timestamp file (`Timestamp.load`; `[]` on any error) -/
   tsRecords : List Timestamp.Record
+  longHost : String := ""
+  interfaces : List (IpAddr × IpAddr) := []
+  netgroups : List (String × Option String × Option String × Bool) := []
+  regexMatches : List (String × String × Bool) := []
+  digests : List Digest := []
+  wallTime : Nat := 0
+  fileIds : List (String × Nat × Nat) := []
+  globPaths : List (String × List String) := []
+  envFile : EnvList := []
+  restrictedEnvFile : EnvList := []
+  homes : List (String × String) := []
+  selinuxEnabled : Bool := false
+  mailerAvailable : Bool := false
+  locatedSudoers : List Located := []
+  execFd : Option Nat := none
+  root : Principal := { name := "root", uid := 0, gid := 0, groups := [], home := "/root", shell := "/bin/bash" }
+  previousUser : Option Principal := none
+  listColumns : Nat := 0
+  utcOffset : Int := 0
 
 /-- Whose credentials must be checked before `action` may happen. -/
 inductive AuthReq where
@@ -113,6 +133,15 @@ structure ExecPlan where
   pamService : String
   pamSession : Bool
   pamSetcred : Bool
+  cwdOptional : Bool := false
+  timeout : Nat := 0
+  noexecFile : Option String := none
+  apparmorProfile : Option String := none
+  rlimits : List (String × String) := []
+  utmpUser : Option String := none
+  execFd : Option Nat := none
+  iolog : Option IoLog.Plan := none
+  execBackground : Bool := false
 
 /-- `sudoedit` (`-e`): files are copied to temporary files owned by the invoking user,
 the editor runs as the invoking user, and changed files are written back as the target
@@ -138,6 +167,10 @@ structure EditPlan where
   pamService : String
   pamSession : Bool
   pamSetcred : Bool
+  follow : Bool := false
+  checkdir : Bool := true
+  /-- Original file operands, exactly as evaluated by sudoers before making paths absolute. -/
+  policyFiles : List String := []
 
 inductive Action where
   | exec (plan : ExecPlan)
@@ -169,6 +202,8 @@ structure Decision where
   /-- record a successful authentication in the timestamp file -/
   updateTimestamp : Bool
   log : Option LogLine
+  adminFlag : Option String := none
+  mail : Bool := false
   deriving Inhabited
 
 end LeanSudo.Core

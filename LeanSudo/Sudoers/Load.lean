@@ -7,7 +7,7 @@ import LeanSudo.Sys.Core
 Reads `/etc/sudoers`, resolves `@include`/`@includedir` (and the `#` spellings) in
 place, and enforces sudo's file-security rules on every file read:
 
-* must be a regular file opened without following symlinks,
+* must be a regular file (symlinks followed, metadata checked on the opened fd),
 * owned by uid 0,
 * not world-writable, and if group-writable then owned by gid 0.
 
@@ -40,12 +40,11 @@ def dirName (path : String) : String :=
   | [""] => "/"
   | parts => "/".intercalate parts
 
-/-- Expand `%h` (short host name) and `%%`, and resolve relative paths against the
+/-- Expand `%h` (short host name), and resolve relative paths against the
 directory of the including file. -/
 def resolveIncludePath (including : String) (host : String) (raw : String) : String :=
   let rec expand : List Char → List Char
     | '%' :: 'h' :: rest => host.toList ++ expand rest
-    | '%' :: '%' :: rest => '%' :: expand rest
     | c :: rest => c :: expand rest
     | [] => []
   let p := String.ofList (expand raw.toList)
@@ -72,7 +71,7 @@ inductive Source where
 /-- Read and parse one file (no include resolution). Parse errors and unreadable
 files throw; ownership/mode violations are reported as `insecure`. -/
 def readSource (path : String) : IO Source := do
-  let (st, text) ← try readFileNoFollow path
+  let (st, text) ← try readFileFollow path
     catch e => throw <| IO.userError s!"unable to open {path}: {e}"
   match checkPerms path st with
   | .error msg => return .insecure msg
@@ -116,14 +115,16 @@ partial def loadFile (host : String) (depth : Nat) (path : String) :
 partial def loadDir (host : String) (depth : Nat) (dir : String) :
     IO (List Located) := do
   -- A missing include directory is not an error (sudo ignores it).
-  let some st ← lstat dir | return []
+  let some st ← stat dir | return []
   match checkDirPerms dir st with
   | .error msg => throw <| IO.userError msg
   | .ok () => pure ()
   let names ← listDir dir
   let mut out : Array Located := #[]
   for name in sortNames (names.filter includeDirEntryOk) do
-    out := out ++ (← loadFile host depth (dir ++ "/" ++ name))
+    let path := dir ++ "/" ++ name
+    let some st ← stat path | continue
+    if st.isReg then out := out ++ (← loadFile host depth path)
   return out.toList
 end
 

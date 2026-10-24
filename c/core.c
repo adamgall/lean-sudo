@@ -31,6 +31,11 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <syslog.h>
+#include <sys/wait.h>
+#include <sys/file.h>
+#include <sys/prctl.h>
+#include <sys/ioctl.h>
+#include <sys/utsname.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -399,12 +404,12 @@ LEAN_EXPORT lean_obj_res lean_sudo_access(b_lean_obj_arg path, uint32_t mode) {
 #define READ_CAP ((size_t)16 << 20)
 
 /* readFileNoFollow : String → IO (FileStat × String) */
-LEAN_EXPORT lean_obj_res lean_sudo_read_file_nofollow(b_lean_obj_arg path) {
+static lean_obj_res read_file(b_lean_obj_arg path, bool follow) {
     const char *p = cstr_arg(path);
     if (!p) return io_err(NUL_ARG_ERROR);
     int fd;
     do {
-        fd = open(p, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
+        fd = open(p, O_RDONLY | (follow ? 0 : O_NOFOLLOW) | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
     } while (fd < 0 && errno == EINTR);
     if (fd < 0) return io_errno_path("unable to open", p, errno);
     struct stat st;
@@ -458,6 +463,14 @@ LEAN_EXPORT lean_obj_res lean_sudo_read_file_nofollow(b_lean_obj_arg path) {
     free(buf);
     if (!s) return io_errf("%s: file is not valid UTF-8", p);
     return io_ok(mk_pair(mk_filestat(&st), s));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_read_file_nofollow(b_lean_obj_arg path) {
+    return read_file(path, false);
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_read_file_follow(b_lean_obj_arg path) {
+    return read_file(path, true);
 }
 
 /* listDir : String → IO (Array String) — names excluding . and .., unsorted */
@@ -553,6 +566,200 @@ LEAN_EXPORT lean_obj_res lean_sudo_syslog(b_lean_obj_arg facility, b_lean_obj_ar
     return io_ok(lean_box(0));
 }
 
+LEAN_EXPORT lean_obj_res lean_sudo_syslog_bytes(b_lean_obj_arg facility,
+        b_lean_obj_arg priority, b_lean_obj_arg bytes, uint8_t pid) {
+    int fac, pri;
+    const char *f = cstr_arg(facility), *p = cstr_arg(priority);
+    if (!f || !lookup_name(facilities, f, &fac)) return io_err("unknown syslog facility");
+    if (!p || !lookup_name(priorities, p, &pri)) return io_err("unknown syslog priority");
+    size_t n = lean_sarray_size(bytes);
+    if (n > INT_MAX || memchr(lean_sarray_cptr(bytes), 0, n))
+        return io_err("invalid syslog message");
+    openlog("sudo", pid ? LOG_PID : 0, fac);
+    syslog(fac | pri, "%.*s", (int)n, (const char *)lean_sarray_cptr(bytes));
+    closelog();
+    return io_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_unix_time(void) {
+    time_t now = time(NULL);
+    if (now < 0) return io_errno(errno);
+    return io_ok(mk_nat((uint64_t)now));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_terminal_columns(uint32_t fd) {
+    if (fd > INT_MAX) return io_err("invalid terminal descriptor");
+    struct stat st;
+    if (fstat((int)fd, &st) == 0 && S_ISFIFO(st.st_mode)) return io_ok(mk_nat(0));
+    struct winsize ws;
+    unsigned int columns = 80;
+    if (ioctl((int)fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col) columns = ws.ws_col;
+    return io_ok(mk_nat(columns));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_utc_offset(void) {
+    time_t now = time(NULL);
+    struct tm tm;
+    if (!localtime_r(&now, &tm)) return io_err("unable to determine UTC offset");
+    return io_ok(lean_int64_to_int((int64_t)tm.tm_gmtoff));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_architecture(void) {
+    struct utsname u;
+    if (uname(&u) != 0) return io_errno(errno);
+    return io_ok(mk_str_lossy(u.machine));
+}
+
+
+LEAN_EXPORT lean_obj_res lean_sudo_no_new_privs(void) {
+    return io_ok(lean_box(prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_open_command(b_lean_obj_arg path) {
+    const char *p = cstr_arg(path);
+    if (!p) return io_err(NUL_ARG_ERROR);
+    int fd = open(p, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
+    if (fd < 0) return io_errno_path("unable to open", p, errno);
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return io_err("command is not a regular file");
+    }
+    if (fd < 3) {
+        int copy = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+        close(fd);
+        if (copy < 0) return io_errno(errno);
+        fd = copy;
+    }
+    return io_ok(mk_pair(mk_nat((uint64_t)fd), mk_filestat(&st)));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_close_command(uint32_t fd) {
+    if (fd < 3 || fd > INT_MAX) return io_err("invalid command descriptor");
+    if (close((int)fd) != 0) return io_errno(errno);
+    return io_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_admin_flag(b_lean_obj_arg path,
+        uint32_t uid, uint32_t gid, b_lean_obj_arg groups) {
+    const char *p = cstr_arg(path);
+    if (!p || uid == UINT32_MAX || gid == UINT32_MAX) return io_err("invalid admin flag arguments");
+    size_t n = lean_array_size(groups);
+    gid_t *gs = calloc(n ? n : 1, sizeof(*gs));
+    if (!gs) return io_errno(ENOMEM);
+    for (size_t i = 0; i < n; i++) {
+        b_lean_obj_arg g = lean_array_get_core(groups, i);
+        if (!lean_is_scalar(g) || lean_unbox(g) >= UINT32_MAX) {
+            free(gs); return io_err("invalid admin flag group");
+        }
+        gs[i] = (gid_t)lean_unbox(g);
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (setgroups(n, gs) != 0 || setresgid(gid, gid, gid) != 0 ||
+            setresuid(uid, uid, uid) != 0 || geteuid() != uid || getegid() != gid)
+            _exit(1);
+        int fd = open(p, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+        if (fd < 0) _exit(errno == EEXIST ? 0 : 1);
+        _exit(close(fd) == 0 ? 0 : 1);
+    }
+    free(gs);
+    if (pid < 0) return io_errno(errno);
+    int status;
+    while (waitpid(pid, &status, 0) < 0) if (errno != EINTR) return io_errno(errno);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return io_err("unable to create admin flag");
+    return io_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_log_time(uint8_t year) {
+    time_t now = time(NULL);
+    struct tm tm;
+    char buf[64];
+    if (!localtime_r(&now, &tm) ||
+        !strftime(buf, sizeof(buf), year ? "%b %e %H:%M:%S %Y" : "%b %e %H:%M:%S", &tm))
+        return io_err("unable to format log timestamp");
+    return io_ok(lean_mk_string(buf));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_append_log(b_lean_obj_arg path, b_lean_obj_arg text) {
+    const char *p = cstr_arg(path), *s = cstr_arg(text);
+    if (!p || !s) return io_err(NUL_ARG_ERROR);
+    int fd = open(p, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600);
+    if (fd < 0) return io_errno_path("unable to open log file", p, errno);
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != 0 ||
+        (st.st_mode & 022) || flock(fd, LOCK_EX) != 0) {
+        close(fd); return io_err("unsafe or inaccessible log file");
+    }
+    int rc = write_all(fd, s, strlen(s));
+    int saved = errno;
+    close(fd);
+    if (rc != 0) return io_errno(saved);
+    return io_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_send_mail(b_lean_obj_arg path, b_lean_obj_arg args,
+        b_lean_obj_arg body) {
+    const char *p = cstr_arg(path), *text = cstr_arg(body);
+    if (!p || !text) return io_err(NUL_ARG_ERROR);
+    size_t count = lean_array_size(args);
+    if (count > 63) return io_err("too many mailer flags");
+    char **argv = calloc(count + 2, sizeof(*argv));
+    if (!argv) return io_errno(ENOMEM);
+    const char *base = strrchr(p, '/');
+    argv[0] = (char *)(base ? base + 1 : p);
+    for (size_t i = 0; i < count; i++) {
+        argv[i + 1] = (char *)cstr_arg(lean_array_get_core(args, i));
+        if (!argv[i + 1]) { free(argv); return io_err(NUL_ARG_ERROR); }
+    }
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) != 0) { free(argv); return io_errno(errno); }
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    int ngroups = getgroups(0, NULL);
+    gid_t *groups = ngroups < 0 ? NULL : calloc((size_t)ngroups + 1, sizeof(*groups));
+    if (!groups || getgroups(ngroups, groups) != ngroups) {
+        free(groups); free(argv); close(fds[0]); close(fds[1]);
+        return io_err("unable to get mailer groups");
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[1]);
+        if (dup2(fds[0], STDIN_FILENO) < 0) _exit(126);
+        int nullfd = open("/dev/null", O_RDWR);
+        if (nullfd < 0 || dup2(nullfd, 1) < 0 || dup2(nullfd, 2) < 0) _exit(126);
+        if (setgroups((size_t)ngroups, groups) != 0 || setresgid(gid, gid, gid) != 0 ||
+            setresuid(uid, uid, uid) != 0 || getuid() != uid || geteuid() != uid ||
+            getgid() != gid || getegid() != gid) _exit(126);
+        if (uid != 0 && setuid(0) == 0) _exit(126);
+        if (chdir("/") != 0) _exit(126);
+        long maxfd = sysconf(_SC_OPEN_MAX);
+        if (maxfd < 0) _exit(126);
+        for (int fd = 3; fd < maxfd; fd++) close(fd);
+        execve(p, argv, environ);
+        _exit(127);
+    }
+    close(fds[0]);
+    free(argv);
+    free(groups);
+    if (pid < 0) { close(fds[1]); return io_errno(errno); }
+    struct sigaction ignore = {.sa_handler = SIG_IGN}, old;
+    sigemptyset(&ignore.sa_mask);
+    if (sigaction(SIGPIPE, &ignore, &old) != 0) {
+        close(fds[1]); kill(pid, SIGKILL);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        return io_err("unable to protect mail pipe");
+    }
+    int rc = write_all(fds[1], text, strlen(text));
+    close(fds[1]);
+    (void)sigaction(SIGPIPE, &old, NULL);
+    int status;
+    while (waitpid(pid, &status, 0) < 0) if (errno != EINTR) return io_errno(errno);
+    if (rc != 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        return io_err("unable to send mail");
+    return io_ok(lean_box(0));
+}
+
 /* ========================================================================= */
 /* PAM                                                                        */
 /* ========================================================================= */
@@ -606,6 +813,7 @@ static struct {
     char **(*getenvlist)(pam_handle_t *);
     const char *(*strerror)(pam_handle_t *, int);
     int (*set_item)(pam_handle_t *, int, const void *);
+    int (*get_item)(const pam_handle_t *, int, const void **);
 } pamfn;
 
 static bool pam_loaded;
@@ -632,6 +840,7 @@ static void pam_load(void) {
         {"pam_getenvlist", (void *)&pamfn.getenvlist},
         {"pam_strerror", (void *)&pamfn.strerror},
         {"pam_set_item", (void *)&pamfn.set_item},
+        {"pam_get_item", (void *)&pamfn.get_item},
     };
     for (size_t i = 0; i < sizeof syms / sizeof syms[0]; i++) {
         void *f = dlsym(h, syms[i].name);
@@ -672,6 +881,8 @@ static const char *conv_error_message(int code) {
     switch (code) {
     case CONV_ERR_NONINTERACTIVE: return "a password is required";
     case CONV_ERR_NO_TTY:
+        if (getenv("SSH_CONNECTION") && !getenv("SSH_TTY"))
+            return "a terminal is required to read the password; either use ssh's -t option or configure an askpass helper";
         return "a terminal is required to read the password; either use the -S option to "
                "read from standard input or configure an askpass helper";
     case CONV_ERR_TIMEOUT: return "timed out reading password";
@@ -691,6 +902,8 @@ typedef struct {
     bool use_stdin, noninteractive, override, pwfeedback;
     uint32_t timeout;
     char *prompt;
+    char *user, *ruser, *askpass, *lecture;
+    bool silent, session_silent, bell, lectured;
     int conv_error;
 } sudo_pam_t;
 
@@ -759,9 +972,66 @@ static int64_t monotonic_ms(void) {
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+/* The helper is unprivileged and never receives privileged descriptors. */
+static int read_askpass(sudo_pam_t *st, const char *prompt, char *buf, size_t size) {
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) != 0) return CONV_ERR_READ;
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return CONV_ERR_READ; }
+    if (pid == 0) {
+        close(fds[0]);
+        if (dup2(fds[1], STDOUT_FILENO) < 0) _exit(126);
+        int nullfd = open("/dev/null", O_RDONLY);
+        if (nullfd < 0 || dup2(nullfd, STDIN_FILENO) < 0) _exit(126);
+        uid_t uid = getuid();
+        gid_t gid = getgid();
+        if (setresgid(gid, gid, gid) != 0 || setresuid(uid, uid, uid) != 0 ||
+            getuid() != uid || geteuid() != uid || getgid() != gid || getegid() != gid)
+            _exit(126);
+        long maxfd = sysconf(_SC_OPEN_MAX);
+        if (maxfd < 0) _exit(126);
+        for (int fd = 3; fd < maxfd; fd++) close(fd);
+        execl(st->askpass, st->askpass, prompt, (char *)NULL);
+        _exit(127);
+    }
+    close(fds[1]);
+    size_t n = 0;
+    int result = CONV_OK;
+    int64_t deadline = st->timeout ? monotonic_ms() + (int64_t)st->timeout * 1000 : 0;
+    for (;;) {
+        int timeout = -1;
+        if (deadline) {
+            int64_t left = deadline - monotonic_ms();
+            if (left <= 0) { result = CONV_ERR_TIMEOUT; break; }
+            timeout = left > INT_MAX ? INT_MAX : (int)left;
+        }
+        struct pollfd pfd = {.fd = fds[0], .events = POLLIN};
+        int rc = poll(&pfd, 1, timeout);
+        if (rc < 0 && errno == EINTR) continue;
+        if (rc <= 0) { result = rc == 0 ? CONV_ERR_TIMEOUT : CONV_ERR_READ; break; }
+        char c;
+        ssize_t k = read(fds[0], &c, 1);
+        if (k < 0 && errno == EINTR) continue;
+        if (k < 0) { result = CONV_ERR_READ; break; }
+        if (k == 0 || c == '\n') break;
+        if (n < size - 1) buf[n++] = c;
+    }
+    close(fds[0]);
+    if (result != CONV_OK) kill(pid, SIGKILL);
+    int status;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) { result = CONV_ERR_READ; break; }
+    }
+    buf[n] = '\0';
+    if (result == CONV_OK && n == 0) result = CONV_ERR_NO_PASSWORD;
+    if (result != CONV_OK) explicit_bzero(buf, size);
+    return result;
+}
+
 /* Read one line into buf (NUL-terminated, newline stripped). Returns CONV_OK or an error. */
 static int read_password(sudo_pam_t *st, const char *prompt, bool echo, char *buf, size_t size) {
     int in, out, own_fd = -1;
+    if (st->askpass) return read_askpass(st, prompt, buf, size);
     if (st->use_stdin) {
         in = STDIN_FILENO;
         out = STDERR_FILENO;
@@ -771,6 +1041,7 @@ static int read_password(sudo_pam_t *st, const char *prompt, bool echo, char *bu
         in = out = own_fd;
     }
 
+    if (st->bell && !st->use_stdin && isatty(out)) (void)write_str(out, "\a");
     (void)write_str(out, prompt);
 
     bool noecho = false, feedback = false;
@@ -877,7 +1148,16 @@ static int read_password(sudo_pam_t *st, const char *prompt, bool echo, char *bu
 }
 
 static bool is_generic_password_prompt(const char *p) {
-    return p && strncmp(p, "Password", 8) == 0;
+    return p && (strcmp(p, "Password:") == 0 || strcmp(p, "Password: ") == 0);
+}
+
+static bool use_sudo_prompt(const sudo_pam_t *st, const char *p) {
+    if (st->override) return true;
+    if (is_generic_password_prompt(st->prompt)) return false;
+    if (is_generic_password_prompt(p)) return true;
+    size_t n = strlen(st->ruser);
+    return p && strncmp(p, st->ruser, n) == 0 &&
+        (strcmp(p + n, "'s Password:") == 0 || strcmp(p + n, "'s Password: ") == 0);
 }
 
 static int sudo_conv(int num_msg, const struct pam_message **msg, struct pam_response **resp,
@@ -901,9 +1181,15 @@ static int sudo_conv(int num_msg, const struct pam_message **msg, struct pam_res
                 st->conv_error = CONV_ERR_NONINTERACTIVE;
                 goto fail;
             }
+            if (st->lecture && !st->lectured) {
+                int fd = open("/dev/tty", O_WRONLY | O_NOCTTY | O_CLOEXEC);
+                (void)write_str(fd >= 0 ? fd : STDERR_FILENO, st->lecture);
+                if (fd >= 0) close(fd);
+                st->lectured = true;
+            }
             bool echo = m->msg_style == PAM_PROMPT_ECHO_ON;
             const char *prompt = m->msg ? m->msg : "";
-            if (!echo && (st->override || is_generic_password_prompt(m->msg))) prompt = st->prompt;
+            if (use_sudo_prompt(st, prompt)) prompt = st->prompt;
             char buf[PAM_PW_MAX];
             int err = read_password(st, prompt, echo, buf, sizeof buf);
             if (err != CONV_OK) {
@@ -923,8 +1209,11 @@ static int sudo_conv(int num_msg, const struct pam_message **msg, struct pam_res
         case PAM_ERROR_MSG:
         case PAM_TEXT_INFO:
             if (m->msg) {
-                (void)write_str(STDERR_FILENO, m->msg);
-                (void)write_str(STDERR_FILENO, "\n");
+                int fd = open("/dev/tty", O_WRONLY | O_NOCTTY | O_CLOEXEC);
+                int out = fd >= 0 ? fd : STDERR_FILENO;
+                (void)write_str(out, m->msg);
+                (void)write_str(out, "\n");
+                if (fd >= 0) close(fd);
             }
             break;
         default:
@@ -952,6 +1241,10 @@ static void sudo_pam_free(sudo_pam_t *st) {
         explicit_bzero(st->prompt, strlen(st->prompt));
         free(st->prompt);
     }
+    free(st->user);
+    free(st->ruser);
+    free(st->askpass);
+    free(st->lecture);
     free(st);
 }
 
@@ -1004,6 +1297,10 @@ LEAN_EXPORT lean_obj_res lean_sudo_pam_start(b_lean_obj_arg service, b_lean_obj_
     if (!st) return io_errno(ENOMEM);
     st->prompt = strdup(pr);
     if (!st->prompt) { free(st); return io_errno(ENOMEM); }
+    st->user = strdup(usr);
+    st->ruser = strdup(ru);
+    if (!st->user || !st->ruser) { sudo_pam_free(st); return io_errno(ENOMEM); }
+    st->silent = st->session_silent = true;
     st->use_stdin = use_stdin;
     st->noninteractive = noninteractive;
     st->override = override;
@@ -1014,13 +1311,47 @@ LEAN_EXPORT lean_obj_res lean_sudo_pam_start(b_lean_obj_arg service, b_lean_obj_
 
     int rc = pamfn.start(svc, usr, &st->conv, &st->pamh);
     if (rc != PAM_SUCCESS) return pam_start_fail(st, rc);
-    rc = pamfn.set_item(st->pamh, PAM_RUSER, ru);
-    if (rc != PAM_SUCCESS) return pam_start_fail(st, rc);
-    if (tt) {
-        rc = pamfn.set_item(st->pamh, PAM_TTY, tt);
-        if (rc != PAM_SUCCESS) return pam_start_fail(st, rc);
-    }
+    if (*ru) (void)pamfn.set_item(st->pamh, PAM_RUSER, ru);
+    if (tt) (void)pamfn.set_item(st->pamh, PAM_TTY, tt);
     return io_ok(lean_alloc_external(pam_class, st));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_pam_configure(b_lean_obj_arg h, uint8_t silent,
+        uint8_t session_silent, uint8_t bell, b_lean_obj_arg askpass, b_lean_obj_arg rhost,
+        b_lean_obj_arg prompt_user) {
+    sudo_pam_t *st = pam_data(h);
+    if (st->ended) return io_err("PAM handle already ended");
+    const char *ap = cstr_arg(askpass), *rh = cstr_arg(rhost), *pu = cstr_arg(prompt_user);
+    if (!ap || !rh || !pu) return io_err(NUL_ARG_ERROR);
+    char *copy = *ap ? strdup(ap) : NULL;
+    if (*ap && !copy) return io_errno(ENOMEM);
+    char *user_copy = strdup(pu);
+    if (!user_copy) { free(copy); return io_errno(ENOMEM); }
+    free(st->ruser);
+    st->ruser = user_copy;
+    free(st->askpass);
+    st->askpass = copy;
+    st->silent = silent;
+    st->session_silent = session_silent;
+    st->bell = bell;
+    if (*rh) (void)pamfn.set_item(st->pamh, PAM_RHOST, rh);
+    return io_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_pam_lecture(b_lean_obj_arg h, b_lean_obj_arg text) {
+    sudo_pam_t *st = pam_data(h);
+    if (st->ended) return io_err("PAM handle already ended");
+    const char *s = cstr_arg(text);
+    if (!s) return io_err(NUL_ARG_ERROR);
+    char *copy = *s ? strdup(s) : NULL;
+    if (*s && !copy) return io_errno(ENOMEM);
+    free(st->lecture);
+    st->lecture = copy;
+    return io_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_obj_res lean_sudo_pam_lectured(b_lean_obj_arg h) {
+    return io_ok(lean_box(pam_data(h)->lectured));
 }
 
 static lean_obj_res pam_call(b_lean_obj_arg h, int (*fn)(pam_handle_t *, int), int flags) {
@@ -1033,7 +1364,17 @@ static lean_obj_res pam_call(b_lean_obj_arg h, int (*fn)(pam_handle_t *, int), i
 }
 
 LEAN_EXPORT lean_obj_res lean_sudo_pam_authenticate(b_lean_obj_arg h) {
-    return pam_call(h, pamfn.authenticate, PAM_SILENT);
+    sudo_pam_t *st = pam_data(h);
+    if (st->ended) return io_err("PAM handle already ended");
+    st->conv_error = CONV_OK;
+    int rc = pamfn.authenticate(st->pamh, st->silent ? PAM_SILENT : 0);
+    if (rc == PAM_SUCCESS) {
+        const void *user = NULL;
+        if (pamfn.get_item(st->pamh, PAM_USER, &user) != PAM_SUCCESS ||
+            !user || strcmp(user, st->user) != 0) rc = PAM_AUTH_ERR;
+    }
+    st->last_status = rc;
+    return io_ok(lean_int_to_int(rc));
 }
 
 LEAN_EXPORT lean_obj_res lean_sudo_pam_acct_mgmt(b_lean_obj_arg h) {
@@ -1046,11 +1387,11 @@ LEAN_EXPORT lean_obj_res lean_sudo_pam_chauthtok(b_lean_obj_arg h) {
 
 LEAN_EXPORT lean_obj_res lean_sudo_pam_setcred(b_lean_obj_arg h, uint8_t establish) {
     return pam_call(h, pamfn.setcred,
-                    establish ? PAM_ESTABLISH_CRED : (PAM_DELETE_CRED | PAM_SILENT));
+                    establish ? PAM_REINITIALIZE_CRED : (PAM_DELETE_CRED | PAM_SILENT));
 }
 
 LEAN_EXPORT lean_obj_res lean_sudo_pam_open_session(b_lean_obj_arg h) {
-    return pam_call(h, pamfn.open_session, 0);
+    return pam_call(h, pamfn.open_session, pam_data(h)->session_silent ? PAM_SILENT : 0);
 }
 
 LEAN_EXPORT lean_obj_res lean_sudo_pam_close_session(b_lean_obj_arg h) {

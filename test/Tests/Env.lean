@@ -40,7 +40,7 @@ def err (i : EnvInput) : Option String :=
 def get (i : EnvInput) (k : String) : Option String := (run i).bind (lookup · k)
 
 def sudoTail : EnvList :=
-  [("SUDO_COMMAND", "/usr/bin/id -u"), ("SUDO_USER", "alice"), ("SUDO_UID", "1000"),
+  [("SUDO_HOME", "/home/alice"), ("SUDO_COMMAND", "/usr/bin/id -u"), ("SUDO_USER", "alice"), ("SUDO_UID", "1000"),
    ("SUDO_GID", "100")]
 
 /-! ### env_reset (default) -/
@@ -97,7 +97,7 @@ def sudoTail : EnvList :=
 
 /-! ### -i (login shell) -/
 def login : EnvInput := { base with loginShell := true }
-#guard get login "PATH" == some loginPath
+#guard get login "PATH" == some "/home/alice/bin:/usr/bin"
 #guard get login "SHELL" == some "/bin/bash"
 #guard get login "HOME" == some "/root"
 #guard get { login with settings := { envKeep := ["HOME", "LOGNAME"] } } "HOME" == some "/root"
@@ -105,6 +105,17 @@ def login : EnvInput := { base with loginShell := true }
 #guard get { login with settings := { envReset := false } } "FOO" == none
 #guard get { login with settings := { securePath := some "/sbin" } } "PATH" == some "/sbin"
 
+#guard get { login with userEnv := [] } "PATH" == some stdPath
+#guard get base "SUDO_HOME" == some "/home/alice"
+#guard get { base with ttyName := some "/dev/pts/9" } "SUDO_TTY" == some "/dev/pts/9"
+#guard get { base with setenvAllowed := true, cmdlineVars := [("SUDO_TTY", "fake")] } "SUDO_TTY" == none
+#guard get { base with userEnv := [("DPKG_COLORS", "always")] } "DPKG_COLORS" == some "always"
+#guard get { base with settings := { setLogname := false } } "USER" == some "alice"
+#guard get { base with settings := { setLogname := false, envReset := false } } "USER" == some "alice"
+#guard get { base with envFile := [("SITE", "trusted"), ("LD_PRELOAD", "/site/lib.so")] } "SITE" == some "trusted"
+#guard get { base with envFile := [("LD_PRELOAD", "/site/lib.so")] } "LD_PRELOAD" == some "/site/lib.so"
+#guard get { base with restrictedEnvFile := [("LD_PRELOAD", "/bad.so")] } "LD_PRELOAD" == none
+#guard get { base with restrictedEnvFile := [("DISPLAY", ":4")] } "DISPLAY" == some ":0"
 /-! ### -s keeps the user's SHELL; set_home applies -/
 #guard get { base with shellMode := true } "SHELL" == some "/bin/zsh"
 #guard get { base with shellMode := true, settings := { envKeep := ["HOME"], setHome := true } } "HOME" ==
