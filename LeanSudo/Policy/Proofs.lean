@@ -20,6 +20,9 @@ Properties of `LeanSudo.Policy.evaluate`, stated in terms of the matching functi
    (Defaults, includes) do not influence the judgement;
 7. `pathMatches_literal_basename`, `cmndBase_literal_basename` — a literal sudoers
    path never matches a command with a different basename (multicall binaries).
+8. `runas_allow_no_group_user_match` — without `-g`, a run-as user list must allow;
+9. `usCandidates_of_userListOk_false` / `notbob_alias_no_candidates` — a denied
+   invoking user, including a DENY inside User_Alias, contributes no candidates.
 -/
 
 namespace LeanSudo.Policy
@@ -65,6 +68,35 @@ theorem mem_usCandidates {al : Aliases} {f : Nat} {st : Settings} {r : Request} 
   by_cases h : userListOk al f r.user us.users = true
   · simp only [h, ↓reduceIte, true_and, List.mem_flatMap]
   · simp [h]
+
+/-- A rejected invoking-user list cannot contribute any command candidate. -/
+theorem usCandidates_of_userListOk_false {al : Aliases} {f : Nat} {st : Settings}
+    {r : Request} {us : UserSpec} (h : userListOk al f r.user us.users = false) :
+    usCandidates al f st r us = [] := by
+  simp [usCandidates, h]
+
+/-- Inner User_Alias negation excludes bob regardless of the spec's commands. -/
+theorem notbob_alias_no_candidates (st : Settings) (r : Request) (entries : List HostCmnds) :
+    usCandidates
+      { user := [("NOTBOB", [⟨false, .all⟩, ⟨true, .name "bob"⟩])] } 1 st
+      { r with user := ⟨"bob", 1001, 1001, [], "/home/bob", "/bin/sh"⟩ }
+      ⟨[⟨false, .alias "NOTBOB"⟩], entries⟩ = [] := by
+  apply usCandidates_of_userListOk_false
+  dsimp only
+  decide
+
+/-- With no requested group there is no self-rescue for an unspecified user. -/
+theorem runas_allow_no_group_user_match {al : Aliases} {f : Nat} {st : Settings}
+    {r : Request} {us : List (Member UserAtom)} {gs : Option (List (Member UserAtom))}
+    (hg : r.runasGroup = none)
+    (h : runasOk al f st r (some ⟨some us, gs⟩) = true) :
+    runasUserResult al f r.runasUser us = some true := by
+  cases hu : runasUserResult al f r.runasUser us with
+  | none => simp [runasOk, hu, hg] at h
+  | some b =>
+    cases b with
+    | false => simp [runasOk, hu] at h
+    | true => rfl
 
 theorem mem_candidates {s : Sudoers} {st : Settings} {r : Request} {c : Candidate} :
     c ∈ candidates s st r ↔
@@ -309,9 +341,9 @@ theorem evaluate_append_deny_all (s : Sudoers) (st : Settings) (r : Request)
   apply evaluate_append_negated s st r _ _ _ hrun
   · simp [userListOk, userListResult, matchList, atomMatches_user_name, userBase]
   · simp [hostListOk, matchList, atomMatches_host_all, hostBase]
-  · unfold runasOk runasGroupOk
-    cases r.runasGroup <;>
-      simp [runasUserResult, runasGroupResult, matchList, atomMatches_user_all, userBase, groupBase]
+  · simp only [runasOk, runasUserResult, matchList, atomMatches_user_all, userBase]
+    cases hg : r.runasGroup <;>
+      simp [runasGroupOk, hg, runasGroupOk.groupResult, matchList, groupBase]
   · simp only [cmndMemberResult, cmndListResult, matchList]
     rw [atomMatches_nonAlias _ _ _ _ _ rfl]
     cases hc : r.command <;> simp_all [isRunCmd, cmndBase]

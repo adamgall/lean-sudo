@@ -160,31 +160,50 @@ def isRunasDefault (st : Settings) (t : Principal) : Bool :=
     | none => false
   | _ => st.runasDefault == t.name
 
-/-- Group half of a run-as check. No `-g` ⇒ fine. Otherwise the group list's last
-match decides; if it has none (or there is no group list) the requested group must be
-the target user's primary group. -/
+/-- Group half when the run-as user matched ALLOW. No `-g` ⇒ fine.
+As in sudoers `runas_grouplist_matches`, an unspecified group result falls
+back to the target's primary/supplementary groups, including inside aliases.
+Callers with an unmatched user must use `runasGroupResult` without this fallback. -/
 def runasGroupOk (al : Aliases) (fuel : Nat) (r : Request) (gs : Option (List (Member UserAtom))) :
     Bool :=
   match r.runasGroup with
   | none => true
   | some g =>
-    match gs.bind (runasGroupResult al fuel g) with
-    | some b => b
-    | none => g.gid == r.runasUser.gid
+    let fallback := g.gid == r.runasUser.gid || r.runasUser.groups.any (·.2 == g.gid)
+    let result := gs.bind (groupResult g fallback fuel)
+    result.getD fallback
+where
+  groupResult (g : GroupInfo) (fallback : Bool) : Nat → List (Member UserAtom) → Option Bool
+    | fuel, ms =>
+      let result := matchList (fun a =>
+        match a with
+        | .alias n =>
+          match fuel with
+          | 0 => none
+          | f + 1 => (lookupAlias al.runas n).bind (groupResult g fallback f)
+        | _ => if groupBase g a then some true else none) ms
+      result.orElse (fun _ => if fallback then some true else none)
 
-/-- Does a command spec's effective run-as spec permit the requested target? -/
-def runasOk (al : Aliases) (fuel : Nat) (st : Settings) (r : Request) : Option RunasSpec → Bool
-  | none | some ⟨none, none⟩ =>
-    isRunasDefault st r.runasUser && runasGroupOk al fuel r none
-  | some ⟨some us, gs⟩ =>
-    let userPart :=
-      match runasUserResult al fuel r.runasUser us with
-      | some b => b
-      -- sudo: no run-as user matched at all ⇒ running as yourself is fine
-      | none => r.runasUser.uid == r.user.uid
-    userPart && runasGroupOk al fuel r gs
-  | some ⟨none, some gs⟩ =>
-    r.runasUser.uid == r.user.uid && runasGroupOk al fuel r (some gs)
+/-- sudoers `runaslist_matches`: group fallback requires a matched user;
+an unspecified user can be rescued only by an explicitly allowed `-g` and
+the invoking user's own name. An explicit user DENY is never rescued. -/
+def runasOk (al : Aliases) (fuel : Nat) (st : Settings) (r : Request) (rs : Option RunasSpec) : Bool :=
+  let (userResult, gs) := match rs with
+    | none | some ⟨none, none⟩ =>
+      (if isRunasDefault st r.runasUser then some true else none, none)
+    | some ⟨some us, gs⟩ => (runasUserResult al fuel r.runasUser us, gs)
+    | some ⟨none, some gs⟩ =>
+      (if (!r.runasUserExplicit && r.runasGroup.isSome) || r.runasUser.name == r.user.name
+        then some true else none, some gs)
+  match userResult with
+  | some true => runasGroupOk al fuel r gs
+  | some false => false
+  | none =>
+    match r.runasGroup with
+    | none => false
+    | some g =>
+      r.runasUser.name == r.user.name &&
+        (gs.bind (runasGroupResult al fuel g) == some true)
 
 /-! ## Commands -/
 
@@ -200,13 +219,14 @@ def dropLastChar (p : String) : String := String.ofList p.toList.dropLast
 def baseOf (s : String) : String :=
   String.ofList (s.toList.reverse.takeWhile (· != '/')).reverse
 
-/-- Argument constraint. -/
-def argsMatch : CmndArgs → List String → Bool
+/-- Argument constraint. `pathname`: `*`/`?` do not match `/` (sudo uses `FNM_PATHNAME`
+for `sudoedit` arguments, `command_args_match` in match_command.c). -/
+def argsMatch (pathname : Bool) : CmndArgs → List String → Bool
   | .any, _ => true
   | .none, as => as.isEmpty
   | .pattern q, as =>
     let j := " ".intercalate as
-    if hasGlob q then fnmatch q j false else q == j
+    if hasGlob q then fnmatch q j pathname else q == j
 
 /-- Path part of a command atom against the requested `path` (as found by PATH lookup)
 and its `canonical` realpath. `canon` is the realpath oracle for sudoers paths.
@@ -233,8 +253,8 @@ def pathMatches (canon : String → String) (p path canonical : String) : Bool :
 def cmndBase (canon : String → String) : Command → CmndAtom → Bool
   | .run _ _ _, .all => true
   | .sudoedit _, .all => true
-  | .run path canonical args, .command p a => pathMatches canon p path canonical && argsMatch a args
-  | .sudoedit files, .sudoedit a => argsMatch a files
+  | .run path canonical args, .command p a => pathMatches canon p path canonical && argsMatch false a args
+  | .sudoedit files, .sudoedit a => argsMatch true a files
   | _, _ => false
 
 def cmndListResult (al : Aliases) (fuel : Nat) (canon : String → String) (cmd : Command)

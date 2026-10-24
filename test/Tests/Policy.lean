@@ -180,7 +180,7 @@ def runasPol : Sudoers := [
   rule [pos (.name "alice")] [pos .all] [spec (some ⟨some [pos .all, neg (.name "root")], none⟩) (pos (cmd "/bin/e"))],
   rule [pos (.name "alice")] [pos .all] [spec (some ⟨some [pos (.group "wheel"), pos (.id 0)], some [pos (.id 4)]⟩) (pos (cmd "/bin/f"))]]
 
--- (a) no run-as spec: runas_default only, group only the target's primary group
+-- (a) no run-as spec: runas_default, with primary/supplementary group fallback
 #guard isAllow (evaluate runasPol st (req alice (run "/bin/a")))
 #guard evaluate runasPol st (req alice (run "/bin/a") (target := bob)) == .deny
 #guard isAllow (evaluate runasPol { st with runasDefault := "bob" } (req alice (run "/bin/a") (target := bob)))
@@ -192,13 +192,14 @@ def runasPol : Sudoers := [
 #guard evaluate runasPol st (req alice (run "/bin/b") (target := bob)) == .deny
 #guard evaluate runasPol st (req alice (run "/bin/b") (g := some wheelG)) == .deny
 #guard isAllow (evaluate runasPol st (req alice (run "/bin/b") (g := some rootG)))
--- running as yourself when the run-as user list does not mention you
-#guard isAllow (evaluate runasPol st (req alice (run "/bin/b") (target := alice)))
+-- Without -g, an unspecified run-as user is not rescued by being yourself.
+#guard evaluate runasPol st (req alice (run "/bin/b") (target := alice)) == .deny
 -- (c) groups only: target must be the invoking user (`sudo -g wheel`)
 #guard isAllow (evaluate runasPol st (req alice (run "/bin/c") (target := alice) (g := some wheelG)))
 #guard isAllow (evaluate runasPol st (req alice (run "/bin/c") (target := alice)))
-#guard evaluate runasPol st (req alice (run "/bin/c") (target := alice) (g := some admG)) == .deny
-#guard evaluate runasPol st (req alice (run "/bin/c") (target := root) (g := some wheelG)) == .deny
+#guard isAllow (evaluate runasPol st (req alice (run "/bin/c") (target := alice) (g := some admG)))
+#guard evaluate runasPol st
+  { (req alice (run "/bin/c") (target := root) (g := some wheelG)) with runasUserExplicit := true } == .deny
 -- users and groups
 #guard isAllow (evaluate runasPol st (req alice (run "/bin/d") (g := some wheelG)))
 #guard isAllow (evaluate runasPol st (req alice (run "/bin/d") (target := alice) (g := some wheelG)))
@@ -212,6 +213,38 @@ def runasPol : Sudoers := [
 #guard isAllow (evaluate runasPol st (req alice (run "/bin/f") (g := some admG)))
 #guard evaluate runasPol st (req alice (run "/bin/f") (target := carol)) == .deny
 #guard evaluate runasPol st (req alice (run "/bin/f") (target := bob) (g := some aliceG)) == .deny
+
+def bobAsAlice : Sudoers := [
+  rule [pos (.name "bob")] [pos .all]
+    [spec (some ⟨some [pos (.name "alice")], none⟩) (pos (cmd "/usr/bin/id"))]]
+#guard evaluate bobAsAlice st
+  { (req bob (run "/usr/bin/id") bob) with runasUserExplicit := true } == .deny
+#guard evaluate bobAsAlice st (req bob (run "/usr/bin/id") bob (some ⟨"bob", 1001⟩)) == .deny
+#guard isAllow (evaluate bobAsAlice st (req bob (run "/usr/bin/id") alice (some admG)))
+
+def erin : Principal := ⟨"erin", 1003, 1003, [("erin", 1003)], "/home/erin", "/bin/sh"⟩
+def erinGroupOnly : Sudoers := [
+  rule [pos (.name "erin")] [pos .all]
+    [spec (some ⟨none, some [pos (.name "adm")]⟩) (pos (cmd "/usr/bin/id"))]]
+#guard isAllow (evaluate erinGroupOnly st (req erin (run "/usr/bin/id") erin (some admG)))
+#guard evaluate erinGroupOnly st
+  { (req erin (run "/usr/bin/id") root (some admG)) with runasUserExplicit := true } == .deny
+#guard isAllow (evaluate [rule [pos .all] [pos .all] [spec allAll (pos .all)]]
+  st (req bob (run "/usr/bin/id") alice (some wheelG)))
+
+def runasGroupAliasPol : Sudoers := [
+  .runasAlias "NOTADM" [pos .all, neg (.name "adm")],
+  rule [pos .all] [pos .all]
+    [spec (some ⟨some [pos .all], some [pos (.alias "NOTADM")]⟩) (pos .all)]]
+-- Inner DENY defeats even the matched target's supplementary-group fallback.
+#guard evaluate runasGroupAliasPol st (req bob (run "/usr/bin/id") alice (some admG)) == .deny
+#guard isAllow (evaluate runasGroupAliasPol st (req bob (run "/usr/bin/id") alice (some wheelG)))
+-- sudo applies fallback within aliases too, before an outer negation.
+#guard evaluate [
+    .runasAlias "OTHER" [pos (.name "wheel")],
+    rule [pos .all] [pos .all]
+      [spec (some ⟨some [pos .all], some [neg (.alias "OTHER")]⟩) (pos .all)]]
+  st (req bob (run "/usr/bin/id") alice (some admG)) == .deny
 
 /-! ## Commands: arguments, directories, globs, canonical paths, sudoedit -/
 
@@ -445,5 +478,17 @@ def parsedAuth (text : String) (u : Principal) : Option Bool := do
   pure result.1.authenticate
 #guard parsedAuth scopedText bob == some true
 #guard parsedAuth scopedText alice == some false
+
+/-! sudoedit arguments are matched with `FNM_PATHNAME` (as sudo does): `*` must not
+match `/`, so `sudoedit /etc/app/*` does not cover `/etc/app/../shadow`. -/
+def editGlob : Sudoers :=
+  [rule [pos (.name "bob")] [pos .all] [spec asRoot (pos (.sudoedit (.pattern "/etc/app/*")))]]
+#guard isAllow (evaluate editGlob st (req bob (.sudoedit ["/etc/app/conf"])))
+#guard !isAllow (evaluate editGlob st (req bob (.sudoedit ["/etc/app/../shadow"])))
+#guard !isAllow (evaluate editGlob st (req bob (.sudoedit ["/etc/app/sub/conf"])))
+-- ordinary command arguments keep sudo's non-pathname matching
+def argGlob : Sudoers :=
+  [rule [pos (.name "bob")] [pos .all] [spec asRoot (pos (cmd "/usr/bin/cat" (.pattern "/var/log/*")))]]
+#guard isAllow (evaluate argGlob st (req bob (run "/usr/bin/cat" ["/var/log/a/b"])))
 
 end Tests.Policy
