@@ -26,3 +26,22 @@ lean_lib LeanSudo where
 @[default_target]
 lean_exe sudo where
   root := `Main
+
+/-- Compile-time unit tests (`#guard`/`example`), one module per area: `lake build Tests`. -/
+lean_lib Tests where
+  srcDir := "test"
+  globs := #[.submodules `Tests]
+
+/-- IO smoke executables for the C shim (run unprivileged; root-only paths are
+exercised by the docker integration suite). -/
+lean_exe «smoke-core» where
+  srcDir := "test"
+  root := `Smoke.Core
+
+lean_exe «smoke-exec» where
+  srcDir := "test"
+  root := `Smoke.Exec
+
+lean_exe «smoke-ts» where
+  srcDir := "test"
+  root := `Smoke.Ts
