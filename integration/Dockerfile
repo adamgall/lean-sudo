@@ -15,9 +15,10 @@ RUN apt-get update \
 # Test users. alice is in the stock `%sudo` rule; the others get rules from
 # /etc/sudoers.d (fixtures below). bob has no sudo rights at all.
 RUN set -eu; \
-    for u in alice bob carol dave erin frank gina henry; do useradd -m -s /bin/bash "$u"; done; \
+    for u in alice bob carol dave erin frank gina henry ivan judy kate liam mona nick olga pete; do useradd -m -s /bin/bash "$u"; done; \
     usermod -aG sudo alice; \
     printf '%s\n' alice:alicepw bob:bobpw carol:carolpw dave:davepw erin:erinpw frank:frankpw gina:ginapw henry:henrypw \
+      ivan:ivanpw judy:judypw kate:katepw liam:liampw mona:monapw nick:nickpw olga:olgapw pete:petepw \
       | chpasswd
 
 COPY sudoers.d/ /opt/sudo-it/sudoers.d/
@@ -28,6 +29,7 @@ RUN set -eu; \
     /usr/sbin/visudo.ws -c
 
 COPY ptyrun.py tests.sh /opt/sudo-it/
+COPY tests.d/ /opt/sudo-it/tests.d/
 RUN chmod 0755 /opt/sudo-it/ptyrun.py /opt/sudo-it/tests.sh && mkdir -p /opt/impl
 
 ENTRYPOINT ["/opt/sudo-it/tests.sh"]

@@ -46,23 +46,51 @@ def renderUserAtom : UserAtom → String
   | .id n => s!"#{n}"
   | .group n => s!"%{n}"
   | .gid n => s!"%#{n}"
+  | .nonunixGroup n => s!"%:{n}"
+  | .nonunixGid n => s!"%:#{n}"
+  | .netgroup n => s!"+{n}"
+  | .myself => ""
   | .alias n => n
+
+def renderIp : IpAddr → String
+  | .v4 bs => ".".intercalate (bs.map (toString ·.toNat))
+  | .v6 bs =>
+    let hex (n : Nat) : String := String.ofList (Nat.toDigits 16 n)
+    let rec words : List UInt8 → List String
+      | a :: b :: rest => hex (a.toNat * 256 + b.toNat) :: words rest
+      | _ => []
+    ":".intercalate (words bs)
 
 def renderHostAtom : HostAtom → String
   | .all => "ALL"
   | .name n => n
+  | .netgroup n => s!"+{n}"
+  | .network a m => renderIp a ++ "/" ++ renderIp m
   | .alias n => n
 
 def renderArgs : CmndArgs → String
   | .any => ""
   | .none => " \"\""
   | .pattern q => " " ++ escapeChars [',', ':', '=', '\\'] q
+  | .regex re => " " ++ re
+
+def renderDigestAlgo : DigestAlgo → String
+  | .sha224 => "sha224" | .sha256 => "sha256" | .sha384 => "sha384" | .sha512 => "sha512"
+
+def renderDigest (d : Digest) : String :=
+  let hex2 (b : UInt8) : String :=
+    let s := String.ofList (Nat.toDigits 16 b.toNat)
+    if s.length < 2 then "0" ++ s else s
+  renderDigestAlgo d.algo ++ ":" ++ String.join (d.bytes.map hex2)
 
 def renderCmndAtom : CmndAtom → String
   | .all => "ALL"
   | .alias n => n
   | .command p a => p ++ renderArgs a
+  | .commandRegex re a => re ++ renderArgs a
   | .sudoedit a => "sudoedit" ++ renderArgs a
+  | .list => "list"
+  | .digest ds c => ", ".intercalate (ds.map renderDigest) ++ " " ++ renderCmndAtom c
 
 def renderMember {α : Type} (f : α → String) (m : Member α) : String :=
   (if m.negated then "!" else "") ++ f m.atom

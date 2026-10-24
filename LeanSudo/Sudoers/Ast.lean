@@ -5,11 +5,11 @@ This is the shared contract between the parser (`LeanSudo.Sudoers.Parser`) and t
 policy engine (`LeanSudo.Policy.Eval`).
 
 Design rules:
-* The parser is **fail-closed**: any sudoers construct whose semantics we do not
-  implement (netgroups, IP/netmask hosts, digests, regex arguments, NOEXEC,
-  INTERCEPT, CHROOT, TIMEOUT, NOTBEFORE/NOTAFTER, SELinux/AppArmor options, ...)
-  is a parse error, never silently ignored. Silently ignoring a *restricting*
-  construct would widen what is permitted.
+* The parser accepts the full sudoers(5) grammar of sudo 1.9.17. Constructs whose
+  semantics lean-sudo does not implement are still represented here; the decision
+  core refuses a request whose deciding rule uses them (fail-closed at decision
+  time, so an unsupported feature in someone else's rule does not lock everyone out).
+  Syntax that is not valid sudoers is a parse error.
 * Negation parity is normalised: `!!x` is stored as `negated := false`.
 * Run-as specs and tags are *inherited* within one `Cmnd_Spec_List`
   (`(root) NOPASSWD: /a, /b` applies to both commands). The parser resolves that
@@ -41,13 +41,32 @@ inductive UserAtom where
   | group (n : String)
   /-- `%#123` -/
   | gid (n : Nat)
+  /-- `%:group` (non-Unix group, via `group_plugin`) -/
+  | nonunixGroup (n : String)
+  /-- `%:#123` -/
+  | nonunixGid (n : Nat)
+  /-- `+netgroup` -/
+  | netgroup (n : String)
+  /-- the empty run-as list `()` / `(:)`: the invoking user only (sudo's `MYSELF`) -/
+  | myself
   /-- reference to a `User_Alias` (in user lists) or `Runas_Alias` (in run-as lists) -/
   | alias (n : String)
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+/-- An IPv4 (4 bytes) or IPv6 (16 bytes) address, network byte order. -/
+inductive IpAddr where
+  | v4 (bytes : List UInt8)
+  | v6 (bytes : List UInt8)
   deriving Repr, BEq, DecidableEq, Inhabited
 
 inductive HostAtom where
   | all
   | name (n : String)
+  /-- `+netgroup` -/
+  | netgroup (n : String)
+  /-- `ip`, `ip/bits` or `ip/netmask`; `mask` is the (normalised) netmask of the same
+  family, all ones for a bare address -/
+  | network (addr : IpAddr) (mask : IpAddr)
   | alias (n : String)
   deriving Repr, BEq, DecidableEq, Inhabited
 
@@ -62,6 +81,18 @@ inductive CmndArgs where
   the pattern has no glob metacharacters). Escapes (`\,` `\:` `\=` `\\` `\ `) are
   already removed by the parser. -/
   | pattern (p : String)
+  /-- `^…$`: POSIX extended regular expression over the joined arguments -/
+  | regex (re : String)
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+inductive DigestAlgo where
+  | sha224 | sha256 | sha384 | sha512
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+/-- `sha256:…` (hex or base64 in sudoers; stored decoded) -/
+structure Digest where
+  algo : DigestAlgo
+  bytes : List UInt8
   deriving Repr, BEq, DecidableEq, Inhabited
 
 inductive CmndAtom where
@@ -69,8 +100,15 @@ inductive CmndAtom where
   | alias (n : String)
   /-- an absolute path, a glob over absolute paths, or a directory ending in `/` -/
   | command (path : String) (args : CmndArgs)
+  /-- `^…$` path: POSIX extended regular expression over the command path -/
+  | commandRegex (re : String) (args : CmndArgs)
   /-- the `sudoedit` pseudo-command -/
   | sudoedit (args : CmndArgs)
+  /-- the `list` pseudo-command (permits `sudo -l -U user`) -/
+  | list
+  /-- `digest_list command`: `cmd` (a `command`/`commandRegex`) whose file must match
+  one of the digests -/
+  | digest (ds : List Digest) (cmd : CmndAtom)
   deriving Repr, BEq, DecidableEq, Inhabited
 
 /-- `(users : groups)`. `none` means the half was not written. -/
@@ -85,12 +123,40 @@ structure Tags where
   passwd : Option Bool := Option.none
   /-- `SETENV:` = `some true`, `NOSETENV:` = `some false` -/
   setenv : Option Bool := Option.none
+  /-- `NOEXEC:` = `some true`, `EXEC:` = `some false` -/
+  noexec : Option Bool := Option.none
+  /-- `INTERCEPT:` / `NOINTERCEPT:` -/
+  intercept : Option Bool := Option.none
+  /-- `LOG_INPUT:` / `NOLOG_INPUT:` -/
+  logInput : Option Bool := Option.none
+  /-- `LOG_OUTPUT:` / `NOLOG_OUTPUT:` -/
+  logOutput : Option Bool := Option.none
+  /-- `MAIL:` / `NOMAIL:` -/
+  mail : Option Bool := Option.none
+  /-- `FOLLOW:` / `NOFOLLOW:` -/
+  follow : Option Bool := Option.none
   deriving Repr, BEq, DecidableEq, Inhabited
 
 /-- Per-command options. -/
 structure CmndOptions where
-  /-- `CWD=path` (`some (some p)`) or `CWD=*` (`some none`: user may pick with `-D`) -/
+  /-- `CWD=path` (`some (some p)`), `CWD=*` (`some none`: user may pick with `-D`);
+  `~` / `~user` are kept verbatim and expanded by the decision core -/
   cwd : Option (Option String) := Option.none
+  /-- `CHROOT=dir` (`*` kept verbatim) -/
+  chroot : Option String := Option.none
+  /-- `TIMEOUT=` in seconds -/
+  timeout : Option Nat := Option.none
+  /-- `NOTBEFORE=` / `NOTAFTER=` as Unix time (seconds, UTC) -/
+  notBefore : Option Nat := Option.none
+  notAfter : Option Nat := Option.none
+  /-- SELinux `ROLE=` / `TYPE=` -/
+  role : Option String := Option.none
+  type : Option String := Option.none
+  /-- `APPARMOR_PROFILE=` -/
+  apparmorProfile : Option String := Option.none
+  /-- Solaris `PRIVS=` / `LIMITPRIVS=` (no effect on Linux) -/
+  privs : Option String := Option.none
+  limitprivs : Option String := Option.none
   deriving Repr, BEq, DecidableEq, Inhabited
 
 structure CmndSpec where

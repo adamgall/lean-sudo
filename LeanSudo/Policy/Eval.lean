@@ -113,7 +113,7 @@ def userBase (p : Principal) : UserAtom → Bool
   | .id n => n == p.uid
   | .group n => p.groups.any (·.1 == n)
   | .gid n => n == p.gid || p.groups.any (·.2 == n)
-  | .alias _ => false
+  | _ => false
 
 /-- A run-as *group* list atom against a group (`name` = group name, `id` = gid). -/
 def groupBase (g : GroupInfo) : UserAtom → Bool
@@ -126,7 +126,7 @@ def groupBase (g : GroupInfo) : UserAtom → Bool
 def hostBase (host : String) : HostAtom → Bool
   | .all => true
   | .name n => if hasGlob n then fnmatch n host false true else n.toLower == host.toLower
-  | .alias _ => false
+  | _ => false
 
 /-- Result of a user list (with `User_Alias`es) for the invoking user. -/
 def userListResult (al : Aliases) (fuel : Nat) (p : Principal) (l : List (Member UserAtom)) :
@@ -227,6 +227,7 @@ def argsMatch (pathname : Bool) : CmndArgs → List String → Bool
   | .pattern q, as =>
     let j := " ".intercalate as
     if hasGlob q then fnmatch q j pathname else q == j
+  | .regex _, _ => false
 
 /-- Path part of a command atom against the requested `path` (as found by PATH lookup)
 and its `canonical` realpath. `canon` is the realpath oracle for sudoers paths.

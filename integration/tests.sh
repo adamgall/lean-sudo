@@ -1128,6 +1128,15 @@ EOF
 # --- end security boundary regressions -------------------------------------
 
 # ---------------------------------------------------------------------------
+# Additional scenario files (integration/tests.d/*.sh, sourced in name order).
+# Each file uses the harness above (begin/run/pty/expect_*/end) and may install
+# its own sudoers fragments inside a test (reset_state restores them).
+# ---------------------------------------------------------------------------
+for f in "$(dirname "$0")"/tests.d/*.sh; do
+  [[ -f $f ]] && . "$f"
+done
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
