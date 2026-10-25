@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# Run the end-to-end sudo suite in a throwaway container.
-#
-#   integration/run.sh <impl> [test-name-filter]
-#   integration/run.sh --visudo reference|<path-to-visudo>|--build [test-name-filter]
-#
-# <impl>:  reference   original sudo.ws (Ubuntu package `sudo`, /usr/bin/sudo.ws)
-#          sudo-rs     Ubuntu's sudo-rs (/usr/lib/cargo/bin/sudo)
-#          <path>      a sudo binary on the host, e.g. .lake/linux/sudo
-#          --build     build lean-sudo's Linux sudo/visudo first (integration/build.sh,
-#                      a container build; works on macOS) and test that binary
-# filter:  extended regex matched against test names (e.g. 'tty-|env-').
-# --visudo runs visudo-tests.sh (copied in) instead of tests.sh, against
-#          /usr/sbin/visudo.ws (reference) or a host visudo binary.
-#
-# Environment: SUDO_IT_BASE (base image, default ubuntu:26.04, falls back to
-# ubuntu:devel), SUDO_IT_IMAGE (image tag, default lean-sudo-it).
-# Logs: integration/out/<label>.tap and <label>.log (full per-test transcripts).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -46,7 +46,7 @@ case $impl in
     ;;
 esac
 
-# --- visudo suite hook ------------------------------------------------------
+
 entry=()
 visudo_env=()
 sibling_sudo=
@@ -56,7 +56,7 @@ if [[ $visudo == 1 ]]; then
     sudo-rs)   usage ;;
     *)         bin=/opt/impl/visudo; label=visudo-$(basename "$host_bin")
                [[ $label == visudo-visudo ]] && label=custom-visudo
-               # Tests that run sudo after visudo use the sibling sudo binary, if any.
+
                if [[ -f $(dirname "$host_bin")/sudo ]]; then
                  sibling_sudo=$(dirname "$host_bin")/sudo
                  visudo_env=(-e VISUDO_SUDO_BINARY=/opt/impl/sudo)
@@ -77,7 +77,7 @@ elif ! build ubuntu:26.04; then
   build ubuntu:devel || { cat "$buildlog" >&2; exit 2; }
 fi
 
-# Only the log directory is mounted (writable); everything else is copied in.
+
 cid=$(docker create \
   --hostname sudo-it --network none --cap-add SYS_PTRACE --cap-add SYS_ADMIN \
   -v "$here/out:/out" \

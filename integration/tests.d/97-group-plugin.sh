@@ -1,4 +1,4 @@
-# Real Ubuntu sudo group plugins, using the same expectations for both binaries.
+
 group_plugin_policy() {
   printf 'admins:x:42001:ivan\nothers:x:42002:alice\n#42003:x:42003:ivan\n' >/etc/sudo-group
   chmod 0644 /etc/sudo-group
@@ -186,8 +186,8 @@ begin group-plugin-list-other && {
 }
 
 begin group-plugin-incompatible-version && {
-  # Corrupt only the exported ABI version in the real shipped provider. Locate
-  # the field through the loader mapping, so this works on either Docker arch.
+
+
   python3 - <<'PY'
 import ctypes
 from pathlib import Path

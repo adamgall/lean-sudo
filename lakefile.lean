@@ -2,11 +2,9 @@ import Lake
 open Lake DSL System
 
 package «lean-sudo» where
-  -- The C shim dlopen()s libpam at runtime, so only libdl/libutil are needed at link time.
   moreLinkArgs := #["-ldl", "-lutil",
     if System.Platform.isOSX then "-Wl,-export_dynamic" else "-Wl,--export-dynamic"]
 
-/-- C shim translation units (each owned by one Lean `LeanSudo.Sys.*` module). -/
 def shimSources : Array String := #[
   "core", "exec", "ts", "visudo", "edit", "sys", "iolog", "lookup", "groupplugin",
   "plugins", "sss", "logsrv", "intercept", "intercept_trace", "intercept_dso", "shim"]
@@ -15,7 +13,6 @@ def shimCFlags : Array String :=
   #["-fPIC", "-O2", "-Wall", "-Wextra", "-Werror", "-D_GNU_SOURCE",
     "-fstack-protector-strong", "-D_FORTIFY_SOURCE=2"]
 
-/-- Headers shared by shim translation units; every object is rebuilt when one changes. -/
 def shimHeaders : Array String := #[
   "locale_scope.h", "logsrv.h", "intercept.h", "intercept_dso.h", "plugins.h",
   "sudo_plugin.h", "shim.h"]

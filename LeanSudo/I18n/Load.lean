@@ -2,8 +2,6 @@ import LeanSudo.I18n
 import LeanSudo.I18n.Render
 import LeanSudo.Sys.Core
 
-/-! Gettext's IO boundary. Catalogs and locale data are accepted only beneath
-root-owned, non-writable directories. No user-selected path is opened as root. -/
 namespace LeanSudo.I18n
 
 structure Catalogs where
@@ -17,10 +15,6 @@ private def safeName (s : String) : Bool :=
   !s.isEmpty && s != "." && s != ".." &&
     s.toList.all (fun c => c.isAlphanum || "_-.@".contains c)
 
-/-- Resolve first, then validate every ancestor of the path actually opened.
-An unprivileged process cannot replace either that file or any directory in its
-path between validation and opening. Symlinks in the original spelling cannot
-redirect the subsequent read. -/
 private def trustedPath (path : String) : IO (Option String) := do
   let some path ← Sys.realpath path | return none
   if !path.startsWith "/" then return none
@@ -84,8 +78,6 @@ private def selected (env : List (String × String)) (category : String) : Strin
     ((env.lookup category).filter (!·.isEmpty)) |>.getD
       (((env.lookup "LANG").filter (!·.isEmpty)).getD "C")
 
-/-- setlocale(LC_ALL, "") is atomic: one invalid category leaves the initial C
-locale in place. LANGUAGE is consulted by gettext only after locale activation. -/
 def messageLocale (env : List (String × String)) : IO String := do
   let messages := selected env "LC_MESSAGES"
   if isCLocale messages then return "C"
@@ -96,7 +88,6 @@ def messageLocale (env : List (String × String)) : IO String := do
     if !(← categoryExists archive (selected env category) category) then return "C"
   return selected env "LC_MESSAGES"
 
-/-- gettext's locale specificity order, including normalized codesets. -/
 def localeVariants (name : String) : List String := Id.run do
   if !safeName name then return []
   let modifier := (name.splitOn "@").drop 1 |>.head?
@@ -116,13 +107,10 @@ private def loadDomain (languages : List String) (domain : String) : IO Catalog 
   let mut catalogs : List Catalog := []
   for language in languages do
     if isCLocale language then break
-    -- Ubuntu's local-altlocaledir.diff appends the langpack tree *after all*
-    -- specificity variants in the bound /usr/share/locale tree.
     for root in ["/usr/share/locale", "/usr/share/locale-langpack"] do
       for variant in localeVariants language do
         if let some bytes ← trustedBytes (root ++ "/" ++ variant ++ "/LC_MESSAGES/" ++ domain ++ ".mo") then
           if let some catalog := parseMo bytes then catalogs := catalogs ++ [catalog]
-  -- Retain the highest-priority entry for each msgid, including its metadata.
   let mut result : Catalog := catalogs.headD {}
   for catalog in catalogs.drop 1 do
     result := merge result catalog
@@ -147,14 +135,12 @@ def gettext (msgid : String) (policy : Bool := true) : IO String := do
   let cats ← catalogs
   return lookup (if policy then cats.sudoers else cats.sudo) msgid
 
-/-- Translate only at the terminal boundary, never while constructing log data. -/
 def translate (text : String) (policy : Bool := true) : IO String := do
   let cats ← catalogs
   return render (if policy then cats.diagnostics else cats.frontend) text
 
 private initialize logCatalog : IO.Ref (String × Catalog) ← IO.mkRef ("C", {})
 
-/-- Logs use sudoers_locale, not the invoking user's LANGUAGE or message locale. -/
 def translateLog (locale text : String) : IO String := do
   if isCLocale locale then return text
   let (cached, catalog) ← logCatalog.get

@@ -1,8 +1,5 @@
 import LeanSudo.I18n
 
-/-! Translate the presentation of diagnostics without translating policy results,
-log records, command arguments or user-configured strings. The original rendering
-is retained verbatim if no catalog entry matches. -/
 namespace LeanSudo.I18n
 
 private inductive Part where
@@ -50,8 +47,6 @@ private def trimLine (s : String) : String :=
 private def score (ps : List Part) : Nat :=
   ps.foldl (fun n p => match p with | .literal s => n + s.length | _ => n) 0
 
-/-- Match one complete diagnostic, not substrings of untrusted operands. Prefer
-more-specific templates to generic entries such as "%s: %s". -/
 private def renderTemplate (catalog : Catalog) (text : String) : String := Id.run do
   if text.isEmpty then return text
   let translated := lookup catalog text
@@ -79,8 +74,6 @@ private def renderTemplate (catalog : Catalog) (text : String) : String := Id.ru
             specificity := weight
   return best
 
-/-- File/line diagnostics prepend a source location rather than a gettext msgid.
-Match the complete remaining diagnostic after that envelope. -/
 def renderMessage (catalog : Catalog) (text : String) : String := Id.run do
   let translated := renderTemplate catalog text
   if translated != text then return translated
@@ -92,8 +85,6 @@ def renderMessage (catalog : Catalog) (text : String) : String := Id.run do
       return ": ".intercalate (fields.take (i + 1)) ++ ": " ++ translated
   return text
 
-/-- Some sudo help blocks are single multiline msgids. Keep their per-line
-presentation available without changing untranslated or non-corresponding blocks. -/
 def presentation (catalog : Catalog) : Catalog :=
   { catalog with entries := catalog.entries ++ catalog.entries.flatMap fun (source, target) =>
       if !source.contains '\n' || source.contains '\x00' then [] else
@@ -102,8 +93,6 @@ def presentation (catalog : Catalog) : Catalog :=
       if sources.length != targets.length then [] else
       (sources.zip targets).filter (fun pair => !pair.1.isEmpty && pair.1 != pair.2) }
 
-/-- Diagnostic envelopes are not gettext strings. Their enclosed message is.
-Newline splitting preserves every byte, including final and empty lines. -/
 def render (catalog : Catalog) (text : String) : String :=
   if text.isEmpty || catalog.entries.isEmpty then text else
   let exact := lookup catalog text

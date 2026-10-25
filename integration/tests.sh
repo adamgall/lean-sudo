@@ -1,15 +1,15 @@
 #!/bin/bash
-# End-to-end sudo tests. Runs INSIDE the test container as root (see run.sh).
-#
-#   tests.sh SUDO_BINARY [NAME_FILTER]
-#
-# SUDO_BINARY is installed as the real setuid-root /usr/bin/sudo (and
-# /usr/bin/sudoedit -> sudo). NAME_FILTER is an extended regex matched against
-# test names. Output is TAP; exit status is 0 iff every selected test passed.
-#
-# Expectations are the ACTUAL behaviour of the reference (sudo.ws 1.9.17p2 on
-# Ubuntu 26.04). Checks that pin an implementation detail of the reference are
-# written tolerantly and say so in a comment.
+
+
+
+
+
+
+
+
+
+
+
 set -u
 
 IMPL_BIN=${1:?usage: tests.sh SUDO_BINARY [NAME_FILTER]}
@@ -23,30 +23,24 @@ SECURE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/b
 PTYRUN=/opt/sudo-it/ptyrun.py
 CMD_TIMEOUT=40
 
-# ---------------------------------------------------------------------------
-# Setup
-# ---------------------------------------------------------------------------
+
+
+
 
 [[ -f $IMPL_BIN ]] || { echo "Bail out! $IMPL_BIN does not exist"; exit 2; }
 rm -f /usr/bin/sudo /usr/bin/sudoedit
 install -o root -g root -m 4755 "$IMPL_BIN" /usr/bin/sudo
 ln -s sudo /usr/bin/sudoedit
 
-# Docker with --network none does not map the container hostname; sudo.ws
-# would print "unable to resolve host" on every run.
+
+
 host=$(hostname)
 getent hosts "$host" >/dev/null || echo "127.0.1.1 $host" >>/etc/hosts
 
-# Pristine copies, restored before every test.
+
 cp -a /etc/sudoers "$WORK/sudoers.orig"
 cp -a /etc/sudoers.d "$WORK/sudoers.d.orig"
 
-# A fake shell for the -s test: reports how it was invoked.
-cat >/usr/local/bin/testshell <<'EOF'
-#!/bin/sh
-echo "testshell:$*"
-EOF
-chmod 0755 /usr/local/bin/testshell
 touch /tmp/frankfile
 
 mkdir -p "$OUTDIR"
@@ -54,14 +48,14 @@ LOG="$OUTDIR/$LABEL.log"
 TAP="$OUTDIR/$LABEL.tap"
 : >"$LOG"
 : >"$TAP"
-# Hand the logs to the host user right away (survives an aborted run).
+
 if [[ -n ${HOST_UID:-} ]]; then chown "$HOST_UID:${HOST_GID:-$HOST_UID}" "$LOG" "$TAP"; fi
 
 uid_of() { id -u "$1"; }
 gid_of() { id -g "$1"; }
 
 reset_state() {
-  # Timestamp/lecture state of every implementation we know about.
+
   rm -rf /run/sudo /var/run/sudo /var/lib/sudo/ts /var/lib/sudo/lectured/* \
          /var/run/sudo-rs /run/sudo-rs /var/db/sudo
   rm -rf /etc/sudoers.d
@@ -70,19 +64,83 @@ reset_state() {
   chown root:root /etc/sudoers; chmod 0440 /etc/sudoers
 }
 
-# ---------------------------------------------------------------------------
-# Harness
-# ---------------------------------------------------------------------------
+
+
+
+
+
+cat >/usr/local/lib/sudo_it_logging.py <<'PY'
+import json
+import pathlib
+import subprocess
+import tempfile
+import time
+import uuid
+
+class Syslog:
+    def __enter__(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='sudo-rsyslog-')
+        root = pathlib.Path(self.tmp.name)
+        self.output = root / 'messages'
+        self.diagnostics = (root / 'stderr').open('w+')
+        config = root / 'rsyslog.conf'
+        config.write_text(
+            'global(maxMessageSize="256k" parser.escapeControlCharactersOnReceive="off")\n'
+            'module(load="imuxsock" SysSock.Name="/dev/log" SysSock.RateLimit.Interval="0")\n'
+            'template(name="raw" type="list") { constant(value="{") '
+            'property(name="rawmsg" format="jsonf") constant(value="}\\n") }\n'
+            '*.* action(type="omfile" file="' + str(self.output) +
+            '" template="raw" flushOnTXEnd="on")\n')
+        self.process = subprocess.Popen(
+            ['rsyslogd', '-n', '-i', str(root / 'pid'), '-f', str(config)],
+            stdout=self.diagnostics, stderr=self.diagnostics)
+        try:
+            self.wait(lambda: pathlib.Path('/dev/log').is_socket())
+            self.drain()
+            self.offset = self.output.stat().st_size
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def wait(self, predicate):
+        deadline = time.monotonic() + 10
+        while not predicate():
+            if self.process.poll() is not None or time.monotonic() >= deadline:
+                self.diagnostics.seek(0)
+                raise AssertionError('rsyslog readiness/drain failed: ' + self.diagnostics.read())
+            time.sleep(.01)
+
+    def drain(self):
+        marker = 'sudo-it-drain-' + uuid.uuid4().hex
+        subprocess.run(['logger', '--socket', '/dev/log', '--', marker], check=True)
+        self.wait(lambda: self.output.exists() and marker in self.output.read_text())
+        return marker
+
+    def messages(self):
+        marker = self.drain()
+        with self.output.open() as stream:
+            stream.seek(self.offset)
+            records = [json.loads(line)['rawmsg'] for line in stream]
+        return [record for record in records if marker not in record]
+
+    def __exit__(self, *args):
+        self.process.terminate()
+        self.process.wait(timeout=10)
+        self.diagnostics.close()
+        self.tmp.cleanup()
+PY
+
 
 NUM=0 PASSED=0 FAILED=0
 FAILED_NAMES=()
 CUR= CMD= RC= OUT= ERR=
 FAILS=()
-XENV=()   # extra environment for the next `run`
+XENV=()
 
 emit() { printf '%s\n' "$*" | tee -a "$TAP" "$LOG"; }
 
-# begin NAME: returns 1 (skip) if NAME does not match the filter.
+
 begin() {
   CUR=$1
   if [[ -n $FILTER ]] && ! [[ $CUR =~ $FILTER ]]; then return 1; fi
@@ -92,8 +150,8 @@ begin() {
   return 0
 }
 
-# run USER SNIPPET: run `/bin/sh -c SNIPPET` as USER (no tty, clean env,
-# cwd = home, stdin = /dev/null). Sets RC, OUT, ERR.
+
+
 run() {
   local user=$1 home
   CMD=$2
@@ -114,9 +172,9 @@ run() {
   } >>"$LOG"
 }
 
-# pty USER SNIPPET [ptyrun steps...]: run in a fresh pty session. The
-# transcript (stdout+stderr as seen on the terminal) lands in OUT; ERR holds
-# ptyrun's own diagnostics.
+
+
+
 pty() {
   local user=$1
   CMD=$2
@@ -139,7 +197,7 @@ expect_rc() {
 expect_rc_not() {
   [[ $RC != "$1" ]] || fail "exit status: expected anything but $1, got $RC"
 }
-# expect_out_line TEXT: some stdout line equals TEXT exactly
+
 expect_out_line() {
   grep -qxF -- "$1" <<<"$OUT" || fail "stdout: expected a line equal to '$1'"
 }
@@ -155,7 +213,7 @@ expect_out_empty() {
 expect_err_has() {
   grep -qF -- "$1" <<<"$ERR" || fail "stderr: expected to contain '$1'"
 }
-# expect_err_match ERE: stderr matches extended regex
+
 expect_err_match() {
   grep -qE -- "$1" <<<"$ERR" || fail "stderr: expected to match /$1/"
 }
@@ -186,22 +244,22 @@ end() {
   fi
 }
 
-# Standard denial / auth messages (substrings shared by sudo.ws and clones).
+
 NOT_IN_SUDOERS='is not in the sudoers file'
 NOT_ALLOWED='is not allowed to execute'
 PW_REQUIRED='a password is required'
 
-# ===========================================================================
-# Tests. Each block: begin NAME && { ...; end; }
-# ===========================================================================
 
-# --- authentication --------------------------------------------------------
+
+
+
+
 
 begin alice-stdin-password && {
   run alice "echo alicepw | sudo -S id -u"
   expect_rc 0
   expect_out_line 0
-  expect_err_has '[sudo] password for alice:'  # -S prompt goes to stderr
+  expect_err_has '[sudo] password for alice:'
   end
 }
 
@@ -245,11 +303,11 @@ begin root-needs-no-password && {
   end
 }
 
-# --- basic policy ----------------------------------------------------------
+
 
 begin bob-not-in-sudoers && {
-  # sudo.ws authenticates bob first, then reports; the password is supplied
-  # so either order works.
+
+
   run bob "echo bobpw | sudo -S id -u"
   expect_rc 1
   expect_out_empty
@@ -258,8 +316,8 @@ begin bob-not-in-sudoers && {
 }
 
 begin bob-noninteractive-denied && {
-  # Reference: authentication comes first, so -n yields 'a password is
-  # required' rather than 'not in the sudoers file'. Tolerant: either.
+
+
   run bob "sudo -n id -u"
   expect_rc 1
   expect_out_empty
@@ -318,8 +376,8 @@ begin carol-cat-denied && {
 }
 
 begin carol-cat-noninteractive-denied && {
-  # Reference asks for a password before denying a command not covered by a
-  # NOPASSWD rule, so -n reports 'a password is required'. Tolerant: either.
+
+
   run carol "sudo -n cat /etc/hostname"
   expect_rc 1
   expect_out_empty
@@ -375,10 +433,10 @@ begin dave-id-allowed && {
 }
 
 begin gina-alias-inner-deny && {
-  # `ALL, LIMITED` with LIMITED = /usr/bin/id, !/usr/bin/whoami: the LIMITED
-  # member is the last match for whoami and its result is DENY, so the broader
-  # ALL before it does not apply. The password is supplied so the outcome
-  # does not depend on whether the denial is reported before or after auth.
+
+
+
+
   run gina "echo ginapw | sudo -S whoami"
   expect_rc 1
   expect_out_empty
@@ -475,7 +533,7 @@ begin unknown-runas-user && {
 }
 
 begin command-not-found && {
-  # Reference authenticates first, so the password is supplied.
+
   run alice "echo alicepw | sudo -S nosuchcmd"
   expect_rc 1
   expect_out_empty
@@ -491,7 +549,7 @@ begin chdir-option-not-permitted && {
   end
 }
 
-# --- exit status -----------------------------------------------------------
+
 
 begin exit-status-propagation && {
   run alice "echo alicepw | sudo -S sh -c 'exit 42'"
@@ -500,15 +558,15 @@ begin exit-status-propagation && {
 }
 
 begin signal-death-propagation && {
-  # sudo re-raises the command's fatal signal on itself, so the invoking
-  # shell sees 128+SIGTERM.
+
+
   run alice "echo alicepw | sudo -S sh -c 'kill -TERM \$\$'; echo shell-saw=\$?"
   expect_rc 0
   expect_out_line shell-saw=143
   end
 }
 
-# --- environment -----------------------------------------------------------
+
 
 begin env-reset-drops-user-vars && {
   XENV=(FOO=bar)
@@ -562,8 +620,8 @@ begin env-target-identity-other-user && {
 }
 
 begin env-ld-preload-dropped && {
-  # (The dynamic loader of the non-setuid shell prints a harmless complaint
-  # about the nonexistent library; only the command's environment matters.)
+
+
   XENV=(LD_PRELOAD=/nonexistent/libevil.so LD_LIBRARY_PATH=/tmp)
   run alice "echo alicepw | sudo -S env"
   expect_rc 0
@@ -589,7 +647,7 @@ begin env-var-arg-denied-without-setenv && {
 }
 
 begin env-E-allowed-for-ALL-command && {
-  # sudoers(5): SETENV is implied for a command matched by ALL.
+
   XENV=(FOO=bar)
   run alice "echo alicepw | sudo -S -E env"
   expect_rc 0
@@ -605,17 +663,17 @@ begin env-E-with-setenv-keeps-safe-vars && {
   expect_out_line USER=root
   expect_out_line SUDO_USER=erin
   expect_out_line "PATH=$SECURE_PATH"
-  # -E preserves the invoking user's HOME (sudo.ws resets it only via
-  # env_reset, which -E bypasses for non-dangerous variables).
+
+
   expect_out_line HOME=/home/erin
   end
 }
 
 begin env-E-still-drops-dangerous-vars && {
-  # Even with -E and SETENV, sudo's built-in env_delete list applies.
+
   XENV=(LD_PRELOAD=/nonexistent/libevil.so LD_FOO=1 BASH_ENV=/tmp/evil
         PYTHONPATH=/tmp/evil PERL5OPT=-d FOO=bar)
-  # exec env(1) so that the bash-function export reaches sudo unmodified.
+
   run erin "exec env 'BASH_FUNC_evil%%=() { echo pwned; }' sudo -n -E env"
   expect_rc 0
   expect_out_line FOO=bar
@@ -636,7 +694,7 @@ begin env-var-arg-with-setenv && {
   end
 }
 
-# --- listing ---------------------------------------------------------------
+
 
 begin list-alice && {
   run alice "echo alicepw | sudo -S -l"
@@ -647,7 +705,7 @@ begin list-alice && {
 }
 
 begin list-carol && {
-  # listpw=any: carol has NOPASSWD entries, so no password is needed.
+
   run carol "sudo -n -l"
   expect_rc 0
   expect_out_has '/usr/bin/id'
@@ -678,7 +736,7 @@ begin list-carol-command-denied && {
   end
 }
 
-# --- tty: prompt, timestamps -----------------------------------------------
+
 
 begin tty-prompt-and-no-echo && {
   pty alice "sudo id -u" -e '\[sudo\] password for alice: ' -s 'alicepw\r'
@@ -745,7 +803,7 @@ begin tty-timestamp-is-per-tty && {
   pty alice "sudo -v && echo validated" -e 'password for alice: ' -s 'alicepw\r'
   expect_rc 0
   expect_out_line validated
-  # A new pty session (new tty, new session id) must not reuse it.
+
   pty alice "sudo -n true; echo second-session=\$?"
   expect_rc 0
   expect_out_line second-session=1
@@ -753,7 +811,7 @@ begin tty-timestamp-is-per-tty && {
   end
 }
 
-# --- shells ----------------------------------------------------------------
+
 
 begin login-shell-i && {
   run alice "echo alicepw | sudo -S -i pwd && echo alicepw | sudo -S -i printenv HOME"
@@ -764,29 +822,32 @@ begin login-shell-i && {
 }
 
 begin login-shell-i-is-login-shell && {
-  # root's shell is bash; `shopt -q login_shell` succeeds only in a login shell.
+
   run alice "echo alicepw | sudo -S -i shopt -q login_shell"
   expect_rc 0
   end
 }
 
 begin shell-s-runs-SHELL && {
-  # How the command words are quoted for `$SHELL -c` is an implementation
-  # detail; only check that $SHELL ran with -c and the command.
-  run alice "SHELL=/usr/local/bin/testshell; export SHELL; echo alicepw | sudo -S -s hello"
+
+  run alice "printf 'alicepw\n' | SHELL=/bin/bash sudo -S -s declare -p BASH BASH_EXECUTION_STRING"
   expect_rc 0
-  expect_out_has 'testshell:-c hello'
+  expect_out_line 'declare -- BASH="/bin/bash"'
+  expect_out_line 'declare -- BASH_EXECUTION_STRING="declare -p BASH BASH_EXECUTION_STRING"'
   end
 }
 
 begin shell-s-interactive && {
-  run alice "SHELL=/usr/local/bin/testshell; export SHELL; echo alicepw | sudo -S -s"
+  pty alice "SHELL=/bin/bash sudo -k -s" \
+    -e 'password for alice:' -s 'alicepw\r' -e '# ' \
+    -s 'echo shell:$BASH interactive:$-\r' -e 'shell:/bin/bash interactive:' \
+    -s 'exit\r'
   expect_rc 0
-  expect_out_line 'testshell:'
+  [[ $OUT =~ shell:/bin/bash\ interactive:[a-zA-Z]*i ]] || fail 'sudo -s did not start interactive bash'
   end
 }
 
-# --- informational / usage ------------------------------------------------
+
 
 begin help-exit-0 && {
   run alice "sudo -h"
@@ -809,13 +870,13 @@ begin usage-error-no-args && {
   end
 }
 
-# --- sudoers file integrity ------------------------------------------------
+
 
 begin sudoers-syntax-error-reported && {
-  # Reference (sudo.ws error recovery): reports the error, then keeps going
-  # with the entries it could parse, so alice's command still runs. A
-  # fail-closed implementation refuses instead (exit 1). Tolerant: the error
-  # must be reported; either outcome is accepted.
+
+
+
+
   printf 'this is not valid sudoers\n' >/etc/sudoers.d/zz-bad
   chmod 0440 /etc/sudoers.d/zz-bad
   run alice "echo alicepw | sudo -S id -u"
@@ -825,7 +886,7 @@ begin sudoers-syntax-error-reported && {
 }
 
 begin sudoers-main-syntax-error-reported && {
-  # Same as above for /etc/sudoers itself (tolerant for the same reason).
+
   echo 'garbage here' >>/etc/sudoers
   run carol "sudo -n id -u"
   expect_err_match 'syntax error|parse error'
@@ -834,9 +895,9 @@ begin sudoers-main-syntax-error-reported && {
 }
 
 begin sudoers-world-writable-include-ignored && {
-  # Reference: warns '<file> is world writable' and skips that file; other
-  # sources still apply. The grant in the bad file must never take effect.
-  # lean-sudo refuses outright rather than dropping a possible denial.
+
+
+
   printf 'bob ALL=(ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/zz-ww
   chmod 0666 /etc/sudoers.d/zz-ww
   run bob "sudo -n id -u"
@@ -847,8 +908,8 @@ begin sudoers-world-writable-include-ignored && {
 }
 
 begin sudoers-group-writable-nonroot-group-ignored && {
-  # Reference: a group-writable file whose group is not root is skipped with
-  # 'is owned by gid N, should be 0'. lean-sudo refuses; wording is tolerant.
+
+
   printf 'bob ALL=(ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/zz-gw
   chgrp bob /etc/sudoers.d/zz-gw
   chmod 0460 /etc/sudoers.d/zz-gw
@@ -860,7 +921,7 @@ begin sudoers-group-writable-nonroot-group-ignored && {
 }
 
 begin sudoers-include-owned-by-nonroot-ignored && {
-  # Reference skips the insecure include; lean-sudo refuses outright.
+
   printf 'bob ALL=(ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/zz-own
   chown bob:root /etc/sudoers.d/zz-own
   chmod 0440 /etc/sudoers.d/zz-own
@@ -890,9 +951,9 @@ begin sudoers-owned-by-nonroot-refused && {
 }
 
 begin sudoers-include-dir-world-writable-ignored && {
-  # Reference: warns and skips the whole directory (carol's rules live
-  # there, so carol is not granted anything). Tolerant: refusing outright is
-  # also accepted.
+
+
+
   chmod 0777 /etc/sudoers.d
   run carol "sudo -n id -u"
   expect_rc 1
@@ -901,12 +962,12 @@ begin sudoers-include-dir-world-writable-ignored && {
   end
 }
 
-# --- installation ----------------------------------------------------------
+
 
 begin binary-without-setuid-bit && {
-  # Reference: '<path> must be owned by uid 0 and have the setuid bit set'
-  # when its own binary lacks the bit; 'effective uid is not 0' otherwise
-  # (e.g. nosuid mounts). Tolerant: either message.
+
+
+
   install -o root -g root -m 0755 /usr/bin/sudo /tmp/sudo-nosuid
   run alice "/tmp/sudo-nosuid -n true"
   expect_rc 1
@@ -916,8 +977,8 @@ begin binary-without-setuid-bit && {
   end
 }
 
-# --- sudoedit ---
-# Editors are root-installed, but must execute with henry's credentials.
+
+
 edit_setup() {
   rm -f /etc/henryfile /etc/henrynew /etc/henrylink
   printf 'original\n' >/etc/henryfile
@@ -1076,16 +1137,16 @@ begin sudoedit-refuses-owned-directory-without-write-bit && {
   [[ $(cat /etc/henryowned/file) == original ]] || fail "owned-directory file modified"
   end
 }
-# --- end sudoedit ---
 
-# --- security boundary regressions -----------------------------------------
+
+
 
 begin exec-symlink-swap-during-prompt && {
-  # Keep stdin open until after the swap, so authentication brackets the race.
-  # Wait for sudo itself so a failed launch cannot masquerade as a successful test.
+
+
   run carol 'mkdir -p ~/x; printf "#!/bin/sh\necho pwned\n" > ~/evil; chmod +x ~/evil; ln -sf /usr/bin/id ~/x/id; ( sleep 1; echo carolpw ) | sudo -S -u bob ~/x/id & pid=$!; sleep 0.4; ln -sfn ~/evil ~/x/id; wait "$pid"'
   expect_err_has '[sudo] password for carol:'
-  # sudo.ws may recheck the path after authentication and refuse the swap.
+
   if [[ $RC == 0 ]]; then
     expect_out_has "uid=$(uid_of bob)(bob)"
   else
@@ -1100,8 +1161,8 @@ begin exec-symlink-swap-during-prompt && {
 begin requiretty-refuses-unrelated-stdin-pty && {
   printf 'Defaults:carol requiretty\n' >/etc/sudoers.d/zz-requiretty
   chmod 0440 /etc/sudoers.d/zz-requiretty
-  # A slave inherited after setsid is a tty fd, but not a controlling terminal.
-  # subprocess keeps stdout/stderr in the harness, so refusal remains observable.
+
+
   cat >"$WORK/no-controlling-tty.py" <<'EOF'
 import os
 import pty
@@ -1125,20 +1186,20 @@ EOF
   end
 }
 
-# --- end security boundary regressions -------------------------------------
 
-# ---------------------------------------------------------------------------
-# Additional scenario files (integration/tests.d/*.sh, sourced in name order).
-# Each file uses the harness above (begin/run/pty/expect_*/end) and may install
-# its own sudoers fragments inside a test (reset_state restores them).
-# ---------------------------------------------------------------------------
+
+
+
+
+
+
 for f in "$(dirname "$0")"/tests.d/*.sh; do
   [[ -f $f ]] && . "$f"
 done
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
+
+
+
 
 emit "1..$NUM"
 emit "# implementation: $LABEL ($IMPL_BIN)"

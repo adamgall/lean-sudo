@@ -1,8 +1,6 @@
 import LeanSudo.Core
 import LeanSudo.SudoConf
 
-/-! sudo's front-end plugin boundary. All command metadata is derived from the
-verified decision; native code only implements the public plugin ABI. -/
 namespace LeanSudo.Sys.Plugins
 
 @[extern "lean_sudo_plugins_load"]
@@ -22,8 +20,6 @@ opaque openAudit (settings userInfo submitArgv submitEnv : @& Array String)
 @[extern "lean_sudo_plugins_check"]
 opaque check (commandInfo argv env : @& Array String) : IO Bool
 
-/-- Intercepted execs use the same approval chain without reopening I/O plugins.
-Log-only interception emits the front-end audit event without checking approval. -/
 @[extern "lean_sudo_plugins_check_subcommand"]
 opaque checkSubcommand (commandInfo argv env : @& Array String) (enforce : Bool) : IO Bool
 
@@ -63,9 +59,6 @@ private def opt (name : String) (value : Option String) : List String :=
 private def flag (name : String) (value : Bool) : List String :=
   if value then [name ++ "=true"] else []
 
-/-- Only explicitly selected command-line settings are present, except for the
-front-end's default update_ticket and plugin_dir settings. plugin_path is added
-by the native host separately for each loaded object. -/
 def settings (progname : String) (o : Cli.Options) (conf : SudoConf.Config)
     (interfaces : List String) : Array String :=
   (flag "preserve_environment" (o.preserveEnv == .all) ++ opt "runas_group" o.group ++
@@ -83,7 +76,6 @@ def settings (progname : String) (o : Cli.Options) (conf : SudoConf.Config)
     opt "remote_host" o.host ++ opt "timeout" o.timeoutText ++ opt "cmnd_chroot" o.chroot ++
     opt "cmnd_cwd" o.chdir ++ flag "askpass" o.askpass).toArray
 
-/-- The approval result is a conjunction, never a replacement for the decision. -/
 def executable (decision : Core.Decision) : Bool :=
   match decision.action with | .exec _ | .edit _ => true | _ => false
 
@@ -117,8 +109,6 @@ private def ioInfo (p : Option IoLog.Plan) (path : Option String) : List String 
     (if p.passpromptRegex.isEmpty then [] else
       ["passprompt_regex=" ++ listValue p.passpromptRegex.toList])
 
-/-- sudoers_policy_store_result's command_info, using the selected execution
-plan rather than reinterpreting sudoers in the ABI shim. -/
 def commandInfo (ctx : Core.Context) (p : Core.ExecPlan)
     (source iologPath : Option String := none) : Array String := Id.run do
   let s := ctx.settings
@@ -166,8 +156,6 @@ def editCommandInfo (ctx : Core.Context) (p : Core.EditPlan) (editor : String)
   (if p.checkdir then #[] else #["sudoedit_checkdir=false"]) ++
   (if p.follow then #["sudoedit_follow=true"] else #[])
 
-/-- Rejected checks still return sudoers' descriptive metadata, but never an
-execution plan. In particular the command umask has not yet been selected. -/
 def rejectionInfo (ctx : Core.Context) (source : Option String := none) : Array String :=
   if ctx.opts.mode == .list then #["command=list"]
   else if ctx.opts.mode == .validate then #["command=validate"]
@@ -210,4 +198,3 @@ def rejectionInfo (ctx : Core.Context) (source : Option String := none) : Array 
       opt "apparmor_profile" s.apparmorProfile).toArray
 
 end LeanSudo.Sys.Plugins
-

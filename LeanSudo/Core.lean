@@ -3,23 +3,6 @@ import LeanSudo.Policy.Eval
 import LeanSudo.Policy.List
 import LeanSudo.Sudoedit.Check
 
-/-!
-# Pure decision core
-
-The shell supplies facts; only this total function authorizes execution. Unsupported
-deciding restrictions fail closed after authentication. Listing another user's
-privileges requires root, the list pseudo-command, or suitable ALL privileges.
-Authentication for `-l command` follows the listing policy even when that command
-is not permitted; the command check itself is silent, as in sudo 1.9.17p2.
-Authentication exemptions include exempt_group and unchanged uid/gid/security contexts.
-Enabled run-as shell checks and unknown-ID restrictions are enforced from shell facts.
-Sudoedit policy sees the original file operands. The runtime receives those same
-operands made absolute against the invoking directory and traverses pinned directory
-descriptors without lexically folding symlink-sensitive parent components.
-Execution preserves the requested basename beneath the lookup-time canonical parent.
-Digest rules and fdexec=always instead use the descriptor pinned before authentication.
-Command displays and SUDO_COMMAND retain the lookup path and unescaped shell arguments.
--/
 namespace LeanSudo.Core
 
 open Policy
@@ -32,15 +15,12 @@ def files (ctx : Context) : List String :=
   ctx.opts.command.map fun p => if p.startsWith "/" then p
     else ctx.cwd ++ (if ctx.cwd.endsWith "/" then "" else "/") ++ p
 
-/-- Paths handed to descriptor-relative traversal are absolute and C-string-safe.
-Dot, parent and repeated-slash components retain their kernel resolution semantics. -/
 def normalizedEditFile (p : String) : Bool :=
   p.startsWith "/" && !p.contains '\x00'
 
 def invalidEditFile (ctx : Context) : Option String :=
   (files ctx).find? (fun p => !normalizedEditFile p)
 
-/-- Policy/logging see the unescaped shell command; exec retains escaped argv. -/
 def policyArgs (ctx : Context) (rc : ResolvedCmd) : List String :=
   if ctx.opts.shell || ctx.opts.login then
     if ctx.opts.command.isEmpty then [] else ["-c", String.intercalate " " ctx.opts.command]
@@ -51,8 +31,6 @@ def runCommand (ctx : Context) : Command :=
   | some rc => .run rc.path rc.canonical (policyArgs ctx rc)
   | none => let typed := ctx.opts.command.headD ""; .run typed typed ctx.opts.command.tail
 
-/-- A rooted authorization uses only its own lookup result and actual execution
-arguments. A missing/malformed rooted result never falls back to the host root. -/
 def resolvedFor (ctx : Context) (a : Allowed) : Option ResolvedCmd :=
   match a.selection with
   | none => ctx.command
@@ -63,7 +41,6 @@ def resolvedFor (ctx : Context) (a : Allowed) : Option ResolvedCmd :=
       | _, _ => none
     else none
 
-/-- A selected root's missing descriptor must not reuse a host-root descriptor. -/
 def descriptorFor (ctx : Context) (a : Allowed) : Option Nat :=
   match a.selection with
   | none => ctx.execFd
@@ -95,11 +72,9 @@ def authUser (ctx : Context) : Principal :=
   else if ctx.settings.runaspw then ctx.runasDefaultUser.getD ctx.root
   else if ctx.settings.targetpw then ctx.target else ctx.invoking
 
-/-- sudo's user-facing host is the resolved full name, unlike its short matcher key. -/
 def displayHost (ctx : Context) : String :=
   ctx.opts.host.getD (if ctx.longHost.isEmpty then ctx.host else ctx.longHost)
 
-/-- Listing headers and NO_HOST/NO_CHECK diagnostics use runas.shost. -/
 def displayShortHost (ctx : Context) : String :=
   ((ctx.opts.host.getD ctx.host).splitOn ".").headD ctx.host
 
@@ -108,7 +83,6 @@ def listOtherDenied (ctx : Context) : Bool :=
     !canListOther ctx.sudoers (authorizationSettings ctx) { request ctx with user := ctx.invoking }
       (ctx.listUser.getD ctx.invoking) ctx.root
 
-/-- Listing another user is an authorization decision, not a pre-authentication error. -/
 def policyJudgement (ctx : Context) : Judgement :=
   if listOtherDenied ctx then .deny else evaluate ctx.sudoers (authorizationSettings ctx) (request ctx)
 
@@ -118,7 +92,6 @@ def sameIdentity (ctx : Context) : Bool :=
       | none => false
       | some g => ctx.invoking.groups.any (fun x => x.2 == g.gid))
 
-/-- Changing a security context is not "running as yourself", even with identical IDs. -/
 def sameSecurityContext (ctx : Context) (a : Allowed) : Bool :=
   (ctx.opts.role.or (a.role.or ctx.settings.role)).isNone &&
   (ctx.opts.type.or (a.type.or ctx.settings.type)).isNone &&
@@ -140,7 +113,6 @@ def authentication (ctx : Context) (j : Judgement) : AuthReq :=
 
 def targetGid (ctx : Context) : Nat := (ctx.targetGroup.map (·.gid)).getD ctx.target.gid
 
-/-- On Linux stay_setuid retains the invoking real gid as all three command gids. -/
 def commandGid (ctx : Context) : Nat :=
   if ctx.settings.staySetuid then ctx.invokingRealGid.getD ctx.invoking.gid else targetGid ctx
 
@@ -155,8 +127,6 @@ def commandUmask (ctx : Context) : Nat :=
 
 def commandText (ctx : Context) : String := (request ctx).command.text
 
-
-/-- env.c limits the argument portion of SUDO_COMMAND to 4096 bytes. -/
 def sudoCommand (ctx : Context) : String :=
   let text := commandText ctx
   let path := match (request ctx).command with
@@ -166,7 +136,6 @@ def sudoCommand (ctx : Context) : String :=
   if text.utf8ByteSize ≤ path.utf8ByteSize + 1 + 4096 then text
   else String.fromUTF8! (text.toUTF8.extract 0 (path.utf8ByteSize + 1 + 4096))
 
-/-- Expand home paths from passwd facts gathered before privilege transition. -/
 def expandHomePath (targetHome : String) (homes : List (String × String))
     (p : String) : Option String :=
   if p == "~" then some targetHome
@@ -192,20 +161,15 @@ def cwdPermitted (ctx : Context) (a : Allowed) : Bool :=
 def configuredCwd (ctx : Context) (a : Allowed) : Option String :=
   (ctx.opts.chdir.or (effectiveCwd ctx a)).filter (· != "*")
 
-/-- Run commands use their deciding CHROOT option; sudoedit ignores that option
-and applies only Defaults runchroot to its editor child, as sudo.ws does. -/
 def effectiveChroot (ctx : Context) (a : Allowed) : Option String :=
   (if ctx.opts.mode == .edit then none else a.chroot).or (authorizationSettings ctx).runchroot
 
-/-- Even an identical fixed root does not authorize the command-line -R option. -/
 def chrootPermitted (ctx : Context) (a : Allowed) : Bool :=
   ctx.opts.chroot.isNone || effectiveChroot ctx a == some "*"
 
-/-- The wildcard permits -R; by itself it does not select a new process root. -/
 def configuredChroot (ctx : Context) (a : Allowed) : Option String :=
   (ctx.opts.chroot.or (effectiveChroot ctx a)).filter (· != "*")
 
-/-- Preserve the winning lookup's root across post-authorization runtime options. -/
 def selectedChroot (ctx : Context) (a : Allowed) : Option String :=
   if ctx.opts.mode == .edit then configuredChroot ctx a
   else match a.selection with
@@ -229,8 +193,6 @@ def environment (ctx : Context) (a : Allowed) : EnvInput :=
 def pamService (ctx : Context) : String :=
   if ctx.opts.login then ctx.settings.pamLoginService else ctx.settings.pamService
 
-/-- Match and execution preserve the final name (including multicall dispatch),
-while resolving its parent directory once, before policy and authentication. -/
 def executionPath (ctx : Context) (rc : ResolvedCmd) : String :=
   let parent := ctx.canon (dirOf rc.path)
   parent ++ (if parent.endsWith "/" then "" else "/") ++ baseOf rc.path
@@ -238,7 +200,6 @@ def executionPath (ctx : Context) (rc : ResolvedCmd) : String :=
 def selectedExecutionPath (ctx : Context) (a : Allowed) (rc : ResolvedCmd) : String :=
   (a.selection.map (·.executionPath)).getD (executionPath ctx rc)
 
-/-- A user timeout can shorten, but never extend, the deciding rule's limit. -/
 def commandTimeout (ctx : Context) (a : Allowed) : Nat :=
   let policy := a.timeout.getD ctx.settings.commandTimeout
   match ctx.opts.timeout with
@@ -311,8 +272,6 @@ def notFoundText (ctx : Context) : String :=
 
 def notFound (ctx : Context) : Action := .fail (notFoundText ctx) 1
 
-/-- A failing policy check carries its actual warning/rejection/audit effects,
-not an inferred accept event or a classification parsed from diagnostic text. -/
 structure FailureInfo where
   message : String
   prefixed : Bool := true
@@ -375,7 +334,6 @@ def postCommandFailure (ctx : Context) (a : Allowed) : Option FailureInfo :=
     some { message := "unknown user in working directory" }
   else none
 
-/-- Command enforcement failures, independent of their display and event classification. -/
 def enforcementError (ctx : Context) (a : Allowed) : Option String :=
   ((preCommandFailure ctx a).orElse (fun _ => postCommandFailure ctx a)).map (·.message)
 
@@ -474,8 +432,6 @@ def deniedAction (ctx : Context) : Action :=
     .fail (s!"Sorry, user {(displayUser ctx).name} is not allowed to execute '{commandText ctx}' as {target} on {displayHost ctx}.\n" ++
       (ctx.settings.cmddenialMessage.map (· ++ "\n")).getD "" ++ incident ctx) 1
 
-/-- sudo's lbuf escaping: controls/blanks use #0octal; quoted argv escapes
-backslashes and apostrophes without changing the command's argument boundaries. -/
 def logEscape (text : String) (blanks : Bool := false) (quotes : Bool := false) : String :=
   String.join (text.toList.map fun c =>
     let n := c.toNat
@@ -496,7 +452,6 @@ def logCommand (ctx : Context) : String :=
   | .sudoedit fs => "sudoedit" ++ String.join (fs.map (" " ++ logArgument ·))
   | _ => commandText ctx
 
-/-- The frontend has already formed shell argv before set_cmnd resolves a path. -/
 def unresolvedLogCommand (ctx : Context) : String × List String :=
   if ctx.opts.mode == .edit then ("sudoedit", ctx.opts.command)
   else if ctx.opts.shell || ctx.opts.login || ctx.opts.impliedShell then
@@ -537,12 +492,9 @@ def logLine (ctx : Context) (reason : Option String) (allowed : Option Allowed :
             (if args.isEmpty then "" else " " ++ String.intercalate " " (args.map logArgument))
         | none => logCommand commandCtx) }
 
-/-- Event output follows the resolved sudoers format, including JSON. -/
 theorem logLine_format (ctx : Context) (reason : Option String) (allowed : Option Allowed) :
     (logLine ctx reason allowed).format = ctx.settings.logFormat := rfl
 
-/-- Alerts retain the stage's command and directory facts, not requested overrides
-    whose permission checks have not yet succeeded. Raw alerts still name the submitter. -/
 def failureLog (ctx : Context) (failure : FailureInfo)
     (allowed : Option Allowed := none) : Option LogLine := do
   let reason ← failure.reason
@@ -562,7 +514,6 @@ def failureLog (ctx : Context) (failure : FailureInfo)
       lookupComplete := failure.lookupComplete
       msg := if failure.raw then logEscape ctx.invoking.name ++ " : " ++ logEscape reason else line.msg }
 
-/-- Only %d and %% are special; other percent sequences pass through unchanged. -/
 def formatAuthFailure (message : String) (attempts : Nat) : String :=
   String.ofList (go (toString attempts).toList message.toList)
 where
@@ -587,8 +538,6 @@ def successAdminFlag (ctx : Context) : Option String :=
       if p.startsWith "~/" then (displayUser ctx).home ++ String.ofList (p.toList.drop 1) else p
   else none
 
-/-- The pre-authentication checks follow sudoers_check_common: remote host,
-    root_sudo, closefrom, numeric identities, implied shell, requiretty, valid shell. -/
 def earlyFailure (ctx : Context) : Option FailureInfo :=
   if (Cli.timeoutError ctx.opts).isSome then
     some { message := s!"sudo: {(Cli.timeoutError ctx.opts).getD ""}\nsudo: error initializing audit plugin sudoers_audit\n", prefixed := false }
@@ -623,7 +572,6 @@ def earlyFailure (ctx : Context) : Option FailureInfo :=
     some (warningInfo message message)
   else none
 
-/-- These modes and failures cannot authorize a privileged operation. -/
 def earlyAction (ctx : Context) : Option Action :=
   match ctx.opts.mode with
   | .help => some (.print (Cli.helpFor ctx.progname) 0)
@@ -632,14 +580,11 @@ def earlyAction (ctx : Context) : Option Action :=
   | .removeTimestamp => some .removeTimestamp
   | _ => (earlyFailure ctx).map FailureInfo.action
 
-/-- sudo checks listing authentication independently of `-l command` authorization. -/
 def authJudgement (ctx : Context) (j : Judgement) : Judgement :=
   if ctx.opts.mode = .list then
     evaluate ctx.sudoers ctx.settings { request ctx with user := ctx.invoking, command := .list }
   else j
 
-/-- Directory permission failures precede policy denial and command-not-found
-    diagnostics, so an unauthorized -R never reveals namespace lookup facts. -/
 def decisionFailure (ctx : Context) : Judgement → Option FailureInfo
   | .allow a => allowedFailure ctx a
   | .deny => permissionFailure ctx

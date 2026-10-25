@@ -1,11 +1,5 @@
 import LeanSudo.Sys.Exec
 
-/-! Descriptor-relative sudoedit primitives. All opens, access checks, temporary
-creation and removal run in a forked worker after a permanent, verified identity
-drop. The parent never changes credentials. `noneFd` also means AT_FDCWD on input.
-Callers own returned descriptors and must close them, including on exceptions.
-Read/write operate on already-authorized descriptors; writes attempt restoration
-from the original snapshot on error. No path-based privileged copy is performed. -/
 namespace LeanSudo.Sys.Edit
 
 def noneFd : UInt32 := 0xFFFFFFFF

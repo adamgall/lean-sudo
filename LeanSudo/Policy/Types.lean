@@ -1,23 +1,11 @@
 import LeanSudo.Sudoers.Ast
 
-/-!
-# Policy contract types
-
-Shared between the policy engine (`LeanSudo.Policy.Eval`, `LeanSudo.Policy.Defaults`),
-the environment builder (`LeanSudo.Env`), the decision core (`LeanSudo.Core`) and the
-IO shell (`Main`). Everything here is pure data. `Facts` carries invocation-wide
-evidence; `CommandFacts` is replaced as a unit when selecting a different root.
--/
-
 namespace LeanSudo
 
-/-- A resolved account (from `getpwnam`/`getpwuid` + `getgrouplist`). -/
 structure Principal where
   name : String
   uid : Nat
-  /-- primary gid -/
   gid : Nat
-  /-- all groups the account is a member of, including the primary group, as (name, gid) -/
   groups : List (String × Nat)
   home : String
   shell : String
@@ -29,16 +17,10 @@ structure GroupInfo where
   deriving Repr, BEq, DecidableEq, Inhabited
 
 inductive Command where
-  /-- run a command. `path` is the absolute path found by PATH lookup (as the user
-  named it), `canonical` its `realpath`, `args` are argv[1..]. -/
   | run (path : String) (canonical : String) (args : List String)
-  /-- `sudo -e` / `sudoedit` on the given files -/
   | sudoedit (files : List String)
-  /-- `sudo -l` without a command (any matching rule) -/
   | list
-  /-- Permission check for listing another user's privileges. -/
   | checkList
-  /-- `sudo -v` (any matching rule) -/
   | validate
   deriving Repr, BEq, DecidableEq, Inhabited
 
@@ -67,23 +49,16 @@ structure CommandFacts where
   digests : List Sudoers.Digest := []
   deriving Repr, BEq, DecidableEq, Inhabited
 
-/-- Command lookup facts for one root. Paths are logical paths inside that root;
-the shell gathers their stat/digest data through host-prefixed paths. -/
 structure RootCommandFacts extends CommandFacts where
   command : Command
   argv : List String := []
   found : Bool := true
   execFd : Option Nat := none
-  /-- Namespace safety failure, enforced only if this lookup wins authorization. -/
   refusal : Option String := none
-  /-- Whether the resolved executable has setuid or setgid mode bits. -/
   setid : Bool := false
   deriving Repr, BEq, DecidableEq, Inhabited
 
-/-- The command selected by the deciding CHROOT rule, not a subsequent lookup. -/
 structure CommandSelection where
-  /-- Root lookup key; `*` denotes a wildcard rule without an explicit user root,
-  not a directory named `*`. -/
   root : String
   command : Command
   executionPath : String
@@ -95,27 +70,18 @@ structure CommandSelection where
   deriving Repr, BEq, DecidableEq, Inhabited
 
 structure Facts extends CommandFacts where
-  /-- Canonical paths and parent directories, precomputed by the shell. -/
   canon : String → String := id
   interfaces : List (Sudoers.IpAddr × Sudoers.IpAddr) := []
-  /-- (netgroup, user, host, innetgr result). -/
   netgroups : List (String × Option String × Option String × Bool) := []
-  /-- (user, plugin group spelling, provider answered exactly 1). -/
   pluginGroups : List (String × String × Bool) := []
-  /-- Zoneless civil timestamps mapped by mktime; missing bounds fail closed. -/
   localTimeBounds : List (Nat × Nat) := []
   rootFacts : List (String × RootCommandFacts) := []
 
 structure Request extends Facts where
-  /-- the invoking user -/
   user : Principal
-  /-- short host name -/
   host : String
-  /-- target user (for `-g` alone with a `(:group)` rule this is the invoking user) -/
   runasUser : Principal
-  /-- target group given with `-g`, if any -/
   runasGroup : Option GroupInfo
-  /-- whether `-u` was given explicitly -/
   runasUserExplicit : Bool
   command : Command
   lhost : String := ""
@@ -128,20 +94,15 @@ inductive TimestampType where
   | tty | ppid | global | kernel
   deriving Repr, BEq, DecidableEq, Inhabited
 
-/-- Policy for `listpw` / `verifypw`. -/
 inductive PwPolicy where
   | all | always | any | never
   deriving Repr, BEq, DecidableEq, Inhabited
 
-/-- Effective `Defaults` settings. Field defaults are sudo's compiled-in defaults. -/
 structure Settings where
   envReset : Bool := true
-  /-- variables preserved when `env_reset` is on (patterns may end in `*`) -/
   envKeep : List String := ["COLORS", "DISPLAY", "DPKG_COLORS", "HOSTNAME", "KRB5CCNAME",
     "LS_COLORS", "PATH", "PS1", "PS2", "XAUTHORITY", "XAUTHORIZATION", "XDG_CURRENT_DESKTOP"]
-  /-- variables preserved only if their value contains no `%` or `/` -/
   envCheck : List String := ["COLORTERM", "LANG", "LANGUAGE", "LC_*", "LINGUAS", "TERM", "TZ"]
-  /-- variables removed when `env_reset` is off (patterns may end in `*`) -/
   envDelete : List String := ["IFS", "CDPATH", "LOCALDOMAIN", "RES_OPTIONS", "HOSTALIASES",
     "NLSPATH", "PATH_LOCALE", "LD_*", "_RLD*", "TERMINFO", "TERMINFO_DIRS", "TERMPATH",
     "TERMCAP", "ENV", "BASH_ENV", "PS4", "GLOBIGNORE", "BASHOPTS", "SHELLOPTS",
@@ -149,7 +110,6 @@ structure Settings where
     "FPATH", "NULLCMD", "READNULLCMD", "ZDOTDIR", "TMPPREFIX", "PYTHONHOME", "PYTHONPATH",
     "PYTHONINSPECT", "PYTHONUSERBASE", "RUBYLIB", "RUBYOPT", "*=()*"]
   securePath : Option String := none
-  /-- seconds; `none` = never expires (negative `timestamp_timeout`) -/
   timestampTimeout : Option Nat := some 900
   timestampType : TimestampType := .tty
   passwdTries : Nat := 3
@@ -164,7 +124,6 @@ structure Settings where
   requiretty : Bool := false
   visiblepw : Bool := false
   passprompt : String := "[sudo] password for %p: "
-  /-- Explicit sudoers text is not translated as a compiled-in message. -/
   passpromptConfigured : Bool := false
   passpromptOverride : Bool := false
   badpassMessage : String := "Sorry, try again."
@@ -173,13 +132,10 @@ structure Settings where
   runasDefault : String := "root"
   umask : Nat := 0o022
   umaskOverride : Bool := false
-  /-- global equivalent of the SETENV tag -/
   setenv : Bool := false
   shellNoargs : Bool := false
-  /-- colon separated list -/
   editor : String := "/usr/bin/editor"
   envEditor : Bool := true
-  /-- syslog facility name, `none` disables syslog -/
   syslog : Option String := some "authpriv"
   logAllowed : Bool := true
   logDenied : Bool := true
@@ -266,7 +222,6 @@ structure Settings where
   lectureFile : Option String := none
   lectureStatusDir : String := "/var/lib/sudo/lectured"
   insults : Bool := false
-  /-- Password prompt timeout in seconds; none denotes a negative timeout. -/
   passwdTimeout : Option Nat := some 0
   syslogGoodpri : Option String := some "notice"
   syslogBadpri : Option String := some "alert"
@@ -315,7 +270,6 @@ structure Settings where
   logServerPeerKey : Option String := none
   deriving Repr, Inhabited
 
-/-- Resource-limit settings passed without reinterpretation to the execution layer. -/
 def Settings.resourceLimits (st : Settings) : List (String × String) :=
   [("rlimit_as", st.rlimitAs), ("rlimit_core", st.rlimitCore),
    ("rlimit_cpu", st.rlimitCpu), ("rlimit_data", st.rlimitData),
@@ -325,14 +279,9 @@ def Settings.resourceLimits (st : Settings) : List (String × String) :=
    ("rlimit_stack", st.rlimitStack)].filterMap fun (name, value) =>
      value.map (name, ·)
 
-/-- What the policy permits for an allowed request. -/
 structure Allowed extends Sudoers.TagEffects, Sudoers.ExecutionOptions where
-  /-- the matching rule requires authentication (PASSWD tag / `authenticate`) -/
   needsAuth : Bool
-  /-- the user may preserve/set environment variables (`SETENV` tag, `setenv`
-  default, or the command was matched by `ALL`) -/
   setenv : Bool
-  /-- The deciding command match verified a digest (including through aliases). -/
   usesDigest : Bool := false
   selection : Option CommandSelection := none
   deriving Repr, BEq, DecidableEq, Inhabited

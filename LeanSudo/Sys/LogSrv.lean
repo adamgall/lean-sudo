@@ -31,7 +31,6 @@ private opaque isBroker : IO Bool
 @[extern "leansudo_logsrv_clock"]
 private opaque awakeTime : IO Nat
 
-/-- sudo's server syntax; brackets disambiguate IPv6 from a port suffix. -/
 def endpoint (value : String) : Option (String × String × Bool) := do
   let tls := value.endsWith "(tls)"
   let value := if tls then value.dropEnd 5 |>.toString else value
@@ -106,8 +105,6 @@ private def connectFirst (st : Settings) (servers : List String) : IO Bool := do
         cause := (lines.drop 1).head?
       closeTransport
       pure false
-    -- sudoers fails over connection establishment, not a peer's malformed
-    -- handshake: protocol errors from an established connection are final.
     if connected then return ← handshake
   for message in cause do Sys.writeStderr ("sudo: " ++ message ++ "\n")
   throw (IO.userError "unable to connect to log server")
@@ -128,7 +125,6 @@ private def consume (s : Session) (message : ServerMessage) : IO Session := do
   | .abort message => throw (IO.userError ("abort message received from server: " ++ message))
   | .hello _ => throw (IO.userError "unexpected ServerHello")
 
-
 private partial def awaitId (s : Session) : IO Session := do
   if !s.logId.isEmpty then return s
   let some message ← readMessage true | throw (IO.userError "log server closed connection")
@@ -140,8 +136,6 @@ private partial def awaitCommit (s : Session) : IO Session := do
   awaitCommit (← consume s message)
 
 private partial def drain (s : Session) : IO Session := do
-  -- sudoers stops logging on an established-session transport failure; only
-  -- initial connection setup fails over. RestartMessage belongs to sendlog.
   let some message ← readMessage false | return s
   drain (← consume s message)
 
@@ -160,12 +154,10 @@ private def info (d : EventLog.Details) : List InfoMessage :=
         | .string s => some s | _ => none) }
     | _ => none
 
-/-- Close transport and detach relay callbacks, including exceptional command exits. -/
 def close : IO Unit := do
   current.set none
   closeTransport
   queueClose
-
 
 private def streamMask (plan : Option LeanSudo.IoLog.Plan) : UInt32 :=
   match plan with
@@ -173,8 +165,6 @@ private def streamMask (plan : Option LeanSudo.IoLog.Plan) : UInt32 :=
   | some p =>
     let bits := [p.stdin, p.stdout, p.stderr, p.ttyin, p.ttyout]
     (bits.zipIdx.foldl (fun (n : Nat) (b, i) => if b then n + 2 ^ i else n) 0).toUInt32
-/-- Remote I/O replaces local files, as in sudoers_io. Accept events without I/O
-use ignore_logfile_errors; I/O setup and streaming use ignore_iolog_errors. -/
 def accept (st : Settings) (details : EventLog.Details) (plan : Option LeanSudo.IoLog.Plan) : IO Unit := do
   if st.logServers.isEmpty || (!st.logAllowed && plan.isNone) then return
   let io := plan.isSome
@@ -200,7 +190,6 @@ def accept (st : Settings) (details : EventLog.Details) (plan : Option LeanSudo.
       throw (IO.userError (if io then "error initializing I/O plugin sudoers_io"
         else "sudoers_audit: unable to log accept event"))
 
-/-- Reject and alert records are independent short-lived connections. -/
 def event (st : Settings) (details : EventLog.Details) (reason : String) (alert : Bool := false) : IO Unit := do
   if st.logServers.isEmpty || (!alert && !st.logDenied) then return
   if ← isBroker then
@@ -208,7 +197,6 @@ def event (st : Settings) (details : EventLog.Details) (reason : String) (alert 
     if !s.subcommands then return
     let now ← Sys.eventTime false st.sudoersLocale
     let time : TimeSpec := { seconds := now.seconds, nanoseconds := now.nanoseconds }
-    -- sudo's subcommand path retains the initially accepted closure's empty reason.
     enqueue (encodeClient (if alert then .alert time "" (info details) else .reject time "" (info details)))
     return
   try
@@ -225,8 +213,6 @@ def poll : IO Unit := do
   try current.set (some (← drain s))
   catch error => failure s error
 
-/-- Called only in the policy broker. Encoded events travel to the original
-process, which alone owns the TLS state and serializes event and I/O messages. -/
 def subcommand (details : EventLog.Details) (reason : Option String) : IO Unit := do
   let some s ← current.get | return
   if !s.subcommands then return
@@ -246,8 +232,6 @@ def subcommandWire (bytes : ByteArray) : IO Unit := do
     current.set (some (← drain s))
   catch error => failure s error
 
-/-- Invoked synchronously by the privileged relay, never by the command child.
-Commit offsets track durable storage; fatal transport errors stop the command. -/
 @[export leansudo_logsrv_io_event]
 def ioEvent (event : UInt32) (data : ByteArray) (a b : UInt32) : IO Unit := do
   let some s ← current.get | return
@@ -265,8 +249,6 @@ def ioEvent (event : UInt32) (data : ByteArray) (a b : UInt32) : IO Unit := do
     current.set (some s)
   catch error => failure s error
 
-/-- I/O sessions send ExitMessage and wait for their final durable commit,
-independently of local log_exit_status. Sudo's audit-only client just closes. -/
 def finish (exitValue : Nat) (signal : String) (dumpedCore : Bool)
     (error : String := "") : IO Unit := do
   let some s ← current.get | return

@@ -1,9 +1,3 @@
-/*
- * Linux exec interception, following sudo 1.9.17p2 src/exec_ptrace.c.
- * Transport only: subsequent execve calls are authorized by ls_intercept_check.
- * execveat is passed through, matching sudo 1.9.17p2's documented limitation.
- * The original environment is preserved and, when requested, verified at exec.
- */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -35,7 +29,6 @@
 #if defined(__x86_64__)
 #include <sys/user.h>
 typedef struct user_regs_struct native_regs;
-/* Linux's NT_PRSTATUS layout for an i386 task, independent of host headers. */
 typedef struct {
   uint32_t ebx, ecx, edx, esi, edi, ebp, eax, ds, es, fs, gs;
   uint32_t orig_eax, eip, cs, eflags, esp, ss;
@@ -55,7 +48,7 @@ typedef struct { uint32_t regs[18]; } compat_regs;
 #ifndef NT_ARM_SYSTEM_CALL
 #define NT_ARM_SYSTEM_CALL 0x404
 #endif
-#endif /* native register architecture */
+#endif
 enum { ABI_NATIVE, ABI_COMPAT, ABI_X32 };
 typedef struct {
   union { native_regs native; compat_regs compat; } u;
@@ -64,8 +57,6 @@ typedef struct {
   int compat_layout;
 } trace_regs;
 
-/* Linux limits each string to 32 pages and total arguments to at most 6 MiB.
- * These bounds also prevent unbounded reads of malicious unterminated vectors. */
 #define TRACE_BYTES (8U * 1024U * 1024U)
 #define TRACE_STRING (2U * 1024U * 1024U)
 struct trace_task {
@@ -104,8 +95,6 @@ static void task_remove(pid_t pid) {
     p = &(*p)->next;
   }
 }
-/* Record a consumed stop, including the tid change made by a non-leader exec.
- * A nonzero status means that no restart request has consumed this stop yet. */
 static struct trace_task *task_stopped(pid_t pid, int status) {
   struct trace_task *t = task_find(pid);
   unsigned event = (unsigned)status >> 16;
@@ -157,8 +146,6 @@ static int remote_rw(pid_t pid, uintptr_t addr, void *data, size_t len, int writ
   ssize_t done = writing ? process_vm_writev(pid, &local, 1, &remote, 1, 0) :
       process_vm_readv(pid, &local, 1, &remote, 1, 0);
   if (done == (ssize_t)len) return 0;
-  /* Credential transitions may require ptrace. Reads restart from the beginning;
-   * writes resume after any completed bytes, preserving partial adjacent words. */
   size_t off = writing && done > 0 ? (size_t)done : 0;
   while (off < len) {
     uintptr_t pos = addr + off, aligned = pos & ~(uintptr_t)(sizeof(long) - 1);
@@ -238,7 +225,6 @@ static char **remote_vector(pid_t pid, uintptr_t addr, size_t width, size_t *bud
   size_t count = 0, cap = 16;
   char **v = calloc(cap, sizeof *v);
   if (!v) return NULL;
-  /* Linux accepts a NULL environment; represent it as an empty vector. */
   if (!addr) return v;
   while (*budget >= width) {
     uintptr_t p;
@@ -289,7 +275,6 @@ static uintptr_t reg_arg(const trace_regs *r, unsigned n) {
     }
   }
   if (r->abi == ABI_COMPAT) {
-    /* A 64-bit executable can also invoke the i386 ABI using int $0x80. */
     switch (n) {
     case 0: value = r->u.native.rbx; break;
     case 1: value = r->u.native.rcx; break;
@@ -340,8 +325,6 @@ static uintptr_t reg_sp(const trace_regs *r) {
   return r->compat_layout ? r->u.compat.regs[13] : r->u.native.sp;
 #endif
 }
-/* Normalize the syscall number only after the seccomp event has identified
- * its ABI. Pointer widths and register layouts are independent on x32. */
 static long reg_syscall(const trace_regs *r) {
 #if defined(__x86_64__)
   unsigned long nr = r->compat_layout ? r->u.compat.orig_eax : r->u.native.orig_rax;
@@ -366,12 +349,9 @@ static int skip_exec(pid_t pid, trace_regs *r) {
   else r->u.native.orig_rax = (unsigned long)-1;
   return put_regs(pid, r);
 #else
-  /* Unlike x86, ARM preserves x0/r0 when the tracer skips a syscall.
-   * Teardown detaches without a syscall-exit stop to supply the result. */
   if (r->compat_layout) r->u.compat.regs[0] = (uint32_t)-ENOSYS;
   else r->u.native.regs[0] = (unsigned long)-ENOSYS;
   if (put_regs(pid, r)) return -1;
-  /* NT_ARM_SYSTEM_CALL controls both the native and ARM EABI syscall. */
   int nr = -1;
   struct iovec iov = {&nr, sizeof nr};
   return ptrace(PTRACE_SETREGSET, pid, (void *)(uintptr_t)NT_ARM_SYSTEM_CALL, &iov) < 0
@@ -398,9 +378,6 @@ static int denied_exit(struct trace_task *t) {
   if (put_regs(t->pid, &r)) return -1;
   t->denied = 0; return 0;
 }
-/* Only the set-ID fact uses the tracee's namespace. Policy and verification
- * retain the tracer's host view, as sudo's pathname_matches() does: rebasing
- * an approved /bin/foo into a changed root could authorize a different file. */
 static int syscall_stat(pid_t pid, const char *raw, struct stat *st) {
   char path[PATH_MAX + 64];
   int n;
@@ -426,9 +403,6 @@ static char *exec_path(const char *raw, const char *cwd) {
     return NULL;
   return path;
 }
-/* Prepare the kernel's script argv transformation while the requested image
- * is stopped. Nested #! interpreters are supported, including one optional
- * argument (Linux treats the entire remaining shebang as a single argument). */
 static int expected_image(const char *command, const char *label,
     const char *cwd, char ***argv, struct stat *image, const struct stat *requested) {
   char *current = strdup(command);
@@ -514,8 +488,6 @@ static int verify_exec(struct trace_task *t) {
 }
 static int rewrite_path(pid_t pid, trace_regs *r, const char *command,
     char *const argv[], char *const env[], int empty_argv) {
-  /* Match upstream's path_mismatch storage below SP and the amd64 red zone.
-   * The stack pointer itself must not move across the intercepted syscall. */
   size_t len = strlen(command) + 1;
   size_t space = (len + sizeof(long) - 1) & ~(sizeof(long) - 1);
   uintptr_t sp = reg_sp(r);
@@ -526,9 +498,6 @@ static int rewrite_path(pid_t pid, trace_regs *r, const char *command,
   set_reg_arg(r, 0, addr);
   if (put_regs(pid, r)) return -1;
 
-  /* Re-read registers and all arguments after writing, before any resume.
-   * A shared-memory tracee must not turn a successful write into approval of
-   * changed arguments. Post-exec verification still covers the later race. */
   trace_regs actual;
   if (get_regs(pid, &actual) || actual.compat_layout != r->compat_layout) return -1;
   actual.abi = r->abi;
@@ -555,16 +524,12 @@ static int check_exec(struct trace_task *t) {
   if (nr != SYS_execve && nr != SYS_execveat) return -1;
   clear_expected(t);
   if (t->initial) { t->initial = 0; return 0; }
-  /* sudo 1.9.17p2 traces execveat but deliberately does not check its policy.
-   * Preserve this upstream limitation for every supported syscall ABI. */
   if (nr == SYS_execveat) return 0;
   size_t budget = TRACE_BYTES;
   char *raw = remote_string(t->pid, reg_arg(&r, 0), &budget);
   size_t width = r.abi == ABI_NATIVE ? sizeof(uintptr_t) : sizeof(uint32_t);
   char **argv = remote_vector(t->pid, reg_arg(&r, 1), width, &budget);
   char **env = remote_vector(t->pid, reg_arg(&r, 2), width, &budget);
-  /* Linux supplies an empty argv[0] when execve receives an empty vector.
-   * sudo's policy callback still checks the requested pathname. */
   int empty_argv = argv && !argv[0];
   if (empty_argv) {
     argv[0] = strdup("");
@@ -635,7 +600,6 @@ int ls_intercept_trace_child(void) {
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
   };
   struct sock_fprog prog = {(unsigned short)(sizeof filter / sizeof filter[0]), filter};
-  /* Do not set no_new_privs: that would change the authorized set-ID semantics. */
   return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog);
 }
 int ls_intercept_trace_attach(pid_t pid) {
@@ -667,8 +631,6 @@ int ls_intercept_trace_wait(pid_t pid, int status) {
   if (!WIFSTOPPED(status)) return pid == root_pid ? 0 : 1;
   unsigned event = (unsigned)status >> 16;
   int sig = WSTOPSIG(status), deliver = 0;
-  /* waitpid(-1) also reports unrelated children, notably job-control stops.
-   * Only PTRACE_EVENT_STOP can introduce an automatically attached task. */
   if (!t && !event) return 1;
   t = task_stopped(pid, status);
   if (!t) goto fail;
@@ -678,8 +640,6 @@ int ls_intercept_trace_wait(pid_t pid, int status) {
     if (result > 0) return 1;
   } else if (event == PTRACE_EVENT_EXEC) {
     if (t->argv && verify_exec(t)) {
-      /* Do not let even the first instruction of a mismatched image run.
-       * Its real parent still receives the ordinary SIGKILL wait status. */
       kill(pid, SIGKILL);
       (void)ptrace(PTRACE_CONT, pid, NULL, (void *)(intptr_t)SIGKILL);
       t->status = 0;
@@ -714,9 +674,6 @@ void ls_intercept_trace_close(void) {
     if (gate[i] >= 0) close(gate[i]);
     gate[i] = -1;
   }
-  /* PTRACE_INTERRUPT also wakes PTRACE_LISTEN without manufacturing a
-   * SIGSTOP or losing an existing job stop. Already consumed stops need no
-   * second wait, since the kernel will not report them again. */
   for (struct trace_task *t = tasks; t; t = t->next) {
     if (!t->status && ptrace(PTRACE_INTERRUPT, t->pid, NULL, NULL) < 0 && errno != ESRCH)
       kill(t->pid, SIGKILL);
@@ -730,8 +687,6 @@ void ls_intercept_trace_close(void) {
       if (pid < 0) {
         if (errno == EINTR) continue;
         int wait_error = errno;
-        /* ECHILD means all tracees are gone. Any other failure must not
-         * release an image whose post-exec verification is still pending. */
         while (tasks) {
           if (wait_error != ECHILD) kill(tasks->pid, SIGKILL);
           task_remove(tasks->pid);
@@ -749,17 +704,12 @@ void ls_intercept_trace_close(void) {
     unsigned event = (unsigned)t->status >> 16;
     int sig = WSTOPSIG(t->status), deliver = 0, failed = 0;
     if (event == PTRACE_EVENT_SECCOMP) {
-      /* This stop has already passed RET_TRACE's tracer-presence check.
-       * Explicitly skip it; merely detaching here could execute unchecked.
-       * Subsequent untraced RET_TRACE execs fail with ENOSYS in the kernel. */
       trace_regs r;
       failed = get_regs(pid, &r) || skip_exec(pid, &r);
     } else if (event == PTRACE_EVENT_EXEC) {
       failed = t->argv && verify_exec(t);
     } else if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK ||
         event == PTRACE_EVENT_CLONE) {
-      /* A fork may win the race with INTERRUPT. Its child is already seized
-       * and will report its own initial stop before it executes anything. */
       failed = task_forked(pid);
     } else if (!event && sig == (SIGTRAP | 0x80)) {
       failed = !t->denied || denied_exit(t);
@@ -768,8 +718,6 @@ void ls_intercept_trace_close(void) {
     } else if (event != PTRACE_EVENT_STOP) {
       failed = 1;
     }
-    /* DETACH preserves an existing kernel group-stop; only real signal
-     * delivery stops need reinjection. Never inject synthetic SIGTRAP. */
     if (failed) kill(pid, SIGKILL);
     if (ptrace(PTRACE_DETACH, pid, NULL,
         (void *)(intptr_t)(failed ? SIGKILL : deliver)) < 0 && errno != ESRCH)

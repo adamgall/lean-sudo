@@ -1,13 +1,13 @@
-# Real sudo.ws 1.9.17p2 timestamp interoperability on Ubuntu's little-endian
-# 64-bit ABI. Run ^timestamp-interop- against the reference runner first: there
-# /usr/bin/sudo and /usr/bin/sudo.ws are both the installed reference program.
-# Source: sudo-project/sudo v1.9.17p2 plugins/sudoers/{timestamp.c,timestamp.h}.
-# Every sudo child has argv[0]="sudo" and the SAME real UID. In particular, do
-# not pipe a password into a shell function: that would change sudo's parent.
-# Review regressions below exercise timestamp.c ts_find_record/ts_match_record,
-# timestamp_status and timestamp_remove, plus check.c MODE_IGNORE_TICKET.
-# Slot identity deliberately precedes validity: GLOBAL ignores start_time when
-# matching, but timestamp_status validates BOTH timespecs even for GLOBAL.
+
+
+
+
+
+
+
+
+
+
 
 timestamp_interop_setup() {
   local scope=$1 timeout=${2:-5} owner=${3:-root} directory=${4:-custom}
@@ -78,8 +78,8 @@ case $action in
   scopes)
     fresh
     cached "$reader"
-    # A separate bash, kept alive by its post-command marker, is a distinct
-    # parent in the same controlling tty/session (not a final-command exec).
+
+
     child_action=probe-denied
     [[ $scope == tty || $scope == global ]] && child_action=probe-cached
     /bin/bash "$root/client.sh" "$root" "$child_action" "$writer" "$reader" "$scope"
@@ -98,7 +98,7 @@ case $action in
     fresh
     cached "$reader"
     call "$reader" 0 -K
-    # Stop before any further sudo can recreate the file. Root checks unlink.
+
     ;;
   timeout-zero)
     fresh
@@ -108,7 +108,7 @@ case $action in
   timeout-short)
     fresh
     cached "$reader"
-    # 0.05 minutes = 3 seconds; a 4-second wait crosses the real clock expiry.
+
     sleep 4
     denied "$reader"
     denied "$writer"
@@ -119,8 +119,8 @@ case $action in
     metadata before
     denied "$writer"
     denied "$reader"
-    # The reference authenticates the actual slot. The selected writer then
-    # authenticates and refreshes it again; no success ticket is invented.
+
+
     authenticate /usr/bin/sudo.ws
     call "$writer" 0 -k
     authenticate "$writer"
@@ -130,16 +130,16 @@ case $action in
     if [[ $action == lock-refresh ]]; then
       cached "$reader"
     else
-      # Normalize the child's disposition explicitly: a background harness may
-      # have passed SIG_IGN through Bash. Python exec preserves this PID/PPID.
+
+
       disposition=default status=0
       if [[ $action == lock-interrupt-ignored ]]; then
         disposition=ignored
       fi
       /usr/bin/python3 "$root/records.py" exec-reader "$disposition" "$reader" \
         -n /usr/bin/id -u >"$out" 2>"$err" || status=$?
-      # Both dispositions yield authentication-required in sudo.ws 1.9.17p2:
-      # the frontend installs its own handler before timestamp locking.
+
+
       [[ $status == 1 ]] || bad "interrupted $reader: expected 1, got $status"
       [[ ! -s $out ]] || bad 'interrupted waiter executed the command'
       grep -qF 'a password is required' "$err" || bad 'interrupted lock did not fall back to authentication-required'
@@ -163,7 +163,7 @@ case $action in
         [[ ! -s $out && ! -s $err ]] || bad '-k emitted unexpected output'
         ;;
       review-ignore-missing|review-ignore-existing)
-        # Even an existing CURRENT ticket must not satisfy -k command.
+
         call "$reader" 1 -k -n /usr/bin/id -u
         [[ ! -s $out ]] || bad '-k -n ran without authentication'
         grep -qF 'a password is required' "$err" || bad '-k -n denial was not authentication-required'
@@ -190,8 +190,8 @@ import struct
 import sys
 import time
 
-# timestamp_entry: four u16s, uid_t, pid_t, two signed 64-bit timespecs,
-# then an eight-byte dev_t/pid_t union. Explicit little endian, no host ABI.
+
+
 ENTRY = struct.Struct('<HHHHIiqqqqQ')
 LOCK = ENTRY.pack(2, 56, 4, 0, 0, 0, 0, 0, 0, 0, 0)
 assert ENTRY.size == 56
@@ -233,7 +233,7 @@ elif action in ('layout', 'disabled'):
     ds = directory.stat()
     assert stat.S_ISDIR(ds.st_mode) and stat.S_IMODE(ds.st_mode) == 0o700, ds
     assert (ds.st_uid, ds.st_gid) == (user.pw_uid, user.pw_gid), ds
-    # sudo.ws uses the decimal invoking UID, NOT the login name or auth UID.
+
     assert sorted(p.name for p in directory.iterdir()) == [str(uid)], list(directory.iterdir())
     path = directory / str(uid)
     fs = path.stat()
@@ -255,7 +255,7 @@ elif action in ('layout', 'disabled'):
         assert row[3] == 0, row
         stamp = row[8] * 1_000_000_000 + row[9]
         assert meta['before'] <= stamp <= meta['after'], (stamp, meta)
-    # Global caching still has its separate per-parent serialization slot.
+
     assert len(rows) == (3 if scope == 'global' else 2), rows
     if scope == 'global':
         locks = [r for r in rows if r[2] == 3]
@@ -298,8 +298,8 @@ elif action == 'mutate':
     elif variant == 'corrupt-header':
         data = b'not-a-sudo-timestamp\x00'
     elif variant == 'skip-foreign':
-        # Keep the valid global ticket AFTER three unsupported records. Their
-        # declared sizes must be honored and their bytes/offsets preserved.
+
+
         foreign_version = list(row)
         foreign_version[0] = 3
         foreign_type = list(row)
@@ -312,8 +312,8 @@ elif action == 'mutate':
         data = data[:offset] + sentinels + data[offset:]
         Path(dest + '.sentinel').write_bytes(sentinels)
         Path(dest + '.offset').write_text(str(offset))
-    # Keep the real file's ownership/mode; this is deliberate disk corruption,
-    # not a substitute authentication service or a synthetic success ticket.
+
+
     Path(dest).write_bytes(data)
 elif action == 'preserved':
     path, = args
@@ -343,8 +343,8 @@ elif action == 'locking':
     user = pwd.getpwnam('alice')
     env = dict(HOME=user.pw_dir, USER=user.pw_name, LOGNAME=user.pw_name,
                SHELL='/bin/bash', PATH='/usr/bin:/bin', LANG='C.UTF-8')
-    # exec through setpriv retains one stable bash parent for ALL sudo calls.
-    # A private session also lets failure cleanup kill every descendant.
+
+
     child = subprocess.Popen(
         ['setpriv', '--reuid=alice', f'--regid={user.pw_gid}', '--init-groups',
          '--', '/bin/bash', root + '/client.sh', root, 'lock-' + mode,
@@ -369,9 +369,9 @@ elif action == 'locking':
         assert row[3] == 0, row
         authenticated = data[offset:offset + 56]
         fcntl.lockf(fd, fcntl.LOCK_EX, 56, offset, os.SEEK_SET)
-        # While holding ONLY the selected record, make it unusable. Restore
-        # these real authenticated bytes before releasing: the waiter must
-        # read after obtaining the lock, not consume a pre-lock stale snapshot.
+
+
+
         disabled = list(row)
         disabled[3] |= 1
         assert os.pwrite(fd, ENTRY.pack(*disabled), offset) == 56
@@ -407,8 +407,8 @@ elif action == 'locking':
         else:
             assert mode in ('interrupt', 'interrupt-ignored'), mode
             os.kill(waiter, signal.SIGINT)
-        # Both interruption cases must finish while the record stays locked:
-        # sudo.ws falls back to authentication for both initial dispositions.
+
+
         output, errors = child.communicate(timeout=8)
         assert child.returncode == 0, (child.returncode, output, errors)
         assert f'timestamp-interop-ok:lock-{mode}\n' in output, output
@@ -467,7 +467,7 @@ elif action == 'review':
             bad = valid.copy()
             disable = []
             if variant.startswith('negative-sid'):
-                bad[5] = -1  # sudo.ws stores getsid()'s signed failure value.
+                bad[5] = -1
                 if variant == 'negative-sid-followed-valid':
                     bad[4] = pwd.getpwnam('bob').pw_uid
                 fixture = prefix + ENTRY.pack(*bad) + ticket + suffix
@@ -484,9 +484,9 @@ elif action == 'review':
                 if variant == 'nonglobal-invalid-start':
                     selected_offset = offset + 56
             elif variant == 'malformed-known-k':
-                # SID/time are NOT part of identity. -k must disable every
-                # matching UID (TS_ANYUID is on the search key), preserving
-                # the malformed bytes. Unsupported formats are skipped.
+
+
+
                 damaged = []
                 for field, value in ((5, -1), (8, -1), (9, 1_000_000_000)):
                     row = valid.copy()
@@ -501,9 +501,9 @@ elif action == 'review':
                 disable.append(offset + len(damaged) * 56)
                 fixture = prefix + b''.join(damaged) + ticket + suffix
             elif many:
-                # These are fixture sizes, not format/implementation caps.
-                # Dense records exceed the former 64 KiB cutoff; sparse
-                # extension records force declared-size seeks over 256 MiB.
+
+
+
                 count = 32768 if variant == 'many-records' else 4096
                 stride = 56 if variant == 'many-records' else 65535
                 foreign = valid.copy()
@@ -535,15 +535,15 @@ elif action == 'review':
                 fd = os.open(path, os.O_RDWR)
                 fcntl.lockf(fd, fcntl.LOCK_EX, 56, 0, os.SEEK_SET)
         if variant in ('ignore-existing', 'ignore-missing'):
-            # inotify complements the held LOCKEXCL: an implementation that
-            # merely opens without locking must fail too. Register AFTER our
-            # own opens; inspect events BEFORE our post-command file reads.
+
+
+
             libc = ctypes.CDLL(None, use_errno=True)
             watch = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
             assert watch >= 0, ('inotify_init1', ctypes.get_errno())
             watched = path if variant == 'ignore-existing' else Path(root)
-            # IN_OPEN | IN_MODIFY | IN_ATTRIB | IN_CREATE | IN_DELETE |
-            # IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF
+
+
             mask = 0x20 | 0x2 | 0x4 | 0x100 | 0x200 | 0x40 | 0x80 | 0x400 | 0x800
             assert libc.inotify_add_watch(watch, os.fsencode(watched), mask) >= 0, (
                 'inotify_add_watch', ctypes.get_errno())
@@ -558,7 +558,7 @@ elif action == 'review':
             assert not Path(directory).exists(), '-k command created timestamp storage'
         elif many:
             assert path.stat().st_size == expected_size, 'scan appended or truncated a slot'
-            # Keep fixture verification bounded too; never read sparse holes.
+
             with path.open('rb') as stream:
                 assert stream.read(len(prefix)) == prefix
                 for index in range(count):
@@ -571,8 +571,8 @@ elif action == 'review':
         else:
             actual = path.read_bytes()
             if selected_offset is not None:
-                # Successful cached commands refresh only the chosen ticket's
-                # timestamp. Earlier malformed/foreign slots must stay intact.
+
+
                 stamp = slice(selected_offset + 32, selected_offset + 48)
                 expected[stamp] = actual[stamp]
             assert actual == expected, ('unexpected slot append/rewrite', actual.hex(), expected.hex())
@@ -633,8 +633,8 @@ for timestamp_interop_direction in reference-to-installed installed-to-reference
 
     begin "timestamp-interop-$timestamp_interop_direction-$timestamp_interop_scope-parent-session-isolation" && {
       timestamp_interop_setup "$timestamp_interop_scope"
-      # Both ppid and tty cases run on a real pty, so only the parent changes
-      # for the nested bash. A later pty invocation is a genuinely new session.
+
+
       timestamp_interop_client scopes "$timestamp_interop_writer" "$timestamp_interop_reader" tty
       timestamp_interop_probe=probe-denied
       [[ $timestamp_interop_scope == global ]] && timestamp_interop_probe=probe-cached
@@ -699,9 +699,9 @@ for timestamp_interop_direction in reference-to-installed installed-to-reference
   }
 done
 
-# Build every damaged/foreign fixture from a ticket actually authenticated by
-# sudo.ws. Restore identical bytes before each implementation, preventing the
-# reference's defensive repair from hiding a reader bug in the installed sudo.
+
+
+
 for timestamp_interop_variant in foreign-auth-uid unsupported-version unsupported-type unsupported-size disabled negative-seconds invalid-nanoseconds future zero-size truncated corrupt-header skip-foreign; do
   begin "timestamp-interop-record-$timestamp_interop_variant" && {
     timestamp_interop_setup global
@@ -722,9 +722,9 @@ for timestamp_interop_variant in foreign-auth-uid unsupported-version unsupporte
   }
 done
 
-# Each case is independently filterable, starts with a real sudo.ws ticket,
-# and uses one stable parent while root mutates that parent's private file.
-# Do not use /run/sudo/ts here: cleanup must never touch a host user's ticket.
+
+
+
 for timestamp_interop_review in negative-sid-followed-valid negative-sid-first-duplicate negative-sid-k malformed-known-k invalid-time-first-duplicate global-invalid-start nonglobal-invalid-start ignore-missing ignore-existing many-records sparse-records; do
   begin "timestamp-interop-review-$timestamp_interop_review" && {
     timestamp_interop_scope=ppid

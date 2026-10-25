@@ -1,4 +1,4 @@
-# Execution hardening and sudo's child lifecycle.
+
 begin exec-default-core-limit && {
   run root "ulimit -c unlimited; sudo -n /bin/sh -c 'ulimit -c; ulimit -Hc'"
   expect_rc 0
@@ -164,7 +164,36 @@ Defaults !rlimit_core
 EOF
   run root "/bin/bash -c 'ulimit -Sc 42; exec sudo -n /bin/bash -c \"ulimit -Sc\"'"
   expect_rc 0
+  expect_out_line 0
+  end
+}
+
+begin exec-disabled-core-limit-without-pam-session && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-limits <<'EOF'
+Defaults !rlimit_core,!pam_session
+EOF
+  run root "/bin/bash -c 'ulimit -Sc 42; exec sudo -n /bin/bash -c \"ulimit -Sc\"'"
+  expect_rc 0
   expect_out_line 42
+  end
+}
+
+begin exec-disabled-core-limit-pam-override && {
+  printf 'root soft core 7\n' >/etc/security/limits.d/99-sudo-it-core.conf
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-limits <<'EOF'
+Defaults !rlimit_core
+EOF
+  run root "/bin/bash -c 'ulimit -Sc 42; exec sudo -n /bin/bash -c \"ulimit -Sc\"'"
+  expect_rc 0
+  expect_out_line 7
+  rm -f /etc/sudoers.d/exec-limits
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-limits <<'EOF'
+Defaults rlimit_core="1024,2048"
+EOF
+  run root "sudo -n /bin/bash -c 'ulimit -Sc; ulimit -Hc'"
+  expect_rc 0
+  [[ $OUT == $'1\n2' ]] || fail "sudoers core limit did not override PAM: $OUT"
+  rm -f /etc/security/limits.d/99-sudo-it-core.conf
   end
 }
 
@@ -173,7 +202,7 @@ begin exec-pty-utmp-session && {
   install -m 0440 /dev/stdin /etc/sudoers.d/exec-utmp <<'EOF'
 Defaults use_pty, set_utmp, utmp_runas
 EOF
-  # Ubuntu's uutils who uses systemd sessions, not the traditional utmp file.
+
   pty root "sudo -n -u ivan /usr/bin/python3 -c 'print(\"ivan\" if b\"ivan\" in open(\"/run/utmp\", \"rb\").read() else \"missing\")'"
   expect_rc 0
   expect_out_has ivan
@@ -201,8 +230,8 @@ Defaults !use_pty
 root ALL = TIMEOUT=2 NOPASSWD: /bin/sh
 EOF
   marker="$WORK/timeout-descendant"
-  # sudo 1.9.17p2 exec_nopty.c calls terminate_command(pid, false):
-  # only the command receives HUP/TERM/KILL, not its background descendants.
+
+
   run root "sudo -n /bin/sh -c '/bin/sleep 30 & echo \$! >\"$marker\"; wait'"
   expect_rc_not 0
   sleep_pid=$(cat "$marker" 2>/dev/null)
@@ -351,7 +380,7 @@ PERL
   end
 }
 
-# Build a self-contained jail without relying on the host's merged-/usr links.
+
 exec_chroot_setup() {
   python3 - <<'PY'
 import os, pathlib, shutil, subprocess
@@ -369,13 +398,13 @@ for source, destination in (("/bin/dash", "/bin/sh"), ("/usr/bin/id", "/usr/bin/
 (root / "usr/bin/jail-tool").write_text(
     '#!/bin/sh\nprintf "jail-marker\\ncwd=%s\\n" "$PWD"\n/usr/bin/id -u\n')
 os.chmod(root / "usr/bin/jail-tool", 0o755)
-# Policy and target identity must not come from the jail's NSS configuration.
+
 (root / "etc/nsswitch.conf").write_text("passwd: unavailable\ngroup: unavailable\n")
 PY
 }
 
-# Isolate filesystem-rule lookup from sudo's cross-NSS cmnd_info-reset bug.
-# The generic jail helper above is also used by SSSD integration tests.
+
+
 exec_chroot_files_only() {
   cp /etc/nsswitch.conf /tmp/exec-nsswitch.saved
   python3 - <<'PY'
@@ -558,8 +587,8 @@ EOF
   end
 }
 
-# Documented deviation: sudo's prefixed host lookup follows absolute symlinks
-# outside the jail. lean-sudo refuses that ambiguous namespace before execution.
+
+
 begin exec-chroot-absolute-symlink-escape-refused && {
   exec_chroot_setup
   exec_chroot_files_only
@@ -582,8 +611,8 @@ EOF
   end
 }
 
-# Documented deviation: a later empty NSS source must not discard an allowed
-# command's selected root and turn successful lookup into "command not found".
+
+
 begin exec-chroot-empty-later-nss-retains-command && {
   exec_chroot_setup
   exec_chroot_files_only
@@ -609,8 +638,8 @@ EOF
   end
 }
 
-# Documented deviation: sudo's nested PERM_RUNAS lookup can call setgroups
-# after dropping effective root. Dedicated lookup workers retain no such state.
+
+
 begin exec-chroot-nonroot-rule-lookup-retains-privileges && {
   exec_chroot_setup
   exec_chroot_files_only
@@ -655,8 +684,8 @@ root ALL = CHROOT=~root/exec-chroot-home NOPASSWD: /usr/bin/jail-tool
 EOF
   run root "sudo -n /usr/bin/jail-tool"
   if [[ $LABEL == reference ]]; then
-    # Upstream expands the home only after command lookup, too late to find a
-    # command present solely in the jail. lean-sudo expands captured host facts.
+
+
     expect_rc 1
     expect_err_has '/usr/bin/jail-tool: command not found'
   else
@@ -698,8 +727,8 @@ root ALL = CHROOT=/srv/lean-sudo-jail NOPASSWD: NOEXEC: /usr/bin/jail-tool
 EOF
   run root "sudo -n jail-tool"
   if [[ $LABEL == reference ]]; then
-    # The dynamic loader warns but executes without protection. The explicit
-    # lean-sudo NOEXEC contract instead refuses a missing in-jail library.
+
+
     expect_rc 0
     expect_out_line jail-marker
   else
@@ -727,8 +756,8 @@ EOF
   end
 }
 
-# CHROOT=* without -R uses host facts. A literal directory named "*" under the
-# caller's cwd must never alias an allowed host parent onto an attacker path.
+
+
 begin exec-chroot-wildcard-caller-tree-cannot-redirect-host && {
   exec_chroot_files_only
   install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'

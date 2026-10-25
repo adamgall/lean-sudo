@@ -7,17 +7,24 @@ is Ubuntu's sudo.ws 1.9.17p2 (`/usr/bin/sudo.ws`), not the distribution's defaul
 `sudo` alternatives link. The separate visudo suite runs the selected visudo
 against the same container fixtures.
 
-Current full-suite results:
+Historical full-suite baseline (before replacing dependency mocks with real
+services and removing cases without a real substitute):
 
 | Suite | sudo.ws | lean-sudo |
 |---|---:|---:|
-| sudo | 946/946 | 946/946 |
+| sudo | 912/912 | 912/912 |
 | visudo | 154/154 | 154/154 |
 
 These are shared compatibility suites, not a claim that every behavior is
 identical: intentional safety differences are encoded in the expectations.
 Ubuntu's sudo-rs remains an optional comparison target for the sudo suite; no
 current pass count is claimed for it.
+
+The only tests are these Docker end-to-end suites: no unit tests and no mocks.
+Dependencies must be real software running in the container. Commands, editors
+and execution-environment probes invoked by sudo are test inputs, not replacement
+dependencies; use a real editor where the scenario is about interactive editing.
+`/etc/hosts` and `/etc/netgroup` entries configure real NSS files backends.
 
 ## Running
 
@@ -83,8 +90,28 @@ cases to use `strace` across credential transitions and inspect actual Linux
 `USER_CMD` netlink records. `SYS_ADMIN` lets both sudo implementations install
 their exec-interception seccomp filter without `no_new_privs`, which would change
 set-ID command semantics. No host audit daemon or `AUDIT_CONTROL` capability is
-required. Tests also capture syslog datagrams locally rather than requiring a
-running syslog service.
+required: strace observes real kernel audit traffic, not a replacement audit
+service. Likewise, utmp readers and inotify are observation tools, not mocks.
+
+Syslog tests run real rsyslog with imuxsock on `/dev/log`, disabled rate limiting,
+a 256 KiB message limit and no control-character escaping. A shared harness
+context preserves `%rawmsg%` bytes in JSON-framed output; a logger marker and
+deadline-bounded polling drain the daemon before assertions. Mail tests invoke
+Exim's sendmail interface and inspect local delivery in `/var/mail/root`, including
+headers and the submitting identity in Exim's log; strace observes the real
+sendmail arguments and supplementary groups. `example.test` is a local domain
+and `admin` aliases to root; no external network is needed. Negative mail
+assertions observe the real mailbox rather than a script standing in for an MTA.
+
+Askpass scenarios run the packaged `ssh-askpass` GUI under Xvfb and type into it
+with xdotool; `/proc` supplies the helper's real/effective/saved/filesystem UIDs.
+SSH terminal-discovery tests use key-authenticated `ssh -T` sessions through a
+real loopback sshd. PAM account and empty-password cases use pam_unix and actual
+account state; the session-error case uses pam_limits against the kernel's file
+descriptor ceiling. Non-generic challenges use pam_oath HOTP validation, including
+rejection of an invalid token, rather than a permissive challenge module.
+Shell-mode tests execute real Bash. All required packages are installed while
+building the image, before the network-disabled tests start.
 
 `tests.sh` is the root entrypoint. It installs the supplied sudo binary with mode
 4755, creates the sudoedit symlink and adds a hostname entry if needed. Before
@@ -160,8 +187,17 @@ explicitly. The numbered prefixes control source order, not ownership.
 | `95-coverage.sh` | `coverage-*`: differential CLI, authentication/listpw/verifypw, timestamps, umask, shell/cwd/environment, listing, sudoedit, signal and job-control matrices. |
 | `96-sssd.sh` | `sssd-*`: real LDAP/SSSD roles, allow/deny/negation, runas, signed sudoOrder, global/role options, argument wildcards, short/long listings and NSS source/action ordering. |
 | `97-group-plugin.sh` | `group-plugin-*`: shipped group_file/system_group providers, named/numeric membership, negation, aliases/runas/Defaults/listing, always_query_group_plugin and loader/init/ABI failures. |
-| `98-logsrv.sh` | `logsrv-*`: real sudo_logsrvd TCP/TLS events and I/O, generated CA/client credentials, trust/identity failures, unreachable-server policies, failover, final commits, live disconnect/restart failure policy, malformed frames and serialized intercepted subcommands. |
-| `99b-plugins.sh` | `plugin host`: shipped audit_json event structure/status, approval restrictions/options, extra I/O streams/terminal/binary data, callback lifecycle, loader failures, plugin version output, trace/DSO intercepted approval and log-only audit, audit-failure veto versus notification, and comment/CRLF/escaped/indented-continuation parsing. The fixture DSO is compiled in a separate Docker build stage. |
+| `98-logsrv.sh` | `logsrv-*`: real sudo_logsrvd TCP/TLS events and I/O, generated CA/client credentials, trust/identity failures, unreachable-server policies, failover, final commits, live disconnect/restart failure policy and serialized intercepted subcommands. |
+| `99b-plugins.sh` | `plugin host`: shipped audit_json event structure/status and policy rejection, upstream sample I/O binary/terminal streams, loader diagnostics and upstream plugin version output. |
+
+The plugin build stage downloads sudo 1.9.17p2 and checks the SHA-256 published
+on [sudo.ws](https://www.sudo.ws/releases/stable/) before building its unmodified
+`sample_plugin.so` and `sample_approval.so`. Tests also use Ubuntu's shipped
+`audit_json.so`, `sudoers.so`, `group_file.so` and `system_group.so`.
+The sample approval plugin's business-hours policy depends on the actual clock;
+only its deterministic version interface is tested. Synthetic callback failures,
+command-name approval rules and malformed log-server peers have no real substitute
+and are not tested. No test-only plugin DSO is built or loaded.
 
 ### Real remote logging fixtures
 
@@ -290,3 +326,100 @@ Reference comparisons use strict mode where appropriate; unused-invalid-alias
 cases assert the intentional difference explicitly. Rejected edits retain the
 existing policy on `x`/EOF, while the deliberately dangerous `Q` override remains
 available.
+
+## Comment-free source policy
+
+Run `scripts/check-no-comments.sh` from any directory to check tracked Lean, C,
+Python, shell, Dockerfile and ignore files. It reports `file:line: comment` and
+exits 1 on violations. The checker also scans recognized Python, Perl, C and
+shell heredocs. Shebangs and Docker's syntax parser directive remain executable
+metadata. Sudoers fixtures, sudoers heredocs, LDIF, Markdown and license files
+are data, not source comments; their parser-test content must remain intact.
+The checker uses only Bash, Git and Python's standard library.
+
+### Harness invariants
+
+The reference contract is Ubuntu's sudo.ws 1.9.17p2. Differential tests retain
+the same `argv[0]` and compare complete output, including whitespace and final
+newlines, rather than rewriting diagnostics. Authentication may precede a
+policy denial, so tests that target denial either supply the password or accept
+the reference's authentication-required disposition.
+
+The isolated container has no external network or eligible non-loopback
+interface. The harness maps its hostname locally to avoid unrelated resolver
+warnings. State is restored before each case and log ownership is handed to
+the host immediately, including for aborted runs. `run` uses a clean environment,
+the user's home directory and no terminal; `XENV` supplies the next invocation's
+extra environment. `pty` uses a fresh controlling terminal. `ptyrun.py` waits
+for each expectation only after the preceding match and accepts terminal control
+bytes through `-s`.
+
+### Regression fixture design
+
+* Timestamp interoperability uses genuinely authenticated reference tickets,
+  explicit little-endian 64-bit records, stable parent processes and private
+  sessions/directories. Never pipe authentication into a shell function or use
+  a host user's timestamp directory. Global slot identity ignores start time,
+  but timestamp validity checks both timespecs. Unsupported records retain
+  their declared sizes and original bytes. Sparse/dense fixtures exercise
+  traversal, not an artificial size cap. Lock tests modify only the locked
+  record and restore authenticated bytes before unlocking; inotify separately
+  detects forbidden access. A four-second sleep exceeds the configured
+  0.05-minute timeout.
+* System-local validity bounds use libc `mktime(tm_isdst=-1)`, not today's UTC
+  offset. Historical root listings test winter, summer, spring gaps and autumn
+  folds without changing the clock; a fresh process resolves ambiguous folds.
+  Timezone restoration preserves symlinks and metadata without following the
+  replacement destination. Live denial tests include an always-valid command
+  as a readiness control.
+* Locale tests prove translations are actually installed before comparing
+  diagnostics. Generic PAM prompts, explicit literal prompts, libc strerror
+  and gettext domains are distinct contracts. Regex `.` in the C locale matches
+  a byte, not a multibyte character. Caller TZ must not change policy time
+  evaluation, but an allowed TZ remains available to the executed command.
+* Command lookup searches as runas before retrying as the invoker. A regular
+  file needs any execute bit; successful lookup does not grant directory access
+  at execution. A dot-only result is terminal rather than a reason to retry
+  under different credentials. Editor lookup sees secure_path before env swap.
+* Jails are self-contained rather than relying on merged-/usr host symlinks;
+  policy and identity come from host NSS. The jailed editor intentionally cannot
+  open the host temporary pathname. Absolute symlink escapes, missing NOEXEC
+  libraries and retained command roots follow the documented fail-closed
+  deviations. A literal directory named `*` must not reinterpret CHROOT=*.
+* Intercept terminal tests keep commands in sudo's foreground process group;
+  an interactive job-control shell would invalidate that fixture. Background
+  execution is observed before the parent exits. CLONE_FS tests synchronize a
+  real interpreter's cwd change after authorization, rather than racing it.
+  Cleanup includes stranded commands and brokers.
+* Logging comparisons retain priorities, event fields, duplicate JSON keys,
+  spacing and record counts. Only transport times, process identities and
+  generated identities are normalized, with identity correspondence checked
+  first. No-mail assertions cover a bounded delivery interval. Event-only
+  log-server clients do not wait for commit acknowledgements, and the
+  reference audit-only client closes without an ExitMessage.
+* Upstream audit_json preserves repeated event keys but ships malformed named
+  array values and a 10-4-4-4-10 UUID grouping. Its narrowly scoped normalization
+  preserves every event pair. Approval-plugin wall-clock policy is exercised
+  only through version queries. Group-plugin ABI corruption locates the actual
+  exported field through the loader mapping.
+* SSSD cases own fresh LDAP data, caches and foreground service groups. A real
+  positive command proves readiness even for negative cases. Preserve packaged
+  ownership and the supplementary sssd group; never stop unrelated daemons.
+  LDAP insertion order must not substitute for signed sudoOrder. NSS SUCCESS
+  includes DENY, and unavailable SSSD must not silently grant access via files.
+* GUI askpass runs on a real X server and waits for the visible window. HOTP
+  tests use consecutive real counters, then prove that invalid tokens fail.
+  PAM's hard-limit test exceeds the kernel ceiling rather than mocking failure.
+  Terminal replay uses the packaged, unmodified sudoreplay.
+
+The test-image build context is `integration/`; the Linux builder uses the
+repository root. Apple Silicon builds matching aarch64-linux binaries. The
+toolchain layer changes with `lean-toolchain`, and `.lake` is a locked cache
+mount. The upstream archive checksum is published at
+<https://www.sudo.ws/releases/stable/>. The offline MTA delivers root and
+admin@example.test mail into the real root mailbox.
+
+`scripts/loc.sh` counts all tracked implementation lines, including blank lines,
+under LeanSudo and c plus the executable entrypoints. Harness, tests and docs
+are excluded. Non-whitespace bytes and lines over 100 columns are also reported
+so joining lines cannot masquerade as a size reduction.

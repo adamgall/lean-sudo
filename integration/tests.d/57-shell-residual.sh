@@ -1,4 +1,4 @@
-# Residual sudo.ws compatibility: authentication disposition, lookup and auditing.
+
 begin shell-residual-noninteractive-empty-password && {
   install -m 0440 /dev/stdin /etc/sudoers.d/shell-residual <<'EOF'
 ivan ALL=(root) /usr/bin/true
@@ -12,13 +12,8 @@ EOF
 }
 
 begin shell-residual-noninteractive-auth-option && {
-  cat >/etc/pam.d/shell-residual <<'EOF'
-auth required pam_permit.so
-account required pam_permit.so
-session required pam_permit.so
-EOF
+  passwd -d judy >/dev/null
   install -m 0440 /dev/stdin /etc/sudoers.d/shell-residual <<'EOF'
-Defaults:judy pam_service=shell-residual
 judy ALL=(root) /usr/bin/true
 EOF
   run judy 'sudo -nk /usr/bin/true'
@@ -27,7 +22,7 @@ EOF
   printf 'Defaults:judy noninteractive_auth\n' >>/etc/sudoers.d/shell-residual
   run judy 'sudo -nk /usr/bin/true'
   expect_rc 0
-  rm -f /etc/pam.d/shell-residual
+  printf 'judy:judypw\n' | chpasswd
   end
 }
 
@@ -96,9 +91,40 @@ EOF
   expect_rc 1
   expect_err_has '1 incorrect password attempt'
   grep -qF 'user NOT in sudoers' /var/log/shell-residual.log || fail 'missing policy denial'
-  grep -qF '1 incorrect password attempt' /var/log/shell-residual.log || fail 'missing file-only auth event preceding denial'
+  [[ -x /usr/sbin/sendmail ]] || fail 'denial-mail regression requires the installed MTA'
+  ! grep -qF '1 incorrect password attempt' /var/log/shell-residual.log || fail 'redundant auth event logged before mailed policy denial'
   end
 }
+
+for auth_mail_case in no-mailer no-denial-mail no-badpass-mail; do
+  begin shell-residual-denied-command-auth-log-"$auth_mail_case" && {
+    case $auth_mail_case in
+      no-mailer) auth_mail_options='mailerpath=/nonexistent-sudo-it-sendmail' ;;
+      no-denial-mail) auth_mail_options='!mail_no_user' ;;
+      no-badpass-mail) auth_mail_options='!mail_no_user,!mail_badpass' ;;
+    esac
+    rm -f /var/log/shell-residual.log
+    printf 'Defaults:bob logfile=/var/log/shell-residual.log,passwd_tries=1,%s\n' "$auth_mail_options" |
+      install -m 0440 /dev/stdin /etc/sudoers.d/shell-residual
+    run bob "printf 'wrong\n' | sudo -kS /usr/bin/true"
+    expect_rc 1
+    expect_out_empty
+    expect_err_has '1 incorrect password attempt'
+    [[ $(grep -cF 'user NOT in sudoers' /var/log/shell-residual.log) == 1 ]] ||
+      fail 'expected exactly one policy denial'
+    if [[ $auth_mail_case == no-badpass-mail ]]; then
+      ! grep -qF '1 incorrect password attempt' /var/log/shell-residual.log ||
+        fail 'auth event logged with neither logging nor mail enabled'
+    else
+      [[ $(grep -cF '1 incorrect password attempt' /var/log/shell-residual.log) == 1 ]] ||
+        fail 'expected exactly one file-only auth event'
+      [[ $(grep -nF '1 incorrect password attempt' /var/log/shell-residual.log | cut -d: -f1) -lt \
+         $(grep -nF 'user NOT in sudoers' /var/log/shell-residual.log | cut -d: -f1) ]] ||
+        fail 'auth event did not precede policy denial'
+    fi
+    end
+  }
+done
 
 begin shell-residual-log-denied-file-only && {
   rm -f /var/log/shell-residual.log
@@ -213,30 +239,22 @@ begin shell-residual-syslog-denied-disabled && {
 Defaults:alice passwd_tries=1,!log_denied
 EOF
   cat >/tmp/shell-residual-syslog.py <<'PY'
-import os, pwd, socket, subprocess
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-sock.bind("/dev/log")
-sock.settimeout(0.1)
+import os, pwd, subprocess, sys
+sys.path.insert(0, '/usr/local/lib')
+from sudo_it_logging import Syslog
 pw = pwd.getpwnam("alice")
 def drop():
     os.initgroups(pw.pw_name, pw.pw_gid)
     os.setgid(pw.pw_gid)
     os.setuid(pw.pw_uid)
-try:
+with Syslog() as logger:
     p = subprocess.Popen(["/usr/bin/sudo", "-kS", "/usr/bin/true"],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, cwd=pw.pw_dir, preexec_fn=drop)
     out, err = p.communicate(b"wrong\n")
-    while True:
-        try:
-            message = sock.recv(16384).decode()
-        except socket.timeout:
-            break
+    for message in logger.messages():
         if "incorrect password attempt" in message:
             print(message)
-finally:
-    sock.close()
-    os.unlink("/dev/log")
 PY
   run root 'python3 /tmp/shell-residual-syslog.py'
   expect_rc 0

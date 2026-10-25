@@ -2,9 +2,6 @@ import LeanSudo.Sudoers.Parser
 import LeanSudo.Policy.Eval
 import LeanSudo.SudoConf
 
-/-! SSSD's wire result is already sorted by descending sudoOrder. Conversion
-reverses that order, just like sssd.c, and partitions negative LDAP members to
-last position (ldap_util.c). Values are data, never reparsed as sudoers lines. -/
 namespace LeanSudo.Sss
 open Sudoers
 open SudoConf (blank trimStart trimEnd)
@@ -15,7 +12,6 @@ def values (r : Rule) (name : String) : List String :=
   let key := name.toLower
   ((r.find? fun a => a.1.toLower == key).map (·.2.toList)).getD []
 
-/-- Toggle every leading !, ignoring intervening horizontal whitespace. -/
 def negation (text : String) : Bool × String := Id.run do
   let mut chars := text.toList
   let mut neg := false
@@ -25,7 +21,6 @@ def negation (text : String) : Bool × String := Id.run do
     chars := chars.drop 1 |>.dropWhile blank
   return (neg, String.ofList chars)
 
-/-- Stable partition: an exclusion always follows all positive members. -/
 def negativesLast {α : Type} (negative : α → Bool) (xs : List α) : List α :=
   xs.filter (fun x => !negative x) ++ xs.filter negative
 
@@ -37,7 +32,6 @@ theorem negativesLast_mem {α : Type} (negative : α → Bool) (xs : List α) (x
 theorem negativesLast_exclusion_suffix {α : Type} (negative : α → Bool) (xs : List α) :
     negativesLast negative xs = xs.filter (fun x => !negative x) ++ xs.filter negative := rfl
 
-/-- ldap_util.c sudo_ldap_parse_option; unlike sudoers, values are not tokenized. -/
 def parseOption (text : String) : DefaultsSetting := Id.run do
   let parts := text.splitOn "="
   if parts.length > 1 && !(parts.headD "").isEmpty then
@@ -70,8 +64,6 @@ def userMembers (xs : List String) : List (Member UserAtom) :=
     let (neg, text) := negation text
     ⟨neg, userAtom text⟩)
 
-/-- sssd.c rechecks sudoUser in wire order and stops on its first match.
-Only one ! is stripped there (unlike LDAP run-as, host and command members). -/
 def invokingMembers (xs : List String) : List (Member UserAtom) :=
   (xs.map fun text =>
     let neg := text.startsWith "!"
@@ -84,8 +76,6 @@ def hostMembers (xs : List String) : List (Member HostAtom) :=
       .netgroup (text.drop 1).toString else (Parser.network text).getD (.name text)
     ⟨neg, atom⟩)
 
-/-- LDAP commands split at the first single blank; remaining argument bytes,
-including additional blanks, quotes and sudoers punctuation, stay literal. -/
 def command (text : String) : Except String (Member CmndAtom) := do
   let (neg, text) := negation text
   let (digests, rest) ← match (Parser.readDigests (Parser.context "SSSD" text)).run
@@ -135,8 +125,6 @@ private def options (r : Rule) : CmndOptions := Id.run do
         | _ => o
   return o
 
-/-- Tags are a projection for the existing evaluator and short listing. Full
-privilege Defaults are applied only to the winning privilege by the shell. -/
 def optionTags (xs : List String) : Tags := xs.foldl (fun tags raw =>
   let d := parseOption raw
   match d.op with
@@ -176,14 +164,11 @@ def role (r : Rule) : Except String (Option Located) := do
   return some { file := "SSSD", line := 1, entry := .userSpec {
     users := invokingMembers (values r "sudoUser"), entries := [{ hosts := hostMembers hosts, cmnds }] } }
 
-/-- Do not sort textually or round sudoOrder: SSSD has already performed its
-numeric sort. Reverse its result exactly (including its equal-order tie order). -/
 def convert (defaults rules : Array Rule) : Except String (List Located) := do
   let ds := defaults.toList.map fun r =>
     { file := "sudoRole " ++ ((values r "cn").headD "UNKNOWN"), line := 1,
       entry := .defaults .global ((values r "sudoOption").map parseOption) : Located }
   return ds ++ (← rules.toList.reverse.filterMapM role)
-/-- sssd.c uses the first nonempty ipa_hostname assignment (independent of domain). -/
 def ipaHostname (text : String) : Option String :=
   (text.splitOn "\n").findSome? fun line => do
     let line := line.trimAscii.toString
@@ -193,8 +178,6 @@ def ipaHostname (text : String) : Option String :=
         let value := trimStart (rest.drop 1).toString
         if value.isEmpty then none else some value
 
-/-- SSSD's optional IPA hostname belongs to that backend alone. Resolve user
-and host lists against that hostname, without changing the files backend. -/
 def withIpaHost (entries : List Located) (st : Settings) (facts : Request)
     (subjects : List Principal) (hostname : String) : List Located :=
   let facts := { facts with host := (hostname.splitOn ".").headD hostname, lhost := hostname }
@@ -210,7 +193,6 @@ def withIpaHost (entries : List Located) (st : Settings) (facts : Request)
       { located with entry := .userSpec { us with
           users := users.map (fun p => ⟨false, .name p.name⟩), entries := hosts } }
     | _ => located
-
 
 theorem convert_empty : convert #[] #[] = .ok [] := rfl
 

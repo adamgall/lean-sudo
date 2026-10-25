@@ -1,10 +1,12 @@
-# Compare JSON events with the installed sudo.ws in the same container.  json and
-# json_pretty are seek-and-append objects (duplicate event keys); json_compact is
-# JSON lines. A local datagram socket captures syslog without requiring rsyslog.
+
+
+
 jsonlog_compare() {
   local format=$1 scenario=$2
   python3 - "$format" "$scenario" <<'PY'
-import json, os, pathlib, pwd, re, shutil, socket, subprocess, sys, threading
+import json, os, pathlib, pwd, re, shutil, subprocess, sys
+sys.path.insert(0, '/usr/local/lib')
+from sudo_it_logging import Syslog
 
 fmt, scenario = sys.argv[1:]
 path = pathlib.Path('/var/log/sudo.json')
@@ -47,33 +49,14 @@ def normalize(value, key=''):
         assert re.fullmatch(r'[A-Z][a-z]{2} [ 0-9][0-9] \d\d:\d\d:\d\d', value)
         return '<local>'
     if key in ('runenv', 'submitenv'):
-        # Environment order is not semantically significant; every name/value is.
+
         return sorted(value)
     return value
 
 def execute(binary):
     if scenario == 'iolog': shutil.rmtree('/var/log/sudo-json-io', ignore_errors=True)
     path.unlink(missing_ok=True)
-    messages = []
-    sock = None
-    # There is normally no /dev/log in the integration image. Do not interfere
-    # with a real logger when the image supplies one.
-    if not os.path.exists('/dev/log'):
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        sock.bind('/dev/log')
-        # Send this marker only after sudo has exited. UNIX datagrams preserve
-        # queue order, so consuming it proves all earlier log sends were drained.
-        # A stop flag could terminate the reader with records still queued.
-        drained = b'\x00jsonlog-capture-complete'
-        def receive():
-            while True:
-                message = sock.recv(262144)
-                if message == drained:
-                    return
-                messages.append(message.decode())
-        thread = threading.Thread(target=receive)
-        thread.start()
-    try:
+    with Syslog() as logger:
         cmd = ['setpriv', '--reuid=' + str(user.pw_uid), '--regid=' + str(user.pw_gid),
                '--init-groups', '--', binary, '-n'] + args
         result = subprocess.run(cmd, cwd=user.pw_dir, env=env, capture_output=True)
@@ -82,13 +65,7 @@ def execute(binary):
         if scenario == 'twice':
             result = subprocess.run(cmd, cwd=user.pw_dir, env=env, capture_output=True)
             assert result.returncode == 0
-    finally:
-        if sock:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sender:
-                sender.sendto(drained, '/dev/log')
-            thread.join()
-            sock.close()
-            os.unlink('/dev/log')
+        messages = logger.messages()
     text = path.read_text()
     if fmt == 'json_compact':
         records = [pair for line in text.splitlines() for pair in decode(line)]
@@ -110,13 +87,12 @@ def execute(binary):
             if scenario == 'signal': assert values['signal'] == 'TERM' and not values['dumped_core']
         if kind == 'reject': assert values['reason'] == ('a password is required' if scenario == 'authreject' else 'command not allowed')
     cee = [m.split('@cee:', 1)[1] for m in messages if '@cee:' in m]
-    if sock:
-        assert len(cee) == len(records), (messages, kinds)
-        for data, record in zip(cee, records):
-            assert '\n' not in data and ' : (command continued)' not in data
-            decoded = decode(data)
-            assert decoded[0][0] == 'sudo'
-            assert normalize(decoded[0][1]) == normalize(Pairs([record]))
+    assert len(cee) == len(records), (messages, kinds)
+    for data, record in zip(cee, records):
+        assert '\n' not in data and ' : (command continued)' not in data
+        decoded = decode(data)
+        assert decoded[0][0] == 'sudo'
+        assert normalize(decoded[0][1]) == normalize(Pairs([record]))
     return normalize(Pairs(records))
 
 reference = execute('/usr/bin/sudo.ws')

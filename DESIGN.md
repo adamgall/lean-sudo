@@ -314,6 +314,7 @@ inductive ExitStatus where
   | exited (code : Nat)
   | signaled (sig : Nat)
 initializeProcess (disableCoredump : Bool := true) : IO Unit
+restoreCoreLimit : IO Unit
 lastDumpedCore : IO Bool
 runCommand : ExecSpec → IO ExitStatus
 exitWith : ExitStatus → IO α
@@ -328,6 +329,19 @@ normal mode uses the target IDs. Optional login cwd failure warns; required cwd
 failure aborts. The supervisor relays signals/job control, enforces deadlines and
 keeps PAM alive through background command completion. `exitWith` clamps exit codes
 above 255 rather than wrapping success.
+
+The caller's core limit is restored before PAM credentials and session setup,
+not over PAM's result in the command child. Explicit sudoers resource limits are
+applied afterward; `!rlimit_core` leaves PAM's limit intact, while `!pam_session`
+preserves the caller's limit. Ubuntu's systemd package installs
+`/etc/security/limits.d/10-coredump-debian.conf`, which sets the root soft core
+limit to zero.
+
+Authentication-failure file events follow sudo.ws's combined log/mail gate.
+When a usable mailer will report a policy denial, the redundant bad-password
+event is omitted from both logfile and syslog; the diagnostic still goes to
+stderr. Without that denial mail, `mail_badpass` can produce a file-only
+authentication event even when the mailer is unavailable.
 
 ### Timestamp
 

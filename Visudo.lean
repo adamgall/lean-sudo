@@ -5,28 +5,11 @@ import LeanSudo.Sys.Core
 import LeanSudo.Sys.Extra
 import LeanSudo.I18n.Load
 
-/-!
-# `visudo` entry point
-
-* **Check mode** (`-c`): parse the sudoers file and everything it includes, run the
-  semantic checks of `LeanSudo.Visudo.Core`, and print `<file>: parsed OK` per file.
-  Without `-f` (or with `-O`/`-P`) every file must also be owned by 0:0 / have mode
-  0440, as in sudo.ws. `-f -` reads standard input.
-* **Edit mode**: lock the original files with record locks compatible with sudo.ws,
-  reuse their `.tmp` copies, and edit the main file and explicit includes in order.
-  All changes are checked together before installation; `-I` suppresses editing
-  includes, not parsing them. `What now?` supports re-edit, discard and force-save.
-* **Export**: the upstream compatibility invocation of `cvtsudoers` via PATH.
--/
-
 open LeanSudo LeanSudo.Sys LeanSudo.Sudoers LeanSudo.Policy LeanSudo.Visudo
 
 namespace VisudoMain
 
-/-! ## Loading a policy file by file -/
-
 structure LoadState where
-  /-- every file read, in order (main file first) -/
   files : Array String := #[]
   entries : Array Located := #[]
   errors : Array String := #[]
@@ -51,9 +34,6 @@ def readSudoers (path : String) : IO (Except String String) := do
   | .ok (_, text) => pure (.ok text)
   | .error e => pure (.error (toString e))
 
-/-- Only visudo -s validates path ERE tokens. Upstream's GOTREGEX action
-checks the final `$` token rather than the accumulated argument expression, so
-argument ERE validity remains a runtime check even in strict mode. -/
 def commandRegexes : CmndAtom → List String
   | .commandRegex re _ => [re]
   | .digest _ c => commandRegexes c
@@ -114,7 +94,6 @@ partial def includeFile (host : String) (depth : Nat) (path : String) : LoadM Un
       addError s!"visudo: {e}"
 
 partial def includeDir (host : String) (depth : Nat) (dir : String) : LoadM Unit := do
-  -- A missing directory is ignored; an insecure one is skipped (as sudo does).
   let some st ← stat dir | return
   match checkDirPerms dir st with
   | .error msg => addWarning s!"visudo: {msg}"
@@ -137,14 +116,11 @@ partial def includeDir (host : String) (depth : Nat) (dir : String) : LoadM Unit
           | .error e => addWarning s!"visudo: {e}"
 end
 
-/-- Result of checking a complete policy. -/
 structure Analysis where
   files : Array String
   entries : List Located
-  /-- syntax, include and semantic errors (any ⇒ the policy is rejected) -/
   errors : List String
   warnings : List String
-  /-- Parser and applied Defaults warnings, also emitted before the first editor. -/
   initialWarnings : List String
   settings : Settings
   editable : Array String
@@ -157,8 +133,6 @@ def aliasColumn (line : String) : Nat :=
   let rest := ((chars.dropWhile Char.isWhitespace).dropWhile (!·.isWhitespace)).dropWhile Char.isWhitespace
   chars.length - rest.length + 1
 
-/-- The shared AST stores entry lines; recover upstream's diagnostic columns from
-the retained source, without altering the runtime policy representation. -/
 def semanticDiagnostic (sources : List (String × String)) (entries : List Located)
     (message : String) : String := Id.run do
   let warning := message.startsWith "Warning: "
@@ -212,8 +186,6 @@ def analyze (host path text : String) (strict : Bool)
   let user ← if s.errors.isEmpty then invokingPrincipal else pure none
   let applied : Settings × List String := (user.bind fun user =>
     (resolveDefaults (entries.map (·.entry)) user host none none (verbose := true)).toOption).getD ({}, [])
-  -- Unknown Defaults warnings are already fatal, source-located type errors.
-  -- Keep callback warnings here without duplicating those semantic diagnostics.
   let callbacks := applied.2.filter fun warning => !sem.any (·.endsWith warning)
   pure { files := s.files, entries,
          errors := s.errors.toList ++ sem.map (semanticDiagnostic s.sources entries),
@@ -228,8 +200,6 @@ def shortHost : IO String := do
 
 def eprint (s : String) : IO Unit := do IO.eprintln (← I18n.translate s)
 
-/-! ## Check mode -/
-
 def readStdin : IO String := do
   let stdin ← IO.getStdin
   let mut acc := ""
@@ -239,7 +209,6 @@ def readStdin : IO String := do
     acc := acc ++ line
   pure acc
 
-/-- sudo.ws's `check_file`: owner 0:0 and mode exactly 0440 (when enforced). -/
 def ownerPermProblems (path : String) (owner perms : Bool) : IO (List String) := do
   let some st ← stat path | return []
   let o := if owner && (st.uid != 0 || st.gid != 0) then
@@ -273,18 +242,14 @@ def checkMode (o : Options) (path : String) : IO UInt32 := do
       probs.forM say
   pure (if ok then 0 else 1)
 
-/-! ## Edit mode -/
-
 def isExecFile (p : String) : IO Bool := do
   match ← stat p with
   | some st => if st.isReg then access p 1 else pure false
   | none => pure false
 
-/-- `p` made absolute against the current directory. -/
 def absolutize (p : String) : IO String := do
   if p.startsWith "/" then pure p else pure ((← getcwd) ++ "/" ++ p)
 
-/-- Absolute path of an editor command (PATH lookup when it has no `/`). -/
 def resolveCmd (env : List (String × String)) (cmd : String) : IO (Option String) := do
   if cmd.isEmpty then return none
   if cmd.contains '/' then
@@ -295,7 +260,6 @@ def resolveCmd (env : List (String × String)) (cmd : String) : IO (Option Strin
     if ← isExecFile p then return some (← absolutize p)
   return none
 
-/-- sudo's editor choice: `(path, argv0, extra args)` or the error message. -/
 def chooseEditor (st : Settings) (env : List (String × String)) :
     IO (Except String (String × String × List String)) := do
   let list := (st.editor.splitOn ":").filter (!·.isEmpty)
@@ -310,7 +274,6 @@ def chooseEditor (st : Settings) (env : List (String × String)) :
       | [] => pure ()
     return .error s!"specified editor ({last}) doesn't exist"
   if !st.envEditor then
-    -- the user's editor is only allowed if it is one of the `editor` list
     for v in envVals do
       match splitWords v with
       | cmd :: args =>
@@ -323,7 +286,6 @@ def chooseEditor (st : Settings) (env : List (String × String)) :
       if let some p ← resolveCmd env cmd then return .ok (p, cmd, args)
     | [] => pure ()
   return .error s!"no editor found (editor path = {st.editor})"
-
 
 partial def whatNow : IO Char := do
   let out ← IO.getStdout
@@ -340,8 +302,6 @@ partial def whatNow : IO Char := do
 def removeQuietly (p : String) : IO Unit :=
   try IO.FS.removeFile p catch _ => pure ()
 
-/-- A session retains all originals and temporary copies until the entire policy
-has been checked, so an error in an include can never partially install an edit. -/
 structure EditFile where
   path : String
   original : FileStat
@@ -451,8 +411,6 @@ partial def checkEdits (o : Options) (host : String) (session : IO.Ref (Array Ed
               files := files.set! i (← editFile f (i == 0) editor line)
               session.set files
       reparse := true
-  -- Upstream opens every file discovered during reparsing, even under -I:
-  -- that option suppresses the initial include-edit pass only.
   let previous ← known.get
   known.set (previous ++ a.files.filter (!previous.contains ·))
   for path in a.files do

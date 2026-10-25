@@ -1,27 +1,5 @@
 import Std
 
-/-!
-# sudo log-server protobuf bodies
-
-Pure implementation of sudo v1.9.17p2 `lib/logsrv/log_server.proto`:
-https://github.com/sudo-project/sudo/blob/v1.9.17p2/lib/logsrv/log_server.proto
-
-The transport, not this module, adds the four-byte network-order frame length.
-Signed values use protobuf int64/int32 (two's complement, **not** zigzag).
-The public Int API normalizes values to the schema width. Window dimensions must
-be nonnegative int32 values and stream indices must be in 0..4; an unrepresentable
-window or stream encodes as an empty, hence rejected, message. Decoding validates
-UTF-8, field numbers, lengths, varint overflow and wire types. Deprecated group
-wire types are rejected, as in protobuf-c. Unknown supported fields are skipped.
-Scalar fields have proto3 defaults; repeated numbers accept packed/unpacked forms.
-
-General roundtrip proofs cover bounded varints, signed scalar normalization,
-arbitrary UTF-8 and binary envelopes, TimeSpec, ClientHello, and the server
-commit/log-id/error/abort families. Additional finite-family proofs cover I/O
-stream routing and capability flags. There is no claimed universal roundtrip
-theorem for all ClientMessage/ServerMessage values.
--/
-
 namespace LeanSudo.LogSrv
 
 structure TimeSpec where
@@ -71,14 +49,12 @@ inductive ServerMessage where
 
 namespace Wire
 
-/-- Unsigned protobuf base-128 representation. -/
 def encNat (n : Nat) : List UInt8 :=
   if n < 128 then [UInt8.ofNat n]
   else UInt8.ofNat (n % 128 + 128) :: encNat (n / 128)
 termination_by n
 decreasing_by omega
 
-/-- Mathematical varint decoder; the wire entry point bounds it to ten bytes. -/
 def decNat : List UInt8 → Option (Nat × List UInt8)
   | [] => none
   | b :: bs =>
@@ -88,7 +64,6 @@ def decNat : List UInt8 → Option (Nat × List UInt8)
       | some (n, rest) => some (b.toNat - 128 + 128 * n, rest)
       | none => none
 
-/-- Varint roundtrip preserves an arbitrary following byte sequence. -/
 theorem decNat_encNat (n : Nat) (rest : List UInt8) :
     decNat (encNat n ++ rest) = some (n, rest) := by
   rw [encNat]
@@ -129,31 +104,24 @@ theorem encNat_length_uint64 (n : Nat) (bound : n < 2 ^ 64) :
     (encNat n).length ≤ 10 :=
   encNat_length_le n 10 (by decide) (by omega)
 
-/-- List-facing bounded varint primitive; `varintAt` uses the same ten-byte
-`decNat` primitive directly on a bounded byte-array window. -/
 def varint (bs : List UInt8) : Option (Nat × List UInt8) := do
   let (n, rest) ← decNat (bs.take 10)
   if n < 2 ^ 64 then pure (n, rest ++ bs.drop 10) else none
 
-/-- The overflow-checking list primitive preserves arbitrary trailing bytes for
-every uint64 whose canonical representation fits the ten-byte limit. -/
 theorem varint_encNat (n : Nat) (rest : List UInt8)
     (bound : n < 2 ^ 64) (width : (encNat n).length ≤ 10) :
     varint (encNat n ++ rest) = some (n, rest) := by
   simp [varint, List.take_append, List.take_of_length_le width, decNat_encNat,
     bound, List.drop_append, List.drop_eq_nil_of_le width]
 
-/-- Every bounded uint64 roundtrips through the bounded wire parser. -/
 theorem varint_uint64 (n : Nat) (rest : List UInt8) (bound : n < 2 ^ 64) :
     varint (encNat n ++ rest) = some (n, rest) :=
   varint_encNat n rest bound (encNat_length_uint64 n bound)
 
-/-- Interpret the low `bits` bits as a signed integer. -/
 def signed (bits : Nat) (n : Nat) : Int :=
   let n := n % 2 ^ bits
   if n < 2 ^ (bits - 1) then Int.ofNat n else Int.ofNat n - Int.ofNat (2 ^ bits)
 
-/-- Negative int32 values are sign-extended to 64 bits before varint encoding. -/
 def unsigned (bits : Nat) (n : Int) : Nat :=
   let n := signed bits (n % Int.ofNat (2 ^ bits)).toNat
   (n % Int.ofNat (2 ^ 64)).toNat
@@ -181,7 +149,6 @@ inductive Value where
 
 abbrev Field := Nat × Value
 
-/-- A bounded window, never a conversion of the remaining frame to a list. -/
 def window (bs : ByteArray) (pos count : Nat) : List UInt8 :=
   (bs.extract pos (pos + count)).data.toList
 
@@ -189,8 +156,6 @@ def window (bs : ByteArray) (pos count : Nat) : List UInt8 :=
     window bs pos count = (bs.data.toList.drop pos).take count := by
   simp [window]
 
-/-- Only the next ten bytes can be inspected by the varint primitive. Its
-non-tail recursion therefore has a fixed bound independent of the frame. -/
 def varintAt (bs : ByteArray) (pos : Nat) : Option (Nat × Nat) := do
   let input := window bs pos 10
   let (n, rest) ← decNat input
@@ -203,10 +168,6 @@ theorem varintAt_encNat (bs : ByteArray) (pos n : Nat) (rest : List UInt8)
   simp [varintAt, suffix, List.take_append, List.take_of_length_le width,
     decNat_encNat, bound]
 
-/-- Flat wire scanning: each successful step advances a byte index and appends
-one field to an array. There is no group stack, suffix-length scan, or non-tail
-field call. Fuel bounds the loop by the frame size; the cursor guard enforces
-actual progress. The accumulated array is converted to a list only once. -/
 def fieldsAux (bs : ByteArray) : Nat → Nat → Array Field → Option (List Field)
   | 0, _, _ => none
   | fuel + 1, pos, acc =>
@@ -236,15 +197,12 @@ def fieldsAux (bs : ByteArray) : Nat → Nat → Array Field → Option (List Fi
 def fieldsArray (bs : ByteArray) : Option (List Field) :=
   fieldsAux bs (bs.size + 1) 0 #[]
 
-/-- List-facing convenience API, using exactly the same indexed decoder. -/
 def fields (bs : List UInt8) : Option (List Field) :=
   fieldsArray ⟨bs.toArray⟩
 
 @[simp] theorem fieldsArray_toArray (bs : List UInt8) :
     fieldsArray ⟨bs.toArray⟩ = fields bs := rfl
 
-/-- Group start and end tags are rejected without parsing any following fields.
-This is a theorem about the actual scanning loop, for every cursor and suffix. -/
 theorem fieldsAux_reject_group (bs : ByteArray) (fuel pos key next : Nat)
     (acc : Array Field) (notEnd : pos ≠ bs.size)
     (keyParsed : varintAt bs pos = some (key, next))
@@ -253,7 +211,6 @@ theorem fieldsAux_reject_group (bs : ByteArray) (fuel pos key next : Nat)
   rcases group with group | group <;>
     simp [fieldsAux, notEnd, keyParsed, group]
 
-/-- The varint window has a frame-independent maximum length. -/
 theorem varint_window_bounded (bs : ByteArray) (pos : Nat) :
     (window bs pos 10).length ≤ 10 := by
   simpa only [window_eq, List.length_take] using
@@ -281,7 +238,6 @@ def asString (v : Value) : Option String := do
   let bs ← asBytes v
   String.fromUTF8? ⟨bs.toArray⟩
 
-/-- String fields preserve every valid Unicode string, including embedded NUL. -/
 theorem asString_utf8 (s : String) :
     asString (.bytes s.toUTF8.data.toList) = some s := by
   simp [asString, asBytes, String.toUTF8, String.fromUTF8?, String.fromUTF8, s.isValidUTF8]
@@ -294,7 +250,6 @@ def getString (tag : Nat) (fs : List Field) : Option String := do
   let ss ← (values tag fs).mapM asString
   pure (ss.getLast?.getD "")
 
-/-- Repeated occurrences of a singular embedded message merge in wire order. -/
 def getMessage (tag : Nat) (fs : List Field) : Option (List Field) := do
   let chunks ← (values tag fs).mapM asBytes
   fields chunks.flatten
@@ -303,9 +258,6 @@ def getData (tag : Nat) (fs : List Field) : Option ByteArray := do
   let chunks ← (values tag fs).mapM asBytes
   pure ⟨(chunks.getLast?.getD []).toArray⟩
 
-/-- Select a oneof, merging successive occurrences of the same embedded-message
-case. Unknown fields do not reset a oneof. Strings and numeric cases replace.
-Chunks are prepended and flattened once, never appended to a growing prefix. -/
 def oneof (known merge : Nat → Bool) (fs : List Field) : Option Field := do
   let (selected, chunks) ← fs.foldl (fun selected f =>
     if !known f.1 then selected
@@ -321,14 +273,12 @@ def oneof (known merge : Nat → Bool) (fs : List Field) : Option Field := do
   | .bytes _ => pure (selected.1, .bytes chunks.reverse.flatten)
   | _ => pure selected
 
-/-- Validate every known occurrence before decoding the selected oneof case. -/
 @[inline] def decodeOneof (known merge : Nat → Bool) (dec : Field → Option α)
     (fs : List Field) : Option α := do
   for f in fs do
     if known f.1 then let _ ← dec f; pure ()
   dec (← oneof known merge fs)
 
-/-- Reading a canonical one-byte key advances the cursor by exactly one. -/
 theorem varintAt_small (bs : ByteArray) (pos n : Nat) (rest : List UInt8)
     (suffix : bs.data.toList.drop pos = UInt8.ofNat n :: rest) (small : n < 128) :
     varintAt bs pos = some (n, pos + 1) := by
@@ -368,7 +318,6 @@ private theorem fieldsAux_bytes_small (bs : ByteArray) (fuel pos tag : Nat)
     show (tag * 8 + 2) / 8 = tag by omega,
     show (tag * 8 + 2) % 8 = 2 by omega] <;> omega
 
-/-- The numeric-field step consumes its key and varint before its sole tail call. -/
 theorem fieldsAux_number_step (bs : ByteArray) (fuel pos tag n : Nat)
     (rest : List UInt8) (acc : Array Field)
     (suffix : bs.data.toList.drop pos = UInt8.ofNat (tag * 8) :: encNat n ++ rest)
@@ -386,8 +335,6 @@ theorem fieldsAux_number_step (bs : ByteArray) (fuel pos tag n : Nat)
   simp [fieldsAux, Nat.ne_of_lt notEnd, keyParsed, valueParsed, progress,
     show (tag * 8) / 8 = tag by omega, show (tag * 8) % 8 = 0 by omega] <;> omega
 
-/-- Every log-server embedded-message tag preserves an arbitrary bounded binary
-payload through the complete field parser, not just the varint primitives. -/
 theorem fields_bytes_roundtrip (tag : Nat) (payload : List UInt8)
     (positive : 0 < tag) (small : tag < 16) (bound : payload.length < 2 ^ 64) :
     fields (bytes tag payload) = some [(tag, .bytes payload)] := by
@@ -452,8 +399,6 @@ private theorem fields_time (a b : Nat) (ha : a < 2 ^ 64) (hb : b < 2 ^ 64) :
       bs.size := by omega
   simp [Wire.fieldsAux, endPos]
 
-/-- All representable POSIX time values roundtrip through protobuf's numeric
-field parser, including the negative int32 sign-extension case. -/
 theorem time_roundtrip (t : TimeSpec)
     (slo : -(2 ^ 63) ≤ t.seconds) (shi : t.seconds < 2 ^ 63)
     (nlo : -(2 ^ 31) ≤ t.nanoseconds) (nhi : t.nanoseconds < 2 ^ 31) :
@@ -478,8 +423,6 @@ private def encInfo (i : InfoMessage) : List UInt8 :=
   | .numbers ns => Wire.bytes 5 (Wire.bytes 1 ((ns.map (fun n =>
       Wire.encNat (Wire.unsigned 64 n))).flatten))
 
-/-- Packed numbers share the indexed, ten-byte-bounded varint reader and use a
-reverse accumulator rather than one stack frame per number. -/
 private def packedNumbersAux (bs : ByteArray) : Nat → Nat → List Int → Option (List Int)
   | 0, _, _ => none
   | fuel + 1, pos, acc =>
@@ -575,8 +518,6 @@ private def encIoHeader (stream : Nat) (delay : TimeSpec) (size : Nat) : List UI
   Wire.encNat (tag * 8 + 2) ++ Wire.encNat (time.length + dataHeader.length + size) ++
     time ++ dataHeader
 
-/-- Encode one unframed client protobuf body. I/O payloads are appended directly
-to their small header, without allocating a linked list for each payload byte. -/
 def encodeClient (m : ClientMessage) : ByteArray :=
   match m with
   | .io stream delay data =>
@@ -584,8 +525,6 @@ def encodeClient (m : ClientMessage) : ByteArray :=
     else ByteArray.empty
   | _ => ⟨(encClient m).toArray⟩
 
-/-- The allocation-efficient I/O encoder is byte-for-byte identical to the
-protobuf field encoder for arbitrary streams, timestamps and binary payloads. -/
 theorem encodeClient_io_eq (stream : Nat) (delay : TimeSpec) (data : ByteArray) :
     encodeClient (.io stream delay data) = ⟨(encClient (.io stream delay data)).toArray⟩ := by
   apply ByteArray.ext
@@ -594,7 +533,6 @@ theorem encodeClient_io_eq (stream : Nat) (delay : TimeSpec) (data : ByteArray) 
       List.length_append, Nat.add_assoc]
   · simp [encodeClient, encClient, valid]
 
-/-- Unknown fields are skipped. No recognized oneof case is a protocol failure. -/
 def decodeClient (body : ByteArray) : Option ClientMessage := do
   let fs ← Wire.fieldsArray body
   Wire.decodeOneof (fun n => decide (1 ≤ n ∧ n ≤ 13)) (fun _ => true) decClientField fs
@@ -623,7 +561,6 @@ private def decServerField (f : Wire.Field) : Option ServerMessage := do
   | (5, v) => pure (.abort (← Wire.asString v))
   | _ => none
 
-/-- Encode one unframed server protobuf body. -/
 def encodeServer (m : ServerMessage) : ByteArray := ⟨(encServer m).toArray⟩
 
 def decodeServer (body : ByteArray) : Option ServerMessage := do
@@ -646,7 +583,6 @@ private theorem serverText_roundtrip (tag : Nat) (ctor : String → ServerMessag
     simp only [encodeServer, encServer, Wire.text, decodeServer, Wire.fieldsArray_toArray] <;>
     rw [parsed] <;> simp [Wire.decodeOneof, Wire.oneof, decServerField, utf8]
 
-/-- Arbitrary bounded log IDs survive the complete server message codec. -/
 theorem logId_roundtrip (s : String) (bound : s.toUTF8.size < 2 ^ 64) :
     decodeServer (encodeServer (.logId s)) = some (.logId s) :=
   serverText_roundtrip 3 .logId s bound (by simp)
@@ -659,7 +595,6 @@ theorem abort_roundtrip (s : String) (bound : s.toUTF8.size < 2 ^ 64) :
     decodeServer (encodeServer (.abort s)) = some (.abort s) :=
   serverText_roundtrip 5 .abort s bound (by simp)
 
-/-- Arbitrary bounded client descriptions survive both protobuf envelopes. -/
 theorem clientHello_roundtrip (s : String) (bound : s.toUTF8.size + 11 < 2 ^ 64) :
     decodeClient (encodeClient (.hello s)) = some (.hello s) := by
   have stringBound : s.toUTF8.size < 2 ^ 64 := by omega
@@ -687,7 +622,6 @@ private theorem decServerField_commit (bs : List UInt8) :
       ((Wire.fields bs).bind decTime).bind (fun t => some (.commit t)) := by
   simp [decServerField, Wire.asBytes, Option.bind_assoc]
 
-/-- Every representable signed TimeSpec survives the complete commit codec. -/
 theorem commit_roundtrip (t : TimeSpec)
     (slo : -(2 ^ 63) ≤ t.seconds) (shi : t.seconds < 2 ^ 63)
     (nlo : -(2 ^ 31) ≤ t.nanoseconds) (nhi : t.nanoseconds < 2 ^ 31) :
@@ -707,20 +641,16 @@ theorem commit_roundtrip (t : TimeSpec)
   rw [parsed]
   simp [Wire.decodeOneof, Wire.oneof, decoded]
 
-/-- Zero-time acceptance, for either value of the I/O negotiation flag. -/
 theorem accept_zero_roundtrip (expect : Bool) :
     decodeClient (encodeClient (.accept ⟨0, 0⟩ [] expect)) =
       some (.accept ⟨0, 0⟩ [] expect) := by
   cases expect <;> decide +kernel
 
-/-- Zero-time exit, for either core-dump flag. -/
 theorem exit_zero_roundtrip (core : Bool) :
     decodeClient (encodeClient (.exit ⟨0, 0⟩ 0 core "" "")) =
       some (.exit ⟨0, 0⟩ 0 core "" "") := by
   cases core <;> decide +kernel
 
-/-- Every supported I/O stream preserves arbitrary byte values in this binary
-boundary vector; stream routing is independent of the transport framing. -/
 theorem io_stream_roundtrip (stream : Fin 5) :
     decodeClient (encodeClient (.io stream.val ⟨0, 0⟩ ⟨#[0, 128, 255]⟩)) =
       some (.io stream.val ⟨0, 0⟩ ⟨#[0, 128, 255]⟩) := by
@@ -728,7 +658,6 @@ theorem io_stream_roundtrip (stream : Fin 5) :
   have hcases : stream = 0 ∨ stream = 1 ∨ stream = 2 ∨ stream = 3 ∨ stream = 4 := by omega
   rcases hcases with h | h | h | h | h <;> subst stream <;> dsimp only <;> decide +kernel
 
-/-- Both server subcommand capability values survive the hello handshake. -/
 theorem hello_capability_roundtrip (capability : Bool) :
     decodeServer (encodeServer (.hello ⟨"", "", [], capability⟩)) =
       some (.hello ⟨"", "", [], capability⟩) := by

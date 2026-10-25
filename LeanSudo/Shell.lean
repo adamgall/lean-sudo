@@ -23,8 +23,6 @@ import LeanSudo.Intercept
 import LeanSudo.Sys.Intercept
 import LeanSudo.Sys.Plugins
 
-/-! Linux IO boundary: collect facts, execute the verified decision, and bracket PAM
-resources. Policy decisions belong to `Core.decide`, not this module. -/
 namespace LeanSudo.Shell
 
 private def warn (msg : String) : IO Unit := do
@@ -82,8 +80,6 @@ private def group (name : String) : IO (GroupInfo × Bool) := do
 private def absolute (cwd path : String) : String :=
   if path.startsWith "/" then path else cwd ++ "/" ++ path
 
-/-- Match sudo 1.9.17p2: inspect prefixed names without changing the policy
-process's root or consulting NSS inside an untrusted filesystem. -/
 private def rootedPath (root : Option String) (path : String) : String :=
   root.map (· ++ path) |>.getD path
 
@@ -125,7 +121,6 @@ private def resolvePath (search name : String) (ignoreDot : Bool)
     if dot then paths := paths.push ("./" ++ name, true)
     return paths
   let found ← lookupAs paths target.uid targetGid targetGroups ignoreDot root
-  -- NOT_FOUND_DOT is terminal: only NOT_FOUND retries as the invoking user.
   if found.1.isSome || found.2 then return found
   lookupAs paths invoking.uid realGid (invoking.groups.map (·.2)) ignoreDot root
 
@@ -250,8 +245,6 @@ private def gatherCommandFacts (policy : Sudoers.Sudoers) (r : Request)
   let expanded := paths ++ globPaths.flatMap (·.2)
   let commandPaths := match r.command with | .run p canonical _ => some (p, canonical) | _ => none
   let requested := commandPaths.toList.map (·.1)
-  -- Keep the parent selected during lookup; do not resolve the invoking user's
-  -- original directory a second time while collecting decision facts.
   let inspected := fun p => match commandPaths with
     | some (requested, canonical) =>
       if p == requested then canonical
@@ -276,8 +269,6 @@ private def gatherCommandFacts (policy : Sudoers.Sudoers) (r : Request)
     (fun p => subjects.map (p, ·))).mapM fun (p, s) => return (p, s, ← Sys.regexMatches p s policyLocale)
   return { r with canon, canonPaths := table, fileIds, globPaths, regexMatches }
 
-/-- An escaping symlink cannot be interpreted safely by sudo's prefix-based
-lookup. Keep its diagnostic with this candidate, not an unrelated root's rule. -/
 private def rootEscape (root path : String) : IO (Option String) := do
   if root == "*" then return none
   for name in [path, Policy.dirOf path] do
@@ -320,8 +311,6 @@ private def rootCommandFacts (policy : Sudoers.Sudoers) (opts : Cli.Options)
   let resolved ← if baselineRoot == some root then pure fallback else do
     let result ← resolveCommand opts invoking target env cwd st realGid targetGroup lookupRoot
     pure result.1
-  -- sudo retains the original command and lookup status when a rule-specific
-  -- lookup fails, allowing ALL and exact-name matching to proceed.
   let chosen := if lookupRoot.isNone then resolved else resolved.or fallback
   let command := chosen.map (fun c => Command.run c.path c.canonical
     (if opts.shell || opts.login then opts.command else c.args)) |>.getD r.command
@@ -370,8 +359,6 @@ private def defaults (policy : Sudoers.Sudoers) (invoking : Principal) (host : S
 
 private def identityInitializationFailure (opts : Cli.Options) (invoking : Principal)
     (tty : Option String) (cwd : String) (resolvedGroup : Option String) (message : String) : IO α := do
-  -- init_vars has not populated command argv yet: sudo logs this warning but
-  -- its Linux audit backend skips the null argv (there is no USER_CMD record).
   let body := Core.logEscape message ++ " ; " ++
     (tty.map (fun t => "TTY=" ++ Core.logEscape (if t.startsWith "/dev/" then (t.drop 5).toString else t) ++ " ; ")).getD "" ++
     "PWD=" ++ Core.logEscape cwd ++ " ; " ++
@@ -382,8 +369,6 @@ private def identityInitializationFailure (opts : Cli.Options) (invoking : Princ
   warn message
   throw (IO.userError "error initializing audit plugin sudoers_audit")
 
-/-- The early fqdn callback precedes logfile/format Defaults callbacks. Local
-lookup failure is a raw parse alert; failure resolving only `-h` is NO_LOG. -/
 private def hostnameWarning (invoking : Principal) (host message : String)
     (log : Bool) : IO Unit := do
   let reason := "unable to resolve host " ++ host ++ ": " ++ message
@@ -416,7 +401,6 @@ private def localTimeBounds (policy : Sudoers.Sudoers) : IO (List (Nat × Nat)) 
   let mut resolved := []
   for civil in bounds.eraseDups do
     if let some epoch ← Sys.localCivilEpoch civil then
-      -- Pre-epoch bounds retain the parser's contemporary-clock zero model.
       resolved := (civil, epoch.toNat) :: resolved
   return resolved.reverse
 
@@ -425,7 +409,6 @@ private def selectSources (sources : List (Nsswitch.Source × List Sudoers.Locat
   let selected := Nsswitch.select (fun entries =>
     !(Policy.candidates (entries.map (·.entry)) st r).isEmpty)
     (!Policy.isRunCmd r.command) sources false
-  -- Defaults are collected from all backends before authorization lookup.
   let defs := sources.flatMap fun (_, entries) => entries.filter fun l =>
     match l.entry with | .defaults _ _ => true | _ => false
   defs ++ selected.flatten.filter (fun l =>
@@ -700,7 +683,6 @@ private def jsonDetails (ctx : Core.Context) (accepted : Bool)
     runcwd := some cwd, source := chosen.bind fun ((file, pos), _) =>
       pos.map fun (line, col) => s!"{file}:{line}:{col}",
     ttyname := ctx.ttyName, submithost := some (ctx.submitHost.getD ctx.longHost), submitcwd := some ctx.cwd,
-    -- sudoers_to_eventlog records the passwd primary gid, even with explicit -g.
     rungid := some ctx.target.gid, runuid := some ctx.target.uid, columns, lines,
     runargv := some argv, runenv,
     submitenv := some (ctx.userEnv.map fun (k, v) => k ++ "=" ++ v) }
@@ -731,8 +713,6 @@ private def localizedLog (ctx : Core.Context) (line : Core.LogLine) : IO Core.Lo
     else line.msg
   return { line with reason := some translated, msg }
 
-/-- Preserve the event's policy phase: warnings before command lookup retain raw
-argv, and warnings before rule selection do not acquire a later rule's source. -/
 private def lineDetails (ctx : Core.Context) (line : Core.LogLine)
     (commandEnv : Option (List String)) (override : Option EventLog.Details) :
     IO EventLog.Details := do
@@ -762,8 +742,6 @@ private def logLine (ctx : Core.Context) (line : Core.LogLine)
   if sendRemote then
     if let some reason := line.reason then
       if let some details := details then
-        -- The log-server warning metadata uses "unknown"; local JSON omits a
-        -- missing ttyname, as eventlog_store_json does.
         let details := if remoteUnknownTty then { details with ttyname := some "unknown" } else details
         Sys.LogSrv.event ctx.settings details reason (line.event == .alert)
   if line.format != "sudo" then
@@ -837,11 +815,12 @@ private def authFailure (ctx : Core.Context) (decision : Core.Decision)
   let listOrValidate := ctx.opts.mode == .list || ctx.opts.mode == .validate
   let line := Core.authFailureLog ctx failure.attempts (failure.attempts == 0)
   let logit := EventLog.logAuthFailure allowed ctx.settings.logDenied listOrValidate failure
-  if logit || (ctx.settings.logfile.isSome && EventLog.fileAuthFailure listOrValidate failure) then
+  let mailit := EventLog.mailAuthFailure allowed ctx.settings.mailBadpass ctx.settings.mailAlways
+    (Core.denialMail ctx) listOrValidate failure
+  if logit || mailit then
     let _ ← logLine ctx { line with priority := if logit then line.priority else "none" }
     pure ()
-  if EventLog.mailAuthFailure allowed ctx.settings.mailBadpass ctx.settings.mailAlways
-      (Core.denialMail ctx) listOrValidate failure then mail ctx line
+  if mailit then mail ctx line
   if failure.attempts == 0 then warn "a password is required"
   else if ctx.settings.authfailMessage.isSome then
     Sys.writeStderr ("sudo: " ++ Core.authFailureMessage ctx failure.attempts ++ "\n")
@@ -901,7 +880,6 @@ private def account (ctx : Core.Context) (h : Sys.PamHandle) : IO Unit := do
   | 13 => throw (IO.userError "Account expired or PAM config lacks an \"account\" section for sudo, contact your system administrator")
   | _ => throw (IO.userError ("PAM account management error: " ++ (← Sys.pamStrerror h rc)))
 
--- Cleanup must preserve the command's status, even if reporting the warning fails.
 private def cleanup (action : IO Unit) : IO Unit := do
   try action
   catch e =>
@@ -927,7 +905,7 @@ private def environment (input : EnvInput) (h : Sys.PamHandle) (unknownTarget : 
 
 private def session (ctx : Core.Context) (h : Sys.PamHandle) (setcred openSession : Bool)
     (run : IO Sys.ExitStatus) : IO Sys.ExitStatus := do
-  -- pam.c ends the transaction instead of starting a session for a synthetic uid.
+  Sys.restoreCoreLimit
   if ctx.targetUnknownUid then
     cleanup (Sys.pamEnd h 0)
     return ← run
@@ -1006,9 +984,6 @@ private def interceptedContext (original : Core.Context) (root : Option String) 
     finally for handle in plugin do Sys.GroupPlugin.close handle
   let algos := ((ctx.sudoers.flatMap Sudoers.Parser.cmndAtoms).flatMap digestAlgos).eraseDups
   let digests ← commandDigests algos (rootedPath root command.canonical)
-  -- The subcommand inherits the selected execution root. Refresh its command
-  -- facts, rather than reusing the parent's inode/digests or authorizing a rule
-  -- that would require switching to a different root mid-execution.
   let roots := original.rootFacts.filterMap fun (name, _) =>
     let expanded := (Sys.commandLookupRoot (some name)).bind
       (Core.expandHomePath ctx.target.home ctx.homes)
@@ -1224,8 +1199,6 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
     let some h := h | throw (IO.userError "missing PAM transaction")
     let some editor := editor | throw (IO.userError "missing selected editor")
     if let some .accept := decision.audit then audit ctx true
-    -- sudo_edit permanently becomes root before preparing files and opening
-    -- the PAM session; the editor child still drops to plan.editUid.
     try Sys.setUid 0 catch e =>
       throw (IO.userError ("unable to change uid to root (0): " ++ e.toString))
     let status ← session ctx h plan.pamSetcred plan.pamSession do
@@ -1240,8 +1213,6 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
     return .exited code.toNat
   | .validate => return .exited 0
   | .resetTimestamp =>
-    -- Removal uses ts_init_key directly, unlike authentication's nonglobal
-    -- key: Linux kernel-mode `-k` selects a ppid record, not its tty ticket.
     let scope ← if ctx.settings.timestampType == .kernel then do
         let ppid ← Sys.getppid
         let some start ← Sys.processStartTime ppid |
@@ -1260,8 +1231,6 @@ private def execute (ctx : Core.Context) (decision : Core.Decision)
   let authUser := match decision.auth with
     | .required u => u
     | .none => Core.authUser ctx
-  -- A pre-lock timestamp snapshot cannot waive authentication on its own.
-  -- Early failures and timestamp-reset actions never enter policy authentication.
   let needsAuth := match decision.auth with
     | .required _ => true
     | .none => (Core.earlyAction ctx).isNone &&
@@ -1303,7 +1272,6 @@ private def execute (ctx : Core.Context) (decision : Core.Decision)
           cleanup do
             let _ ← Sys.stateMarker ctx.settings.lectureStatusDir ctx.invoking.uid true
             pure ()
-        -- Approval precedes timestamp renewal in validate/list modes too.
         try account ctx h catch e =>
           warn e.toString
           authFailure ctx decision { error := true }
@@ -1332,14 +1300,11 @@ private def configuration : IO SudoConf.Config := do
     if let some problem := SudoConf.fileProblem st.uid st.mode then
       warn (path ++ " " ++ problem)
       return ← IO.ofExcept (SudoConf.parseFile st.uid st.mode "")
-    -- Read the object whose fstat was approved, never reopen the pathname.
     let (_, text) ← Sys.readFileFollow s!"/proc/self/fd/{fd}"
     IO.ofExcept (SudoConf.parseFile st.uid st.mode text)
   finally
     Sys.closeDescriptor fd.toUInt32
 
-/-- `/proc/self/cmdline` preserves argv[0] (unlike the executable's realpath) and
-lets us reject invalid UTF-8 before decoded Lean arguments reach policy. -/
 def run (args : List String) : IO UInt32 := do
   let mut diagnosticProgname := "sudo"
   try
@@ -1404,7 +1369,6 @@ def run (args : List String) : IO UInt32 := do
         (args.length + 1 - opts.command.length).toUInt32
     if opts.mode == .version then
       if let some message := Cli.timeoutError opts then
-        -- The front-end version was printed before loading plugins.
         warn message
         throw (IO.userError "error initializing audit plugin sudoers_audit")
       let text ← if (← Sys.getuid) == 0 then do

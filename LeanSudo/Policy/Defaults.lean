@@ -1,65 +1,25 @@
 import LeanSudo.Policy.Eval
 
-/-!
-# `Defaults` resolution
-
-`resolveDefaults` folds the applicable `Defaults` entries over sudo's compiled-in
-`Settings` (the field defaults of `Settings`). Application order is sudo's:
-
-1. global, host and user defaults together in file order,
-2. run-as defaults,
-3. command defaults.
-
-Within each phase early options are applied before ordinary options, as in
-`update_defaults`; matching uses the current settings and gathered system facts.
-
-Value conventions (matching sudo where it has a notion of it):
-* flags: `name` / `!name`; a value is an error.
-* lists (`env_keep`, `env_check`, `env_delete`): `=` replaces, `+=` appends (names
-  already present are not duplicated), `-=` removes, `!name` clears. Values are split
-  on whitespace, so one quoted value may hold several names.
-* `umask`: octal ≤ 0777. `!umask` stores `0o777`, which (as in sudo) means "do not
-  change the user's umask"; the exec layer must treat `0o777` that way.
-* `timestamp_timeout`: minutes, possibly fractional (`2.5`), stored as whole seconds
-  (rounded down); negative ⇒ `none` (never expires); `!timestamp_timeout` ⇒ 0.
-* `tty_tickets` ⇒ `timestamp_type=tty`, `!tty_tickets` ⇒ `timestamp_type=global`
-  (sudo's `cb_tty_tickets`).
-* `listpw`/`verifypw`: `all|always|any|never`; `!listpw` ⇒ `never`.
-* `syslog`: a facility name; `!syslog` ⇒ no syslog.
-* Options are checked against sudo's complete typed option table and stored.
-  Unsupported actions are rejected by the decision core, not by the parser.
-* Invalid typed values are fatal like syntax errors: silently substituting a
-  permissive compiled-in default could widen access. Unknown option names only
-  warn; `ignore_unknown_defaults` suppresses that warning in its early phase.
--/
-
 namespace LeanSudo.Policy
 
 open LeanSudo.Sudoers
 
-/-! ## Value parsing -/
-
-/-- Split on whitespace, dropping empty words. -/
 def splitWords (v : String) : List String :=
   ((v.split Char.isWhitespace).filter (fun word => !word.isEmpty)).map
     (·.toString) |>.toList
 
 def digitVal (c : Char) : Nat := c.toNat - '0'.toNat
 
-/-- Strict unsigned decimal (at least one digit, nothing else). -/
 def parseDecimal (v : String) : Option Nat :=
   let cs := v.toList
   if cs.isEmpty || !cs.all Char.isDigit then none
   else some (cs.foldl (fun a c => a * 10 + digitVal c) 0)
 
-/-- Strict octal (at least one digit `0`–`7`). -/
 def parseOctal (v : String) : Option Nat :=
   let cs := v.toList
   if cs.isEmpty || !cs.all (fun c => '0' ≤ c && c ≤ '7') then none
   else some (cs.foldl (fun a c => a * 8 + digitVal c) 0)
 
-/-- Minutes to whole seconds, rounding down. Subsecond remainders are deliberately
-discarded, so cached authentication never outlives the configured duration. -/
 def parseTimeout (v : String) : Option (Option Nat) :=
   let (neg, rest) : Bool × List Char :=
     match v.toList with
@@ -96,13 +56,9 @@ def syslogFacilities : List String :=
   ["authpriv", "auth", "daemon", "user", "local0", "local1", "local2", "local3", "local4",
    "local5", "local6", "local7"]
 
-/-! ## Typed option table (sudo 1.9.17p2 `def_data.in`) -/
-
-/-- Paths are checked before storage, just as `valid_path` in sudoers. -/
 inductive DefaultPath where
   | unrestricted | absolute | changeDirectory
 
-/-- Each constructor carries a correctly typed setter. -/
 inductive DefaultKind where
   | flag (set : Settings → Bool → Settings)
   | string (boolean : Bool) (path : DefaultPath) (set : Settings → Option String → Settings)
@@ -117,7 +73,6 @@ inductive DefaultKind where
   | facility (set : Settings → Option String → Settings)
   | priority (set : Settings → Option String → Settings)
 
-/-- All options are accepted and stored; execution support is checked by the decision core. -/
 def defaultKind : String → Option DefaultKind
   | "syslog" => some (.facility (fun st v => { st with syslog := v }))
   | "syslog_goodpri" => some (.priority (fun st v => { st with syslogGoodpri := v }))
@@ -311,7 +266,6 @@ private def valueOf (name : String) (boolean : Bool) : DefaultsOp → Except Str
   | .flag true => noValue name
   | op => badOp name op
 
-/-- Parse a typed value, preserving the option's disabled value and diagnostics. -/
 private def parsedSetting (st : Settings) (d : DefaultsSetting) (boolean : Bool)
     (off : α) (parse : String → Option α) (set : Settings → α → Settings)
     : Except String Settings := do
@@ -322,8 +276,6 @@ private def parsedSetting (st : Settings) (d : DefaultsSetting) (boolean : Bool)
     | some value => pure (set st value)
     | none => invalid d.name text
 
-/-- Defaults command timeouts use lowercase units without whitespace or signs.
-Unlike command-spec timeouts, units need not appear in descending order. -/
 def parseCommandTimeout (v : String) : Option Nat :=
   go v.toList 0 0 false
 where
@@ -356,8 +308,6 @@ private def checkPath (name : String) (path : DefaultPath) (v : String) : Except
       throw s!"values for \"{name}\" must start with a '/', '~', or '*'"
   | .unrestricted => pure ()
 
-/-- Apply one setting. Type-only checks disable callbacks; verbose policy setup
-additionally emits deprecation diagnostics, as visudo does but runtime sudo does not. -/
 def applySetting (st : Settings) (d : DefaultsSetting) (callbacks : Bool := true)
     (verbose : Bool := false) : Except String (Settings × Option String) := do
   let n := d.name
@@ -424,22 +374,17 @@ def applySetting (st : Settings) (d : DefaultsSetting) (callbacks : Bool := true
     some (location ++ "\"runchroot\" is deprecated and will be removed in a future sudo release")
     else none)
 
-/-- Apply settings in order, collecting warnings. -/
 def applySettings (st : Settings) (ds : List DefaultsSetting) (verbose : Bool := false)
     : Except String (Settings × List String) :=
   ds.foldlM (fun (acc : Settings × List String) d => do
     let (st', w) ← applySetting acc.1 d true verbose
     pure (st', acc.2 ++ w.toList)) (st, [])
 
-/-! ## Scoping -/
-
-/-- `Defaults` entries of a policy, in file order. -/
 def defaultsOf : Sudoers → List (DefaultsScope × List DefaultsSetting)
   | [] => []
   | .defaults sc ss :: es => (sc, ss) :: defaultsOf es
   | _ :: es => defaultsOf es
 
-/-- Early Defaults whose callbacks affect subsequent option processing. -/
 def earlyDefaults : List String :=
   ["ignore_unknown_defaults", "fqdn", "match_group_by_gid", "group_plugin",
    "runas_default", "sudoers_locale"]
@@ -460,9 +405,6 @@ private def scopeMatches (al : Aliases) (st : Settings) (user : Principal) (host
     cmndListResult al al.fuel canon cm cs
       (facts.map fun r => { r with command := cm, fastGlob := st.fastGlob }) == some true
 
-/-- Resolve all options, rejecting invalid values and retaining unknown-option warnings.
-`initial` supplies front-end defaults (such as `-p` implying passprompt_override);
-explicit sudoers settings still override that seed. -/
 def resolveDefaults (s : Sudoers) (user : Principal) (host : String) (runas : Option Principal)
     (cmd : Option Command) (canon : String → String := id) (facts : Option Request := none)
     (initial : Settings := {}) (verbose : Bool := false) : Except String (Settings × List String) := do
@@ -476,7 +418,6 @@ def resolveDefaults (s : Sudoers) (user : Principal) (host : String) (runas : Op
         let (st, warnings) ← applySettings acc.1 (ss.filter fun d => earlyDefaults.contains d.name == early) verbose
         return (st, acc.2 ++ warnings)) acc) acc) (initial, [])
 
-/-- Clearing an unknown option cannot mutate any setting. -/
 theorem applySetting_unknown (st : Settings) (d : DefaultsSetting)
     (h : defaultKind d.name = none) :
     (applySetting st d).toOption.map Prod.fst = some st := by

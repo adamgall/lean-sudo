@@ -1,27 +1,7 @@
 import LeanSudo.Sudoers.Ast
 
-/-!
-# sudoers parser
-
-A scannerless recursive-descent parser for sudoers(5) 1.9.17. Lexical rules follow
-sudo's `toke.l`; unsupported execution features are represented in the AST and
-refused by the decision core, not by the grammar. Syntax errors remain fatal.
-Nonfatal syntax deprecations are retained on each located entry for the runtime
-and visudo loaders to render without changing policy semantics.
-Escape decoding, character-class folds, and separated lists share scanners while
-retaining token-specific delimiters, empty-value checks, and error messages.
-
-Termination: every loop runs over a bounded range of `input length + 1` iterations and
-each iteration consumes at least one character (or exits); running out of iterations
-is reported as an error rather than silently truncating the input.
-
-`parse` finally re-checks structural invariants of its result (`Located.wellFormed`);
-the theorems at the end of this file are stated about `parse` itself.
--/
-
 namespace LeanSudo.Sudoers
 
-/-- A sudoers syntax error with a 1-based line and column. -/
 structure ParseError where
   file : String
   line : Nat
@@ -29,7 +9,6 @@ structure ParseError where
   msg : String
   deriving Repr, BEq, Inhabited
 
-/-- `<file>:<line>:<col>: syntax error[: detail]` (sudo 1.9 style). -/
 def ParseError.toString (e : ParseError) : String :=
   s!"{e.file}:{e.line}:{e.col}: syntax error" ++ (if e.msg.isEmpty then "" else s!": {e.msg}")
 
@@ -37,21 +16,18 @@ instance : ToString ParseError := ⟨ParseError.toString⟩
 
 namespace Parser
 
-/-- A character with its 1-based source position. -/
 structure PChar where
   c : Char
   line : Nat
   col : Nat
   deriving Repr, Inhabited
 
-/-- Attach positions (tail-recursive: sudoers files can be large). -/
 def annotate : List Char → Nat → Nat → List PChar → List PChar
   | [], _, _, acc => acc.reverse
   | c :: cs, l, k, acc =>
     if c == '\n' then annotate cs (l + 1) 1 (⟨c, l, k⟩ :: acc)
     else annotate cs l (k + 1) (⟨c, l, k⟩ :: acc)
 
-/-- Position just past the last character. -/
 def endPos : List Char → Nat → Nat → Nat × Nat
   | [], l, k => (l, k)
   | c :: cs, l, k => if c == '\n' then endPos cs (l + 1) 1 else endPos cs l (k + 1)
@@ -60,13 +36,10 @@ structure Ctx where
   file : String
   eofLine : Nat
   eofCol : Nat
-  /-- Iteration bound for every loop: one more than the input length. Each loop
-  iteration consumes at least one character or exits, so this is never exhausted. -/
   fuel : Nat
 
 structure ParseState where
   input : List PChar
-  /-- Diagnostics for the current entry, accumulated in reverse order. -/
   warnings : List String := []
 
 abbrev P := ReaderT Ctx (StateT ParseState (Except ParseError))
@@ -83,11 +56,8 @@ def warnAt (pos : Nat × Nat) (message : String) : P Unit := do
   let warning := s!"{(← read).file}:{pos.1}:{pos.2}: {message}"
   modifyThe ParseState fun s => { s with warnings := warning :: s.warnings }
 
-/-! ## Character classes -/
-
 def isBlank (c : Char) : Bool := c == ' ' || c == '\t' || c == '\r'
 
-/-- sudo's `WORD` characters (excluding escapes). -/
 def isWordChar (c : Char) : Bool :=
   !(isBlank c || c == '\n' || c == '#' || c == '>' || c == '!' || c == '=' || c == ':' ||
     c == ',' || c == '(' || c == ')' || c == '"' || c == '\\')
@@ -99,12 +69,10 @@ def isAliasName (s : String) : Bool :=
 
 def isTagChar (c : Char) : Bool := c.isUpper || c == '_'
 
-/-- After a backslash: is this a line continuation (`[[:blank:]]*\n`)? -/
 def isCont : List PChar → Bool
   | [] => false
   | c :: cs => if c.c == '\n' then true else if isBlank c.c then isCont cs else false
 
-/-- Skip blanks and line continuations. `inCont`: inside a continuation, before its newline. -/
 def skipWsAux : Bool → List PChar → List PChar
   | _, [] => []
   | false, c :: cs =>
@@ -113,13 +81,11 @@ def skipWsAux : Bool → List PChar → List PChar
     else c :: cs
   | true, c :: cs => if c.c == '\n' then skipWsAux false cs else skipWsAux true cs
 
-/-- Does the input start with `s`? Returns the rest. -/
 def stripPrefix : List PChar → List Char → Option (List PChar)
   | inp, [] => some inp
   | c :: cs, d :: ds => if c.c == d then stripPrefix cs ds else none
   | [], _ :: _ => none
 
-/-- Uppercase keyword (`[A-Z_]+`) followed by optional blanks and a separator char. -/
 def kwAux : List PChar → List Char → Option (String × Char × List PChar)
   | [], _ => none
   | c :: cs, acc =>
@@ -130,8 +96,6 @@ def kwAux : List PChar → List Char → Option (String × Char × List PChar)
         match skipWsAux false (c :: cs) with
         | d :: ds => some (String.ofList acc.reverse, d.c, ds)
         | [] => none
-
-/-! ## Primitive parsers -/
 
 def curPos : P (Nat × Nat) := do
   match (← get) with
@@ -180,7 +144,6 @@ def decodedWord (reversed : List UInt8) : P String := do
   | some s => return s
   | none => err "non-UTF-8 escaped string"
 
-/-- `copy_string`: hex escapes are decoded only in WORD/ENVAR strings. -/
 def wordEscape : P (List UInt8) := do
   match (← get) with
   | x :: a :: b :: rest =>
@@ -193,7 +156,6 @@ def wordEscape : P (List UInt8) := do
   | x :: _ => advance; return charBytes x.c
   | [] => err "unterminated escape"
 
-/-- Shared WORD/ENVAR escape scanner; retain raw bytes for pre-decoding empty checks. -/
 def escapedRun (breakEscape : Char → Bool) (stop : Bool → Char → Bool) :
     P (List UInt8 × Bool) := do
   let mut acc : List UInt8 := []
@@ -216,13 +178,10 @@ def escapedRun (breakEscape : Char → Bool) (stop : Bool → Char → Bool) :
     | [] => break
   return (acc, esc)
 
-/-- sudo `WORD`: returns the unescaped text and whether any escape was used. -/
 def readWord : P (String × Bool) := do
   let (acc, esc) ← escapedRun (· == '\t') (fun _ c => !isWordChar c)
   return (← decodedWord acc, esc)
 
-/-- INSTR emits standalone backslashes verbatim (including `\xHH`).
-Only a backslash paired with a quote is decoded; continuations are removed. -/
 def readQuoted : P String := do
   expect '"'
   let mut acc : List UInt8 := []
@@ -252,7 +211,6 @@ def readQuoted : P String := do
         acc := (charBytes c.c).reverse ++ acc
   err "unterminated quoted string"
 
-/-- Consume a character class without allocating intermediate character lists. -/
 def foldChars (p : Char → Bool) (step : α → Char → α) (init : α) : P α := do
   let mut acc := init
   for _ in [0:(← fuel)] do
@@ -264,11 +222,9 @@ def foldChars (p : Char → Bool) (step : α → Char → α) (init : α) : P α
     | none => break
   return acc
 
-/-- Look ahead through a character class, leaving speculative input unconsumed. -/
 def takeChars (p : Char → Bool) (input : List PChar) : List Char :=
   (input.takeWhile (fun c => p c.c)).map (·.c)
 
-/-- Decimal number (for `#uid` / `%#gid`); must not run into a word character. -/
 def readNat : P Nat := do
   if (← fuel) == 0 || !(← peek).any Char.isDigit then err "expected a numeric id"
   let n ← foldChars Char.isDigit (fun n c => n * 10 + (c.toNat - '0'.toNat)) 0
@@ -276,7 +232,6 @@ def readNat : P Nat := do
   | some c => if isWordChar c || c == '\\' then err "invalid numeric id" else pure n
   | none => pure n
 
-/-- One contiguous `!+` token, followed by optional blanks. -/
 def negCount : P Nat := do
   ws
   let n ← foldChars (· == '!') (fun n _ => n + 1) 0
@@ -288,7 +243,6 @@ def member (atom : P α) : P (Member α) := do
   let a ← atom
   return ⟨n % 2 == 1, a⟩
 
-/-- Nonempty separated lists, preserving each caller's exhaustion diagnostic. -/
 def sepBy1 (sep : Char) (item : P α) (tooLong : String) : P (List α) := do
   let mut acc := [← item]
   for _ in [0:(← fuel)] do
@@ -300,10 +254,7 @@ def sepBy1 (sep : Char) (item : P α) (tooLong : String) : P (List α) := do
     else return acc.reverse
   err tooLong
 
-/-- `item (, item)*` with optional blanks around the commas. -/
 def list1 (item : P α) : P (List α) := sepBy1 ',' item "list too long"
-
-/-! ## Atoms -/
 
 def userAtom : P UserAtom := do
   match (← peek) with
@@ -452,9 +403,6 @@ def hostAtom : P HostAtom := do
 def isCmdTerminator (c : Char) : Bool :=
   isBlank c || c == '\n' || c == '#' || c == ':' || c == ','
 
-/-- A command path (`isPath`) or argument word, with sudo's command escapes:
-`\*` `\?` `\[` `\]` `\!` `\^` are kept verbatim (glob escapes for fnmatch);
-`\:` `\\` `\,` `\=` `\ ` `\t` `\#` lose the backslash. -/
 def readCmdWord (isPath : Bool) : P String := do
   let mut acc : List Char := []
   for _ in [0:(← fuel)] do
@@ -482,8 +430,6 @@ def readCmdWord (isPath : Bool) : P String := do
         acc := c.c :: acc
   return String.ofList acc.reverse
 
-/-- Length of the competing WORD token, before copy_string unescaping. Flex
-chooses it over REGEX whenever it consumes more input (e.g. `^/bin/[$]$`). -/
 def wordTokenLength : List PChar → Nat
   | c :: d :: rest =>
     if c.c == '\\' && d.c != '\t' && d.c != '\n' then 2 + wordTokenLength rest
@@ -491,10 +437,6 @@ def wordTokenLength : List PChar → Nat
   | [c] => if isWordChar c.c then 1 else 0
   | [] => 0
 
-/-- INITIAL's REGEX token uses flex longest-match, not ERE bracket/group parsing.
-Its body admits a bare backslash or `\#`/`\$`. Consequently a `\$` may either
-belong to the body or provide the terminal dollar; keep the latest such candidate
-until an unescapable dollar or lexical boundary fixes the token's end. -/
 def readPathRegex : P String := do
   expect '^'
   let mut acc := ['^']
@@ -520,8 +462,6 @@ def readPathRegex : P String := do
       if c.c == '$' then return String.ofList acc.reverse
   finish best
 
-/-- GOTREGEX argument tokens end at the first unescaped `$`, including within
-ERE brackets and groups. Every backslash pair is retained verbatim. -/
 def readRegex : P String := do
   expect '^'
   let mut acc := ['^']
@@ -545,7 +485,6 @@ def readRegex : P String := do
         if c.c == '$' then return String.ofList acc.reverse
   err "unterminated regular expression"
 
-/-- Command arguments up to the next unescaped `,` `:` `#` or end of line. -/
 def cmndArgs : P CmndArgs := do
   ws
   if (← peek) == some '^' then return .regex (← readRegex)
@@ -630,7 +569,6 @@ def readDigests : P (List Digest) := do
     if (digestStart (← get)).isNone then err "expected a digest"
   err "digest list too long"
 
-/-- The undigested command; directories cannot carry argument constraints. -/
 def plainCmndAtom (allowArgs : Bool) : P CmndAtom := do
   match (← peek) with
   | some '/' =>
@@ -656,7 +594,6 @@ def plainCmndAtom (allowArgs : Bool) : P CmndAtom := do
     if w == "list" then return .list
     errAt pos s!"expected a fully-qualified path name, found \"{w}\""
 
-/-- `digestlist opcmnd`: negation follows the digest list, as in gram.y. -/
 def cmndMember (allowArgs : Bool) : P (Member CmndAtom) := do
   let ds ← readDigests
   let cmd ← member (plainCmndAtom allowArgs)
@@ -665,8 +602,6 @@ def cmndMember (allowArgs : Bool) : P (Member CmndAtom) := do
   | .command .. | .commandRegex .. | .sudoedit .. | .list | .all =>
     return { cmd with atom := .digest ds cmd.atom }
   | _ => err "a digest requires a path name"
-
-/-! ## Command specifications -/
 
 def groupAtom : P UserAtom := do
   let a ← userAtom
@@ -691,13 +626,11 @@ def runasSpec : P RunasSpec := do
   expect ')'
   return { users := some users, groups }
 
-/-- State inherited between the commands of one `Cmnd_Spec_List`. -/
 structure Inherit where
   runas : Option RunasSpec := none
   options : CmndOptions := {}
   tags : Tags := {}
 
-/-- sudo timeout: a sequence of decimal amounts with optional d/h/m/s units. -/
 def parseTimeout (s : String) : Option Nat := do
   let mut rest := s.toList
   let mut total := 0
@@ -726,7 +659,6 @@ def parseTimeout (s : String) : Option Nat := do
     if rest.isEmpty then return total
   none
 
-/-- Gregorian civil date to Unix days, including normalization as timegm does. -/
 def civilDays (year month day : Nat) : Int :=
   let month : Int := month
   let y : Int := year + (month - 1) / 12
@@ -737,9 +669,6 @@ def civilDays (year month day : Nat) : Int :=
   let doy := (153 * (m + (if m > 2 then -3 else 9)) + 2) / 5 + day - 1
   era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468
 
-/-- Generalized Time; zone-less civil seconds are encoded as UTC, with a local
-flag requesting per-bound system-zone mktime resolution in the trusted shell.
-Pre-epoch values clamp to zero for contemporary clocks. -/
 def parseGentime (s : String) : Option Nat := do
   let cs := s.toList
   let digits := cs.takeWhile Char.isDigit
@@ -882,8 +811,6 @@ def hostCmnds : P HostCmnds := do
   let cmnds ← cmndSpecList
   return { hosts, cmnds }
 
-/-- The event source column is byte-counted by sudo's lexer. Parser diagnostics
-retain character columns; only the consumed final physical line needs conversion. -/
 private def sourcePosition (stop : Nat × Nat) (extra : Nat) : List PChar → Nat × Nat
   | [] => (stop.1, stop.2 + extra)
   | c :: cs =>
@@ -902,8 +829,6 @@ def userSpec : P UserSpec := do
   let entries ← sepBy1 ':' hostCmnds "user specification too long"
   return { users, entries, source := some (sourcePosition (← curPos) 0 before) }
 
-/-! ## Aliases and Defaults -/
-
 def aliasName : P String := do
   ws
   let pos ← curPos
@@ -915,7 +840,6 @@ def aliasName : P String := do
     errAt pos s!"\"{w}\" is a reserved word and cannot be used as an alias name"
   return w
 
-/-- `NAME = list (: NAME = list)*` -/
 def aliasDefs (item : P α) : P (List (String × List α)) :=
   sepBy1 ':' (do
     let name ← aliasName
@@ -924,7 +848,6 @@ def aliasDefs (item : P α) : P (List (String × List α)) :=
     ws
     return (name, ← list1 item)) "alias definition too long"
 
-/-- Bare Defaults value (sudo `ENVAR`): no `"` `!` `=` `,` or blanks; `\c` → `c`. -/
 def bareValue : P String := do
   let (acc, _) ← escapedRun (fun _ => false) fun empty c =>
     isBlank c || c == '\n' || c == '"' || c == '#' || c == '=' ||
@@ -971,7 +894,6 @@ def defaultsSetting : P DefaultsSetting := do
     let pos := if n != 0 then pos else next
     return { name, op := .flag (n % 2 == 0), source := some ((← read).file, pos.1, pos.2) }
 
-/-- After the `Defaults` keyword. -/
 def defaultsEntry : P Entry := do
   let original ← get
   let scope ← match (← peek) with
@@ -987,9 +909,6 @@ def defaultsEntry : P Entry := do
   ws
   return .defaults scope (← list1 defaultsSetting)
 
-/-! ## Entries -/
-
-/-- Include path: quoted, or up to the next blank (`\ ` escapes a blank). -/
 def includePath : P String := do
   ws
   if (← peek) == some '"' then return (← readQuoted)
@@ -997,7 +916,6 @@ def includePath : P String := do
   if acc.isEmpty then err "missing include path"
   return (← decodedWord acc)
 
-/-- Skip a comment (current char `#`) up to and including the newline. -/
 def skipComment : P Unit := do
   for _ in [0:(← fuel)] do
     match (← get) with
@@ -1006,7 +924,6 @@ def skipComment : P Unit := do
       set cs
       if c.c == '\n' then break
 
-/-- End of an entry: blanks, then end of line, end of file or a comment. -/
 def endOfEntry : P Unit := do
   ws
   match (← get) with
@@ -1016,14 +933,12 @@ def endOfEntry : P Unit := do
     else if c.c == '#' && !(cs.head?.map (·.c.isDigit)).getD false then skipComment
     else err s!"unexpected {describe (some c.c)}"
 
-/-- Keyword followed by a blank (or a line continuation). -/
 def keyword (inp : List PChar) (kw : String) : Option (List PChar) :=
   match stripPrefix inp kw.toList with
   | some (c :: cs) =>
     if isBlank c.c || (c.c == '\\' && isCont cs) then some (c :: cs) else none
   | _ => none
 
-/-- `Defaults` followed by a scope marker, blank, or end of line. -/
 def defaultsKeyword (inp : List PChar) : Option (List PChar) :=
   match stripPrefix inp "Defaults".toList with
   | some [] => some []
@@ -1033,7 +948,6 @@ def defaultsKeyword (inp : List PChar) : Option (List PChar) :=
     else none
   | none => none
 
-/-- Parse one entry starting at the current (non-blank) character. -/
 def entry : P (List Entry) := do
   let inp ← get
   let try1 (kw : String) (k : P (List Entry)) : Option (P (List Entry)) :=
@@ -1088,17 +1002,12 @@ def entries : P (List Located) := do
       acc := (es.reverse.map fun e => { file, line := c.line, entry := e, warnings }) ++ acc
   err "input too long"
 
-/-! ## Post-conditions -/
-
-/-- Command atoms occurring anywhere in an entry. -/
 def cmndAtoms : Entry → List CmndAtom
   | .cmndAlias _ ms => ms.map (·.atom)
   | .defaults (.cmnd cs) _ => cs.map (·.atom)
   | .userSpec s => s.entries.flatMap fun hc => hc.cmnds.map (·.cmnd.atom)
   | _ => []
 
-/-- Literal paths are absolute, regex paths anchored, including beneath digests.
-Pseudo-commands (`sudoedit`, `list`, `ALL`) do not denote filesystem paths. -/
 def CmndAtom.pathOk : CmndAtom → Bool
   | .command p _ => p.toList.head? == some '/'
   | .commandRegex re _ => re.startsWith "^" && re.endsWith "$"
@@ -1108,7 +1017,6 @@ def CmndAtom.pathOk : CmndAtom → Bool
 def wellFormed (file : String) (l : Located) : Bool :=
   decide (1 ≤ l.line) && l.file == file && (cmndAtoms l.entry).all CmndAtom.pathOk
 
-/-- Defence in depth: reject (as an internal error) any result violating `wellFormed`. -/
 def check (file : String) (es : List Located) : Except ParseError (List Located) :=
   match es.find? (fun l => !wellFormed file l) with
   | some l => .error { file, line := l.line, col := 1, msg := "internal error: malformed entry" }
@@ -1132,13 +1040,10 @@ def context (file text : String) : Ctx :=
 end Parser
 
 open Parser in
-/-- Parse the text of one sudoers file. `file` is used for `Located.file` and errors. -/
 def parse (file : String) (text : String) : Except ParseError (List Located) :=
   match (entries (context file text)).run { input := annotate text.toList 1 1 [] } with
   | .error e => .error e
   | .ok (es, _) => check file es
-
-/-! ## Theorems -/
 
 theorem parse_wellFormed {file text : String} {es : List Located}
     (h : parse file text = .ok es) : ∀ l ∈ es, Parser.wellFormed file l = true := by
@@ -1147,7 +1052,6 @@ theorem parse_wellFormed {file text : String} {es : List Located}
   · cases h
   · exact Parser.check_ok h
 
-/-- Every parsed entry records a 1-based line. -/
 theorem parse_line_pos {file text : String} {es : List Located}
     (h : parse file text = .ok es) : ∀ l ∈ es, 1 ≤ l.line := by
   intro l hl
@@ -1155,7 +1059,6 @@ theorem parse_line_pos {file text : String} {es : List Located}
   simp only [Parser.wellFormed, Bool.and_eq_true, decide_eq_true_eq] at this
   exact this.1.1
 
-/-- Every parsed entry records the given file name. -/
 theorem parse_file_eq {file text : String} {es : List Located}
     (h : parse file text = .ok es) : ∀ l ∈ es, l.file = file := by
   intro l hl
@@ -1163,7 +1066,6 @@ theorem parse_file_eq {file text : String} {es : List Located}
   simp only [Parser.wellFormed, Bool.and_eq_true, beq_iff_eq] at this
   exact this.1.2
 
-/-- The same structural guarantee covers nested digest commands and regexes. -/
 theorem parse_atom_safe {file text : String} {es : List Located}
     (h : parse file text = .ok es) :
     ∀ l ∈ es, ∀ c ∈ Parser.cmndAtoms l.entry, Parser.CmndAtom.pathOk c = true := by
@@ -1172,7 +1074,6 @@ theorem parse_atom_safe {file text : String} {es : List Located}
   simp only [Parser.wellFormed, Bool.and_eq_true, List.all_eq_true] at hw
   exact hw.2 c hc
 
-/-- The parser never yields a command atom with a non-absolute path. -/
 theorem parse_command_absolute {file text : String} {es : List Located}
     (h : parse file text = .ok es) :
     ∀ l ∈ es, ∀ p a, CmndAtom.command p a ∈ Parser.cmndAtoms l.entry →

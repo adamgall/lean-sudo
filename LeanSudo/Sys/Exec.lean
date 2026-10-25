@@ -1,78 +1,15 @@
-/-!
-# Command execution (`c/exec.c`)
-
-`runCommand` forks, marks fds ≥ `closeFrom` close-on-exec, optionally changes
-the child's root, then drops privileges in the order
-setgroups → setresgid → setresuid. It verifies the drop (`getres[ug]id`, `getgroups`,
-and — unless the target or retained real UID is root — that `setuid(0)` fails),
-then applies `chdir`, `umask`, and `execve`. Any failure before a successful
-`execve` is reported through a close-on-exec pipe and raised here as an
-`IO.userError` (sudo-style text, e.g. `unable to execute /x: No such file or directory`);
-the child never runs the command in that case.
-
-The parent relays signals and job-control stops to the command (see `c/exec.c`),
-optionally through a pty (`usePty`, only when one of fds 0–2 is a terminal), and
-returns the command's status.
-Non-pty job control hands the foreground terminal to a separately grouped command
-stopped by SIGTTIN/SIGTTOU, or suspends sudo until the invoking shell resumes it.
-Foreground restoration refuses to steal a terminal from another job.
-The invoking shell's SIGCONT is relayed to the command even in a separate process
-group; command-originated signals are filtered rather than bounced back.
-User-generated SIGWINCH is relayed without a pty; with a pty, size changes update
-the terminal and explicitly signal the command's process group, as sudo does.
-
-Before anything reaches C, this module checks the arguments and fails closed:
-ids must fit in `uid_t`/`gid_t` and must not be `(uid_t)-1` (which `setresuid`
-treats as "unchanged"), strings must not contain NUL (C would truncate them),
-`path` must be absolute, `argv` non-empty, `umask ≤ 0o777`, `closeFrom ≥ 3`.
-
-The shell calls `initializeProcess` before privileged file access. Child execution
-restores the saved dump settings and applies policy resource limits (core defaults
-to 0,0); login cwd failures warn, while required cwd failures abort. NOEXEC loads
-the configured sudo noexec DSO and refuses an absent or unreadable library,
-including a library absent from the selected chroot. AppArmor profiles
-are ignored when the kernel module is disabled; enabled transitions fail closed.
-Both execution modes enforce command deadlines with
-HUP/TERM followed by KILL after two seconds. Backgrounding forks the supervisor,
-not just the command, so PAM cleanup occurs only after completion.
-`staySetuid` retains the invoking real UID captured at process startup; effective
-and saved UIDs and supplementary groups remain the policy target. All three GIDs
-use the invoking real GID, matching sudo's setegid(target) → setgid(invoking) order.
-All six real/effective/saved IDs are checked after the transition. PAM and the
-command environment still describe the target; shells may voluntarily drop the
-effective IDs when they differ from the real IDs, just as with sudo.
-
-CHROOT is applied only in the final command child, after policy/PAM and all NSS
-lookups, before dropping UIDs. Pre-policy command facts use root-prefixed paths,
-matching sudo 1.9.17p2 rather than changing the privileged policy process's root
-(CVE-2025-32463). The child starts at `/` and then applies any requested cwd.
-Root-prefixed canonical command and parent paths must remain inside the selected
-root; an escaping absolute symlink is refused before the command is authorized.
-The shell expands tilde roots using host passwd facts and retains each deciding
-root's command identity, descriptor, digest, arguments, and set-id mode separately.
-An unoverridden `CHROOT=*` is the host namespace for every lookup fact, including
-canonical parents and digests; a caller-created directory named `*` is irrelevant.
--/
-
 namespace LeanSudo.Sys
 
 structure ExecSpec where
-  /-- absolute path passed to execve -/
   path : String
-  /-- including argv[0] -/
   argv : Array String
-  /-- "KEY=VALUE" -/
   env : Array String
   uid : Nat
   gid : Nat
-  /-- supplementary groups (setgroups) -/
   groups : Array Nat
-  /-- chdir after dropping privileges -/
   cwd : Option String
   umask : Nat
-  /-- only honoured when a std fd is a tty -/
   usePty : Bool
-  /-- `-b` -/
   background : Bool
   closeFrom : Nat := 3
   cwdOptional : Bool := false
@@ -83,9 +20,7 @@ structure ExecSpec where
   utmpUser : Option String := none
   execFd : Option Nat := none
   execBackground : Bool := false
-  /-- Retain invoking real UID and all GIDs; effective/saved UID still use uid. -/
   staySetuid : Bool := false
-  /-- Authorized chroot directory, entered only in the final command child. -/
   chroot : Option String := none
   deriving Repr, Inhabited
 
@@ -96,11 +31,8 @@ inductive ExitStatus where
 
 namespace Exec
 
-/-- Largest id we accept: `(uid_t)-1 = 0xFFFFFFFF` means "no change" to `setresuid`/
-`setresgid`, so it must never be passed through. -/
 def maxId : Nat := 0xFFFFFFFE
 
-/-- Range-checked conversion of a user/group id to the C type. -/
 def toId? (n : Nat) : Option UInt32 :=
   if n ≤ maxId then some n.toUInt32 else none
 
@@ -118,7 +50,6 @@ theorem toId?_some {n : Nat} {v : UInt32} (h : toId? n = some v) :
     exact ⟨toUInt32_toNat_of_lt (by omega), hle⟩
   · cases h
 
-/-- `toId?` never yields the "unchanged" sentinel `(uid_t)-1`. -/
 theorem toId?_ne_sentinel {n : Nat} {v : UInt32} (h : toId? n = some v) :
     v ≠ 0xFFFFFFFF := by
   have ⟨hv, hle⟩ := toId?_some h
@@ -128,7 +59,6 @@ theorem toId?_ne_sentinel {n : Nat} {v : UInt32} (h : toId? n = some v) :
   simp at hv
   omega
 
-/-- Decoding of the C result: exit code, or `0x10000 ||| signal`. -/
 def decodeStatus (r : UInt32) : ExitStatus :=
   if r.toNat ≥ 0x10000 then .signaled (r.toNat - 0x10000) else .exited r.toNat
 
@@ -150,11 +80,8 @@ theorem decodeStatus_signaled (s : Nat) (h : s < 0x10000) :
   · rfl
   · omega
 
-/-- Strings handed to C must not contain NUL. -/
 def cSafe (s : String) : Bool := !s.contains '\x00'
 
-/-- Only private descriptors represent pinned executables; never permit a
-standard descriptor or the sentinel used to select pathname execution. -/
 def validExecFd : Option Nat → Bool
   | none => true
   | some fd => decide (3 ≤ fd ∧ fd ≤ 0x7FFFFFFF)
@@ -173,7 +100,6 @@ theorem validExecFd_exact {fd : Nat} (h : validExecFd (some fd) = true) :
   simp at he
   omega
 
-/-- Validated, C-ready form of an `ExecSpec`. -/
 structure Checked where
   uid : UInt32
   gid : UInt32
@@ -181,7 +107,6 @@ structure Checked where
   umask : UInt32
   closeFrom : UInt32
 
-/-- All argument checks; `.error msg` means nothing is executed. -/
 def check (s : ExecSpec) : Except String Checked := do
   unless s.path.startsWith "/" do
     throw s!"unable to execute {s.path}: path is not absolute"
@@ -209,8 +134,6 @@ def check (s : ExecSpec) : Except String Checked := do
     throw "invalid executable descriptor"
   pure { uid, gid, groups, umask := s.umask.toUInt32, closeFrom := s.closeFrom.toUInt32 }
 
-/-- Retaining invoking real IDs cannot bypass any checked target-ID or argument
-constraint; the same validation applies in both credential modes. -/
 theorem check_staySetuid (s : ExecSpec) (stay : Bool) :
     check { s with staySetuid := stay } = check s := by
   rfl
@@ -226,27 +149,20 @@ opaque runRaw (path : @& String) (argv : @& Array String) (env : @& Array String
 @[extern "leansudo_exec_exit"]
 opaque exitRaw (isSignal : Bool) (n : UInt32) : IO Unit
 
-/-- Flush Lean's buffered stdout/stderr; errors (e.g. a closed pipe) are ignored. -/
 def flushStd : IO Unit := do
   try (← IO.getStdout).flush catch _ => pure ()
   try (← IO.getStderr).flush catch _ => pure ()
 
 end Exec
 
-/-- Repair standard descriptors before opening privileged files, and optionally
-disable core dumps for the privileged process (restored only in the exec child). -/
 @[extern "leansudo_exec_initialize"]
 opaque initializeProcess (disableCoredump : Bool := true) : IO Unit
 
-/-- Core-dump bit from the command's most recent wait status (not its monitor). -/
+@[extern "leansudo_exec_restore_core_limit"]
+opaque restoreCoreLimit : IO Unit
+
 @[extern "leansudo_exec_dumped_core"] opaque lastDumpedCore : IO Bool
 
-/-- fork, drop privileges in the child in the order setgroups → setresgid → setresuid,
-verify the drop with getres[ug]id (abort if it did not take), chdir, umask, close fds,
-execve. The parent relays signals, waits, and returns the child's status. A failed
-execve is reported back through a CLOEXEC pipe as an `IO.userError`.
-With `background`, the original process exits immediately; a background supervisor
-waits and returns here, keeping the caller's PAM session alive until completion. -/
 def runCommand (s : ExecSpec) : IO ExitStatus := do
   let c ← match Exec.check s with
     | .ok c => pure c
@@ -258,9 +174,6 @@ def runCommand (s : ExecSpec) : IO ExitStatus := do
     (s.execFd.map Nat.toUInt32 |>.getD 0xFFFFFFFF) s.execBackground s.staySetuid s.chroot
   pure (Exec.decodeStatus r)
 
-/-- exit(code) or re-raise the signal on ourselves with default disposition
-(falling back to exit(128+sig)). Lean's stdout/stderr are flushed first.
-Exit codes above 255 are clamped to 255 so a failure can never wrap to 0. -/
 def exitWith (s : ExitStatus) : IO α := do
   Exec.flushStd
   match s with

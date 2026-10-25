@@ -12,8 +12,6 @@ private opaque start (path legacy json : @& String) (flags : UInt32)
 @[extern "leansudo_iolog_abort"]
 private opaque abort : IO Unit
 
-/-- Open all log files before allowing execution. Failure is fatal unless the
-policy explicitly opted into ignore_iolog_errors. -/
 def «open» (p : LeanSudo.IoLog.Plan) (m : LeanSudo.IoLog.Metadata)
     (locale : String) : IO (Option String) := do
   try

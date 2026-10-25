@@ -6,42 +6,6 @@ import LeanSudo.Policy.Eval
 import LeanSudo.Sudoedit.Check
 import LeanSudo.I18n.Load
 
-/-!
-# sudoedit (`sudo -e`)
-
-Editor selection and copyback gates are pure and proved in `Check`. Filesystem
-operations use pinned directory descriptors and permanently dropped forked workers
-(`Sys.Edit`): the privileged Lean process never temporarily adopts a user's ids.
-Parent descriptors pin kernel path resolution, including dot/parent components.
-As in sudo, links in writable ancestors are refused and the final directory must
-not be writable (unless sudoedit_checkdir is disabled); FOLLOW controls final links.
-Temporary size and nanosecond mtime determine changes, as in sudo_edit; the temporary
-mtime starts at the original's (or the epoch for a new file). Original inode metadata detects concurrent edits.
-Copy errors preserve the temporary file and attempt to restore the original bytes.
-The original inode is retained, so owner/mode and existing hard links survive.
-Temporary names retain the original's last extension. Unopenable originals are
-skipped; temporary-creation failures abort, and copyback errors override any editor
-status with exit 1. Editor environment variables are always considered, independently
-of visudo's env_editor setting; lookup uses the policy-rebuilt PATH, while the editor
-itself receives the invoking environment. Quoting/backslash splitting and rejection
-of an editor-supplied `--` happen before any file session is created.
-The resolved editor is selected once before Shell opens local/remote I/O logging;
-log metadata retains its words followed by `--` and the original file operands,
-while execution receives only the checked temporary paths. The normal executor
-applies the editor's cwd, pty, timeout, resource-limit and utmp settings; a changed
-editor cwd never changes how original file operands are resolved. As observed in
-sudo.ws, Defaults log_output/command_timeout/noexec apply, but rule
-LOG_OUTPUT/TIMEOUT/NOEXEC attributes are not propagated to sudoedit.
-
-sudo.ws 1.9.17p2's sudoedit root behavior is deliberately preserved: command-rule
-CHROOT is ignored, while Defaults runchroot (or -R permitted by runchroot=*) changes
-only the editor child's root. Originals, temporary creation and copyback still use
-the host filesystem. Consequently a jailed editor cannot normally access the host
-temporary pathname. Rule CHROOT=* alone does not authorize sudoedit's -R option.
-As with exec, an editor or its parent resolving outside the configured root is
-refused before preparation; this is the explicit fail-closed exception to upstream
-root semantics, including absolute symlinks that upstream would follow in the jail.
--/
 def LeanSudo.Core.RunPlan.toSpec (plan : LeanSudo.Core.RunPlan) (path : String)
     (argv env : Array String) (uid gid : Nat) (groups : List Nat) : LeanSudo.Sys.ExecSpec := {
   path, argv, env, uid, gid, groups := groups.toArray,
@@ -102,8 +66,6 @@ private def resolveEditor (who : Sys.Edit.Identity) (path : String)
       let same := self.any fun s => s.dev == st[7]! && s.ino == st[8]!
       if same || (candidate.splitOn "/").getLast! == "sudoedit" then
         throw (IO.userError "sudoedit may not be used as an editor")
-      -- The executor requires an absolute pathname; retain the user's spelling
-      -- in argv[0], and preserve kernel resolution of relative components.
       if candidate.startsWith "/" then return some candidate
       return some ((← Sys.getcwd) ++ "/" ++ candidate)
   return none
@@ -121,8 +83,6 @@ private structure Session where
 private def removeTemp (who : Sys.Edit.Identity) (path : String) : IO Unit := do
   let _ ← Sys.Edit.operation who 5 Sys.Edit.noneFd path
 
-/-- An inaccessible original is skipped; failure to create/copy a temporary is
-fatal for the whole invocation, as in sudo_edit_create_tfiles. -/
 private def prepare (progname : String) (invoker target : Sys.Edit.Identity) (follow checkdir : Bool)
     (file displayFile : String) : IO (Option Session) := do
   let some (dirs, name) := pathParts file
@@ -172,8 +132,6 @@ private def copyBack (progname : String) (invoker target : Sys.Edit.Identity) (m
         pure ((← if changed then Sys.Edit.read fd else pure ByteArray.empty), checked, changed)
       finally Sys.Edit.close fd
     if writeBack changed checked then
-      -- Recheck all ancestors as well as the pinned parent: permissions may have
-      -- changed while the editor was running. Require the same parent inode.
       let some (dirs, _) := pathParts s.file | throw (IO.userError "unsafe edit path")
       let current ← parentDir invoker target checkdir dirs s.displayFile
       try
@@ -202,13 +160,10 @@ private def copyBack (progname : String) (invoker target : Sys.Edit.Identity) (m
     warn progname s!"contents of edit session left in {s.temp}"
     return false
 
-/-- Resolved once, before opening the local or remote I/O log. File operands stay
-in EditPlan, never in these environment-derived editor words. -/
 structure Editor where
   path : String
   words : List String
 
-/-- Resolve and validate the editor before command acceptance and I/O-log setup. -/
 def select (progname : String) (plan : Core.EditPlan) : IO (Option Editor) := do
   try
     let invoker ← Sys.Edit.identity plan.editUid plan.editGid plan.editGroups
@@ -231,9 +186,6 @@ def select (progname : String) (plan : Core.EditPlan) : IO (Option Editor) := do
     warn progname e.toString
     return none
 
-/-- Edit `plan.files`; `env` is the editor's environment (`KEY=VALUE`).
-Diagnostics retain the invoking frontend name and raw policy operands, while
-filesystem operations use their absolute paths even when the editor changes cwd. -/
 def run (progname : String) (plan : Core.EditPlan) (editor : Editor)
     (env : Array String) : IO Sys.ExitStatus := do
   let mut sessions : Array Session := #[]

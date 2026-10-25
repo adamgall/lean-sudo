@@ -1,5 +1,5 @@
-# Differential coverage against Ubuntu's installed sudo.ws 1.9.17p2.
-# Each probe gets an independent cache; compare status and both output streams.
+
+
 coverage_policy() {
   printf 'Defaults lecture=never, passwd_tries=1\n%s\n' "$1" > /etc/sudoers.d/zz-coverage
   chmod 0440 /etc/sudoers.d/zz-coverage
@@ -214,7 +214,7 @@ for coverage_edit in multiple user-group; do
     chmod 0755 /usr/local/bin/coverage-editor
     coverage_args=''
     [[ $coverage_edit != user-group ]] || coverage_args='-u bob -g daemon'
-    # Reset original bytes for each implementation, then compare persisted data.
+
     for coverage_impl in /usr/bin/sudo.ws /usr/bin/sudo; do
       printf 'original\n' >/var/lib/coverage-edit/one
       printf 'original\n' >/var/lib/coverage-edit/two
@@ -243,8 +243,8 @@ begin coverage-nopty-job-control && {
 for coverage_signal in WINCH HUP; do
   begin "coverage-signal-$coverage_signal" && {
     coverage_policy 'Defaults use_pty'
-    # The child asks its independent helper to signal sudo, not itself.
-    # The handler's output proves that sudo relayed the signal.
+
+
     cat >/usr/local/bin/coverage-signal.py <<'PY'
 import os, signal, subprocess, sys, time
 sig = getattr(signal, 'SIG' + sys.argv[1])
@@ -252,7 +252,7 @@ def received(signum, frame):
     print('relayed-' + sys.argv[1], flush=True)
     sys.exit(0)
 signal.signal(sig, received)
-# Find the front-end sudo above the pty monitor, without relying on PID text.
+
 pid = os.getppid()
 while True:
     with open('/proc/%d/stat' % pid) as f:

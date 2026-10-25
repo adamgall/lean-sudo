@@ -1,9 +1,3 @@
-/* sudo 1.9.17p2 exec_intercept.c / intercept.proto transport.
- * Policy belongs exclusively to ls_intercept_check, never to this codec.
- * Despite intercept.proto's comment, sudo's framing is a HOST-order uint32_t.
- * Protobuf fixed64 values are little endian; the authentication token itself
- * is the raw native union of two uint64_t values, as in sudo_intercept_common.c.
- */
 #include "intercept.h"
 #include "intercept_dso.h"
 #include <sys/socket.h>
@@ -163,8 +157,6 @@ int ls_intercept_dso_child(void)
     if (child_fd == -1) { errno = EBADF; return -1; }
     int flags = fcntl(child_fd, F_GETFD);
     if (flags == -1) return -1;
-    /* The sole intentional CLOEXEC exception: the DSO constructor consumes
-     * and closes this socket during the initial executable's startup. */
     return fcntl(child_fd, F_SETFD, flags & ~FD_CLOEXEC);
 }
 
@@ -210,8 +202,6 @@ void ls_intercept_dso_free_environment(char **envp)
     if (envp) { free(envp[0]); free(envp[1]); free(envp); }
 }
 
-/* Strict schema-specific protobuf decoding: no truncated/overflowing varints,
- * unsupported wire types, duplicate singular fields or embedded NUL strings. */
 struct cursor { const unsigned char *p, *end; };
 static int varint(struct cursor *in, uint64_t *value)
 {
@@ -292,7 +282,6 @@ static int parse_policy(struct cursor body, struct request *req)
         text += len + 1;
     }
     if (!req->command[0]) goto bad;
-    /* sudo's plugin API replaces argv[0] with the requested command. */
     req->argv[0] = req->command;
     return 0;
 bad:
@@ -397,8 +386,6 @@ static int check_request(struct request *req)
     if (dirfd != AT_FDCWD) close(dirfd);
     errno = saved;
     if (rc == -1) return -1;
-    /* No pid exists in PolicyCheckRequest. Do not misattribute forked execs
-     * using the pid from the initial constructor's Hello. */
     return ls_intercept_check(req->command, req->argv, req->envp,
         req->cwd ? req->cwd : "", 0, (sb.st_mode & (S_ISUID | S_ISGID)) != 0);
 }
@@ -419,8 +406,6 @@ static int dispatch(struct client *c)
     int result = check_request(&req);
     int rc;
     if (log_only) {
-        /* The upstream client does not wait for a policy response in this
-         * mode. Only a subsequent constructor Hello receives a response. */
         rc = result == 1 ? 0 : -1;
         free(c->buffer);
         c->buffer = NULL;
@@ -433,7 +418,6 @@ static int dispatch(struct client *c)
     return rc;
 }
 
-/* Return 1 complete, 0 would-block, -1 EOF/error. */
 static int receive(int fd, void *buffer, size_t *used, size_t length)
 {
     while (*used < length) {

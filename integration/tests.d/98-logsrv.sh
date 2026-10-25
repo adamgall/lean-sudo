@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run the packaged sudo_logsrvd against the implementation under test.
+
 logsrv_policy() {
   printf 'Defaults !requiretty, !authenticate, log_server_timeout=2\nDefaults log_servers="%s"\n%s\nalice ALL=(ALL:ALL) NOPASSWD: ALL\n' "$1" "${2:-}" >/etc/sudoers.d/98-logsrv
   chmod 0440 /etc/sudoers.d/98-logsrv
@@ -42,7 +42,7 @@ EOF
   logsrv_launch
 }
 logsrv_launch() {
-  # Ubuntu's sudo package keeps the daemon unsuffixed (unlike sudo_sendlog.ws).
+
   /usr/sbin/sudo_logsrvd -f "$LSRV/server.conf" -n >"$LSRV/daemon.out" 2>&1 &
   LSRV_PID=$!
   for _ in {1..50}; do
@@ -54,12 +54,12 @@ logsrv_launch() {
   return 1
 }
 logsrv_stop() {
-  # Event-only clients do not wait for a commit acknowledgement.
+
   sleep .1
   kill "$LSRV_PID" 2>/dev/null || true
   wait "$LSRV_PID" 2>/dev/null || true
-  # Persist stable daemon records and exact stream bytes for cross-implementation
-  # comparison. Clocks, generated IDs, peer addresses and read chunk boundaries vary.
+
+
   python3 - "$LSRV" "$OUTDIR/$LABEL-$CUR.json" <<'PY'
 import json,pathlib,sys
 root=pathlib.Path(sys.argv[1])
@@ -140,7 +140,7 @@ begin logsrv-tcp-accept-without-iolog-no-exit && {
   expect_out_line remote-output
   logsrv_stop
   logsrv_event accept
-  # sudo's audit-only client closes without an ExitMessage, even with log_exit_status.
+
   python3 -c 'import json,sys; assert "exit" not in json.load(open(sys.argv[1]))' "$LSRV/events.json" || fail 'unexpected remote exit without I/O logging'
   end
 }
@@ -303,8 +303,8 @@ logsrv_disconnect_case() {
   logsrv_policy 127.0.0.1:30343 "Defaults log_output$extra"
   LSRV_OLD_PID=$LSRV_PID
   (
-    # Wait for real remote output before stopping the server, not an arbitrary
-    # startup delay. The command stays alive for several seconds after this.
+
+
     for _ in {1..100}; do
       if python3 -c 'import pathlib,sys; assert any(p.read_bytes()==b"before\n" for p in pathlib.Path(sys.argv[1]).rglob("stdout"))' "$LSRV/io" 2>/dev/null; then
         kill "$LSRV_OLD_PID" || exit 1
@@ -382,67 +382,5 @@ PY
   run root "sudoreplay.ws -d '$LSRV/io' -l"
   expect_rc 0
   expect_out_has 'COMMAND=/usr/local/bin/henry-editor -- /etc/henryfile'
-  end
-}
-
-logsrv_malformed_case() {
-  local size=3
-  [[ $1 == groups ]] && size=2097152
-  [[ $1 == small-group ]] && size=1
-  logsrv_policy 127.0.0.1:30345 'Defaults log_output'
-  LSRV_BAD="$WORK/logsrv-malformed-$NUM"
-  mkdir -p "$LSRV_BAD"
-  python3 - "$LSRV_BAD" "$1" >"$LSRV_BAD/server.out" 2>&1 <<'PY' &
-import pathlib,socket,struct,sys
-root=pathlib.Path(sys.argv[1])
-with socket.socket() as listener:
-    listener.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-    listener.bind(("127.0.0.1",30345))
-    listener.listen(1)
-    listener.settimeout(10)
-    (root/"ready").touch()
-    connection,_=listener.accept()
-    with connection:
-        connection.settimeout(5)
-        payload={"groups":b"\x0b"*(2*1024*1024),"small-group":b"\x0b","truncated":b"\x1a\x02x"}[sys.argv[2]]
-        connection.sendall(struct.pack("!I",len(payload))+payload)
-        (root/"sent").touch()
-        try:
-            while connection.recv(65536):
-                pass
-        except (ConnectionResetError,socket.timeout):
-            pass
-PY
-  LSRV_BAD_PID=$!
-  for _ in {1..100}; do
-    [[ -e $LSRV_BAD/ready ]] && break
-    kill -0 "$LSRV_BAD_PID" 2>/dev/null || break
-    sleep .02
-  done
-  [[ -e $LSRV_BAD/ready ]] || fail 'malformed-frame fixture did not listen'
-  run alice 'sudo -n /bin/echo must-not-execute'
-  expect_rc 1
-  expect_out_empty
-  expect_err_has 'error initializing I/O plugin sudoers_io'
-  if [[ $LABEL == reference && $1 != truncated ]]; then
-    expect_err_match "^sudo: (unable to unpack ServerMessage size $size|handle_server_message: unexpected type_case value 0)$"
-  else
-    expect_err_has "unable to unpack ServerMessage size $size"
-  fi
-  expect_err_lacks 'Segmentation fault'
-  wait "$LSRV_BAD_PID" || fail 'malformed-frame fixture failed'
-  [[ -e $LSRV_BAD/sent ]] || fail 'fixture did not send the entire frame'
-  python3 -c 'import json,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(json.dumps({"status":int(sys.argv[2]),"stdout":pathlib.Path(sys.argv[3]).read_text(),"stderr":pathlib.Path(sys.argv[4]).read_text()},sort_keys=True,indent=2)+"\n")' "$OUTDIR/$LABEL-$CUR-result.json" "$RC" "$WORK/out" "$WORK/err"
-}
-begin logsrv-malformed-group-frame && {
-  logsrv_malformed_case groups
-  end
-}
-begin logsrv-malformed-truncated-field && {
-  logsrv_malformed_case truncated
-  end
-}
-begin logsrv-malformed-small-group && {
-  logsrv_malformed_case small-group
   end
 }

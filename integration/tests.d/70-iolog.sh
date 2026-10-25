@@ -1,4 +1,4 @@
-# These sessions are consumed by the distribution's unmodified sudoreplay.
+
 iolog_policy() {
   local dir=$1 options=$2
   install -m 0440 /dev/stdin /etc/sudoers.d/iolog <<EOF
@@ -19,7 +19,7 @@ begin iolog-output-replay-list && {
   expect_out_has 'COMMAND=/usr/bin/echo hi'
   run root "sudoreplay.ws -n -d '$dir' 000001"
   expect_rc 0
-  # The first "hi" is in replay's banner; the second must come from the stream.
+
   expect_out_has hihi
   [[ $(cat "$dir/seq") == 000001 ]] || fail 'initial sequence is not 000001'
   [[ -s "$dir/00/00/01/log.json" && -s "$dir/00/00/01/log" ]] || fail 'missing metadata'

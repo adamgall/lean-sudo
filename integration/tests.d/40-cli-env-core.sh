@@ -1,5 +1,5 @@
 #!/bin/bash
-# sudo.ws front-end, environment and decision-core compatibility.
+
 cli_core_grant_bob() {
   printf 'bob ALL=(ALL:ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/zz-cli-grant
   chmod 0440 /etc/sudoers.d/zz-cli-grant
@@ -398,14 +398,14 @@ begin cli-core-residual-self-apparmor-auth && {
   expect_err_has 'a password is required'
   end
 }
-# Residual audit rows 21/22, sudo.ws v1.9.17p2:
-# https://github.com/sudo-project/sudo/blob/v1.9.17p2/src/parse_args.c
-# parse_env_list adds a name only when getenv succeeds; case 'R' warns after its
-# empty/duplicate checks, before subsequent options and final validation.
-# glibc posix/getopt.c emits scanner diagnostics using argv[0], not getprogname().
+
+
+
+
+
 cli_second_compare_reference() {
   local user=$1 args=$2 status=$3
-  # Preserve the exact argv[0] across implementations, without rewriting output.
+
   run "$user" '/bin/bash -c '\''exec -a /usr/bin/sudo /usr/bin/sudo.ws "$@"'\'' -- '"$args"
   expect_rc "$status"
   cp "$WORK/out" "$WORK/cli-second-reference-out"
@@ -500,7 +500,7 @@ begin cli-core-second-cli-edit-preserve-set-empty && {
   [[ $ERR == 'sudo: you may not specify environment variables in edit mode'$'\nusage: sudo '* ]] || fail 'empty value is set and must be rejected in edit mode'
   end
 }
-# Second residual environment audit: sudo.ws v1.9.17p2 env.c/env_pattern.c.
+
 begin cli-core-second-env-explicit-path && {
   cli_core_grant_bob
   printf 'Defaults secure_path="/usr/bin:/bin"\n' > /etc/sudoers.d/40-cli
@@ -847,12 +847,12 @@ begin cli-core-second-core-login-missing-required-cwd && {
   end
 }
 
-# ResidualGaps3 rows 1/2: compare actual logfile bytes and syslog datagrams,
-# including priority and RAW formatting, with the packaged sudo.ws oracle.
-# Source contracts: sudoers_check_common, logging.c vlog_warning/log_denial.
+
+
+
 cli_core_third_event_fixture() {
   cat >"$WORK/cli-core-third-event.py" <<'PY'
-import json, os, pathlib, pwd, re, shutil, socket, subprocess, sys, tempfile, threading, time
+import json, os, pathlib, pwd, re, shutil, socket, subprocess, sys, tempfile, time
 
 class Pairs(list):
     pass
@@ -878,8 +878,8 @@ def normalize_json(value, key=''):
     return value
 
 def normalize_identity(value, identity):
-    # UUID is a generated per-invocation identity, not a semantic event field.
-    # Check correspondence before replacing it; never erase source/argv/reason.
+
+
     if isinstance(value, Pairs):
         result = Pairs()
         for key, item in value:
@@ -903,7 +903,7 @@ def normalize_log(text, fmt):
     return re.sub(r'(?m)^[A-Z][a-z]{2} [ 0-9][0-9] \d\d:\d\d:\d\d : ', '<time> : ', text)
 
 def normalize_syslog(message):
-    # Keep the complete facility/severity, ident, spacing, body and record count.
+
     match = re.fullmatch(r'(<\d+>)[A-Z][a-z]{2} [ 0-9][0-9] \d\d:\d\d:\d\d (sudo)(?:\[\d+\])?: (.*)', message, re.S)
     assert match, ('unexpected syslog transport', message)
     prefix = match[1] + '<time> ' + match[2] + '[<pid>]: '
@@ -920,43 +920,16 @@ def execute(binary, args, user='judy', cwd=None, env=None,
                    PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', LANG='C.UTF-8')
     path = pathlib.Path(logfile)
     path.unlink(missing_ok=True)
-    saved = None
-    bound = False
-    messages = []
-    errors = []
-    stop = threading.Event()
-    thread = None
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    try:
-        if os.path.lexists('/dev/log'):
-            fd, saved = tempfile.mkstemp(prefix='cli-core-third-event-log-', dir='/dev')
-            os.close(fd)
-            os.replace('/dev/log', saved)
-        sock.bind('/dev/log')
-        bound = True
-        sock.settimeout(.1)
-        def receive():
-            try:
-                while True:
-                    try: messages.append(sock.recv(262144).decode())
-                    except socket.timeout:
-                        if stop.is_set(): break
-            except BaseException as error: errors.append(error)
-        thread = threading.Thread(target=receive)
-        thread.start()
+    import sys
+    sys.path.insert(0, '/usr/local/lib')
+    from sudo_it_logging import Syslog
+    with Syslog() as logger:
         result = subprocess.run(['setpriv', '--reuid=' + str(account.pw_uid),
             '--regid=' + str(account.pw_gid), '--init-groups', '--',
             '/bin/bash', '-c', 'exec -a sudo "$@"', 'sh', binary, *args],
             cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True,
             start_new_session=True, timeout=20)
-    finally:
-        stop.set()
-        if thread: thread.join(timeout=5)
-        sock.close()
-        if bound: os.unlink('/dev/log')
-        if saved is not None: os.replace(saved, '/dev/log')
-    assert not errors, errors
-    assert thread is not None and not thread.is_alive(), 'syslog receiver did not stop'
+        messages = logger.messages()
     return dict(rc=result.returncode, out=result.stdout, err=result.stderr,
         logfile=normalize_log(path.read_text() if path.exists() else '', fmt),
         syslog=[normalize_syslog(message) for message in messages])
@@ -966,10 +939,8 @@ def event_case(fmt, scenario):
         root = pathlib.Path(tmp)
         root.chmod(0o755)
         logfile = root / 'events.log'
-        mail = root / 'mail'
-        mailer = root / 'mailer'
-        mailer.write_text('#!/bin/sh\ncat >>"' + str(mail) + '"\n')
-        mailer.chmod(0o755)
+        mail = pathlib.Path('/var/mail/root')
+        mailer = pathlib.Path('/usr/sbin/sendmail')
         args = ['-n', '/usr/bin/true']
         user = 'judy'
         options = []
@@ -1033,8 +1004,8 @@ def event_case(fmt, scenario):
             options += ['runas_check_shell']
             reason = 'invalid shell for user nobody: /usr/sbin/nologin'
         else: raise AssertionError(scenario)
-        # Reject events legitimately mail under mail_always. All other failed
-        # requests must not accidentally reach the accepted-command mail path.
+
+
         if kind != 'reject': options += ['mail_always', 'mail_all_cmnds']
         config = root / 'server.conf'
         remote = root / 'remote.json'
@@ -1064,9 +1035,18 @@ def event_case(fmt, scenario):
                         except OSError: time.sleep(.02)
                     else: raise AssertionError('sudo_logsrvd did not listen')
                     result = execute(binary, args, user=user, cwd=str(root), logfile=logfile, fmt=fmt)
-                    # Event-only clients and mailers are asynchronous. The daemon
-                    # remains live until both dispositions have had time to drain.
-                    time.sleep(.3)
+
+
+                    deadline = time.monotonic() + 1
+                    while time.monotonic() < deadline:
+                        if kind != 'reject':
+                            assert not mail.exists() or not mail.stat().st_size, (binary, mail.read_text())
+                        time.sleep(.01)
+                    if kind:
+                        deadline = time.monotonic() + 5
+                        while not (remote.exists() and remote.stat().st_size):
+                            assert time.monotonic() < deadline, 'remote event did not arrive'
+                            time.sleep(.01)
                 finally:
                     daemon.terminate()
                     daemon.wait(timeout=5)
@@ -1100,8 +1080,8 @@ def event_case(fmt, scenario):
                         assert 'source' not in fields, fields
                     else:
                         assert fields['source'] == str(policy) + ':2:43', fields
-                    # Preserve every key/value, including UUID, when checking
-                    # that both local destinations received the same event.
+
+
                     assert message[1] == Pairs([('sudo', records)]), (message, records)
                     identity = fields['uuid']
                     assert re.fullmatch(r'[0-9a-f]{10}(?:-[0-9a-f]{4}){3}-[0-9a-f]{10}', identity), identity
@@ -1140,9 +1120,9 @@ for cli_core_third_event_format in json json_compact; do
   done
 done
 
-# ResidualGaps3 rows 4/5 and WaveGReview #10. The shared event fixture captures
-# real /dev/log datagrams and normalizes only timestamps/process identifiers.
-# Keep the reference's complete diagnostics and local event fields in comparison.
+
+
+
 cli_core_third_order_compare() {
   cli_core_third_event_fixture
   python3 - "$WORK/cli-core-third-event.py" "$1" "$2" <<'PY'
@@ -1212,7 +1192,7 @@ elif kind == 'editcwd':
     settings, rule = '', 'ivan ALL=(root) NOPASSWD: sudoedit\n'
     if scenario.startswith('wildcard'): settings = 'Defaults runcwd=*\n'
     if scenario.startswith('fixed'): settings = 'Defaults runcwd="' + str(target) + '"\n'
-    # Unlike sudoedit's LOG_OUTPUT/TIMEOUT tags, command-rule CWD is honored.
+
     if scenario.startswith('rule-wildcard'): rule = 'ivan ALL=(root) CWD=* NOPASSWD: sudoedit\n'
     if scenario == 'rule-fixed': rule = 'ivan ALL=(root) CWD=' + str(target) + ' NOPASSWD: sudoedit\n'
     set_policy(settings, rule)
@@ -1221,10 +1201,10 @@ elif kind == 'editcwd':
         args += ['-D', str(other if scenario == 'fixed-mismatch' else target)]
     relative = scenario.endswith('relative')
     args += ['operand' if relative else str(invoke / 'operand')]
-    # Probe both the editor's cwd and the original selected by a relative operand.
-    # The no-op editor never prints randomized temporary names or mutates files.
-    # sudo.ws opens relative originals in the invoking cwd, then changes only
-    # the editor cwd; its accept record PWD names the editor cwd.
+
+
+
+
     if scenario in ('forbidden', 'fixed-equal', 'fixed-mismatch'):
         expected_error = 'you are not permitted to use the -D option with sudoedit'
         expected_output = b''

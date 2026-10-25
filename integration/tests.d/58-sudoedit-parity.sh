@@ -1,5 +1,5 @@
-# sudo.ws 1.9.17p2 src/sudo_edit.c and plugins/sudoers/editor.c parity.
-# Every case runs unchanged against the installed implementation and reference.
+
+
 sudoedit_parity_setup() {
   edit_setup
   printf 'henry ALL=(ALL:ALL) NOPASSWD: sudoedit\n' >/etc/sudoers.d/58-sudoedit
@@ -165,7 +165,7 @@ for variable in SUDO_EDITOR VISUAL EDITOR; do
   }
 done
 
-# find_editor runs before env_swap_old: secure_path has already replaced PATH.
+
 for path_mode in secure user exempt; do
   begin "sudoedit-parity-editor-path-$path_mode" && {
     sudoedit_parity_setup
@@ -351,8 +351,8 @@ begin sudoedit-chroot-rule-wildcard-does-not-allow-user-root && {
   end
 }
 
-# Supply a distinct jailed editor. It can observe the jail, but the host temp
-# pathname passed by sudoedit is deliberately absent from that filesystem.
+
+
 sudoedit_chroot_editor() {
   python3 - <<'PY'
 import pathlib, re, shutil, subprocess
@@ -422,8 +422,8 @@ begin sudoedit-chroot-fixed-default-denies-identical-user-root && {
   end
 }
 
-# Match the exec jail boundary: absolute symlinks whose host realpath leaves the
-# configured root are intentionally refused, even where sudo.ws follows them.
+
+
 for escape_kind in editor parent; do
   begin "sudoedit-chroot-refuses-$escape_kind-escape" && {
     sudoedit_chroot_setup
@@ -485,7 +485,7 @@ EOF
     expect_rc 0
     expect_out_line editor-output-marker
     if [[ $logging == tag ]]; then
-      # Like CHROOT, command-rule LOG_OUTPUT is not propagated for MODE_EDIT.
+
       [[ ! -e "$dir/seq" ]] || fail 'sudoedit unexpectedly honored LOG_OUTPUT tag'
     else
       run root "sudoreplay.ws -d '$dir' -l"

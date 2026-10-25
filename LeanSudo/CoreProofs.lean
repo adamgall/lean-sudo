@@ -1,14 +1,9 @@
 import LeanSudo.Core
 import LeanSudo.Policy.Proofs
 
-/-! End-to-end authorization, identity, environment and authentication invariants.
-Execution and editing share a checked policy-decision origin; the IO shell must
-successfully perform the returned authentication before execution. -/
 namespace LeanSudo.Core
 open Policy
 
-/-- LDAP privilege Defaults are post-lookup runtime settings, never a second
-opportunity to authorize under a changed runas/user/host matching policy. -/
 theorem privilege_defaults_preserve_authorization (ctx : Context)
     (before after : Settings) :
     policyJudgement { ctx with settings := after, policySettings := some before } =
@@ -85,8 +80,6 @@ private theorem authJudgement_policyJudgement (ctx : Context) :
   by_cases hm : ctx.opts.mode = .list <;>
     simp [authJudgement, policyJudgement, listOtherDenied, hm]
 
-/-- The executable uses either the ordinary matched command or the complete
-command/argv pair retained by the deciding rooted authorization. -/
 def CommandLineage (ctx : Context) (a : Allowed) (rc : ResolvedCmd) : Prop :=
   (a.selection = none ∧
     (request ctx).command = .run rc.path rc.canonical (policyArgs ctx rc)) ∨
@@ -138,7 +131,6 @@ private theorem decide_allowed_action (ctx : Context) (p : ExecPlan ⊕ EditPlan
       | none =>
         exact ⟨a, policyJudgement_allow ctx a hj, rfl, hf, hh, by simp [decide, he, hj]⟩
 
-/-- Every executable plan comes from an allowed resolved run with a checked environment. -/
 theorem exec_origin (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .exec p) :
     ∃ a rc, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
       ctx.opts.mode = .run ∧ resolvedFor ctx a = some rc ∧ p = execPlan ctx a rc ∧
@@ -157,7 +149,6 @@ theorem exec_origin (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .e
         resolvedFor_lineage ctx a rc hm hc, by simp [← hp, execPlan]⟩
   all_goals repeat first | split at hh | cases hh
 
-/-- Editing is authorized for precisely the absolute file list in the returned plan. -/
 theorem edit_origin (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .edit p) :
     ∃ a, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
       ctx.opts.mode = .edit ∧ p = editPlan ctx a ∧
@@ -177,8 +168,6 @@ theorem exec_allowed (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .
   obtain ⟨a, rc, ha, _, hc, hp, _, _, hr, _⟩ := exec_origin ctx p h
   exact ⟨a, rc, ha, hc, hr, by simp [hp, execPlan], by simp [hp, execPlan]⟩
 
-/-- Execution uses precisely the matched canonical parent and requested basename,
-with canonical facts from the deciding root rather than the host's lookup. -/
 theorem exec_path_is_canonical (ctx : Context) (p : ExecPlan)
     (h : (decide ctx).action = .exec p) :
     ∃ a rc, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
@@ -208,8 +197,6 @@ theorem edit_allowed (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .
   obtain ⟨a, ha, hm, rfl, _, _⟩ := edit_origin ctx p h
   exact ⟨a, ha, by simp [request, hm, editPlan]⟩
 
-/-- Runtime traversal receives absolute, NUL-free paths, without changing the
-policy's original operands or lexically folding symlink-sensitive parent components. -/
 theorem edit_files_normalized (ctx : Context) (p : EditPlan)
     (h : (decide ctx).action = .edit p) :
     ∀ file ∈ p.files, file.startsWith "/" = true ∧ file.contains '\x00' = false := by
@@ -224,8 +211,6 @@ theorem edit_files_normalized (ctx : Context) (p : EditPlan)
   simp only [invalidEditFile, List.find?_eq_none] at hb
   simpa [editPlan, normalizedEditFile] using hb
 
-/-- The runtime file list is precisely the policy operands resolved against the
-invoking directory, not a second independently selected list. -/
 theorem edit_files_match_policy (ctx : Context) (p : EditPlan)
     (h : (decide ctx).action = .edit p) :
     (request ctx).command = .sudoedit p.policyFiles ∧
@@ -261,7 +246,6 @@ theorem edit_identity (ctx : Context) (p : EditPlan) (h : (decide ctx).action = 
   obtain ⟨a, _, _, rfl, _, _⟩ := edit_origin ctx p h
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
-/-- The alternatives which can legitimately waive a password check. -/
 def AuthExemption (ctx : Context) (a : Allowed) : Prop :=
   ctx.invoking.uid = 0 ∨ a.needsAuth = false ∨ userIsExempt ctx.settings ctx.invoking = true ∨
     (Timestamp.lookup ctx.now ctx.settings.timestampTimeout ctx.tsScope
@@ -271,7 +255,6 @@ def AuthExemption (ctx : Context) (a : Allowed) : Prop :=
         ctx.invoking.groups.any (fun x => x.2 == g.gid) = true) ∧
       sameSecurityContext ctx a = true)
 
-/-- A shell restriction cannot be bypassed by an otherwise authorized command. -/
 theorem invalid_runas_shell_no_exec (ctx : Context)
     (hs : ctx.settings.runasCheckShell = true)
     (hv : ctx.validShells.contains ctx.target.shell = false) :
@@ -283,14 +266,11 @@ theorem invalid_runas_shell_no_exec (ctx : Context)
   simp [earlyAction, earlyFailure, hm, hs, hv'] at he
   repeat' first | contradiction | (rcases branch_of_ite_eq he with he | he)
 
-/-- Exemption waives authentication but does not alter authorization. -/
 theorem exempt_user_no_auth (ctx : Context) (j : Judgement)
     (h : userIsExempt ctx.settings ctx.invoking = true) :
     authentication ctx j = .none := by
   simp [authentication, policyNeedsAuth, h]
 
-/-- Disabling authentication also suppresses password prompts for denied commands;
-the independent authorization decision remains a denial. -/
 theorem denied_authentication_disabled (ctx : Context)
     (h : ctx.settings.authenticate = false) :
     authentication ctx .deny = .none := by
@@ -362,7 +342,6 @@ private theorem buildEnv_success_iff (i : EnvInput) :
   split <;> simp_all
   split <;> simp_all
 
-/-- PAM contributes values only after validation, and cannot turn rejection into success. -/
 theorem buildEnv_success_pam_independent (i : EnvInput) (pam : EnvList) :
     (∃ env, buildEnv { i with pamEnv := pam } = .ok env) ↔
       (∃ env, buildEnv i = .ok env) := by
@@ -387,7 +366,6 @@ theorem reset_never_waives_auth (ctx : Context) (j : Judgement)
     authentication ctx j = .required (authUser ctx) := by
   simp [authentication, tsValid, hk, hn]
 
-/-- On every policy path, `-k` forces the requested password regardless of cached records. -/
 theorem decide_reset_requires_auth (ctx : Context) (he : earlyAction ctx = none)
     (hk : ctx.opts.resetTimestamp = true)
     (hn : policyNeedsAuth ctx (authJudgement ctx
@@ -420,8 +398,6 @@ theorem administrative_modes_no_auth_or_update (ctx : Context)
     (decide ctx).auth = .none ∧ (decide ctx).updateTimestamp = false := by
   rcases hm with h | h | h | h <;> simp [decide, earlyAction, h]
 
-/-- Execution uses the descriptor pinned for the selected root, or the host
-descriptor only when there is no rooted command selection. -/
 theorem exec_fd_is_pinned (ctx : Context) (p : ExecPlan)
     (h : (decide ctx).action = .exec p) {fd : Nat} (hf : p.execFd = some fd) :
     ctx.execFd = some fd ∨
@@ -440,7 +416,6 @@ theorem exec_fd_is_pinned (ctx : Context) (p : ExecPlan)
     rw [← hfd]
     simpa [descriptorFor, hs] using hd
 
-/-- An unsupported deciding restriction cannot authorize execution. -/
 theorem enforcement_error_no_exec (ctx : Context) (a : Allowed)
     (ha : evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a)
     (he : (enforcementError ctx a).isSome = true) :
@@ -463,8 +438,6 @@ theorem enforcement_error_no_edit (ctx : Context) (a : Allowed)
   have checks := allowedFailure_checks ctx a hf
   simp [enforcementError, checks.1, checks.2] at he
 
-/-- Namespace escape facts of the winning lookup cannot be ignored or replaced
-by a host-root fallback, in either execution mode. -/
 theorem selected_refusal_no_execution (ctx : Context) (a : Allowed)
     (ha : evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a)
     (href : (a.selection.bind (·.refusal)).isSome = true) :
@@ -475,8 +448,6 @@ theorem selected_refusal_no_execution (ctx : Context) (a : Allowed)
       simp [enforcementError, preCommandFailure, hp, hs] at *
   exact ⟨enforcement_error_no_exec ctx a ha he, enforcement_error_no_edit ctx a ha he⟩
 
-/-- Interception may execute ordinary programs, but not forbidden set-id inodes
-from either the host lookup or the deciding rooted lookup. -/
 theorem intercept_setid_no_exec (ctx : Context) (a : Allowed)
     (ha : evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a)
     (hm : ctx.opts.mode = .run)
@@ -488,8 +459,6 @@ theorem intercept_setid_no_exec (ctx : Context) (a : Allowed)
   cases hp : permissionFailure ctx a <;> cases href : a.selection.bind (·.refusal) <;>
     simp [enforcementError, preCommandFailure, hp, href, hm, hi, hs, hmode]
 
-/-- The selected process root is exactly the authorized root, after home
-expansion; a command-line override requires the deciding wildcard permission. -/
 theorem exec_chroot_selection (ctx : Context) (p : ExecPlan)
     (h : (decide ctx).action = .exec p) :
     ∃ a, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
@@ -511,8 +480,6 @@ theorem exec_user_chroot_requires_wildcard (ctx : Context) (p : ExecPlan)
   obtain ⟨a, ha, hp, _⟩ := exec_chroot_selection ctx p h
   exact ⟨a, ha, by simpa [chrootPermitted, hr] using hp⟩
 
-/-- Runtime Defaults cannot move a selected command into a different tilde-root
-after lookup: root expansion uses the same run-as principal as policy matching. -/
 theorem exec_selected_root (ctx : Context) (p : ExecPlan)
     (h : (decide ctx).action = .exec p) (a : Allowed) (selected : CommandSelection)
     (ha : evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a)
@@ -524,8 +491,6 @@ theorem exec_selected_root (ctx : Context) (p : ExecPlan)
   cases hb
   simp [execPlan, runPlan, commandChroot, selectedChroot, hm, hs]
 
-/-- sudoedit roots its editor according to Defaults, not the command's CHROOT
-option; original-file operands remain unchanged (edit_files_match_policy). -/
 theorem edit_chroot_uses_defaults (ctx : Context) (p : EditPlan)
     (h : (decide ctx).action = .edit p) :
     p.chroot = ((ctx.opts.chroot.or (authorizationSettings ctx).runchroot).filter (· != "*")).bind
@@ -547,8 +512,6 @@ theorem edit_user_chroot_requires_wildcard (ctx : Context) (p : EditPlan)
       simp [enforcementError, preCommandFailure, permissionFailure, hp]
     exact False.elim (enforcement_error_no_edit ctx a ha he p h)
 
-/-- Remote destinations affect transport, not command-policy enforcement.
-The shell separately enforces the configured logging failure policy. -/
 theorem enforcementError_logServers (ctx : Context) (a : Allowed) (servers : List String) :
     enforcementError { ctx with settings := { ctx.settings with logServers := servers } } a =
       enforcementError ctx a := by
@@ -559,7 +522,6 @@ theorem enforcementError_logServers (ctx : Context) (a : Allowed) (servers : Lis
     chrootPermitted, commandChroot, selectedChroot, configuredChroot, he]
   rfl
 
-/-- Every execution carries the interception flags of its deciding authorization. -/
 theorem exec_intercept_matches_policy (ctx : Context) (p : ExecPlan)
     (h : (decide ctx).action = .exec p) :
     ∃ a, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
@@ -568,8 +530,6 @@ theorem exec_intercept_matches_policy (ctx : Context) (p : ExecPlan)
   obtain ⟨a, rc, ha, _, _, rfl, _⟩ := exec_origin ctx p h
   exact ⟨a, ha, rfl, rfl⟩
 
-/-- A `%:` atom matches only an affirmative provider answer for this exact
-principal and group. Neither Unix membership nor a missing provider grants it. -/
 theorem group_plugin_requires_yes (ctx : Context) (p : Principal) (group : String)
     (h : userBase p ctx.settings (some (request ctx)) (.nonunixGroup group) = true) :
     (p.name, group, true) ∈ ctx.pluginGroups := by
@@ -578,35 +538,29 @@ theorem group_plugin_requires_yes (ctx : Context) (p : Principal) (group : Strin
   cases Option.some.inj hr
   exact hm
 
-/-- A malformed plugin timeout cannot silently become an unlimited execution. -/
 theorem invalid_timeout_no_execution (ctx : Context)
     (h : (Cli.timeoutError ctx.opts).isSome = true) :
     (∀ p, (decide ctx).action ≠ .exec p) ∧
     (∀ p, (decide ctx).action ≠ .edit p) := by
   cases hm : ctx.opts.mode <;> simp [decide, earlyAction, earlyFailure, FailureInfo.action, hm, h]
 
-/-- An explicitly configured command directory wins over login-home selection
-and cannot be treated as an optional missing home directory. -/
 theorem configured_cwd_required (ctx : Context) (a : Allowed) (rc : ResolvedCmd)
     (path resolved : String) (hp : configuredCwd ctx a = some path)
     (hr : expandHome ctx path = some resolved) :
     (execPlan ctx a rc).cwd = some resolved ∧ (execPlan ctx a rc).cwdOptional = false := by
   simp [execPlan, hp, hr]
 
-/-- Denying permission to list another user is never an execution authorization. -/
 theorem list_other_denied_no_execution (ctx : Context) (h : listOtherDenied ctx = true) :
     (∀ p, (decide ctx).action ≠ .exec p) ∧ (∀ p, (decide ctx).action ≠ .edit p) := by
   cases he : earlyAction ctx with
   | some action => simpa [decide, he] using early_safe ctx action he
   | none => simpa [decide, he, policyJudgement, h] using denied_policy_safe ctx
 
-/-- Editor variables select only the editor, never policy file operands. -/
 theorem editor_variables_preserve_files (ctx : Context) (a : Allowed) (env : EnvList) :
     (editPlan { ctx with userEnv := env } a).files = (editPlan ctx a).files ∧
     (editPlan { ctx with userEnv := env } a).policyFiles = (editPlan ctx a).policyFiles :=
   ⟨rfl, rfl⟩
 
-/-- A policy-stage failure can never be published as an accepted command. -/
 theorem failureLog_ne_accept (ctx : Context) (failure : FailureInfo)
     (allowed : Option Allowed) (line : LogLine)
     (h : failureLog ctx failure allowed = some line) :
@@ -628,7 +582,6 @@ theorem policy_failure_ne_accept (ctx : Context) (j : Judgement)
   apply failureLog_ne_accept ctx failure _ line
   simpa only [policyDecision, hf] using hl
 
-/-- Warnings and audit-only failures do not trigger accepted-command mail. -/
 theorem policy_warning_no_mail (ctx : Context) (j : Judgement)
     (failure : FailureInfo) (hf : decisionFailure ctx j = some failure)
     (hw : failure.denial = false) :

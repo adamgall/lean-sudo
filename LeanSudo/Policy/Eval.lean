@@ -1,51 +1,11 @@
 import LeanSudo.Policy.Types
 import LeanSudo.Util.Glob
 
-/-!
-# Policy evaluation
-
-`evaluate s st r` decides a `Request` against an include-resolved sudoers policy.
-
-## List semantics (sudo's last-match-wins)
-
-Every list (user, host, run-as, command, and alias member lists) is scanned in order;
-the result is decided by the **last** member with a non-`none` result.
-Alias atoms preserve their own member list's tri-state result recursively.
-Member negation flips `some b` to `some (!b)`; `none` stays `none`.
-
-Alias recursion is bounded by fuel `Aliases.fuel` = number of alias definitions + 1.
-`validate` rejects alias cycles, undefined alias references and duplicate alias
-names, so on validated policies the fuel never runs out. On unvalidated input,
-running out of fuel or an undefined alias makes the alias atom *not match*. That is
-the conservative choice for non-negated members but not for negated ones (a
-`!BADALIAS` that silently does not match widens the policy), which is why **callers
-must run `validate` first** (Main does). The proofs in `LeanSudo.Policy.Proofs` do not
-depend on this: soundness is stated in terms of the same matching functions.
-
-## Decision
-
-`candidates` walks all user specifications in file order and collects one
-`Candidate` per command spec whose user list, host list, run-as spec and command
-member all match (for `-l`/`-v` only user and host lists are checked). For running a
-command the last candidate decides (`judge`); no candidate ⇒ `.deny`.
-For own `-l`/`-v`, every spec of a matching user/host entry is allowing:
-listing ignores validity windows and command negation because it executes no command.
-
-CHROOT matching selects a root-indexed command lookup for each rule. User/host/run-as
-facts and policy arguments remain unchanged; path, stat, glob, regex and digest facts
-come from that root. Missing root facts deny rather than dropping a negated rule.
-The winning `Allowed.selection` carries the selected path, argv and descriptor;
-execution must not substitute the host lookup after authorization.
--/
-
 namespace LeanSudo.Policy
 
 open LeanSudo.Sudoers
 open LeanSudo.Glob (fnmatch hasGlob)
 
-/-! ## Generic list matching -/
-
-/-- Last non-UNSPEC result wins; member negation flips ALLOW and DENY. -/
 def matchList {α : Type} (m : α → Option Bool) : List (Member α) → Option Bool
   | [] => none
   | x :: xs =>
@@ -53,9 +13,6 @@ def matchList {α : Type} (m : α → Option Bool) : List (Member α) → Option
     | some b => some b
     | none => (m x.atom).map (fun b => b != x.negated)
 
-/-! ## Aliases and user specifications -/
-
-/-- Alias definitions of a policy, by kind, in file order. -/
 structure Aliases where
   user : List (String × List (Member UserAtom)) := []
   runas : List (String × List (Member UserAtom)) := []
@@ -71,17 +28,14 @@ def aliasesOf : Sudoers → Aliases
   | .cmndAlias n ms :: es => let a := aliasesOf es; { a with cmnd := (n, ms) :: a.cmnd }
   | _ :: es => aliasesOf es
 
-/-- Fuel for alias expansion: enough for any acyclic alias graph. -/
 def Aliases.fuel (a : Aliases) : Nat :=
   a.user.length + a.runas.length + a.host.length + a.cmnd.length + 1
 
-/-- The user specifications of a policy, in file order. -/
 def specsOf : Sudoers → List UserSpec
   | [] => []
   | .userSpec u :: es => u :: specsOf es
   | _ :: es => specsOf es
 
-/-- First definition of an alias (duplicates are rejected by `validate`). -/
 def lookupAlias {β : Type} (l : List (String × β)) (n : String) : Option β :=
   (l.find? (·.1 == n)).map (·.2)
 
@@ -97,7 +51,6 @@ def CmndAtom.aliasName : CmndAtom → Option String
   | .alias n => some n
   | _ => none
 
-/-- Alias-aware tri-state matching. Undefined aliases / exhausted fuel give `none`. -/
 def atomMatches {α : Type} (aliasName : α → Option String)
     (defs : List (String × List (Member α))) (base : α → Bool) : Nat → α → Option Bool
   | 0, a => if (aliasName a).isNone && base a then some true else none
@@ -109,9 +62,6 @@ def atomMatches {α : Type} (aliasName : α → Option String)
       | none => none
     | none => if base a then some true else none
 
-/-! ## Users, groups, hosts -/
-
-/-- sudo's case-insensitive account comparisons (enabled by default). -/
 def nameEq (foldCase : Bool) (a b : String) : Bool :=
   if foldCase then a.toLower == b.toLower else a == b
 
@@ -121,7 +71,6 @@ def netgroupMatch (st : Settings) (facts : Option Request) (n : String)
     r.netgroups.any fun (ng, u, h, yes) =>
       ng == n && u == user && (h == host || (host.isSome && h == some r.host)) && yes)
 
-/-- External membership is an exact query fact, not a Unix/NSS inference. -/
 def pluginGroupMatch (st : Settings) (facts : Option Request) (user group : String) : Bool :=
   st.groupPlugin.isSome && facts.any (fun r =>
     r.pluginGroups.any fun (u, g, yes) => u == user && g == group && yes)
@@ -215,9 +164,6 @@ def runasGroupResult (al : Aliases) (fuel : Nat) (g : GroupInfo) (l : List (Memb
     (st : Settings) : Option Bool :=
   matchList (atomMatches UserAtom.aliasName al.runas (groupBase g st) fuel) l
 
-/-! ## Run-as -/
-
-/-- Is `t` the `runas_default` user (`#uid` form allowed)? -/
 def isRunasDefault (st : Settings) (t : Principal) : Bool :=
   match st.runasDefault.toList with
   | '#' :: ds =>
@@ -226,10 +172,6 @@ def isRunasDefault (st : Settings) (t : Principal) : Bool :=
     | none => false
   | _ => nameEq st.caseInsensitiveUser st.runasDefault t.name
 
-/-- Group half when the run-as user matched ALLOW. No `-g` ⇒ fine.
-As in sudoers `runas_grouplist_matches`, an unspecified group result falls
-back to the target's primary/supplementary groups, including inside aliases.
-Callers with an unmatched user must use `runasGroupResult` without this fallback. -/
 def runasGroupOk (al : Aliases) (fuel : Nat) (r : Request) (gs : Option (List (Member UserAtom)))
     (st : Settings) : Bool :=
   match r.runasGroup with
@@ -251,9 +193,6 @@ where
         | _ => if groupBase g st a then some true else none) ms
       result.orElse (fun _ => if fallback then some true else none)
 
-/-- sudoers `runaslist_matches`: group fallback requires a matched user;
-an unspecified user can be rescued only by an explicitly allowed `-g` and
-the invoking user's own name. An explicit user DENY is never rescued. -/
 def runasOk (al : Aliases) (fuel : Nat) (st : Settings) (r : Request) (rs : Option RunasSpec) : Bool :=
   let (userResult, gs) := match rs with
     | none =>
@@ -271,16 +210,10 @@ def runasOk (al : Aliases) (fuel : Nat) (st : Settings) (r : Request) (rs : Opti
       r.runasUser.name == r.user.name &&
         (gs.bind (fun ms => runasGroupResult al fuel g ms st) == some true)
 
-/-! ## Commands -/
-
-
 def endsWithSlash (p : String) : Bool := p.toList.getLast? == some '/'
 
 def dropLastChar (p : String) : String := String.ofList p.toList.dropLast
 
-
-/-- Argument constraint. `pathname`: `*`/`?` do not match `/` (sudo uses `FNM_PATHNAME`
-for `sudoedit` arguments, `command_args_match` in match_command.c). -/
 def regexMatch (facts : Option Request) (pattern subject : String) : Bool :=
   facts.any fun r => r.regexMatches.any fun (p, s, yes) => p == pattern && s == subject && yes
 
@@ -300,18 +233,13 @@ def fileIdMatch (fallback : Bool) (facts : Option Request) (p path : String) : B
     | some (_, d, i), some (_, d', i') => d == d' && i == i'
     | _, _ => fallback && p == path
 
-/-- Missing facts never authorize directory matching in an IO-backed request. -/
 def sameFile := fileIdMatch false
 
-/-- Unlike directory matching, sudo's literal matcher falls back to exact raw
-path equality when either stat fails (`command_matches_normal`). -/
 def literalFileMatches := fileIdMatch true
 
 def pathNamesMatch (canon : String → String) (p path : String) : Bool :=
   baseOf p == baseOf path && canon (dirOf p) == canon (dirOf path)
 
-/-- Literal matching compares the basename, canonical PARENT directory and inode,
-falling back to the exact path if stat fails. File realpath is deliberately unused. -/
 def literalPathMatches (canon : String → String) (facts : Option Request) (p path : String) : Bool :=
   pathNamesMatch canon p path && literalFileMatches facts p path
 
@@ -333,10 +261,8 @@ def pathMatches (canon : String → String) (p path _canonical : String)
   else if endsWithSlash p then directoryMatches canon facts p path
   else literalPathMatches canon facts p path
 
-/-- Digest spelling is presentation-only: compare the decoded algorithm and bytes. -/
 def digestMatches (a b : Digest) : Bool := a.algo == b.algo && a.bytes == b.bytes
 
-/-- sudo's pseudo-command branch does not inspect file digests. -/
 def isPseudoAtom : CmndAtom → Bool
   | .list | .sudoedit _ => true
   | _ => false
@@ -373,7 +299,6 @@ def cmndMemberResult (al : Aliases) (fuel : Nat) (canon : String → String) (cm
     (m : Member CmndAtom) (facts : Option Request) : Option Bool :=
   cmndListResult al fuel canon cmd [m] facts
 
-/-- Whether the last matching member inside an alias is digest-constrained. -/
 def cmndUsesDigest (al : Aliases) (r : Request) : Nat → CmndAtom → Bool
   | _, .digest _ atom => !isPseudoAtom atom
   | 0, _ => false
@@ -384,18 +309,10 @@ def cmndUsesDigest (al : Aliases) (r : Request) : Nat → CmndAtom → Bool
     last.any (fun m => cmndUsesDigest al r fuel m.atom)
   | _ + 1, _ => false
 
-/-! ## Decision -/
-
-/-- Running a command or sudoedit (as opposed to `-l` / `-v`). -/
 def isRunCmd : Command → Bool
   | .run _ _ _ | .sudoedit _ | .checkList => true
   | .list | .validate => false
 
-/-- `none` is an incompatible user-requested root; `some none` uses the host.
-A literal rule root overrides the global default. A global `*` means no root
-unless the user supplied `-R`; a rule `*` is kept for its own lookup.
-sudoedit ignores per-command CHROOT and needs no executable lookup; its editor's
-global root is handled separately by the core. -/
 def specRoot (r : Request) (cs : CmndSpec) : Option (Option String) :=
   match r.command with
   | .sudoedit _ => some none
@@ -409,8 +326,6 @@ def specRoot (r : Request) (cs : CmndSpec) : Option (Option String) :=
       | some root => some (some root)
       | none => some (r.defaultChroot.filter (· != "*"))
 
-/-- Root lookup changes only command path resolution, never policy arguments
-or the kind of pseudo-command the caller requested. -/
 def rootedCommand (command : Command) (facts : RootCommandFacts) : Command :=
   match command, facts.command with
   | .run _ _ args, .run path canonical _ => .run path canonical args
@@ -431,8 +346,6 @@ def specRequest (r : Request) (cs : CmndSpec) : Option Request :=
   | some (some root) =>
     (r.rootFacts.find? (·.1 == root)).map (fun (_, facts) => withRootFacts r facts)
 
-/-- The rule's logical execution path uses the same canonical parent and basename
-that the matcher compares, not an independently supplied path. -/
 def rootExecutionPath (r : Request) (facts : RootCommandFacts) : String :=
   match rootedCommand r.command facts with
   | .run path _ _ =>
@@ -454,8 +367,6 @@ def specSelection (r : Request) (cs : CmndSpec) : Option CommandSelection := do
       refusal := facts.refusal
       setid := facts.setid }
 
-/-- Missing oracle data is a hard denial, not a skipped negation. Explicit
-not-found facts still participate, allowing ALL to reach command-not-found handling. -/
 def specCmndResult (al : Aliases) (fuel : Nat) (r : Request) (cs : CmndSpec) : Option Bool :=
   match specRoot r cs with
   | none => none
@@ -469,7 +380,6 @@ def specUsesDigest (al : Aliases) (fuel : Nat) (r : Request) (cs : CmndSpec) : B
   isRunCmd r.command && (specRequest r cs).any (fun selected =>
     cmndUsesDigest al selected fuel cs.cmnd.atom)
 
-/-- A matching command spec, retaining its command member's ALLOW or DENY result. -/
 structure Candidate where
   spec : CmndSpec
   allow : Bool
@@ -477,28 +387,20 @@ structure Candidate where
   selection : Option CommandSelection := none
   deriving Repr, BEq, Inhabited
 
-/-- Resolve a zoneless civil timestamp using its own system-zone conversion,
-not the offset at request time. Explicitly zoned timestamps are already epochs. -/
 def resolveTimeBound (localTimeBounds : List (Nat × Nat)) (localTime : Bool)
     (n : Nat) : Option Nat :=
   if localTime then (localTimeBounds.find? (·.1 == n)).map (·.2) else some n
 
-/-- Bounds are inclusive. A missing conversion for either local bound makes the
-spec inapplicable; an absent bound imposes no restriction. -/
 def inTimeWindow (now : Nat) (cs : CmndSpec) (localTimeBounds : List (Nat × Nat)) : Bool :=
   cs.options.notBefore.all (fun n =>
     (resolveTimeBound localTimeBounds cs.options.notBeforeLocal n).any (· ≤ now)) &&
   cs.options.notAfter.all (fun n =>
     (resolveTimeBound localTimeBounds cs.options.notAfterLocal n).any (now ≤ ·))
 
-/-- Does a command spec apply to the request? For `-l`/`-v` every spec does (only the
-user and host lists are relevant); otherwise run-as and the command member must match. -/
 def specApplies (al : Aliases) (fuel : Nat) (st : Settings) (r : Request) (cs : CmndSpec) : Bool :=
   !isRunCmd r.command || (inTimeWindow r.now cs r.localTimeBounds &&
     (runasOk al fuel st r cs.runas && (specCmndResult al fuel r cs).isSome))
 
-/-- Listing/validation are authorized by any applicable user/host entry, even
-one containing only negated commands; execution retains the tri-state result. -/
 def specAllow (al : Aliases) (fuel : Nat) (r : Request) (cs : CmndSpec) : Bool :=
   if isRunCmd r.command then (specCmndResult al fuel r cs).getD false
   else true
@@ -520,11 +422,9 @@ def candidatesCore (al : Aliases) (specs : List UserSpec) (st : Settings) (r : R
     List Candidate :=
   specs.flatMap (usCandidates al al.fuel st r)
 
-/-- All candidates of a policy for a request, in file order. -/
 def candidates (s : Sudoers) (st : Settings) (r : Request) : List Candidate :=
   candidatesCore (aliasesOf s) (specsOf s) st r
 
-/-- Does a spec require authentication (PASSWD/NOPASSWD tag, else `authenticate`)? -/
 def specNeedsAuth (st : Settings) (cs : CmndSpec) : Bool := cs.tags.passwd.getD st.authenticate
 
 def commandImpliesSetenv : CmndAtom → Bool
@@ -534,34 +434,28 @@ def commandImpliesSetenv : CmndAtom → Bool
 
 def allowedOf (st : Settings) (c : Candidate) : Allowed :=
   { needsAuth := specNeedsAuth st c.spec
-    -- `ALL` (written directly in the spec) implies SETENV, like sudo's parser does
     setenv := c.spec.tags.setenv.getD (st.setenv || commandImpliesSetenv c.spec.cmnd.atom)
     toTagEffects := c.spec.tags.toTagEffects
     toExecutionOptions := c.spec.options.toExecutionOptions
     usesDigest := c.usesDigest
     selection := c.selection }
 
-/-- `listpw`/`verifypw` over the allowing specs. -/
 def pwNeedsAuth (pol : PwPolicy) (st : Settings) (ok : List Candidate) : Bool :=
   match pol with
   | .never => false
   | .always => true
-  -- authenticate unless every one is NOPASSWD
   | .all => ok.any (specNeedsAuth st ·.spec)
-  -- authenticate unless at least one is NOPASSWD
   | .any => ok.all (specNeedsAuth st ·.spec)
 
 def judgeListing (pol : PwPolicy) (st : Settings) (cands : List Candidate) : Judgement :=
   if (cands.filter (·.allow)).isEmpty then .deny
   else .allow { needsAuth := pwNeedsAuth pol st (cands.filter (·.allow)), setenv := false, cwd := none }
 
-/-- Running a command: the last candidate decides. -/
 def judgeRun (st : Settings) (cands : List Candidate) : Judgement :=
   match cands.getLast? with
   | some c => if c.allow then .allow (allowedOf st c) else .deny
   | none => .deny
 
-/-- `listpw` for `-l`, `verifypw` for `-v`. -/
 def pwPolicyFor (st : Settings) : Command → PwPolicy
   | .list => st.listpw
   | _ => st.verifypw
@@ -569,11 +463,9 @@ def pwPolicyFor (st : Settings) : Command → PwPolicy
 def judge (st : Settings) (cmd : Command) (cands : List Candidate) : Judgement :=
   if isRunCmd cmd then judgeRun st cands else judgeListing (pwPolicyFor st cmd) st cands
 
-/-- Decide a request. Callers must have checked the policy with `validate`. -/
 def evaluate (s : Sudoers) (st : Settings) (r : Request) : Judgement :=
   judge st r.command (candidates s st r)
 
-/-- Pseudo-command lookup ignores the requested run-as group, as lookup.c does. -/
 def listingRunasResult (al : Aliases) (st : Settings) (r : Request) (p : Principal)
     (cs : CmndSpec) : Option Bool :=
   match cs.runas with
@@ -582,8 +474,6 @@ def listingRunasResult (al : Aliases) (st : Settings) (r : Request) (p : Princip
   | none | some ⟨none, none⟩ => if isRunasDefault st p then some true else none
   | _ => none
 
-/-- `sudo -l -U other`: list/ALL for that user, or ALL as root. An explicit
-target-user denial is never rescued by the root fallback. -/
 def canListOther (s : Sudoers) (st : Settings) (r : Request) (other root : Principal) : Bool :=
   if r.user.uid == 0 || r.user.uid == other.uid then true else
   let al := aliasesOf s
@@ -604,8 +494,6 @@ def canListOther (s : Sudoers) (st : Settings) (r : Request) (other root : Princ
       matchList (atomMatches CmndAtom.aliasName al.cmnd base al.fuel) [cs.cmnd]
   results.getLast?.getD false
 
-/-! ## Static checks -/
-
 def userAliasRefs (l : List (Member UserAtom)) : List String :=
   l.filterMap fun m => UserAtom.aliasName m.atom
 def hostAliasRefs (l : List (Member HostAtom)) : List String :=
@@ -613,7 +501,6 @@ def hostAliasRefs (l : List (Member HostAtom)) : List String :=
 def cmndAliasRefs (l : List (Member CmndAtom)) : List String :=
   l.filterMap fun m => CmndAtom.aliasName m.atom
 
-/-- Alias references by kind: (user, runas, host, cmnd). -/
 structure Refs where
   user : List String := []
   runas : List String := []
@@ -644,12 +531,10 @@ def entryRefs : Entry → Refs
       cmnd := us.entries.flatMap fun hc => hc.cmnds.flatMap fun cs => cmndAliasRefs [cs.cmnd] }
   | .include _ | .includeDir _ => {}
 
-/-- First name occurring twice. -/
 def firstDup : List String → Option String
   | [] => none
   | n :: ns => if ns.contains n then some n else firstDup ns
 
-/-- Names reachable from `start` by following alias references (bounded). -/
 def closure (refs : String → List String) : Nat → List String → List String
   | 0, acc => acc
   | f + 1, acc =>
@@ -670,8 +555,6 @@ def checkKind {α : Type} (kind : String) (defs : List (String × List (Member �
   if let some n := firstCycle defs refsOf then
     throw s!"cycle in {kind} \"{n}\""
 
-/-- Reject duplicate alias names, references to undefined aliases and alias cycles
-(sudo's/visudo's alias checks). Must pass before `evaluate`/`resolveDefaults` are used. -/
 def validate (s : Sudoers) : Except String Unit := do
   let al := aliasesOf s
   let refs : Refs := s.foldl (fun (acc : Refs) e => acc.append (entryRefs e)) {}

@@ -1,4 +1,3 @@
-/* System lookup oracles: no policy decisions live in this translation unit. */
 #include "shim.h"
 #include "locale_scope.h"
 #include <arpa/inet.h>
@@ -20,7 +19,6 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-/* Userspace message type from libaudit.h, part of the stable audit ABI. */
 #ifndef AUDIT_USER_CMD
 #define AUDIT_USER_CMD 1123
 #endif
@@ -63,22 +61,6 @@ LEAN_EXPORT lean_obj_res leansudo_sys_netgroup(b_lean_obj_arg group, b_lean_obj_
   return lean_io_result_mk_ok(lean_box(innetgr(lean_string_cstr(group), optional(host), optional(user), optional(domain)) != 0));
 }
 
-/*
- * Repetition validation adapted from sudo lib/util/regex.c (1.9.17p2).
- * Copyright (c) 2023 Todd C. Miller <Todd.Miller@sudo.ws>
- *
- * Permission to use, copy, modify, and distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
- */
 static int regex_number(const char *str, const char **end) {
   int n = 0;
   char c;
@@ -134,9 +116,6 @@ static int regex_check(const char *pattern) {
   return 0;
 }
 
-/* Shared sudoers locale for matching and audit timestamp/path formatting.
- * Thread-local scopes leave PAM/libc diagnostics in the invoking user locale.
- * Cache the default C object for ordinary operations. */
 static pthread_once_t match_locale_once = PTHREAD_ONCE_INIT;
 static locale_t match_c_locale;
 
@@ -150,8 +129,6 @@ locale_t leansudo_locale_enter(const char *name, locale_t *previous) {
   locale_t locale = match_c_locale;
   if (*name && strcmp(name, "C") != 0 && strcmp(name, "POSIX") != 0) {
     locale = newlocale(LC_ALL_MASK, name, (locale_t)0);
-    /* Like sudoers_setlocale, unavailable configured locales fall back to C;
-     * an allocation failure is not an unavailable locale. */
     if (!locale) {
       if (errno == ENOMEM) return (locale_t)0;
       locale = match_c_locale;
@@ -246,8 +223,6 @@ LEAN_EXPORT lean_obj_res leansudo_sys_hostname(b_lean_obj_arg host, lean_obj_arg
   return lean_io_result_mk_ok(out);
 }
 
-/* Quote safe values and hex-encode unsafe bytes, as libaudit does. The caller
- * reserves 2*n+3 bytes, including quotes and termination. */
 static void audit_value(char *out, const char *value, size_t n) {
   int encode = 0;
   for (size_t i = 0; i < n; i++) {
@@ -268,7 +243,6 @@ static void audit_value(char *out, const char *value, size_t n) {
   *out = 0;
 }
 
-/* USER_CMD netlink record, matching audit_log_user_command's value encoding. */
 LEAN_EXPORT lean_obj_res leansudo_sys_audit(b_lean_obj_arg command, b_lean_obj_arg tty, uint8_t success, lean_obj_arg world) {
   (void)world;
   int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_AUDIT);
@@ -289,7 +263,6 @@ LEAN_EXPORT lean_obj_res leansudo_sys_audit(b_lean_obj_arg command, b_lean_obj_a
   struct { struct nlmsghdr hdr; char data[8970]; } msg;
   memset(&msg, 0, sizeof msg);
   const char *term = lean_string_cstr(tty);
-  /* Do not allow a terminal name to inject extra audit fields. */
   if (strpbrk(term, " \t\n\r\"'") != NULL) term = "(unknown)";
   if (strncmp(term, "/dev/", 5) == 0) term += 5;
   int len = snprintf(msg.data, sizeof msg.data, "cwd=%s cmd=%s exe=%s terminal=%s res=%s",

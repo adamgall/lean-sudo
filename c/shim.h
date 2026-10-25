@@ -1,5 +1,3 @@
-/* Shared Linux ABI plumbing. Borrowed Lean strings reject embedded NUL; policy
- * strings use strict UTF-8. Child-side helpers never allocate or enter Lean. */
 #ifndef LEANSUDO_SHIM_H
 #define LEANSUDO_SHIM_H
 #include <lean/lean.h>

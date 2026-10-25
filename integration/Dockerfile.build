@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1
-# Linux builder for lean-sudo's `sudo` and `visudo` (see integration/README.md).
-# Build context: the repository root (see /.dockerignore).
-#
-#   integration/build.sh            # → .lake/linux/{sudo,visudo}
-#
-# On Apple Silicon this yields aarch64-linux binaries, matching the arm64 test image.
+
+
+
+
+
+
 ARG BASE=ubuntu:26.04
 FROM ${BASE} AS build
 
@@ -13,7 +13,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git build-essential zstd \
  && rm -rf /var/lib/apt/lists/*
 
-# Toolchain layer: only invalidated when lean-toolchain changes.
+
 COPY lean-toolchain /src/lean-toolchain
 RUN curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
       | sh -s -- -y --default-toolchain none \
@@ -21,15 +21,11 @@ RUN curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init
 
 COPY . /src
 WORKDIR /src
-# .lake is a cache mount so incremental rebuilds only recompile changed modules.
+
 RUN --mount=type=cache,id=lean-sudo-lake,sharing=locked,target=/src/.lake \
     lake build sudo visudo \
  && mkdir -p /out && cp .lake/build/bin/sudo .lake/build/bin/visudo /out/
 
-# Export the independent ABI fixture alongside the implementation binaries.
-RUN curl -fsSL https://raw.githubusercontent.com/sudo-project/sudo/v1.9.17p2/include/sudo_plugin.h \
-      -o /tmp/sudo_plugin.h \
- && cc -std=c11 -O2 -fPIC -shared -I/tmp integration/plugin-host.c -o /out/plugin-host.so
 
 FROM scratch AS artifact
 COPY --from=build /out/ /

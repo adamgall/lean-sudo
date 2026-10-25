@@ -1,23 +1,10 @@
 import LeanSudo
 import Lean
 
-/-!
-Axiom audit. Every declaration (theorems, definitions, instances, private and
-auto-generated ones included) defined in a `LeanSudo.*` module may depend only on Lean's
-three standard axioms (`propext`, `Quot.sound`, `Classical.choice`). Any other axiom,
-in particular `sorryAx` (from `sorry`/`admit`) or `Lean.ofReduceBool` (from
-`native_decide`), makes this file fail to elaborate.
-
-  lake build LeanSudo && lake env lean scripts/AxiomAudit.lean
-
-Complements the source-level grep (no `sorry`/`admit`/`native_decide`/`implemented_by`).
--/
-
 open Lean Elab Command
 
 def allowedAxioms : List Name := [``propext, ``Quot.sound, ``Classical.choice]
 
-/-- Declarations whose defining module is `LeanSudo` or `LeanSudo.*`. -/
 def inLeanSudo (env : Environment) (n : Name) : Bool :=
   match env.getModuleIdxFor? n with
   | some idx => (`LeanSudo).isPrefixOf (env.header.moduleNames[idx.toNat]!)

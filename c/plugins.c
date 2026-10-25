@@ -1,17 +1,3 @@
-/*
- * Non-policy plugin host. ABI sequencing follows sudo 1.9.17p2 sudo.c,
- * load_plugins.c and exec_iolog.c, Copyright (c) 2009-2024 Todd C. Miller.
- * Permission to use, copy, modify, and distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
- */
 #include "shim.h"
 #include "plugins.h"
 #include <dlfcn.h>
@@ -78,8 +64,6 @@ static void hooks_free(void);
 
 static int bridge_server = -1, bridge_client = -1;
 static pid_t bridge_owner;
-/* Remains set after transport failure: a forked broker must never fall back
- * to callbacks against its stale private copy of the host's plugin state. */
 static bool bridge_child_mode;
 static int bridge_dispatch(void);
 static lean_obj_res bridge_request(unsigned op, char **info, char **argv, char **env);
@@ -309,7 +293,6 @@ static int open_plugin(struct plugin *p, bool version, const char **why) {
     return a->open(SUDO_API_VERSION, conversation, plugin_printf, p->settings,
         user_info, info, argc, argv, env, p->options, why);
 }
-/* The caller's plugin loop skips disabled opens; its block handles other failures. */
 #define OPEN_PLUGIN_OR_FAIL(p) \
     const char *why = NULL; \
     int rc = open_plugin(p, false, &why); \
@@ -345,7 +328,7 @@ static bool command_context(b_lean_obj_arg info, b_lean_obj_arg argv, b_lean_obj
 LEAN_EXPORT lean_obj_res lean_sudo_plugins_accept(b_lean_obj_arg info, b_lean_obj_arg argv, b_lean_obj_arg env) {
     if (!command_context(info, argv, env)) return ls_error("unable to allocate plugin context");
     (void)audit_accept("sudoers_policy", SUDO_POLICY_PLUGIN, command_info, run_argv, run_env);
-    return ls_ok(lean_box(true)); /* sudo.c ignores audit failure for list/validate. */
+    return ls_ok(lean_box(true));
 }
 static lean_obj_res check_current(bool initial, bool enforce) {
     if (enforce) {
@@ -381,8 +364,6 @@ static lean_obj_res check_current(bool initial, bool enforce) {
         p->opened = true;
     }
     bool accepted = audit_accept("sudo", SUDO_FRONT_END, command_info, run_argv, run_env);
-    /* exec_intercept.c treats policy/front-end audit as notification, unlike
-     * initial execution. approval_check still acts on its own audit result. */
     return ls_ok(lean_box(!initial || accepted));
 }
 #undef OPEN_PLUGIN_OR_FAIL
@@ -391,9 +372,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_plugins_check(b_lean_obj_arg info, b_lean_obj
     return check_current(true, true);
 }
 
-/* Subcommand callbacks must not free the vectors retained by an open I/O
- * plugin, nor reopen that plugin. Log-only checks retain the initial metadata
- * except for the actual command and working directory. */
 static lean_obj_res check_subcommand(char **info, char **argv, char **env, bool enforce) {
     if (!enforce) {
         size_t n = ls_strv_len(command_info), extra = ls_strv_len(info), used = 0;
@@ -460,9 +438,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_plugins_reject(b_lean_obj_arg message, uint8_
     return rc ? ls_unit() : ls_error("unable to log policy event");
 }
 
-/* The Lean interception broker is forked, but plugin state belongs to the
- * original privileged host. A private CLOEXEC socket carries callback data
- * and an affirmative result back; missing/malformed replies never authorize. */
 void ls_plugins_broker_close(void) {
     if (bridge_server >= 0) close(bridge_server);
     if (bridge_client >= 0) close(bridge_client);
@@ -761,8 +736,6 @@ int ls_plugins_io_suspend(int signo) {
     return io_event(true, 0, 0, signo);
 }
 
-/* Environment hooks are process-local, as in sudo's hooks.c. Reentrant libc
- * calls from a hook bypass hooks so providers may inspect the real environment. */
 struct env_hook { struct env_hook *next; struct sudo_hook value; };
 static struct env_hook *env_hooks;
 static _Thread_local unsigned in_hook;
@@ -811,7 +784,6 @@ char *getenv(const char *name) {
         if (!strncmp(*v, name, len) && (*v)[len] == '=') return *v + len + 1;
     return NULL;
 }
-/* Preserve each hook's signature while sharing dispatch and reentrancy handling. */
 #define ENV_HOOK_CHAIN(kind, call) \
     if (!in_hook) { \
         in_hook++; \
@@ -850,8 +822,6 @@ int putenv(char *value) {
 }
 #undef ENV_HOOK_CHAIN
 
-/* Event objects stay allocated until the end of the current dispatch. A
- * callback may delete/free itself or another event without invalidating traversal. */
 struct event {
     struct sudo_plugin_event public;
     struct event *next;
@@ -865,8 +835,6 @@ static struct event *events;
 static bool event_dispatching, event_break;
 static struct pollfd *event_poll;
 static size_t event_poll_capacity;
-/* Like core.c's prompt wakeup pipe, this descriptor pair has process lifetime:
- * a signal can run on another runtime thread while a plugin is being removed. */
 static int event_signal_pipe[2] = {-1, -1};
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2, "signal flags must be lock-free");
 static atomic_uint event_signal_pending[NSIG], event_signal_wanted[NSIG];
@@ -906,8 +874,6 @@ static int event_signal_acquire(int signo) {
         action.sa_flags = SA_SIGINFO | SA_RESTART;
         sigemptyset(&action.sa_mask);
         if (sigaction(signo, NULL, &old)) return -1;
-        /* exec temporarily replaces our handler and may restore it after an
-         * event was deleted; retain the original disposition in that case. */
         if (!(old.sa_flags & SA_SIGINFO) || old.sa_sigaction != event_signal_handler) {
             event_signal_saved[signo] = old;
             event_signal_saved_valid[signo] = true;
@@ -980,7 +946,6 @@ static int event_pending(struct sudo_plugin_event *pub, int flags, struct timesp
 }
 static int event_fd(struct sudo_plugin_event *pub) { return ((struct event *)pub)->fd; }
 static void event_setbase(struct sudo_plugin_event *pub, void *base) {
-    /* Only this host's default loop is a valid base in this ABI transport. */
     if (base != NULL) { errno = EINVAL; return; }
     event_del(pub);
 }
@@ -1062,7 +1027,6 @@ int ls_plugins_poll(struct pollfd *fds, nfds_t count, int timeout) {
     for (int signo = 1; signo < NSIG; signo++)
         signal_ready[signo] = atomic_exchange(&event_signal_pending[signo], 0);
     event_dispatching = true;
-    /* Capture readiness before callbacks can alter the active set. */
     for (struct event *e = events; e; e = e->next) {
         if (!e->active) continue;
         short ready = event_poll[i++].revents;
@@ -1176,7 +1140,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_plugins_user_info(b_lean_obj_arg group_source
             else { free(groups); goto failed; }
         }
     }
-    /* Ten decimal digits per gid, a comma, and the terminating NUL. */
     size_t cap = 8 + (size_t)ngroups * 11;
     char *group_text = malloc(cap);
     if (!group_text) { free(groups); goto oom; }
@@ -1192,8 +1155,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_plugins_user_info(b_lean_obj_arg group_source
         bool rc = fact(&a, "cwd=%s", cwd);
         free(cwd); if (!rc) goto oom;
     }
-    /* /dev/tty denotes the controlling terminal but its stat device is 5:0.
-     * TIOCGDEV reports the actual terminal device even with redirected stdio. */
     unsigned dev = 0;
     char name[PATH_MAX] = {0};
     bool have_dev = false;
@@ -1211,7 +1172,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_plugins_user_info(b_lean_obj_arg group_source
     }
 #ifdef __linux__
     if (have_dev && !name[0]) {
-        /* Linux devpts encodes the pts index in the device minor number. */
         unsigned maj = (dev >> 8) & 0xfff;
         unsigned min = (dev & 0xff) | ((dev >> 12) & 0xfff00);
         if (maj >= 136 && maj <= 143)

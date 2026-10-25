@@ -1,7 +1,7 @@
-# System-zone validity bounds: run reference first with '^local-bound-'.
-# sudo 1.9.17p2 plugins/sudoers/gentime.c uses mktime(tm_isdst=-1), not
-# the UTC offset at invocation time. Historic listings expose that distinction
-# without changing the clock; pure matcher tests cover synthetic gap-time denial.
+
+
+
+
 
 local_bound_cleanup() {
   [[ -n ${LOCAL_BOUND_DIR:-} ]] || return 0
@@ -36,8 +36,8 @@ local_bound_setup() {
     fail 'America/New_York zoneinfo is required'
     return 1
   }
-  # cp -a preserves a regular file, symlink (including a dangling one), and
-  # metadata. Remove the destination first so neither replacement follows it.
+
+
   if [[ -e /etc/localtime || -L /etc/localtime ]]; then
     cp -a /etc/localtime "$LOCAL_BOUND_DIR/localtime" || {
       fail 'Cannot save system timezone'
@@ -51,9 +51,9 @@ local_bound_setup() {
   }
 }
 
-# Both implementations see the same policy, system zone and caller environment.
-# Pin the expected result independently, then compare complete stdout/stderr,
-# including listing whitespace and final newlines, with the installed sudo.ws.
+
+
+
 local_bound_compare() {
   local user=$1 command=$2 status=$3
   run "$user" 'sudo() { /bin/bash -c '\''exec -a sudo /usr/bin/sudo.ws "$@"'\'' -- "$@"; }; '"$command"
@@ -74,12 +74,12 @@ local_bound_listing() {
     summer)
       before=20240715120000 expected_before=20240715160000Z ;;
     spring-gap)
-      # 02:30 never occurred: libc normalizes it to 03:30 EDT (07:30 UTC).
+
       before=20240310023000 expected_before=20240310073000Z ;;
     fall-fold)
       before=20241103013000
-      # The ambiguous occurrence is libc's choice, not an imposed DST flag.
-      # Use a fresh process, with caller TZ removed, just like sudo's parser.
+
+
       expected_before=$(env -u TZ python3 -c 'import time; time.tzset(); epoch = time.mktime((2024, 11, 3, 1, 30, 0, 0, 0, -1)); print(time.strftime("%Y%m%d%H%M%SZ", time.gmtime(epoch)))') || {
         fail 'Cannot resolve fold with system-zone mktime'
         return 1
@@ -90,7 +90,7 @@ local_bound_listing() {
       before=20240310023000+0530 expected_before=20240309210000Z ;;
     caller-TZ)
       before=20240115120000 expected_before=20240115170000Z
-      # A hostile caller zone must not replace /etc/localtime, for either bound.
+
       XENV=(TZ=UTC+12) ;;
   esac
   after=$before expected_after=$expected_before
@@ -100,8 +100,8 @@ local_bound_listing() {
   printf 'pete ALL = (root) NOTBEFORE=%s NOTAFTER=%s NOPASSWD: /usr/bin/id\n' \
     "$before" "$after" | install -m 0440 /dev/stdin /etc/sudoers.d/local-bound-time
   if [[ $mode == short ]]; then option=-l; else option=-ll; fi
-  # Root listing another user shows historic/expired bounds without requiring
-  # their windows to contain today's clock. run scrubs TZ unless XENV adds it.
+
+
   local_bound_compare root "sudo -n $option -U pete" 0
   if [[ $mode == short ]]; then
     expect_out_line "    (root) NOTBEFORE=$expected_before NOTAFTER=$expected_after NOPASSWD:"
@@ -112,8 +112,8 @@ local_bound_listing() {
   fi
 }
 
-# Winter and summer together defeat a current-offset implementation in either
-# season. Every case exercises both bound kinds and both listing renderers.
+
+
 for local_bound_case in winter summer spring-gap fall-fold explicit-z explicit-offset caller-TZ; do
   for local_bound_mode in short long; do
     begin "local-bound-$local_bound_case-list-$local_bound_mode" && {
@@ -134,7 +134,7 @@ local_bound_live() {
     future-notbefore-deny) bound=NOTBEFORE; value='+2 days'; status=1 ;;
     past-notafter-deny) bound=NOTAFTER; value='2 days ago'; status=1 ;;
   esac
-  # Large margins avoid scheduling/transition races. No fake clock is needed.
+
   value=$(env -u TZ date -d "$value" +%Y%m%d%H%M%S) || {
     fail 'Cannot generate system-local live bound'
     return 1
@@ -144,7 +144,7 @@ Defaults:pete !authenticate
 pete ALL = (root) NOPASSWD: /usr/bin/true
 pete ALL = (root) $bound=$value NOPASSWD: /usr/bin/id
 EOF
-  # A separate always-valid command rules out a broken fixture causing denial.
+
   local_bound_compare pete 'sudo -n /usr/bin/true' 0
   expect_out_empty
   local_bound_compare pete 'sudo -n /usr/bin/id -u' "$status"

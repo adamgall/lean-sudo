@@ -117,8 +117,6 @@ int ls_compare_gid(const void *a, const void *b) {
     gid_t x = *(const gid_t *)a, y = *(const gid_t *)b;
     return (x > y) - (x < y);
 }
-/* Callers sort groups and allocate verification storage before fork. Compare the
- * complete multiset, including duplicates, and verify filesystem/saved IDs too. */
 int ls_drop_credentials(uid_t uid, gid_t gid, const gid_t *groups, size_t n, gid_t *verify) {
     uid_t ruid, euid, suid;
     gid_t rgid, egid, sgid;

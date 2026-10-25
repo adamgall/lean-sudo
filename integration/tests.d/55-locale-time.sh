@@ -1,11 +1,11 @@
-# Ubuntu resolute sudo.ws 1.9.17p2 source-backed regressions; run reference first.
-# TZ: debian/patches/CVE-2026-96512.patch (unsetenv + tzset, retain submit env).
-# Messages: src/sudo.c setlocale; plugins/sudoers/auth/pam.c PAM_PROMPT_IS_PASSWORD.
-# Matching: plugins/sudoers/sudoers.c sudoers_lookup under SUDOERS_LOCALE_SUDOERS,
-# plugins/sudoers/locale.c configured locale with C fallback.
-# Source tree: https://git.launchpad.net/ubuntu/+source/sudo/tree/?h=ubuntu/resolute-updates
 
-# Unlike the later 80-i18n helper, this deliberately exercises sudo.ws first.
+
+
+
+
+
+
+
 locale_time_compare_reference() {
   local user=$1 command=$2 status=$3
   run "$user" 'sudo() { /bin/bash -c '\''exec -a sudo /usr/bin/sudo.ws "$@"'\'' -- "$@"; }; '"$command"
@@ -19,8 +19,8 @@ locale_time_compare_reference() {
 }
 
 begin locale-time-TZ-notafter-bypass && {
-  # No Z suffix: this is a system-local civil time, not an absolute UTC time.
-  # A caller-selected zone 12 hours behind UTC used to resurrect this rule.
+
+
   expired=$(env -u TZ date -d '1 hour ago' +%Y%m%d%H%M%S)
   printf 'ivan ALL = NOTAFTER=%s NOPASSWD: /usr/bin/id\n' "$expired" >/etc/sudoers.d/locale-time
   chmod 0440 /etc/sudoers.d/locale-time
@@ -41,7 +41,7 @@ begin locale-time-TZ-notbefore-bypass && {
 }
 
 begin locale-time-TZ-command-environment-preserved && {
-  # Sanitizing sudo's own clock must not discard an allowed command variable.
+
   install -m 0440 /dev/stdin /etc/sudoers.d/locale-time <<'EOF'
 Defaults:ivan env_keep += "TZ"
 ivan ALL = NOPASSWD: /usr/bin/printenv TZ
@@ -53,9 +53,9 @@ EOF
 }
 
 begin locale-time-de-PAM-generic-prompt && {
-  # A literal generic sudo prompt yields to Linux-PAM's translated prompt.
-  # Assert the translation is actually installed, so English fallback cannot
-  # accidentally pass the translated-prompt recognition regression below.
+
+
+
   install -m 0440 /dev/stdin /etc/sudoers.d/locale-time <<'EOF'
 Defaults:alice lecture=never,passprompt="Password: ",!passprompt_override
 EOF
@@ -67,7 +67,7 @@ EOF
 }
 
 begin locale-time-de-PAM-generic-prompt-replaced && {
-  # A translated generic PAM prompt must be replaced even without override.
+
   install -m 0440 /dev/stdin /etc/sudoers.d/locale-time <<'EOF'
 Defaults:alice lecture=never,passprompt="Locale password for %p: ",!passprompt_override
 EOF
@@ -81,8 +81,8 @@ begin locale-time-de-libc-missing-home && {
   oldhome=$(getent passwd ivan | cut -d: -f6)
   usermod -d /nonexistent-lean-sudo-locale-home ivan
   XENV=(LANG=de_DE.UTF-8)
-  # Pin libc's localized strerror separately from the diagnostic's translated
-  # format string: this test targets C locale activation, not catalog rendering.
+
+
   run root '/bin/bash -c '\''exec -a sudo /usr/bin/sudo.ws -n -i -u ivan /bin/echo login-continued'\'''
   expect_rc 0
   locale_reference_error=${ERR##*: }
@@ -100,7 +100,7 @@ begin locale-time-regex-caller-locale-independent && {
 ivan ALL = NOPASSWD: /usr/bin/echo ^.$
 EOF
   XENV=(LANG=de_DE.UTF-8 LC_ALL=de_DE.UTF-8)
-  # In C a dot matches a byte, not the two-byte UTF-8 character é.
+
   locale_time_compare_reference ivan 'sudo -n /usr/bin/echo é' 1
   expect_out_empty
   locale_time_compare_reference ivan 'sudo -n /usr/bin/echo a' 0
@@ -114,7 +114,7 @@ Defaults sudoers_locale=de_DE.UTF-8
 ivan ALL = NOPASSWD: /usr/bin/echo ^.$
 EOF
   XENV=(LANG=C)
-  # Only the administrator-selected policy locale may change matching.
+
   locale_time_compare_reference ivan 'sudo -n /usr/bin/echo é' 0
   expect_out_line é
   end
@@ -131,7 +131,7 @@ EOF
   run judy 'sudo -n /usr/bin/true'
   expect_rc 0
   local expected_date expected_month
-  # Python uses libc strftime; Rust date's %x differs from libc's German format.
+
   expected_date=$(python3 -c 'import locale,sys,time; locale.setlocale(locale.LC_ALL,sys.argv[1]); print(time.strftime("%x"))' "$policy_locale")
   expected_month=$(python3 -c 'import locale,sys,time; locale.setlocale(locale.LC_ALL,sys.argv[1]); print(time.strftime("%b %e "))' "$policy_locale")
   if [[ ! -f "/var/log/locale-time-io/judy/$expected_date/log" ]]; then

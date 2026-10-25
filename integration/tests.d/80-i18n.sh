@@ -1,7 +1,7 @@
-# Gettext parity with Ubuntu's sudo.ws and its installed sudo/sudoers catalogs.
-# Compare complete output files (including final newlines and prompt spaces),
-# not just translated substrings. argv[0] stays "sudo" for the reference so
-# diagnostics and help text have the same program name as the tested binary.
+
+
+
+
 i18n_compare_reference() {
   local user=$1 command=$2 status=$3
   run "$user" "$command"
@@ -22,9 +22,9 @@ Defaults lecture=never
 EOF
 }
 
-# These literal translations were read from the installed German catalog and
-# confirmed against sudo.ws. Keeping a positive translation check prevents a
-# missing language pack from making an English-only comparison pass silently.
+
+
+
 begin i18n-de-password-prompt && {
   i18n_no_lecture
   XENV=(LANG=de_DE.UTF-8)
@@ -67,7 +67,7 @@ begin i18n-de-usage-error && {
   i18n_compare_reference alice 'sudo -i -s' 1
   expect_out_empty
   expect_err_has 'sudo: sie dürfen nicht gleichzeitig die -i und die -s Optionen setzen'
-  # The reference leaves the syntax synopsis in English even in German.
+
   expect_err_has 'usage: sudo -h | -K | -k | -V'
   end
 }
@@ -80,8 +80,8 @@ begin i18n-de-help && {
   end
 }
 
-# C must preserve the reference's English bytes at every boundary above,
-# including when LANGUAGE requests a catalog that is actually installed.
+
+
 for i18n_case in password-prompt wrong-password not-in-sudoers list-header usage-error help; do
   begin "i18n-C-byte-unchanged-$i18n_case" && {
     i18n_no_lecture
@@ -116,8 +116,8 @@ for i18n_case in password-prompt wrong-password not-in-sudoers list-header usage
   }
 done
 
-# Both gettext domains must honor LANGUAGE ahead of LANG. The French prompt
-# contains a nonbreaking space (U+00A0), which the byte comparison also pins.
+
+
 begin i18n-LANGUAGE-fr-password-precedence && {
   i18n_no_lecture
   XENV=(LANG=de_DE.UTF-8 LANGUAGE=fr)
@@ -161,8 +161,8 @@ EOF
 
 begin i18n-configured-badpass-untranslated && {
   i18n_no_lecture
-  # Deliberately equal to the default's msgid: an explicitly configured value
-  # stays literal even though the catalog contains a German translation.
+
+
   install -m 0440 /dev/stdin /etc/sudoers.d/zz-i18n-custom <<'EOF'
 Defaults:alice badpass_message="Sorry, try again."
 EOF

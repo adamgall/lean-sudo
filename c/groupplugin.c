@@ -1,4 +1,3 @@
-/* sudo's stable group-provider ABI. Configuration/matching stays in Lean. */
 #include "shim.h"
 #include "sudo_plugin.h"
 #include <dlfcn.h>
@@ -55,7 +54,6 @@ static int group_printf(int type, const char *fmt, ...) {
     return rc;
 }
 
-/* Match sudo's LP64 Linux retry for /lib/foo.so -> /lib64/foo.so. */
 static int group_fallback(char path[PATH_MAX]) {
     char alternate[PATH_MAX];
     const char *slash = strrchr(path, '/');

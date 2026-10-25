@@ -2,22 +2,12 @@ import LeanSudo.SudoConf
 
 namespace LeanSudo.Nsswitch
 
-/-!
-Ordered sudoers sources, matching sudo 1.9.17p2's sudo_nss.c. The first
-case-insensitive sudoers line wins. Ubuntu supports files and SSSD, silently
-ignores other tokens, and defaults to files when no supported source remains.
-Return actions attach only to the immediately preceding newly added source.
-The source selector retains global Defaults from every source, but never
-consults authorization entries beyond a terminal action.
--/
-
 structure Source where
   name : String
   returnIfFound : Bool := false
   returnIfNotFound : Bool := false
   deriving Repr, BEq, Inhabited
 
-/-- Match denotes a specified allow or deny, not merely an allow. -/
 def canContinue (source : Source) (found : Bool) : Bool :=
   !(source.returnIfNotFound && !found || source.returnIfFound && found)
 
@@ -72,15 +62,10 @@ private theorem checkSources_supported_only (tokens : List String) (state : List
   | nil => exact h
   | cons token rest ih => exact ih _ (sourceStep_supported state token h)
 
-/-- Select compiled-in backends from normalized tokens, retaining order and
-return actions. Unrecognized tokens break action attachment, but never warn.
-An empty selection falls back to files, not an unavailable supported backend. -/
 def approveSources (tokens : List String) : List Source :=
   let sources := (tokens.foldl sourceStep ([], false)).1
   if sources = [] then [{ name := "files" }] else sources.reverse
 
-/-- Every backend the runtime can consult is supported, and selection is never
-empty. This applies to the selected chain, not ignored configuration words. -/
 theorem approveSources_supported_only (tokens : List String) :
     approveSources tokens ≠ [] ∧ ∀ source ∈ approveSources tokens,
       source.name = "files" ∨ source.name = "sss" := by
@@ -101,15 +86,11 @@ theorem approveSources_supported_only (tokens : List String) :
     · intro source hs
       exact supported source (by simpa using hs)
 
-/-- Parse the first sudoers entry. Unsupported source/action words are ignored
-as in sudo_nss.c; no recognized source means the ordinary files default. -/
 def configure (text : String) : Except String (List Source) :=
   if text.toList.contains '\x00' then
     .error "/etc/nsswitch.conf: invalid NUL in configuration"
   else .ok (approveSources (rawEntry text))
 
-/-- The configured runtime chain is nonempty and contains only files/SSSD.
-In particular, an explicit supported SSSD source is not replaced by files. -/
 theorem approve_supported_only (text : String) (sources : List Source)
     (configured : configure text = .ok sources) :
     sources ≠ [] ∧ ∀ source ∈ sources, source.name = "files" ∨ source.name = "sss" := by
@@ -119,8 +100,6 @@ theorem approve_supported_only (text : String) (sources : List Source)
   · cases Except.ok.inj configured
     exact approveSources_supported_only _
 
-/-- Retain the visited prefix. Pseudo-command lookup passes cumulative matches;
-execution passes the current source's match, as lookup.c does. -/
 def select {α : Type} (hasMatch : α → Bool) (pseudo : Bool) :
     List (Source × α) → Bool → List α
   | [], _ => []

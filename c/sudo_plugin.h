@@ -1,69 +1,35 @@
-/*
- * SPDX-License-Identifier: ISC
- *
- * Copyright (c) 2009-2023 Todd C. Miller <Todd.Miller@sudo.ws>
- *
- * Permission to use, copy, modify, and distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
- */
-
 #ifndef SUDO_PLUGIN_H
 #define SUDO_PLUGIN_H
 
-/* API version major/minor */
 #define SUDO_API_VERSION_MAJOR 1
 #define SUDO_API_VERSION_MINOR 22
 #define SUDO_API_MKVERSION(x, y) (((x) << 16) | (y))
 #define SUDO_API_VERSION SUDO_API_MKVERSION(SUDO_API_VERSION_MAJOR, SUDO_API_VERSION_MINOR)
 
-/* Getters for plugin API versions */
 #define SUDO_API_VERSION_GET_MAJOR(v) ((v) >> 16)
 #define SUDO_API_VERSION_GET_MINOR(v) ((v) & 0xffffU)
 
-/* "plugin type" for the sudo front end, as passed to an audit plugin */
 #define SUDO_FRONT_END		0
 
-/* Conversation function types and defines */
 struct sudo_conv_message {
-#define SUDO_CONV_PROMPT_ECHO_OFF   0x0001  /* do not echo user input */
-#define SUDO_CONV_PROMPT_ECHO_ON    0x0002  /* echo user input */
-#define SUDO_CONV_ERROR_MSG	    0x0003  /* error message */
-#define SUDO_CONV_INFO_MSG	    0x0004  /* informational message */
-#define SUDO_CONV_PROMPT_MASK	    0x0005  /* mask user input */
-#define SUDO_CONV_PROMPT_ECHO_OK    0x1000  /* flag: allow echo if no tty */
-#define SUDO_CONV_PREFER_TTY	    0x2000  /* flag: use tty if possible */
+#define SUDO_CONV_PROMPT_ECHO_OFF   0x0001
+#define SUDO_CONV_PROMPT_ECHO_ON    0x0002
+#define SUDO_CONV_ERROR_MSG	    0x0003
+#define SUDO_CONV_INFO_MSG	    0x0004
+#define SUDO_CONV_PROMPT_MASK	    0x0005
+#define SUDO_CONV_PROMPT_ECHO_OK    0x1000
+#define SUDO_CONV_PREFER_TTY	    0x2000
     int msg_type;
     int timeout;
     const char *msg;
 };
 
-/*
- * Maximum length of a reply (not including the trailing NUL) when
- * conversing with the user.  In practical terms, this is the longest
- * password sudo will support.  This means that a buffer of size
- * SUDO_CONV_REPL_MAX+1 is guaranteed to be able to hold any reply
- * from the conversation function.
- */
 #define SUDO_CONV_REPL_MAX	1023
 
 struct sudo_conv_reply {
     char *reply;
 };
 
-/*
- * Callback struct to be passed to the conversation function.
- * Can be used to perform operations on suspend/resume such
- * as dropping/acquiring locks.
- */
 typedef int (*sudo_conv_callback_fn_t)(int signo, void *closure);
 struct sudo_conv_callback {
     unsigned int version;
@@ -76,15 +42,10 @@ typedef int (*sudo_conv_t)(int num_msgs, const struct sudo_conv_message msgs[],
 	struct sudo_conv_reply replies[], struct sudo_conv_callback *callback);
 typedef int (*sudo_printf_t)(int msg_type, const char * restrict fmt, ...);
 
-/*
- * Hooks allow a plugin to hook into specific sudo and/or libc functions.
- */
-
 #if defined(__GNUC__) && ((__GNUC__ == 4 && __GNUC_MINOR__ >= 4) || __GNUC__ > 4)
 # pragma GCC diagnostic ignored "-Wstrict-prototypes"
 #endif
 
-/* Hook functions typedefs. */
 #if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 202311L)
 typedef int (*sudo_hook_fn_t)(...);
 #else
@@ -95,7 +56,6 @@ typedef int (*sudo_hook_fn_putenv_t)(char *string, void *closure);
 typedef int (*sudo_hook_fn_getenv_t)(const char *name, char **value, void *closure);
 typedef int (*sudo_hook_fn_unsetenv_t)(const char *name, void *closure);
 
-/* Hook structure definition. */
 struct sudo_hook {
     unsigned int hook_version;
     unsigned int hook_type;
@@ -103,32 +63,19 @@ struct sudo_hook {
     void *closure;
 };
 
-/* Hook API version major/minor */
 #define SUDO_HOOK_VERSION_MAJOR	1
 #define SUDO_HOOK_VERSION_MINOR	0
 #define SUDO_HOOK_VERSION SUDO_API_MKVERSION(SUDO_HOOK_VERSION_MAJOR, SUDO_HOOK_VERSION_MINOR)
 
-/*
- * Hook function return values.
- */
-#define SUDO_HOOK_RET_ERROR	-1	/* error */
-#define SUDO_HOOK_RET_NEXT	0	/* go to the next hook in the list */
-#define SUDO_HOOK_RET_STOP	1	/* stop hook processing for this type */
+#define SUDO_HOOK_RET_ERROR	-1
+#define SUDO_HOOK_RET_NEXT	0
+#define SUDO_HOOK_RET_STOP	1
 
-/*
- * Hooks for setenv/unsetenv/putenv/getenv.
- * This allows the plugin to be notified when a PAM module modifies
- * the environment so it can update the copy of the environment that
- * is passed to execve().
- */
 #define SUDO_HOOK_SETENV	1
 #define SUDO_HOOK_UNSETENV	2
 #define SUDO_HOOK_PUTENV	3
 #define SUDO_HOOK_GETENV	4
 
-/*
- * Plugin interface to sudo's main event loop.
- */
 typedef void (*sudo_plugin_ev_callback_t)(int fd, int what, void *closure);
 
 struct timespec;
@@ -141,30 +88,26 @@ struct sudo_plugin_event {
     void (*setbase)(struct sudo_plugin_event *pev, void *base);
     void (*loopbreak)(struct sudo_plugin_event *pev);
     void (*free)(struct sudo_plugin_event *pev);
-    /* actually larger... */
 };
 
-/* Sudo plugin Event types */
-#define SUDO_PLUGIN_EV_TIMEOUT	0x01	/* fire after timeout */
-#define SUDO_PLUGIN_EV_READ	0x02	/* fire when readable */
-#define SUDO_PLUGIN_EV_WRITE	0x04	/* fire when writable */
-#define SUDO_PLUGIN_EV_PERSIST	0x08	/* persist until deleted */
-#define SUDO_PLUGIN_EV_SIGNAL	0x10	/* fire on signal receipt */
+#define SUDO_PLUGIN_EV_TIMEOUT	0x01
+#define SUDO_PLUGIN_EV_READ	0x02
+#define SUDO_PLUGIN_EV_WRITE	0x04
+#define SUDO_PLUGIN_EV_PERSIST	0x08
+#define SUDO_PLUGIN_EV_SIGNAL	0x10
 
-/* Policy plugin type, used when reporting policy decisions to audit plugins. */
 #define SUDO_POLICY_PLUGIN     1
 
-/* I/O plugin type and defines. */
 struct io_plugin {
 #define SUDO_IO_PLUGIN	    2
-    unsigned int type; /* always SUDO_IO_PLUGIN */
-    unsigned int version; /* always SUDO_API_VERSION */
+    unsigned int type;
+    unsigned int version;
     int (*open)(unsigned int version, sudo_conv_t conversation,
 	sudo_printf_t sudo_plugin_printf, char * const settings[],
 	char * const user_info[], char * const command_info[],
 	int argc, char * const argv[], char * const user_env[],
 	char * const plugin_options[], const char **errstr);
-    void (*close)(int exit_status, int error); /* wait status or error */
+    void (*close)(int exit_status, int error);
     int (*show_version)(int verbose);
     int (*log_ttyin)(const char *buf, unsigned int len, const char **errstr);
     int (*log_ttyout)(const char *buf, unsigned int len, const char **errstr);
@@ -181,17 +124,15 @@ struct io_plugin {
     struct sudo_plugin_event * (*event_alloc)(void);
 };
 
-/* Differ audit plugin close status types. */
 #define SUDO_PLUGIN_NO_STATUS		0
 #define SUDO_PLUGIN_WAIT_STATUS		1
 #define SUDO_PLUGIN_EXEC_ERROR		2
 #define SUDO_PLUGIN_SUDO_ERROR		3
 
-/* Audit plugin type and defines */
 struct audit_plugin {
 #define SUDO_AUDIT_PLUGIN	    3
-    unsigned int type; /* always SUDO_AUDIT_PLUGIN */
-    unsigned int version; /* always SUDO_API_VERSION */
+    unsigned int type;
+    unsigned int version;
     int (*open)(unsigned int version, sudo_conv_t conversation,
 	sudo_printf_t sudo_plugin_printf, char * const settings[],
 	char * const user_info[], int submit_optind,
@@ -213,11 +154,10 @@ struct audit_plugin {
     struct sudo_plugin_event * (*event_alloc)(void);
 };
 
-/* Approval plugin type and defines */
 struct approval_plugin {
 #define SUDO_APPROVAL_PLUGIN	    4
-    unsigned int type; /* always SUDO_APPROVAL_PLUGIN */
-    unsigned int version; /* always SUDO_API_VERSION */
+    unsigned int type;
+    unsigned int version;
     int (*open)(unsigned int version, sudo_conv_t conversation,
 	sudo_printf_t sudo_plugin_printf, char * const settings[],
 	char * const user_info[], int submit_optind,
@@ -229,13 +169,6 @@ struct approval_plugin {
     int (*show_version)(int verbose);
 };
 
-/*
- * version: for compatibility checking
- * group_init: return 1 on success, 0 if unconfigured, -1 on error.
- * group_cleanup: called to clean up resources used by provider
- * user_in_group: returns 1 if user is in group, 0 if not.
- *                note that pwd may be NULL if the user is not in passwd.
- */
 struct passwd;
 struct sudoers_group_plugin {
     unsigned int version;
@@ -245,4 +178,4 @@ struct sudoers_group_plugin {
     int (*query)(const char *user, const char *group, const struct passwd *pwd);
 };
 
-#endif /* SUDO_PLUGIN_H */
+#endif

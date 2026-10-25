@@ -1,4 +1,3 @@
-/* Framed TCP/TLS and the Lean I/O relay bridge. No protobuf or logging policy. */
 #include "logsrv.h"
 #include "shim.h"
 #include <arpa/inet.h>
@@ -21,7 +20,6 @@
 
 #define LOGSRV_MAX_FRAME (2U * 1024U * 1024U)
 
-/* OpenSSL 3's public, opaque ABI: no build-time OpenSSL dependency. */
 typedef struct ssl_st SSL;
 typedef struct ssl_ctx_st SSL_CTX;
 typedef struct ssl_method_st SSL_METHOD;
@@ -71,7 +69,6 @@ static struct {
   struct frame frame;
 } connection = {.fd = -1};
 
-/* Independent lifetime: reconnecting the parent must not discard broker data. */
 static struct {
   int reader, writer;
   uint32_t timeout;
@@ -90,8 +87,6 @@ static int remaining(int64_t deadline) {
   int64_t n = deadline - now;
   return n > INT_MAX ? INT_MAX : (int)n;
 }
-/* 1 ready, 0 no immediate readiness, -1 error/timeout. HUP is readiness:
- * recv/SSL_read must still consume buffered bytes before reporting EOF. */
 static int wait_fd(int fd, short events, int wait, int64_t deadline) {
   for (;;) {
     int ms = remaining(deadline);
@@ -125,7 +120,6 @@ static int nonblocking(int fd) {
 static void reset(void) {
   int saved = errno;
   connection.relay = 0;
-  /* No SSL_shutdown: close must neither block nor emit copied child records. */
   if (connection.ssl) connection.api.ssl_free(connection.ssl);
   if (connection.ctx) connection.api.ctx_free(connection.ctx);
   if (connection.fd >= 0) close(connection.fd);
@@ -147,9 +141,6 @@ static lean_obj_res failure(const char *operation) {
   return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(message)));
 }
 
-/* getaddrinfo has no portable deadline. Isolate it in a resolver child instead
- * of abandoning a thread (and its credentials/resources) after a timeout.
- * Only fixed-size socket addresses cross this private pipe, never pointers. */
 struct resolved_address {
   int family, socktype, protocol;
   socklen_t length;
@@ -236,8 +227,6 @@ static struct address_node *resolve(const char *host, const char *service, int64
   }
 finished:
   saved = errno;
-  /* Even a completed child is stopped before reaping: never wait unboundedly
-   * for resolver cleanup or an NSS module's exit hook. */
   kill(pid, SIGKILL);
   close(pipes[0]);
   while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
@@ -320,9 +309,6 @@ static int tls_load(void) {
   return 0;
 }
 
-/* OpenSSL's socket BIO can write during reads and handshakes, too. Block SIGPIPE
- * only in this thread, consume only a newly pending signal, then restore the
- * original mask. Unlike SIG_IGN this cannot alter the executed command's ABI. */
 static int tls_step(int operation, void *buf, size_t len, short *want) {
   sigset_t blocked, old, pending;
   sigemptyset(&blocked);
@@ -353,21 +339,17 @@ static int tls_step(int operation, void *buf, size_t len, short *want) {
   if (error) { errno = error; return -1; }
   errno = saved;
   if (rc > 0) return rc;
-  if (ssl_error == 2 || ssl_error == 3) { /* SSL_ERROR_WANT_READ / WANT_WRITE */
+  if (ssl_error == 2 || ssl_error == 3) {
     *want = ssl_error == 2 ? POLLIN : POLLOUT;
     return 0;
   }
-  if (ssl_error == 5 && saved == EINTR) { /* SSL_ERROR_SYSCALL */
+  if (ssl_error == 5 && saved == EINTR) {
     *want = 0;
     return 0;
   }
   errno = ssl_error == 6 ? ENODATA : ssl_error == 5 && saved ? saved : EPROTO;
   return -1;
 }
-/* sudo's validate_hostname(..., resolve=0): match a SAN hostname OR the
- * connected peer's SAN IP; only an absent SAN permits subject CN fallback.
- * Chain verification remains mandatory in SSL_connect. No application bytes
- * are sent until this additional identity check succeeds. */
 static int tls_verify_identity(const char *host) {
   struct sockaddr_storage peer;
   socklen_t peer_length = sizeof peer;
@@ -386,9 +368,7 @@ static int tls_verify_identity(const char *host) {
   if (!cert) { errno = EACCES; return -1; }
   size_t host_length = strlen(host);
   if (host_length && host[host_length - 1] == '.') --host_length;
-  unsigned int flags = 4; /* X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS */
-  /* NID_subject_alt_name = 85, X509_CHECK_FLAG_NEVER_CHECK_SUBJECT = 0x20.
-   * In particular, an IP-only SAN must not enable CN hostname fallback. */
+  unsigned int flags = 4;
   if (api->cert_ext_by_nid(cert, 85, -1) >= 0) flags |= 0x20;
   int match = host_length ? api->cert_host(cert, host, host_length, flags, NULL) : -1;
   if (match == 0) match = api->cert_ip(cert, address, address_length, 0);
@@ -404,7 +384,6 @@ static int tls_start(const char *host, int verify, const char *ca, const char *c
   errno = EPROTO;
   connection.ctx = api->ctx_new(api->client_method());
   if (!connection.ctx) return -1;
-  /* SSL_CTRL_SET_MIN_PROTO_VERSION = 123, TLS1_2_VERSION = 0x0303. */
   if (api->ctx_ctrl(connection.ctx, 123, 0x0303, NULL) != 1) return -1;
   api->ctx_set_verify(connection.ctx, verify ? 1 : 0, NULL);
   if (verify) {
@@ -421,7 +400,6 @@ static int tls_start(const char *host, int verify, const char *ca, const char *c
   if (!connection.ssl || api->ssl_set_fd(connection.ssl, connection.fd) != 1) return -1;
   struct in6_addr ip;
   int numeric = inet_pton(AF_INET, host, &ip) == 1 || inet_pton(AF_INET6, host, &ip) == 1;
-  /* SSL_CTRL_SET_TLSEXT_HOSTNAME = 55; host_name = 0. No SNI for IP literals. */
   if (!numeric && api->ssl_ctrl(connection.ssl, 55, 0, (void *)host) != 1) return -1;
   for (;;) {
     int ms = remaining(deadline);
@@ -437,8 +415,6 @@ static int tls_start(const char *host, int verify, const char *ca, const char *c
   return 0;
 }
 
-/* Positive byte count, zero for a nonblocking partial frame, or -1 on error.
- * SSL retries retain exactly the same buffer/length until progress is made. */
 static ssize_t transfer(void *buf, size_t len, int writing, int wait, int64_t deadline) {
   for (;;) {
     int ms = remaining(deadline);
@@ -543,8 +519,6 @@ LEAN_EXPORT lean_obj_res leansudo_logsrv_send(b_lean_obj_arg bytes, lean_obj_arg
   }
   return lean_io_result_mk_ok(lean_box(0));
 }
-/* Network reads may wait/TLS-retry; broker reads must return to the supervisor
- * on EINTR/EAGAIN. Framing and allocation bounds are otherwise identical. */
 static int frame_read(struct frame *frame, bool broker, int wait, int64_t deadline) {
   for (unsigned part = 0; part < 2; part++) {
     if (part && !frame->body) {
@@ -601,8 +575,6 @@ int ls_logsrv_stream(int stream) {
   return stream >= 0 && stream < 5 && (connection.relay & (UINT32_C(1) << stream)) != 0;
 }
 int ls_logsrv_network_fd(void) { return connection.relay ? connection.fd : -1; }
-/* Keep Lean's policy error intact while the syscall relay unwinds and reaps the
- * command; replacing it with errno would lose the callback's diagnostic. */
 static lean_object *callback_error;
 lean_obj_res ls_logsrv_take_error(void) {
   lean_object *result = callback_error;
@@ -646,8 +618,6 @@ static void queue_reset(void) {
 }
 static lean_obj_res queue_failure(const char *operation) {
   int error = errno ? errno : EIO;
-  /* Poison a partial send for every inherited copy of this endpoint. Merely
-   * closing the broker's descriptor would leave the parent's writer alive. */
   if (queue.writer >= 0) shutdown(queue.writer, SHUT_RDWR);
   queue_reset();
   char message[512];
@@ -714,7 +684,6 @@ int ls_logsrv_dispatch(void) {
     queue.frame.header_used = queue.frame.body_used = 0;
     lean_object *result = leansudo_logsrv_subcommand_wire(body, lean_box(0));
     if (callback_status(result)) { queue_reset(); return -1; }
-    /* Lean may close the queue as part of its failure policy. */
     if (queue.reader < 0) return 0;
   }
 }
@@ -731,8 +700,6 @@ void ls_logsrv_detach_child(void) {
   queue.reader = -1;
 }
 void ls_logsrv_child_close(void) {
-  /* Child-side descriptor drop only: no TLS activity or Lean runtime calls
-   * between fork and exec. The parent's connection and buffers are untouched. */
   if (connection.fd >= 0) close(connection.fd);
   connection.fd = -1;
   connection.relay = 0;

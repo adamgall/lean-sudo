@@ -1,4 +1,4 @@
-# Compare listing stdout byte-for-byte with sudo.ws, including the final newline.
+
 compare_list_reference() {
   local options=$1
   run root '/usr/sbin/visudo.ws -cq'

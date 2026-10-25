@@ -1,6 +1,6 @@
-# Second shell audit, rows 14/16/19/20 of ResidualGaps2. Expectations are
-# pinned both semantically and byte-for-byte against Ubuntu's installed sudo.ws.
-# Use the same argv[0], rather than rewriting arbitrary diagnostic text.
+
+
+
 shell_policy_compare() {
   local user=$1 snippet=$2 expected=$3 audit=${4:-} binary side
   for side in reference actual; do
@@ -18,9 +18,9 @@ shell_policy_compare() {
   diff -u "$WORK/shell-policy-reference.err" "$WORK/shell-policy-actual.err" >>"$LOG" || fail 'stderr differs from sudo.ws'
 }
 
-# The reference has not populated runas.argv at this initialization failure, so
-# audit_failure emits no USER_CMD record. Reuse 57's decoder for both dispositions,
-# preserving its trace file because filtered runs still source that helper.
+
+
+
 shell_policy_check_no_audit() (
   local saved=
   [[ -s $WORK/shell-policy.audit ]] || return 1
@@ -50,23 +50,16 @@ for shell_policy_unknown in user group group-before-user user-after-group; do
   }
 done
 
-# Capture actual syslog datagrams, not a logfile surrogate. A pre-existing
-# /dev/log is moved aside and restored in finally, including on probe failure.
+
 shell_policy_syslog_fixture() {
   cat >"$WORK/shell-policy-syslog.py" <<'PY'
-import os, re, socket, subprocess, sys, tempfile
+import re, subprocess, sys
+sys.path.insert(0, '/usr/local/lib')
+from sudo_it_logging import Syslog
 binary, trace, kind = sys.argv[1:]
 name = "shell_policy_missing_" + kind
 options = ["-u", name] if kind == "user" else ["-u", "shell_policy_missing_user", "-g", name]
-saved = None
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-try:
-    if os.path.lexists("/dev/log"):
-        fd, saved = tempfile.mkstemp(prefix="shell-policy-log-", dir="/dev")
-        os.close(fd)
-        os.replace("/dev/log", saved)
-    sock.bind("/dev/log")
-    sock.settimeout(0.1)
+with Syslog() as logger:
     p = subprocess.run(["strace", "-f", "-s", "16384", "-e", "trace=sendto",
                         "-o", trace, "/bin/bash", "-c", 'exec -a sudo "$@"',
                         "sh", binary, "-n", *options, "/usr/bin/true"],
@@ -76,12 +69,8 @@ try:
     assert p.returncode == 1, (p.returncode, p.stdout, p.stderr)
     assert not p.stdout, p.stdout
     messages = []
-    while True:
-        try:
-            message = sock.recv(65536).decode()
-        except socket.timeout:
-            break
-        # Only transport timestamp, process ID, and program prefix vary.
+    for message in logger.messages():
+
         match = re.search(r"sudo(?:\[\d+\])?: (.*)", message, re.S)
         if match and ("unknown user" in match[1] or "unknown group" in match[1]):
             messages.append(match[1])
@@ -90,12 +79,6 @@ try:
     if kind == "group":
         assert "unknown user" not in messages[0], messages
     print(messages[0], end="")
-finally:
-    sock.close()
-    if os.path.lexists("/dev/log") and (saved is not None or os.path.exists("/dev/log")):
-        os.unlink("/dev/log")
-    if saved is not None:
-        os.replace(saved, "/dev/log")
 PY
 }
 
@@ -110,9 +93,9 @@ for shell_policy_kind in user group; do
   }
 done
 
-# A sudoedit-only grant must not authorize either shell mode. Conversely, a
-# shell-only grant must permit the shell to invoke sudoedit as an ordinary word.
-# The nested sudoedit runs as root and uses /usr/bin/true as its editor.
+
+
+
 for shell_policy_mode in shell login; do
   shell_policy_flag=-s
   [[ $shell_policy_mode == login ]] && shell_policy_flag=-i
@@ -148,39 +131,28 @@ EOF
   done
 done
 
-# pam_ftp is already supplied by the image's libpam-modules. For a non-FTP
-# user it asks a non-generic challenge, sets PAM_AUTHTOK, and returns failure;
-# sufficient ignores that failure, then pam_unix validates the real password.
-# No custom module/compiler and no replacement of /etc/pam.d/sudo are needed.
-# Source: linux-pam v1.7.0 modules/pam_ftp/pam_ftp.c (PLEASE_ENTER_PASSWORD).
+
+
+
 for shell_policy_prompt in pam-default defaults-only cli-override cli-policy-disabled; do
   begin "shell-policy-prompt-$shell_policy_prompt" && {
-    # libpam lowercases service names; shell mktemp's mixed-case suffix would
-    # silently select /etc/pam.d/other instead. Python's tempfile alphabet is
-    # lowercase, with an assertion guarding the actual fixture name.
-    shell_policy_service=$(python3 - <<'PY'
-import os, tempfile
-fd, path = tempfile.mkstemp(prefix="shell-policy.", dir="/etc/pam.d")
-os.close(fd)
-if path != path.lower():
-    os.unlink(path)
-    raise RuntimeError("PAM fixture service name must be lowercase")
-print(path)
-PY
-    )
-    chmod 0644 "$shell_policy_service"
-    cat >"$shell_policy_service" <<'EOF'
-auth sufficient pam_ftp.so
-auth required pam_unix.so use_first_pass
-account required pam_permit.so
-session required pam_permit.so
+    shell_policy_service=/etc/pam.d/shell-policy-oath
+    shell_policy_secret=3132333435363738393031323334353637383930
+    printf 'HOTP judy - %s\n' "$shell_policy_secret" >"$WORK/shell-policy.oath"
+    chmod 0600 "$WORK/shell-policy.oath"
+    shell_policy_code_reference=$(oathtool --hotp --counter=0 "$shell_policy_secret")
+    shell_policy_code_actual=$(oathtool --hotp --counter=1 "$shell_policy_secret")
+    cat >"$shell_policy_service" <<EOF
+auth required pam_oath.so usersfile=$WORK/shell-policy.oath window=1 digits=6
+@include common-account
+@include common-session-noninteractive
 EOF
     install -m 0440 /dev/stdin /etc/sudoers.d/zz-shell-policy <<EOF
 Defaults:judy pam_service=${shell_policy_service##*/},lecture=never,passwd_tries=1
 judy ALL=(root) /usr/bin/true
 EOF
     shell_policy_options=
-    shell_policy_expected_prompt='Password required for judy.'
+    shell_policy_expected_prompt="One-time password (OATH) for \`judy': "
     if [[ $shell_policy_prompt != pam-default ]]; then
       printf 'Defaults:judy passprompt="Configured %%u: "\n' >>/etc/sudoers.d/zz-shell-policy
     fi
@@ -189,21 +161,21 @@ EOF
       if [[ $shell_policy_prompt == cli-override ]]; then
         shell_policy_expected_prompt='CLI judy: '
       else
-        # -p seeds the default before sudoers is evaluated; explicit policy can
-        # turn that override back off without changing the PAM challenge.
+
+
         printf 'Defaults:judy !passprompt_override\n' >>/etc/sudoers.d/zz-shell-policy
       fi
     fi
-    shell_policy_compare judy "printf 'judypw\\n' | sp_sudo -kS $shell_policy_options /usr/bin/true" 0
+    shell_policy_compare judy "if [ \"\$SP_BINARY\" = /usr/bin/sudo.ws ]; then printf '%s\n' '$shell_policy_code_reference'; else printf '%s\n' '$shell_policy_code_actual'; fi | sp_sudo -kS $shell_policy_options /usr/bin/true" 0
     expect_out_empty
     printf '%s' "$shell_policy_expected_prompt" >"$WORK/shell-policy-prompt.err"
     cmp -s "$WORK/shell-policy-prompt.err" "$WORK/err" || fail 'PAM challenge selection/expansion differs from the expected prompt'
-    # Prove this is authentication, not a permissive fixture accepting anything.
-    shell_policy_compare judy "printf 'incorrect-shell-policy-password\\n' | sp_sudo -kS $shell_policy_options /usr/bin/true" 1
+
+    shell_policy_compare judy "printf 'invalid-otp\\n' | sp_sudo -kS $shell_policy_options /usr/bin/true" 1
     expect_out_empty
     expect_err_has "$shell_policy_expected_prompt"
     expect_err_has '1 incorrect password attempt'
-    rm -f "$shell_policy_service"
+    rm -f "$shell_policy_service" "$WORK/shell-policy.oath" "$WORK/shell-policy.oath.lock"
     end
   }
 done
@@ -230,9 +202,9 @@ EOF
     cmp -s "$WORK/shell-policy-relative.out" "$WORK/out" || fail 'relative command spelling/arguments were not preserved'
     [[ ! -s $WORK/err ]] || fail 'unexpected relative-command stderr'
     if [[ $shell_policy_relative == logfile ]]; then
-      # The reference preserves relative spelling in SUDO_COMMAND and -l, but
-      # logs the absolute pathname and shell-quotes the argument containing
-      # spaces. Require exactly one reference event and one matching event.
+
+
+
       python3 - "$WORK/shell-policy-command.log" "$shell_policy_dir/foo" <<'PY' >>"$LOG" 2>&1 || fail 'logfile command fields differ from the reference absolute path and quoted arguments'
 import sys
 lines = open(sys.argv[1]).read().splitlines()

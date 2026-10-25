@@ -1,8 +1,3 @@
-/* Credential-scoped stat batches (LeanSudo.Sys.Lookup).
- * No command selection, executable-bit test, PATH or dot policy lives here.
- * A child permanently installs one credential set; the parent never changes ids.
- * The private socket carries fixed-width facts, never child pointers or padding.
- */
 #include "shim.h"
 #include <errno.h>
 #include <grp.h>
@@ -19,12 +14,6 @@
 #define LOOKUP_MAX 65536U
 #define FACT_FIELDS 8U
 
-
-/* Borrowed paths and group storage are prepared before fork. The wire format is
- * two uint64_t header words (credential errno, count), followed on success by
- * count records of eight uint64_t words (stat errno, FileStat's seven fields).
- * Both ends are the same process image, so native endianness is intentional.
- * EOF and successful wait status are required after exactly the expected data. */
 static void inspect_child(int fd, const char *const *paths, size_t count,
         uid_t uid, gid_t gid, const gid_t *groups, size_t ngroups, gid_t *verify) {
     uint64_t header[2] = {0, count};
@@ -52,9 +41,6 @@ static void inspect_child(int fd, const char *const *paths, size_t count,
     _exit(0);
 }
 
-/* These errno values describe a path which cannot be inspected with the supplied
- * credentials, not an infrastructure failure. In particular ENOMEM, EIO,
- * EOVERFLOW and ENAMETOOLONG must not turn into a successful partial search. */
 static int unavailable(uint64_t err) {
     return err == ENOENT || err == ENOTDIR || err == EACCES ||
         err == EPERM || err == ELOOP;
@@ -65,7 +51,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_inspect_paths(b_lean_obj_arg paths,
     size_t count = lean_array_size(paths), ngroups = lean_array_size(group_array);
     if (uid == UINT32_MAX || gid == UINT32_MAX || count > LOOKUP_MAX ||
         ngroups > LOOKUP_MAX) return ls_errno(EINVAL);
-    /* Allocate only syscall inputs; output is streamed directly into Lean. */
     const char **names = count ? malloc(count * sizeof(*names)) : NULL;
     gid_t *groups = ngroups ? malloc(2 * ngroups * sizeof(*groups)) : NULL;
     if ((count && !names) || (ngroups && !groups)) {

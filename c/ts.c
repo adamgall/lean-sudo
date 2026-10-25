@@ -1,10 +1,3 @@
-/*
- * Generic timestamp storage for LeanSudo.Sys.Timestamp. Record layout, matching
- * and lock selection belong to Lean; this file only manages secure descriptors.
- *
- * Storage semantics follow sudo v1.9.17p2 plugins/sudoers/timestamp.c,
- * boottime.c, set_perms.c and lib/util/{secure_path,gettime,mkdir_parents}.c.
- */
 #include "shim.h"
 
 #include <errno.h>
@@ -25,14 +18,11 @@
 #include <time.h>
 #include <unistd.h>
 
-
 static lean_obj_res ts_errno_error(const char *what, int err) {
     char buf[4608];
     snprintf(buf, sizeof buf, "%s: %s", what, strerror(err));
     return ls_error(buf);
 }
-
-/* ---- clocks and process identity ---------------------------------------- */
 
 static int ts_real_time(struct timespec *ts) {
     int rc = TEMP_FAILURE_RETRY(clock_gettime(CLOCK_REALTIME, ts));
@@ -47,7 +37,6 @@ static int ts_real_time(struct timespec *ts) {
     return rc;
 }
 
-/* sudo_gettime_mono uses the suspend-inclusive CLOCK_BOOTTIME on Linux. */
 LEAN_EXPORT lean_obj_res lean_sudo_ts_boottime(lean_obj_arg w) {
     (void)w;
     struct timespec ts;
@@ -89,14 +78,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_ts_getppid(lean_obj_arg w) {
     return lean_io_result_mk_ok(lean_box_uint32((uint32_t)getppid()));
 }
 
-/* ---- timestamp file ------------------------------------------------------ */
-
-/*
- * Open (creating if `create`) the directory `name` relative to `dirfd` without
- * following symlinks, and verify the *opened* directory: a directory owned by
- * uid 0 that is not group/world writable. A freshly created directory gets
- * exactly `mode` (independent of the umask). Returns the fd or -1 with `err` set.
- */
 static int ts_open_dir(int dirfd, const char *name, const char *display, mode_t mode,
                        bool create, char *err, size_t errlen) {
     bool created = false;
@@ -155,7 +136,6 @@ static int ts_open_dir(int dirfd, const char *name, const char *display, mode_t 
     return fd;
 }
 
-/* Persistent per-user marker, separate from authentication timestamps. */
 LEAN_EXPORT lean_obj_res lean_sudo_state_marker(b_lean_obj_arg path, uint32_t uid,
         uint8_t create, lean_obj_arg w) {
     (void)w;
@@ -199,8 +179,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_state_marker(b_lean_obj_arg path, uint32_t ui
     return lean_io_result_mk_ok(lean_box(1));
 }
 
-/* ---- generic timestamp descriptors -------------------------------------- */
-
 static int ts_close_error(int fd, int error) {
     if (fd >= 0)
         (void)close(fd);
@@ -208,7 +186,6 @@ static int ts_close_error(int fd, int error) {
     return -1;
 }
 
-/* Reject embedded NULs, traversal and the chown/setuid sentinel values. */
 static bool ts_valid_args(b_lean_obj_arg directory, b_lean_obj_arg filename,
         uint32_t uid, uint32_t gid) {
     const char *path = lean_string_cstr(directory);
@@ -235,12 +212,6 @@ static bool ts_valid_args(b_lean_obj_arg directory, b_lean_obj_arg filename,
     return true;
 }
 
-/*
- * sudo_secure_open_dir verifies the opened final directory, not its ancestors.
- * Existing paths (including symlinks) are resolved normally. Only newly
- * created parents are reopened with O_NOFOLLOW, as in sudo_open_parent_dir.
- * New parents are owner:group 0711, the final directory owner:group 0700.
- */
 static int ts_check_directory(int fd, uid_t uid, gid_t gid) {
     struct stat st;
     if (TEMP_FAILURE_RETRY(fstat(fd, &st)) != 0)
@@ -293,7 +264,6 @@ static int ts_directory(const char *path, uid_t uid, gid_t gid, bool create) {
             return ts_close_error(dir, errno);
         if (!S_ISDIR(st.st_mode))
             return ts_close_error(dir, ENOTDIR);
-        /* ts_mkdirs also chowns a final directory created by a racing peer. */
         if (created || final) {
             int rc;
             rc = TEMP_FAILURE_RETRY(fchown(dir, uid, gid));
@@ -310,11 +280,6 @@ static int ts_directory(const char *path, uid_t uid, gid_t gid, bool create) {
     return ts_check_directory(dir, uid, gid);
 }
 
-/*
- * PERM_TIMESTAMP changes the effective uid, NOT groups. In particular the
- * configured gid controls directory ownership, not the gid of new files.
- * Never fall back to a privileged open when dropping credentials fails.
- */
 static int ts_owner_open(int dir, const char *name, uid_t uid, bool create) {
     uid_t saved = geteuid();
     int rc;
@@ -323,7 +288,6 @@ static int ts_owner_open(int dir, const char *name, uid_t uid, bool create) {
         if (rc != 0)
             return -1;
     }
-    /* timestamp.c relies on the verified directory and owner credentials. */
     int fd = TEMP_FAILURE_RETRY(openat(dir, name, O_RDWR | O_CLOEXEC |
         (create ? O_CREAT : 0), 0600));
     int error = errno;
@@ -336,7 +300,6 @@ static int ts_owner_open(int dir, const char *name, uid_t uid, bool create) {
     return fd;
 }
 
-/* Linux sudo reads the integer wall-clock boot epoch from /proc/stat. */
 static bool ts_boot_epoch(struct timespec *boot) {
     int fd = TEMP_FAILURE_RETRY(openat(AT_FDCWD, "/proc/stat", O_RDONLY | O_CLOEXEC, 0));
     if (fd < 0)
@@ -359,7 +322,6 @@ static bool ts_boot_epoch(struct timespec *boot) {
         }
         bool complete = strchr(line, '\n') != NULL;
         if (line_start && complete && !strncmp(line, "btime ", 6)) {
-            /* /proc/stat emits decimal ASCII; avoid libc-versioned parsers. */
             const char *end = line + 6;
             long long value = 0;
             while (*end >= '0' && *end <= '9') {
@@ -388,7 +350,6 @@ static bool ts_predates_boot(const struct stat *st) {
     struct timespec now, boot;
     if (ts_real_time(&now) != 0 || !ts_boot_epoch(&boot))
         return false;
-    /* Future boot times are ignored, exactly as timestamp_open does. */
     if (now.tv_sec < boot.tv_sec ||
             (now.tv_sec == boot.tv_sec && now.tv_nsec < boot.tv_nsec))
         return false;
@@ -424,7 +385,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_ts_open(b_lean_obj_arg directory,
             fd = -1;
             if (TEMP_FAILURE_RETRY(unlinkat(dir, name, 0)) != 0 && errno != ENOENT)
                 break;
-            /* Reopen only once: never truncate an inode with record locks. */
             continue;
         }
         break;
@@ -450,7 +410,6 @@ static bool ts_valid_offset(uint64_t offset) {
         (uint64_t)(off_t)offset == offset;
 }
 
-/* Read only the caller's bounded window, never the entire file extent. */
 static lean_obj_res ts_read_extent(uint32_t fd, uint64_t offset, size_t length) {
     if (lean_alloc_sarray_would_overflow(1, length))
         return ts_errno_error("timestamp read", EOVERFLOW);
@@ -477,7 +436,6 @@ static lean_obj_res ts_read_extent(uint32_t fd, uint64_t offset, size_t length) 
     return lean_io_result_mk_ok(arr);
 }
 
-/* Report the extent without allocating memory proportional to file size. */
 LEAN_EXPORT lean_obj_res lean_sudo_ts_size(uint32_t fd, lean_obj_arg w) {
     (void)w;
     if (!ts_valid_fd(fd))
@@ -490,7 +448,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_ts_size(uint32_t fd, lean_obj_arg w) {
     return lean_io_result_mk_ok(lean_box_uint64((uint64_t)st.st_size));
 }
 
-/* Short EOF is returned as a short array, not padded or interpreted here. */
 LEAN_EXPORT lean_obj_res lean_sudo_ts_read_at(uint32_t fd, uint64_t offset,
         uint32_t length, lean_obj_arg w) {
     (void)w;
@@ -544,14 +501,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_ts_truncate(uint32_t fd, uint64_t length,
     return lean_io_result_mk_ok(lean_box(0));
 }
 
-/*
- * timestamp_lock_record temporarily accepts SIGINT/SIGQUIT. Lean has multiple
- * runtime threads: a process-directed signal may reach a different thread,
- * so that handler must also interrupt the thread blocked in F_SETLKW.
- * Upstream's frontend handles cancellation as a cache miss; a bare runtime
- * SIG_DFL must not turn that into process termination. Preserve real handlers.
- * Serialize the process-wide disposition changes, not the file's lock policy.
- */
 static pthread_mutex_t ts_signal_mutex = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic(pthread_t) ts_lock_thread;
 static atomic_int ts_lock_signal;
@@ -562,7 +511,6 @@ static void ts_lock_handler(int signo) {
     if (ts_is_lock_thread) {
         atomic_store_explicit(&ts_lock_signal, signo, memory_order_relaxed);
     } else {
-        /* Publish cancellation only once the waiter has consumed the relay. */
         (void)pthread_kill(atomic_load_explicit(&ts_lock_thread,
             memory_order_relaxed), signo);
     }
@@ -570,7 +518,6 @@ static void ts_lock_handler(int signo) {
 }
 
 static int ts_wait_lock(int fd, struct flock *region) {
-    /* All atomics touched by the signal handler must be lock-free. */
     if (!atomic_is_lock_free(&ts_lock_thread) ||
             !atomic_is_lock_free(&ts_lock_signal)) {
         errno = ENOTSUP;
@@ -645,7 +592,6 @@ restore:
         int caught = atomic_load_explicit(&ts_lock_signal, memory_order_relaxed);
         if (caught != 0)
             error = EINTR;
-        /* An interrupt racing successful acquisition is still cancellation. */
         if (acquired && error != 0) {
             struct flock unlock = *region;
             unlock.l_type = F_UNLCK;
@@ -653,12 +599,6 @@ restore:
         }
         ts_is_lock_thread = 0;
         if (caught != 0) {
-            /*
-             * A relayed interrupt may still be pending on this blocked thread.
-             * Consume it before restoring the inherited mask: upstream's
-             * frontend records the canceled lock rather than terminating.
-             * Typed EINTR carries that event to Lean's cache-miss handling.
-             */
             struct timespec immediate = {0, 0};
             while (sigtimedwait(&interrupts, NULL, &immediate) >= 0 ||
                     errno == EINTR) {
@@ -720,7 +660,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_ts_close(uint32_t fd, lean_obj_arg w) {
     (void)w;
     if (!ts_valid_fd(fd))
         return ts_errno_error("timestamp close", EBADF);
-    /* Linux closes on EINTR; retrying could close a reused descriptor. */
     if (close((int)fd) != 0 && errno != EINTR)
         return ts_errno_error("timestamp close", errno);
     return lean_io_result_mk_ok(lean_box(0));
@@ -739,7 +678,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_ts_remove(b_lean_obj_arg directory,
             return lean_io_result_mk_ok(lean_box(0));
         return ts_errno_error("timestamp directory", errno);
     }
-    /* sudo -K unlinks under restored credentials, without interpreting records. */
     int rc = TEMP_FAILURE_RETRY(unlinkat(dir, lean_string_cstr(filename), 0));
     int error = errno;
     (void)close(dir);

@@ -1,4 +1,4 @@
-# sudo.ws match.c / match_command.c regressions.
+
 begin policy-myself-empty-runas && {
   printf 'ivan ALL = () NOPASSWD: /usr/bin/id\n' >/etc/sudoers.d/policy
   chmod 0440 /etc/sudoers.d/policy
@@ -125,7 +125,7 @@ begin policy-list-pseudo-command && {
   chmod 0440 /etc/sudoers.d/policy
   run ivan 'sudo -n -l -U judy'; expect_rc 0; expect_out_has '/usr/bin/id'
   run ivan 'sudo -n -l -U kate'; expect_rc 1
-  # sudo accepts but deliberately ignores file digests on pseudo-commands.
+
   printf 'ivan ALL = (judy) NOPASSWD: sha256:%064d list\njudy ALL = NOPASSWD: /usr/bin/id\n' 0 >/etc/sudoers.d/policy
   run ivan 'sudo -n -l -U judy'; expect_rc 0; expect_out_has '/usr/bin/id'
   end
@@ -145,7 +145,7 @@ begin policy-nonunix-group-no-plugin && {
 begin policy-interface-network && {
   printf 'ivan 127.0.0.0/8 = NOPASSWD: /usr/bin/id\n' >/etc/sudoers.d/policy
   chmod 0440 /etc/sudoers.d/policy
-  # sudo excludes the loopback interface; --network none has no eligible NIC.
+
   run ivan 'sudo -n /usr/bin/id -u'; expect_rc 1; expect_out_empty
   end
 }

@@ -1,4 +1,3 @@
-/* SSSD sudo responder ABI boundary. All policy interpretation lives in Lean. */
 #include "shim.h"
 #include <dlfcn.h>
 #include <errno.h>
@@ -10,7 +9,6 @@
 #include <string.h>
 #include <sys/types.h>
 
-/* Stable interface from sudo 1.9.17p2 plugins/sudoers/sssd.c. */
 struct sss_sudo_attr {
   char *name;
   char **values;
@@ -37,7 +35,6 @@ static lean_obj_res failure(const char *operation, int error) {
   snprintf(message, sizeof message, "SSSD %s: %s", operation, strerror(error));
   return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(message)));
 }
-
 
 static void *open_library(void) {
   static const char *const paths[] = {
@@ -67,8 +64,6 @@ static bool load_api(void *handle, struct sss_api *api) {
   return ls_dlsyms(handle, symbols, sizeof symbols / sizeof symbols[0]) == NULL;
 }
 
-/* A failed request may return an SSS status with errno in server_error,
- * or a positive errno directly. Do not mistake malformed replies for absence. */
 static int request_error(int rc, uint32_t server_error, int saved_errno) {
   if (server_error > 0) return server_error <= INT_MAX ? (int)server_error : EIO;
   if (rc > 0) return rc;
@@ -82,8 +77,6 @@ static bool unavailable(int error) {
     error == EAGAIN;
 }
 
-/* Only publish a complete result. get_values owns its NULL-terminated copy;
- * free_values must run before free_result and dlclose on every path. */
 static int copy_result(const struct sss_api *api, struct sss_sudo_result *result,
     lean_object **out) {
   if (!result || (result->num_rules && !result->rules)) return EPROTO;
@@ -104,8 +97,6 @@ static int copy_result(const struct sss_api *api, struct sss_sudo_result *result
         goto bad_rule;
       }
       char **values = NULL;
-      /* Isolate this attribute so duplicate names retain their actual values;
-       * libsss_sudo otherwise returns only the first case-insensitive match. */
       struct sss_sudo_rule single = {1, attr};
       error = api->get_values(&single, attr->name, &values);
       if (error != 0 || !values) {

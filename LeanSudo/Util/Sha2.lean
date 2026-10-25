@@ -1,9 +1,5 @@
 import LeanSudo.Sudoers.Ast
 
-/-! FIPS 180-4 SHA-2. Words and schedules use machine arithmetic; padding is
-read virtually so hashing does not copy the input. A local macro specializes
-the shared algorithm at compile time, without runtime word-operation dispatch.
-Only the final digest is serialized. The length proofs do not claim cryptographic correctness. -/
 namespace LeanSudo.Sha2
 
 private def paddedByte (m : ByteArray) (total lengthBytes i : Nat) : UInt8 :=

@@ -1,71 +1,35 @@
-/-!
-# POSIX `fnmatch(3)`
-
-A total, structurally recursive implementation of the subset of `fnmatch(3)` that
-sudo relies on:
-
-* `*` matches any sequence of characters, `?` any single character;
-* bracket expressions `[abc]`, ranges `[a-z]`, negation `[!x]` / `[^x]`, character
-  classes `[[:alpha:]]`; a `]` right after the opening `[` (or `[!`) is literal;
-  an unterminated `[` is a literal `[`;
-* backslash escapes the next character (also inside brackets); a trailing
-  backslash is literal;
-* with `pathname` (`FNM_PATHNAME`), `*`, `?` and bracket expressions never match `/`;
-* `caseInsensitive` (`FNM_CASEFOLD`) compares ASCII letters case-insensitively.
-
-`FNM_PERIOD` is not implemented (sudo never passes it).
-
-The pattern is first tokenised (`tokenize`), then matched (`matchToks`) by
-structural recursion on the token list; `*` tries every suffix of the subject
-(`anySuffix`).
--/
-
 namespace LeanSudo.Glob
 
-/-- One element of a bracket expression. -/
 inductive BItem where
   | single (c : Char)
   | range (lo hi : Char)
-  /-- `[:name:]` -/
   | cls (name : List Char)
   deriving Repr, BEq, Inhabited
 
 inductive Tok where
   | lit (c : Char)
-  /-- `?` -/
   | any
-  /-- `*` -/
   | star
   | bracket (negated : Bool) (items : List BItem)
   deriving Repr, BEq, Inhabited
 
-/-- Characters that make a pattern a glob (`*`, `?`, `[`) or that are interpreted
-specially by `fnmatch` (`\`). -/
 def isMeta (c : Char) : Bool := c == '*' || c == '?' || c == '[' || c == '\\'
 
-/-- Does the pattern contain any character `fnmatch` treats specially? -/
 def hasMeta (p : String) : Bool := p.toList.any isMeta
 
-/-- Does the string contain a glob wildcard (`*`, `?` or `[`)? This is sudo's test for
-"is this a pattern or a literal" in hosts, commands and arguments. -/
 def hasGlob (p : String) : Bool := p.toList.any fun c => c == '*' || c == '?' || c == '['
 
-/-- `name:]rest` ↦ `(name, rest)`. -/
 def splitClass : List Char → Option (List Char × List Char)
   | [] => none
   | ':' :: ']' :: r => some ([], r)
   | c :: r => (splitClass r).map fun (n, r') => (c :: n, r')
 
-/-- Read one possibly backslash-escaped character. -/
 def readChar : List Char → Option (Char × List Char)
   | [] => none
   | ['\\'] => none
   | '\\' :: c :: r => some (c, r)
   | c :: r => some (c, r)
 
-/-- Parse a bracket body (after `[` and the optional `!`/`^`). `first` is true at the
-first position, where `]` is an ordinary member. Returns the items and the input after
-the closing `]`, or `none` if the bracket is unterminated. -/
 def parseBody : Nat → Bool → List Char → List BItem → Option (List BItem × List Char)
   | 0, _, _, _ => none
   | _ + 1, _, [], _ => none
@@ -86,8 +50,6 @@ def parseBody : Nat → Bool → List Char → List BItem → Option (List BItem
         | none => none
       | _ => parseBody n false r (.single c :: acc)
 
-/-- Tokenise with fuel (`tokenize` passes the input length, which suffices since every
-step consumes at least one character). -/
 def tokF : Nat → List Char → List Tok
   | 0, _ => []
   | _ + 1, [] => []
@@ -136,8 +98,6 @@ def itemMatch (ci : Bool) (c : Char) : BItem → Bool
   | .range lo hi => inRange lo hi c || (ci && (inRange lo hi c.toLower || inRange lo hi c.toUpper))
   | .cls nm => classMatch nm c || (ci && (classMatch nm c.toLower || classMatch nm c.toUpper))
 
-/-- `f` holds for some suffix of the subject reachable without skipping a `/` when
-`pathname` is set. -/
 def anySuffix (pathname : Bool) (f : List Char → Bool) : List Char → Bool
   | [] => f []
   | c :: cs => f (c :: cs) || (!(pathname && c == '/') && anySuffix pathname f cs)
@@ -151,16 +111,12 @@ def matchToks (pathname ci : Bool) : List Tok → List Char → Bool
   | .bracket neg items :: ps, d :: s =>
     !(pathname && d == '/') && (items.any (itemMatch ci d) != neg) && matchToks pathname ci ps s
 
-/-- POSIX `fnmatch(pattern, s, (pathname ? FNM_PATHNAME : 0) | (caseInsensitive ? FNM_CASEFOLD : 0)) == 0`. -/
 def fnmatch (pattern s : String) (pathname : Bool) (caseInsensitive : Bool := false) : Bool :=
   matchToks pathname caseInsensitive (tokenize pattern.toList) s.toList
-
-/-! ## Theorems -/
 
 theorem tokF_nil (n : Nat) : tokF n [] = [] := by
   cases n <;> rfl
 
-/-- A metacharacter-free prefix tokenises to literals. -/
 theorem tokF_noMeta_append (cs rest : List Char) (h : cs.all (fun c => !isMeta c) = true) :
     ∀ n, tokF (n + cs.length) (cs ++ rest) = cs.map Tok.lit ++ tokF n rest := by
   induction cs with
@@ -211,7 +167,6 @@ theorem matchToks_lits (pn : Bool) (cs t : List Char) :
   · simp only [beq_iff_eq] at h
     exact this.mpr ⟨[], by simp [h], rfl⟩
 
-/-- **Literal patterns**: a pattern without metacharacters matches exactly itself. -/
 theorem fnmatch_literal (p s : String) (pn : Bool) (h : hasMeta p = false) :
     fnmatch p s pn = (p == s) := by
   have h' : p.toList.all (fun c => !isMeta c) = true := by
@@ -230,7 +185,6 @@ theorem anySuffix_nil_true (f : List Char → Bool) (hf : f [] = true) :
   | nil => simpa [anySuffix] using hf
   | cons c cs ih => simp [anySuffix, ih]
 
-/-- `*` without `pathname` matches everything. -/
 theorem fnmatch_star (s : String) : fnmatch "*" s false = true := by
   have hs : "*".toList = ['*'] := by decide
   have ht : tokenize "*".toList = [Tok.star] := by rw [hs]; rfl
@@ -248,8 +202,6 @@ theorem anySuffix_pathname_empty (u : List Char) :
     · rintro ⟨h1, h2⟩; exact ⟨fun h => h1 h.symm, h2⟩
     · rintro ⟨h1, h2⟩; exact ⟨fun h => h1 h.symm, h2⟩
 
-/-- **`*` does not cross `/` with `pathname`**: a literal prefix followed by `*`
-matches exactly the strings that extend the prefix by a `/`-free suffix. -/
 theorem fnmatch_prefix_star_pathname (pre s : String) (h : hasMeta pre = false) :
     fnmatch (pre ++ "*") s true = true ↔ ∃ t : String, s = pre ++ t ∧ '/' ∉ t.toList := by
   have h' : pre.toList.all (fun c => !isMeta c) = true := by
@@ -273,7 +225,6 @@ theorem fnmatch_prefix_star_pathname (pre s : String) (h : hasMeta pre = false) 
   · rintro ⟨t, rfl, ht⟩
     exact ⟨t.toList, by simp, ht⟩
 
-/-- Special case: with `pathname`, `*` matches exactly the `/`-free strings. -/
 theorem fnmatch_star_pathname (s : String) : fnmatch "*" s true = true ↔ '/' ∉ s.toList := by
   simpa using fnmatch_prefix_star_pathname "" s (by decide)
 

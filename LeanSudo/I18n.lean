@@ -1,13 +1,5 @@
 import Std
 
-/-!
-Pure GNU gettext catalogs. MO offsets and terminating NUL bytes are checked before
-UTF-8 decoding; no input is executed. Plural expressions use the gettext integer
-grammar with short-circuit evaluation. Invalid metadata uses the English rule.
-`merge` keeps the first catalog's entries and each entry's own plural rule.
-Formatting accepts string arguments only, never pointers or printf `%n`; unknown
-or incomplete directives and missing arguments remain literal.
--/
 namespace LeanSudo.I18n
 
 inductive PluralExpr where
@@ -35,7 +27,6 @@ private def operators : List (List Char × String × Nat × (Int → Int → Int
    (['/'], "/", 7, fun a b => if b == 0 then 0 else a.tdiv b),
    (['%'], "%", 7, fun a b => if b == 0 then 0 else a.tmod b)]
 
-/-- C/gettext integer arithmetic; division by zero is defined as zero. -/
 def PluralExpr.eval : PluralExpr → Nat → Int
   | .number k, _ => k
   | .count, n => Int.ofNat n
@@ -102,7 +93,6 @@ mutual
       | none => pure (left, rest)
 end
 
-/-- Parse a complete gettext plural expression, rejecting trailing garbage. -/
 def parsePlural (text : String) : Option PluralExpr := do
   let (e, rest) ← expression (text.length * 4 + 8) 1 text.toList
   if (skipSpace rest).isEmpty then some e else none
@@ -113,13 +103,10 @@ structure PluralRule where
   deriving Repr, BEq, Inhabited
 
 structure Catalog where
-  /-- Raw MO originals/translations, including embedded plural NUL separators. -/
   entries : List (String × String) := []
-  /-- Rules are keyed by the raw original, so catalog merging preserves locale rules. -/
   pluralRules : List (String × PluralRule) := []
   deriving Repr, BEq, Inhabited
 
-/-- Preserve each raw original's plural rule when catalogs are composed. -/
 def ruleFor (catalog : Catalog) (original : String) : PluralRule :=
   ((catalog.pluralRules.find? (fun r => r.1 == original)).map Prod.snd).getD {}
 
@@ -131,7 +118,6 @@ private def singular (s : String) : String := (s.splitOn (String.singleton '\x00
 private def entry (catalog : Catalog) (msgid : String) : Option (String × String) :=
   catalog.entries.find? (fun e => singular e.1 == msgid)
 
-/-- Exact msgid fallback when no nonempty translation exists. -/
 def lookup (catalog : Catalog) (msgid : String) : String :=
   match entry catalog msgid with
   | none => msgid
@@ -139,7 +125,6 @@ def lookup (catalog : Catalog) (msgid : String) : String :=
     let first := singular translated
     if first.isEmpty then msgid else first
 
-/-- An absent catalog entry never changes the original diagnostic. -/
 theorem lookup_absent (catalog : Catalog) (msgid : String)
     (h : catalog.entries.find? (fun e => singular e.1 == msgid) = none) :
     lookup catalog msgid = msgid := by
@@ -148,7 +133,6 @@ theorem lookup_absent (catalog : Catalog) (msgid : String)
 @[simp] theorem lookup_empty (msgid : String) : lookup {} msgid = msgid := by
   simp [lookup, entry]
 
-/-- Missing/empty plural translations fall back to the original English forms. -/
 def nlookup (catalog : Catalog) (msgid plural : String) (n : Nat) : String := Id.run do
   let fallback := if n == 1 then msgid else plural
   let some (original, translated) := entry catalog msgid | return fallback
@@ -159,7 +143,6 @@ def nlookup (catalog : Catalog) (msgid plural : String) (n : Nat) : String := Id
     | return fallback
   return if result.isEmpty then fallback else result
 
-/-- Left-biased catalog composition, retaining per-entry plural metadata. -/
 def merge (preferred fallback : Catalog) : Catalog :=
   { entries := preferred.entries ++ fallback.entries
     pluralRules := preferred.entries.map (fun e => (e.1, ruleFor preferred e.1)) ++
@@ -196,9 +179,6 @@ private def moString (bytes : ByteArray) (big : Bool) (descriptor : Nat) : Optio
     String.fromUTF8? (bytes.extract offset (offset + length))
   else none
 
-/-- Decode GNU MO revision-zero string tables in either byte order.
-All descriptor/hash-table extents and string terminators must be within the file;
-invalid UTF-8, unsupported revisions, and malformed tables are rejected. -/
 def parseMo (bytes : ByteArray) : Option Catalog := do
   if bytes.size < 28 then none else do
     let magic ← word bytes false 0
@@ -240,7 +220,6 @@ private def spec (input : List Char) : Option (Spec × List Char) := do
   let rest := rest.drop flags.length
   let widthDigits := rest.takeWhile Char.isDigit
   let width := ((String.ofList widthDigits).toNat?).getD 0
-  -- Bound padding allocation for untrusted catalog directives.
   if width > 65536 then none else do
     let rest := rest.drop widthDigits.length
     let (precision, rest) := match rest with
@@ -301,9 +280,6 @@ private def formatParts : Nat → List Char → Array String → Nat → List St
           formatParts fuel remaining args (if s.position.isSome then next else next + 1)
     | _ => [String.ofList cs]
 
-/-- Safe printf-style substitution: `%s`, `%c`, integer conversions, `%%`,
-positional arguments, flags, static width/precision and integer length modifiers. Values are
-already-rendered strings. Unsupported directives are preserved, not interpreted. -/
 def format (template : String) (args : List String) : String :=
   String.join (formatParts (template.length + 1) template.toList args.toArray 0)
 

@@ -1,6 +1,3 @@
-/* Privileged interception broker. This file transports facts; Lean alone
- * authorizes them. Each request has its own reply socket, so forked tracees
- * cannot consume another process's authorization. */
 #include "shim.h"
 #include "intercept.h"
 #include "intercept_dso.h"
@@ -27,10 +24,6 @@ int ls_intercept_trace(void) { return active && tracing; }
 int ls_intercept_verify(void) { return active && verifying; }
 pid_t ls_intercept_broker_pid(void) { return broker_pid; }
 
-/* The broker shares sudo's terminal process group but is not a foreground
- * command. Terminal signals are handled by sudo's command monitor, not by this
- * policy service. Block around fork so no signal can reach the uninitialized
- * child before its dispositions have been installed. */
 static pid_t fork_broker(void) {
   const int signals[] = { SIGINT, SIGQUIT, SIGTSTP, SIGHUP };
   sigset_t blocked, saved;

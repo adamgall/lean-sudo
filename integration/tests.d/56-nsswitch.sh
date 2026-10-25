@@ -1,6 +1,6 @@
-# sudo_nss.c compatibility: silently ignore backends absent from Ubuntu's build,
-# and default to files only when no supported source remains. Unavailable SSSD
-# is still a supported source and must never cause an implicit local fallback.
+
+
+
 
 nsswitch_setup() {
   cp -a /etc/nsswitch.conf "$WORK/nsswitch.orig"
@@ -78,8 +78,8 @@ begin nsswitch-first-entry && {
 begin nsswitch-sss-only && {
   nsswitch_setup
   printf '\nsudoers: sss\n' >>/etc/nsswitch.conf
-  # The container has no SSSD service. Even though local policy grants this
-  # command, neither implementation may fall back to that local grant.
+
+
   run ivan 'sudo -n /usr/bin/id -u'
   expect_rc 1
   expect_out_empty
@@ -132,8 +132,8 @@ begin nsswitch-unknown-source && {
 begin nsswitch-sss-never-loads-local-policy && {
   nsswitch_setup
   printf '\nsudoers: sss\n' >>/etc/nsswitch.conf
-  # A refusal alone is insufficient: opening/parsing local policy first must
-  # not leak a syntax diagnostic when files is absent from the source list.
+
+
   printf '\nNSS_LOCAL_POLICY_MUST_NOT_BE_READ !!!\n' >>/etc/sudoers
   run ivan 'sudo -n /usr/bin/id -u'
   expect_rc 1

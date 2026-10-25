@@ -1,4 +1,4 @@
-# Shell/PAM compatibility against Ubuntu's sudo.ws 1.9.17p2.
+
 
 begin shell_prompt_environment && {
   XENV=(SUDO_PROMPT='custom %u on %h: ')
@@ -16,47 +16,106 @@ begin shell_bell_stdin && {
 }
 
 begin shell_ssh_no_tty && {
-  XENV=(SSH_CONNECTION='127.0.0.1 1000 127.0.0.1 22')
-  run alice 'sudo -k /usr/bin/true'
+  mkdir -p /run/sshd "$WORK/ssh"
+  ssh-keygen -q -t ed25519 -N '' -f "$WORK/ssh/id"
+  cp "$WORK/ssh/id.pub" "$WORK/ssh/authorized_keys"
+  chmod 0755 "$WORK/ssh"
+  cat >"$WORK/ssh/sshd_config" <<EOF
+ListenAddress 127.0.0.1
+Port 2222
+HostKey /etc/ssh/ssh_host_ed25519_key
+PidFile $WORK/ssh/sshd.pid
+AuthorizedKeysFile $WORK/ssh/authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM yes
+AllowUsers alice
+StrictModes no
+EOF
+  /usr/sbin/sshd -D -e -f "$WORK/ssh/sshd_config" >"$WORK/ssh/daemon.log" 2>&1 &
+  shell_sshd_pid=$!
+  for ((shell_wait=0; shell_wait<100; shell_wait++)); do
+    ssh-keyscan -T 1 -p 2222 127.0.0.1 >"$WORK/ssh/known_hosts" 2>/dev/null && break
+    kill -0 "$shell_sshd_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  run root "ssh -T -i '$WORK/ssh/id' -p 2222 -o BatchMode=yes -o UserKnownHostsFile='$WORK/ssh/known_hosts' alice@127.0.0.1 'test -n \"\$SSH_CONNECTION\" && test -z \"\$SSH_TTY\" && exec sudo -k /usr/bin/true'"
   expect_rc 1
   expect_err_has "either use ssh's -t option or configure an askpass helper"
+  kill "$shell_sshd_pid" 2>/dev/null
+  wait "$shell_sshd_pid" 2>/dev/null
   end
 }
 
-begin shell_askpass_invoking_identity && {
-  cat >/usr/local/bin/shell-askpass <<'EOF'
-#!/bin/sh
-/usr/bin/id -u >&2
-printf 'alicepw\n'
-EOF
-  chmod 0755 /usr/local/bin/shell-askpass
-  XENV=(SUDO_ASKPASS=/usr/local/bin/shell-askpass)
-  run alice 'sudo -kA /usr/bin/true'
+
+
+shell_run_askpass() {
+  local mode=$1 xvfb_pid driver_pid
+  Xvfb :99 -screen 0 640x480x24 -nolisten tcp -ac >"$WORK/askpass-xvfb.log" 2>&1 &
+  xvfb_pid=$!
+  for ((shell_wait=0; shell_wait<100; shell_wait++)); do
+    DISPLAY=:99 xdotool getdisplaygeometry >/dev/null 2>&1 && break
+    kill -0 "$xvfb_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  rm -f "$WORK/askpass.uid"
+  DISPLAY=:99 python3 - "$WORK/askpass.uid" <<'PY' &
+import glob, os, subprocess, sys, time
+helper = os.path.realpath("/usr/bin/ssh-askpass")
+deadline = time.monotonic() + 15
+while time.monotonic() < deadline:
+    windows = subprocess.run(["xdotool", "search", "--onlyvisible", "--class", ".*"],
+                             capture_output=True, text=True)
+    for proc in glob.glob("/proc/[0-9]*"):
+        try:
+            if os.readlink(proc + "/exe") != helper:
+                continue
+            status = open(proc + "/status").read()
+        except (FileNotFoundError, PermissionError):
+            continue
+        if windows.returncode == 0 and windows.stdout.strip():
+            uid = next(line for line in status.splitlines() if line.startswith("Uid:"))
+            with open(sys.argv[1], "w") as output:
+                output.write(" ".join(uid.split()[1:]))
+            window = windows.stdout.splitlines()[0]
+            subprocess.run(["xdotool", "windowfocus", "--sync", window], check=True)
+            subprocess.run(["xdotool", "type", "--window", window, "alicepw"], check=True)
+            subprocess.run(["xdotool", "key", "--window", window, "Return"], check=True)
+            sys.exit(0)
+    time.sleep(0.05)
+raise SystemExit("askpass window/process did not become ready")
+PY
+  driver_pid=$!
+  XENV=(DISPLAY=:99)
+  [[ $mode == conf ]] || XENV+=(SUDO_ASKPASS=/usr/bin/ssh-askpass)
+  if [[ $mode == display ]]; then
+    run alice 'sudo -k /usr/bin/true'
+  else
+    run alice 'sudo -kA /usr/bin/true'
+  fi
   expect_rc 0
-  expect_err_has "$(uid_of alice)"
-  rm -f /usr/local/bin/shell-askpass
+  wait "$driver_pid" || fail 'could not drive the real askpass window'
+  [[ $(cat "$WORK/askpass.uid" 2>/dev/null) == "$(uid_of alice) $(uid_of alice) $(uid_of alice) $(uid_of alice)" ]] ||
+    fail 'askpass did not run with the invoking user credentials'
+  kill "$xvfb_pid" 2>/dev/null
+  wait "$xvfb_pid" 2>/dev/null
+}
+
+begin shell_askpass_invoking_identity && {
+  shell_run_askpass environment
   end
 }
 
 begin shell_askpass_sudo_conf && {
   cp -a /etc/sudo.conf "$WORK/shell-sudo.conf"
-  printf 'Path askpass /usr/local/bin/shell-askpass\n' >/etc/sudo.conf
-  printf '#!/bin/sh\nprintf "alicepw\\n"\n' >/usr/local/bin/shell-askpass
-  chmod 0755 /usr/local/bin/shell-askpass
-  run alice 'sudo -kA /usr/bin/true'
-  expect_rc 0
+  printf 'Path askpass /usr/bin/ssh-askpass\n' >/etc/sudo.conf
+  shell_run_askpass conf
   cp -a "$WORK/shell-sudo.conf" /etc/sudo.conf
-  rm -f /usr/local/bin/shell-askpass
   end
 }
 
 begin shell_askpass_display_fallback && {
-  printf '#!/bin/sh\nprintf "alicepw\\n"\n' >/usr/local/bin/shell-askpass
-  chmod 0755 /usr/local/bin/shell-askpass
-  XENV=(SUDO_ASKPASS=/usr/local/bin/shell-askpass DISPLAY=:99)
-  run alice 'sudo -k /usr/bin/true'
-  expect_rc 0
-  rm -f /usr/local/bin/shell-askpass
+  shell_run_askpass display
   end
 }
 
@@ -118,28 +177,32 @@ EOF
 }
 
 begin shell_mail_headers_and_identity && {
-  rm -f /tmp/shell-mail-body /tmp/shell-mail-identity
-  cat >/usr/local/bin/shell-sendmail <<'EOF'
-#!/bin/sh
-/usr/bin/id >/tmp/shell-mail-identity
-printf 'flags:%s\n' "$*" >>/tmp/shell-mail-identity
-cat >/tmp/shell-mail-body
-EOF
-  chmod 0755 /usr/local/bin/shell-sendmail
+  rm -f /var/mail/root
+  install -o Debian-exim -g adm -m 0640 /dev/null /var/log/exim4/mainlog
   install -m 0440 /dev/stdin /etc/sudoers.d/shell-mail <<'EOF'
-Defaults mailerpath=/usr/local/bin/shell-sendmail,mailerflags="-t -i",mailto=admin@example.test,mailfrom=sudo@example.test,mailsub="incident on %h",mail_no_user
+Defaults mailerpath=/usr/sbin/sendmail,mailerflags="-t -i",mailto=admin@example.test,mailfrom=sudo@example.test,mailsub="incident on %h",mail_no_user
 EOF
-  run ivan "printf 'ivanpw\n' | sudo -S /usr/bin/true"
+  run root "printf 'ivanpw\n' | strace -f -s 4096 -e trace=execve,setgroups,setresuid,setresgid,setuid,setgid -o '$WORK/shell-mail.trace' runuser -u ivan -- sudo -S /usr/bin/true"
   expect_rc 1
-  run root 'for n in 1 2 3 4 5; do test -s /tmp/shell-mail-body && break; sleep 1; done; cat /tmp/shell-mail-identity /tmp/shell-mail-body'
+  run root 'python3 -c '"'"'import pathlib,time; p=pathlib.Path("/var/mail/root"); deadline=time.monotonic()+10
+while not p.exists() or "Auto-Submitted: auto-generated" not in p.read_text():
+    assert time.monotonic()<deadline, "mail delivery timed out"
+    time.sleep(.01)
+print(p.read_text())
+print(pathlib.Path("/var/log/exim4/mainlog").read_text())'"'"
   expect_rc 0
-  expect_out_has "uid=$(uid_of ivan)(ivan) gid=$(gid_of ivan)(ivan) groups=$(gid_of ivan)(ivan)"
-  expect_out_has 'flags:-t -i'
+  expect_out_has 'U=ivan P=local'
   expect_out_has 'To: admin@example.test'
   expect_out_has 'From: sudo@example.test'
   expect_out_has 'Auto-Submitted: auto-generated'
   expect_out_has 'Subject: incident on '
-  rm -f /usr/local/bin/shell-sendmail
+  run root "cat '$WORK/shell-mail.trace'"
+  expect_rc 0
+  expect_out_has 'execve("/usr/sbin/sendmail", ["sendmail", "-t", "-i"]'
+  expect_out_has "setgroups(1, [$(gid_of ivan)])"
+  expect_out_has "setgid($(gid_of ivan))"
+  expect_out_has "setuid($(uid_of ivan))"
+  rm -f "$WORK/shell-mail.trace"
   end
 }
 
@@ -199,40 +262,47 @@ begin shell_sudo_conf_case_insensitive_plugins && {
 }
 
 begin shell_pam_session_error_nonfatal && {
-  cat >/etc/pam.d/shell-session-error <<'EOF'
-auth required pam_permit.so
-account required pam_permit.so
-session required pam_deny.so
-EOF
+
+  printf 'root hard nofile 1073741824\n' >/etc/security/limits.d/shell-session.conf
   install -m 0440 /dev/stdin /etc/sudoers.d/shell-session <<'EOF'
-Defaults:judy pam_service=shell-session-error
+Defaults:judy pam_session
 judy ALL=(root) /usr/bin/true
 EOF
-  run judy 'sudo -S /usr/bin/true'
+  cat >"$WORK/shell-session.py" <<'PY'
+import subprocess, sys
+sys.path.insert(0, "/usr/local/lib")
+from sudo_it_logging import Syslog
+with Syslog() as log:
+    result = subprocess.run(["setpriv", "--reuid=judy", "--regid=judy", "--init-groups",
+                             "sudo", "-kS", "/usr/bin/true"], input="judypw\n",
+                            capture_output=True, text=True)
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    messages = "\n".join(log.messages())
+    print(messages)
+    assert result.returncode == 0, result.returncode
+    assert "pam_limits(sudo:session)" in messages and "Could not set limit" in messages
+PY
+  run root "python3 '$WORK/shell-session.py'"
   expect_rc 0
-  rm -f /etc/pam.d/shell-session-error
+  rm -f /etc/security/limits.d/shell-session.conf
   end
 }
 
 begin shell_pam_account_error_specific && {
-  cat >/etc/pam.d/shell-account-error <<'EOF'
-auth required pam_permit.so
-account required pam_deny.so
-session required pam_permit.so
-EOF
   install -m 0440 /dev/stdin /etc/sudoers.d/shell-account <<'EOF'
-Defaults:judy pam_service=shell-account-error
 judy ALL=(root) /usr/bin/true
 EOF
-  run judy 'sudo -S /usr/bin/true'
+  chage -E 0 judy
+  run judy "printf 'judypw\n' | sudo -kS /usr/bin/true"
   expect_rc 1
   expect_err_has 'account validation failure, is your account locked?'
-  rm -f /etc/pam.d/shell-account-error
+  chage -E -1 judy
   end
 }
 
-# sudo_auth_approval calls log_auth_failure after an account rejection.
-# Pin the complete reference stderr, including its zero-attempt second line.
+
+
 shell_expect_expired_account_stderr() {
   local expected=$'[sudo] password for judy: sudo: account validation failure, is your account locked?\nsudo: a password is required'
   [[ $ERR == "$expected" ]] || fail "expired account stderr differs: $ERR"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build lean-sudo's Linux `sudo` and `visudo` in a container (integration/Dockerfile.build)
-# and copy them to .lake/linux/. Works on macOS (Docker Desktop/colima) and Linux.
-# Environment: SUDO_IT_BASE (base image, default ubuntu:26.04).
+
+
+
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(dirname "$here")

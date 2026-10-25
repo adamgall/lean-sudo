@@ -1,4 +1,4 @@
-# Intercepted commands retain the original sudo caller and run-as identity.
+
 for intercept_type in trace dso; do
   begin "intercept-${intercept_type}-subcommand-policy" && {
     install -m 0440 /dev/stdin /etc/sudoers.d/intercept <<EOF
@@ -139,39 +139,18 @@ Defaults intercept_type=$intercept_type, log_subcmds, !use_pty
 carol ALL=(root) NOPASSWD: /bin/sh
 EOF
     cat >"$WORK/intercept-syslog.py" <<'PY'
-import os, socket, subprocess, threading, tempfile
-saved = None
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-stop = threading.Event()
-messages = []
-try:
-    if os.path.lexists("/dev/log"):
-        fd, saved = tempfile.mkstemp(prefix="intercept-log-", dir="/dev")
-        os.close(fd)
-        os.replace("/dev/log", saved)
-    sock.bind("/dev/log")
-    sock.settimeout(.1)
-    def receive():
-        while True:
-            try: messages.append(sock.recv(65536).decode(errors="replace"))
-            except socket.timeout:
-                if stop.is_set(): break
-    thread = threading.Thread(target=receive)
-    thread.start()
+import subprocess, sys
+sys.path.insert(0, '/usr/local/lib')
+from sudo_it_logging import Syslog
+with Syslog() as logger:
     result = subprocess.run(["runuser", "-u", "carol", "--", "sudo", "-n",
                              "/bin/sh", "-c", "/usr/bin/id -u; /usr/bin/true"],
                             capture_output=True, text=True)
-    stop.set()
-    thread.join()
+    messages = logger.messages()
     assert result.returncode == 0, result.stderr
     assert any("COMMAND=/usr/bin/id -u" in x for x in messages), messages
     assert any("COMMAND=/usr/bin/true" in x for x in messages), messages
     print("subcommands recorded in syslog")
-finally:
-    stop.set()
-    sock.close()
-    if os.path.lexists("/dev/log"): os.unlink("/dev/log")
-    if saved is not None: os.replace(saved, "/dev/log")
 PY
     run root "python3 '$WORK/intercept-syslog.py'"
     expect_rc 0
@@ -200,9 +179,9 @@ PY
   end
 }
 
-# Keep the command in sudo's foreground process group: an interactive shell
-# with job control would put its children in another group and miss the broker.
-# ptyrun already accepts literal terminal control bytes through -s.
+
+
+
 for intercept_type in trace dso; do
   begin "intercept-${intercept_type}-nopty-terminal-signals" && {
     intercept_dir=$(mktemp -d /tmp/intercept-terminal.XXXXXX)
@@ -237,7 +216,7 @@ EOF
     expect_rc 0
     expect_out_lacks 'not allowed to execute'
     expect_out_lacks 'waitpid:'
-    # Also clean up a stopped/stranded sudo, broker or command on failed steps.
+
     intercept_session=
     read -r intercept_session <"$intercept_dir/session" || :
     if [[ $intercept_session =~ ^[0-9]+$ && $intercept_session -gt 1 ]]; then
@@ -259,8 +238,8 @@ EOF
 /usr/bin/sleep 300 </dev/null >/dev/null 2>&1 &
 child=$!
 printf '%s\n' "$child" >"$1"
-# Wait for the background exec, not for its completion. Otherwise the initial
-# shell could exit before sleep's exec reaches the tracer at all.
+
+
 attempt=0
 while [ "$attempt" -lt 100 ]; do
     if IFS= read -r name <"/proc/$child/comm" && [ "$name" = sleep ]; then
@@ -314,8 +293,8 @@ EOF
     expect_out_line "script-label=$intercept_dir/safe.sh"
     expect_out_line 0
   else
-    # 1.9.17p2 rewrites the pathname but still verifies the original script
-    # label, so relative script execution is killed before its first instruction.
+
+
     expect_rc 137
     expect_out_empty
     expect_err_has Killed
@@ -325,8 +304,8 @@ EOF
 }
 done
 
-# Reuse the exec fixtures' real jail and host-only NSS lookup. Separate verify
-# modes keep authorization failures distinguishable from inode verification.
+
+
 for intercept_verify in intercept_verify '!intercept_verify'; do
   intercept_verify_name=verify
   [[ $intercept_verify == '!intercept_verify' ]] && intercept_verify_name=noverify
@@ -365,11 +344,11 @@ EOF
   }
 done
 
-# A custom script interpreter pauses before opening the script, so CLONE_FS
-# changes its cwd after authorization without relying on a scheduler race.
-# ctypes supplies clone without adding a compiler dependency to the test image.
-# The nested Python shebang needs !intercept_verify; the ordinary shell-script
-# fixture above separately checks the absolute label with verification enabled.
+
+
+
+
+
 begin intercept-trace-relative-script-clone-fs && {
   intercept_dir=$(mktemp -d /tmp/intercept-clone-fs.XXXXXX)
   chmod 0755 "$intercept_dir"
@@ -387,7 +366,7 @@ os.close(proceed)
 print("script-label=" + label)
 print("shared-cwd=" + os.getcwd())
 with open(label) as script:
-    script.readline()  # shebang
+    script.readline()
     sys.stdout.write(script.read())
 PY
   chmod 0755 "$intercept_dir/interpreter"
@@ -414,7 +393,7 @@ os.chdir(sys.argv[1])
 @entry_type
 def child_main(_):
     try:
-        # Failed/timeout runs must not leave the interpreter behind.
+
         if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != parent:
             os._exit(97)
         os.close(ready[0])
@@ -427,7 +406,7 @@ stack = ctypes.create_string_buffer(1024 * 1024)
 stack_top = (ctypes.addressof(stack) + len(stack)) & ~15
 child = -1
 try:
-    child = libc.clone(child_main, stack_top, 0x200 | signal.SIGCHLD, None)  # CLONE_FS
+    child = libc.clone(child_main, stack_top, 0x200 | signal.SIGCHLD, None)
     if child < 0:
         raise OSError(ctypes.get_errno(), "clone(CLONE_FS)")
     os.close(ready[1])

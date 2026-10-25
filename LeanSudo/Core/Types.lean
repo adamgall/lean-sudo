@@ -6,92 +6,41 @@ import LeanSudo.IoLog
 import LeanSudo.Nsswitch
 import LeanSudo.EventLog
 
-/-!
-# Decision-core contract (frozen)
-
-The IO shell (`Main`) gathers every fact into a `Context`, calls the pure
-`LeanSudo.Core.decide : Context → Decision`, and executes the `Decision`:
-
-1. if `auth = .required u`: re-check the timestamp; if invalid, authenticate `u` with PAM
-   (up to `settings.passwdTries` attempts); on failure stop (exit 1);
-2. run PAM account management (always, also when `auth = .none`, for `exec`/`edit`);
-3. if `updateTimestamp` and authentication (or a valid timestamp) succeeded: record it;
-4. log `log` to syslog (if `settings.syslog` is set);
-5. perform `action`.
-
-Every security theorem is stated about `decide` (`LeanSudo.CoreProofs`).
--/
-
 namespace LeanSudo.Core
 
 open LeanSudo.Sudoers
 
-/-- A command resolved by the IO shell (PATH search, or the shell for `-s`/`-i`). -/
 structure ResolvedCmd where
-  /-- absolute path as found by the lookup (as the user named it); used for policy
-  matching and for display (`SUDO_COMMAND`, logs, `-l cmd`), NOT for `execve` -/
   path : String
-  /-- `realpath` of `path`, resolved at lookup time: what the policy compares literal
-  rules against, and the file handed to `execve` (so re-pointing a user-owned symlink
-  after the check cannot change what runs). Multicall binaries still dispatch on
-  `argv0`. -/
   canonical : String
-  /-- `argv[0]`: as typed by the user; `-<basename>` for `-i` -/
   argv0 : String
-  /-- `argv[1..]` -/
   args : List String
   deriving Repr, BEq, DecidableEq, Inhabited
 
-/-- Everything `decide` may depend on. -/
 structure Context extends Facts where
-  /-- `sudo` or `sudoedit` (basename of argv[0]) -/
   progname : String
   opts : Cli.Options
-  /-- getuid + getpwuid; `groups` = the PROCESS groups (getgroups) with names, plus the
-  primary group, as sudo uses for `%group` matching -/
   invoking : Principal
-  /-- short hostname -/
   host : String
-  /-- include-resolved policy; `Policy.validate` has already passed -/
   sudoers : Sudoers
-  /-- `resolveDefaults` with the run-as user and the command (phase 2) -/
   settings : Settings
-  /-- run-as user: `-u` user / `#uid`; `-g` without `-u` ⇒ the invoking user; otherwise
-  `runas_default`. `groups` = getgrouplist of that user. -/
   target : Principal
-  /-- `-g` group, resolved -/
   targetGroup : Option GroupInfo
-  /-- `-U` user for `-l`, resolved -/
   listUser : Option Principal
-  /-- the command for `run` mode (and `-l cmd`); `none` = not found by PATH lookup
-  (`opts.command.head?` is what the user typed). For `-s`/`-i` it is the shell
-  command built with `Cli.shellCommand`. Unused for `-e`, `-v`, `-k`, `-K`, `-l`. -/
   command : Option ResolvedCmd
-  /-- Set-user-ID or set-group-ID mode on the host-root resolved command inode. -/
   commandSetid : Bool := false
-  /-- the invoking user's environment (UTF-8 entries only) -/
   userEnv : EnvList
-  /-- current working directory -/
   cwd : String
-  /-- the invoking process's umask -/
   userUmask : Nat
-  /-- `ttyname` of the controlling terminal (for logging and PAM_TTY), if any -/
   ttyName : Option String
-  /-- `CLOCK_BOOTTIME` nanoseconds -/
   now : Nat
-  /-- timestamp scope of this invocation (`Timestamp.scopeFor settings.timestampType …`) -/
   tsScope : Timestamp.Scope
-  /-- Nonblocking snapshot projected by `Timestamp.LocatedEntry.recordFor`; `[]`
-  on cache errors. Authentication rereads the selected slot under its record lock. -/
   tsRecords : List Timestamp.Record
-  /-- Current session ID for sudo timestamp interoperability. -/
   tsSessionId : Nat := 0
-  /-- Per-terminal/process lock scope, independent of global authentication tickets. -/
   tsLockScope : Timestamp.Scope := .global
   timestampOwnerUid : Nat := 0
   timestampOwnerGid : Nat := 0
   longHost : String := ""
-  /-- Actual submitting hostname, independent of the host selected with -h. -/
   submitHost : Option String := none
   wallTime : Nat := 0
   envFile : EnvList := []
@@ -100,11 +49,8 @@ structure Context extends Facts where
   selinuxEnabled : Bool := false
   mailerAvailable : Bool := false
   locatedSudoers : List Located := []
-  /-- Loaded NSS backends retained for subcommand-specific source selection. -/
   policySources : List (Nsswitch.Source × List Located) := []
-  /-- Pre-privilege Defaults snapshot: winning LDAP options cannot re-authorize a different rule. -/
   policySettings : Option Settings := none
-  /-- The target matched before a winning LDAP runas_default callback changes it. -/
   policyTarget : Option Principal := none
   execFd : Option Nat := none
   root : Principal := { name := "root", uid := 0, gid := 0, groups := [], home := "/root", shell := "/bin/bash" }
@@ -117,22 +63,14 @@ structure Context extends Facts where
   targetUnknownGid : Bool := false
   runasDefaultUser : Option Principal := none
 
-/-- Whose credentials must be checked before `action` may happen. -/
 inductive AuthReq where
   | none
-  /-- the invoking user, or root (`rootpw`) / the target (`targetpw`) /
-  `runas_default` (`runaspw`) -/
   | required (authUser : Principal)
   deriving Repr, BEq, DecidableEq, Inhabited
 
-/-- How to run the command. The environment is `buildEnv { envInput with pamEnv }`
-where `pamEnv` is `pam_getenvlist` after `pam_open_session`; `decide` has already checked
-that `buildEnv envInput` succeeds (its success does not depend on `pamEnv`). -/
 structure RunPlan where
   envInput : EnvInput
-  /-- umask for the command, `≤ 0o777` -/
   umask : Nat
-  /-- PAM service: `pamLoginService` for `-i`, else `pamService` -/
   pamService : String
   pamSession : Bool
   pamSetcred : Bool
@@ -147,46 +85,31 @@ structure RunPlan where
   utmpUser : Option String := none
   iolog : Option IoLog.Plan := none
   execBackground : Bool := false
-  /-- Editor children use this root, but original edit files remain on the host. -/
   chroot : Option String := none
 
 structure ExecPlan extends RunPlan where
   path : String
-  /-- full argv including argv[0] -/
   argv : List String
   uid : Nat
   gid : Nat
-  /-- supplementary groups for `setgroups` -/
   groups : List Nat
   background : Bool
   execFd : Option Nat := none
   staySetuid : Bool := false
-  /-- Recheck intercepted subcommands against the sudoers policy. -/
   intercept : Bool := false
-  /-- Log intercepted subcommands even when policy interception is disabled. -/
   logSubcmds : Bool := false
 
-/-- `sudoedit` (`-e`): files are copied to temporary files owned by the invoking user,
-the editor runs as the invoking user, and changed files are written back as the target
-(`LeanSudo.Sudoedit`). -/
 structure EditPlan extends RunPlan where
-  /-- the files to edit, made absolute against `Context.cwd`, in the order given -/
   files : List String
-  /-- candidate editor command lines in order of preference (`SUDO_EDITOR`, `VISUAL`,
-  `EDITOR` when `env_editor`, then the `editor` setting's entries), each split into
-  words; the IO shell uses the first whose first word resolves to an executable -/
   editors : List (List String)
-  /-- identity the editor runs as (the invoking user) -/
   editUid : Nat
   editGid : Nat
   editGroups : List Nat
-  /-- identity used to read and write back the files (the run-as target) -/
   fileUid : Nat
   fileGid : Nat
   fileGroups : List Nat
   follow : Bool := false
   checkdir : Bool := true
-  /-- Original file operands, exactly as evaluated by sudoers before making paths absolute. -/
   policyFiles : List String := []
   editorSources : List String := []
   editorNotFound : String := ""
@@ -195,24 +118,15 @@ structure EditPlan extends RunPlan where
 inductive Action where
   | exec (plan : ExecPlan)
   | edit (plan : EditPlan)
-  /-- write `stdout` verbatim, exit with `code` (`-l` output, `-l cmd`) -/
   | print (stdout : String) (code : UInt32)
-  /-- write `stderr` verbatim (complete text, including any `sudo: ` prefix and the
-  trailing newline), exit with `code` -/
   | fail (stderr : String) (code : UInt32)
-  /-- `-v`: authentication refreshed the timestamp; exit 0 -/
   | validate
-  /-- `-k` alone: invalidate every record of the invoking uid; exit 0 -/
   | resetTimestamp
-  /-- `-K`: remove the invoking uid's timestamp file; exit 0 -/
   | removeTimestamp
   deriving Inhabited
 
 structure LogLine where
-  /-- syslog priority name (`notice` for allowed, `alert` for denied) -/
   priority : String
-  /-- e.g. `alice : TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/id` or
-  `carol : command not allowed ; TTY=… ; PWD=… ; USER=root ; COMMAND=…` -/
   msg : String
   format : String := "sudo"
   reason : Option String := none
@@ -232,7 +146,6 @@ inductive AuditEvent where
 structure Decision where
   auth : AuthReq
   action : Action
-  /-- record a successful authentication in the timestamp file -/
   updateTimestamp : Bool
   log : Option LogLine
   adminFlag : Option String := none

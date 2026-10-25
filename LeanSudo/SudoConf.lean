@@ -7,8 +7,6 @@ def trimEnd (s : String) : String := String.ofList (s.toList.reverse.dropWhile b
 def words (s : String) : List String :=
   s.splitOn " " |>.flatMap (·.splitOn "\t") |>.filter (!·.isEmpty)
 
-/-- sudo_parseln folding without an intermediate line list. nsswitch trims trailing
-horizontal blanks on completed physical lines; sudo.conf deliberately retains them. -/
 @[specialize] def foldLogicalLinesM {m : Type → Type} [Monad m] {α : Type}
     (trimTrailing : Bool) (step : α → Nat → String → m α) (initial : α)
     (text : String) : m α := do
@@ -33,8 +31,6 @@ structure Plugin where
   line : Nat
   deriving BEq, Repr, Inhabited
 
-/-- Front-end configuration is separate from the sudoers policy. Unknown plugins
-must never silently fall back to sudoers: an approval plugin may restrict access. -/
 structure Config where
   askpass : Option String := none
   noexec : Option String := some "/usr/libexec/sudo/sudo_noexec.so"
@@ -102,12 +98,9 @@ private def line (c : Config) (lineno : Nat) (words : List String) : Except Stri
   | "Plugin" :: _ => throw "invalid sudo.conf Plugin directive"
   | _ => return c
 
-/-- Parse physical lines after joining backslash continuations and stripping comments. -/
 def parse (text : String) : Except String Config :=
   foldLogicalLinesM false (fun c n s => line c n (words s)) {} text
 
-/-- sudo.conf uses sudo_secure_fd with uid 0 and no trusted group: even
-root-group write permission is rejected. Diagnostic precedence matches sudo. -/
 def fileProblem (uid mode : Nat) : Option String :=
   if mode &&& 0o170000 != 0o100000 then some "is not a regular file"
   else if uid != 0 then some s!"is owned by uid {uid}, should be 0"
@@ -115,8 +108,6 @@ def fileProblem (uid mode : Nat) : Option String :=
   else if mode &&& 0o020 != 0 then some "is group writable"
   else none
 
-/-- An insecure front-end configuration is ignored, not parsed. This differs
-from the deliberately fatal handling of insecure sudoers policy files. -/
 def parseFile (uid mode : Nat) (text : String) : Except String Config :=
   match fileProblem uid mode with
   | some _ => .ok {}
@@ -127,13 +118,10 @@ theorem insecure_file_uses_defaults (uid mode : Nat) (text problem : String)
     parseFile uid mode text = .ok {} := by
   simp [parseFile, h]
 
-/-- Built-in emulation must not silently discard arguments; such lines require
-the host's explicit handling rather than bypassing plugin initialization. -/
 theorem plugin_arguments_refused (symbol path : String) (arg : String) (args : List String) :
     supportedPlugin symbol path (arg :: args) = false := by
   simp [supportedPlugin]
 
-/-- No plugin outside the built-in sudoers trio can be silently bypassed. -/
 theorem unknown_plugin_refused (symbol path : String) (args : List String)
     (h : ["sudoers_policy", "sudoers_io", "sudoers_audit"].contains symbol = false) :
     supportedPlugin symbol path args = false := by

@@ -2,22 +2,6 @@ import LeanSudo.Policy.Types
 import LeanSudo.Sudoers.Parser
 import LeanSudo.I18n
 
-/-!
-# Command-line parsing (`sudo` / `sudoedit`)
-
-A pure re-implementation of sudo 1.9's `parse_args.c` on top of a GNU
-`getopt_long`-compatible scanner (short-option bundling, `+` = stop at the first
-operand, unique-prefix long options, `--`), including sudo's interleaving of
-`VAR=value` operands with options.
-
-`parseArgs` preserves warnings produced during option scanning even when a later
-option or validation fails. Callers must emit `ParseResult.warnings` before handling
-`ParseResult.result` (including help/version). `formatError` uses the full `argv[0]`
-for getopt diagnostics and sudo's program identity for its own diagnostics. Named
-environment preservation only retains names present in the supplied environment,
-as in sudo 1.9.17p2 `src/parse_args.c` (`parse_env_list` and case `'R'`).
--/
-
 namespace LeanSudo.Cli
 
 inductive Mode where
@@ -25,77 +9,47 @@ inductive Mode where
   deriving Repr, DecidableEq, Inhabited
 
 inductive PreserveEnv where
-  /-- no `-E` / `--preserve-env` -/
   | none
-  /-- `-E` / `--preserve-env` without a list -/
   | all
-  /-- Set-name metadata for `--preserve-env=a,b`; values are ordered in `envVars`. -/
   | vars (vs : List String)
   deriving Repr, DecidableEq, Inhabited
 
 structure Options where
   mode : Mode := .run
-  /-- `-u user` (may be `#uid`) -/
   user : Option String := none
-  /-- `-g group` (may be `#gid`) -/
   group : Option String := none
-  /-- `-U user` (list mode only) -/
   otherUser : Option String := none
-  /-- `-i` -/
   login : Bool := false
-  /-- `-s` -/
   shell : Bool := false
   preserveEnv : PreserveEnv := .none
-  /-- `-H` -/
   setHome : Bool := false
-  /-- `-n` -/
   nonInteractive : Bool := false
-  /-- `-S` -/
   stdin : Bool := false
-  /-- `-p prompt` (may be empty) -/
   prompt : Option String := none
-  /-- `-b` -/
   background : Bool := false
-  /-- `-k` used as a flag together with a command, `-v`, `-l`, `-s`/`-i` or `-e` -/
   resetTimestamp : Bool := false
-  /-- `-D dir` -/
   chdir : Option String := none
-  /-- number of `-l` options -/
   listVerbose : Nat := 0
-  /-- `-P` -/
   preserveGroups : Bool := false
-  /-- `-B` (accepted; ring the bell when prompting) -/
   bell : Bool := false
-  /-- `-C n`, `n ≥ 3` -/
   closeFrom : Option Nat := none
-  /-- `-A` -/
   askpass : Bool := false
-  /-- `-N`: do not update the timestamp -/
   noUpdate : Bool := false
-  /-- `NAME=value` operands and set `--preserve-env=list` snapshots, in encounter
-  order before the command (sudo's `env_add`). Later entries override earlier ones. -/
   envVars : List (String × String) := []
-  /-- operands after option processing (the command and its arguments, or the files
-  for `-e`/`sudoedit`, or the command to check for `-l`) -/
   command : List String := []
   host : Option String := none
   role : Option String := none
   type : Option String := none
   chroot : Option String := none
   timeout : Option Nat := none
-  /-- Raw plugin setting: timeout validation errors belong to sudoers initialization. -/
   timeoutText : Option String := none
   impliedShell : Bool := false
   deriving Repr, DecidableEq, Inhabited
 
-/-- The front end accepts the setting; sudoers reports an invalid timeout on open. -/
 def timeoutError (o : Options) : Option String :=
   o.timeoutText.bind fun text =>
     if o.timeout.isSome then none else some s!"{text}: invalid timeout value"
 
-/-! ## Usage, help and version text -/
-
-/-- Only sudoedit changes the front-end identity, regardless of the executable name. -/
 def programName (argv0 : String) : String :=
   if Policy.baseOf argv0 == "sudoedit" then "sudoedit" else "sudo"
 
@@ -114,7 +68,6 @@ private def sudoUsage : List (List String) :=
      "[-u user] [VAR=value] [-i | -s] [command [arg ...]]"],
     editUsage "-e " ]
 
-/-- sudo's `display_usage` for the given program name (`sudo` or `sudoedit`). -/
 def usageFor (progname : String) : String :=
   let vecs := if progname == "sudoedit" then [["-h | -V"], editUsage ""] else sudoUsage
   let ind := String.ofList (List.replicate (progname.length + 8) ' ')
@@ -125,7 +78,6 @@ def usageFor (progname : String) : String :=
 
 def usageText : String := usageFor "sudo"
 
-/-- Shared help/listing wrapping: byte-counted, splitting only at ASCII spaces. -/
 def wrapListing (text : String) (columns indent : Nat) : String :=
   if columns ≤ indent + 20 then text else
     "\n".intercalate ((text.splitOn "\n").map fun line =>
@@ -189,7 +141,6 @@ private def helpEntries (sudoedit : Bool) : List String :=
   sudoOnly "  -v, --validate                update user's timestamp without running a command" ++
   both     "  --                            stop processing command line arguments"
 
-/-- Output of `sudo -h` (to stdout, exit status 0). -/
 def helpFor (progname : String) (catalog : I18n.Catalog := {}) : String :=
   let sudoedit := progname == "sudoedit"
   let header := if sudoedit then "%s - edit files as another user\n\n"
@@ -201,7 +152,6 @@ def helpFor (progname : String) (catalog : I18n.Catalog := {}) : String :=
 
 def helpText : String := helpFor "sudo"
 
-/-- Output of `sudo -V`. -/
 def versionText : String :=
   "Sudo version 1.9.17p2\n" ++
   "Sudoers policy plugin version 1.9.17p2\n" ++
@@ -209,7 +159,6 @@ def versionText : String :=
   "Sudoers I/O plugin version 1.9.17p2\n" ++
   "Sudoers audit plugin version 1.9.17p2\n"
 
-/-- Ubuntu's configured sudo.ws feature set, with the native Debian multiarch tuple. -/
 def configureOptions (architecture : String) : String :=
   let triplet := architecture ++ "-linux-gnu"
   "--build=" ++ triplet ++ " --prefix=/usr --includedir=${prefix}/include --mandir=${prefix}/share/man --infodir=${prefix}/share/info --sysconfdir=/etc --localstatedir=/var --disable-option-checking --disable-silent-rules --libdir=${prefix}/lib/" ++ triplet ++
@@ -230,8 +179,6 @@ private def minutesText (seconds : Option Nat) : String :=
 private def octalText (n : Nat) : String :=
   String.ofList [Char.ofNat (48 + n / 64 % 8), Char.ofNat (48 + n / 8 % 8), Char.ofNat (48 + n % 8)]
 
-/-- Root's verbose plugin report is computed from effective Defaults, not the
-invoker's environment or an external sudo binary. Interface strings are OS facts. -/
 def versionFor (root : Bool) (s : Settings := {}) (interfaces : List String := [])
     (architecture : String := "aarch64") : String :=
   if !root then versionText else
@@ -252,7 +199,6 @@ def versionFor (root : Bool) (s : Settings := {}) (interfaces : List String := [
   flag s.mailNoUser "Send mail if the user is not in sudoers" ++
   flag s.mailNoHost "Send mail if the user is not in sudoers for this host" ++
   flag s.mailNoPerms "Send mail if the user is not allowed to run a command" ++
-  -- Upstream's tuple description has no substitution: printed even for "never".
   "Lecture user the first time they run sudo\n" ++
   flag s.authenticate "Require users to authenticate by default" ++
   flag s.rootSudo "Root may run sudo" ++
@@ -330,38 +276,29 @@ def versionFor (root : Bool) (s : Settings := {}) (interfaces : List String := [
     "\nLocal IP address and netmask pairs:\n" ++ String.join (interfaces.map ("\t" ++ · ++ "\n"))) ++
   "\nSudoers I/O plugin version 1.9.17p2\nSudoers audit plugin version 1.9.17p2\n"
 
-/-- Origin matters: libc's getopt uses `argv[0]`, not sudo's program identity. -/
 structure Diagnostic where
   message : String
   getopt : Bool := false
   deriving Repr, DecidableEq
 
-/-- Complete stderr text for a parser diagnostic, excluding earlier warnings. -/
 def formatError (argv0 : String) (e : Diagnostic) : String :=
   let name := if e.getopt then argv0 else programName argv0
   let body := if "usage:".toList.isPrefixOf e.message.toList then e.message
     else name ++ ": " ++ e.message
   if body.toList.getLast? == some '\n' then body else body ++ "\n"
 
-/-- Warnings precede both the final error and successful help/version output. -/
 structure ParseResult where
   warnings : List String
   result : Except Diagnostic Options
 
-/-- Scanner failures retain warnings already emitted by earlier options. -/
 structure ParseFailure where
   diagnostic : Diagnostic
   warnings : List String
 
-/-! ## Option scanner -/
-
-/-- Argument requirement of an option. -/
 inductive ArgSpec where
   | no | req | opt
   deriving Repr, DecidableEq, Inhabited
 
-/-- sudo's short option string `+Aa:BbC:c:D:Eeg:Hh::iKklNnPp:R:r:SsT:t:U:u:Vv`
-(and the restricted `sudoedit` one). `none` = not an option. -/
 def shortSpec (sudoedit : Bool) (c : Char) : Option ArgSpec :=
   match c with
   | 'A' | 'B' | 'K' | 'k' | 'N' | 'n' | 'S' | 'V' => some .no
@@ -374,12 +311,9 @@ def shortSpec (sudoedit : Bool) (c : Char) : Option ArgSpec :=
 structure LongOpt where
   name : String
   spec : ArgSpec
-  /-- equivalent short option; `#` stands for sudo's `OPT_HOSTNAME` (`--host`) -/
   key : Char
-  /-- not available as `sudoedit` -/
   sudoOnly : Bool
 
-/-- sudo's `sudo_long_opts` table, in order. -/
 def longOpts : List LongOpt :=
   [ ⟨"background", .no, 'b', true⟩, ⟨"preserve-env", .opt, 'E', true⟩,
     ⟨"edit", .no, 'e', true⟩, ⟨"set-home", .no, 'H', true⟩, ⟨"login", .no, 'i', true⟩,
@@ -395,7 +329,6 @@ def longOpts : List LongOpt :=
     ⟨"stdin", .no, 'S', false⟩, ⟨"command-timeout", .req, 'T', false⟩,
     ⟨"type", .req, 't', false⟩, ⟨"user", .req, 'u', false⟩, ⟨"version", .no, 'V', false⟩ ]
 
-/-- sudo's `is_envar`: does not start with `/` or `=` and contains `=`. -/
 def isEnvarL : List Char → Bool
   | [] => false
   | '/' :: _ => false
@@ -404,15 +337,12 @@ def isEnvarL : List Char → Bool
 
 def isEnvar (s : String) : Bool := isEnvarL s.toList
 
-/-- Parser state shares option storage; `build` resolves scan-only mode and flag metadata. -/
 structure Raw extends Options where
   progname : String
   sudoedit : Bool
-  /-- Caller environment used by `parse_env_list`; an empty value is still set. -/
   env : List (String × String) := []
   warnings : List String := []
   selected : Option Mode := none
-  /-- `-k` or `-K` seen (`ARG_IGNORE_TICKET`) -/
   ignoreTicket : Bool := false
   preserveAll : Bool := false
   preserveVars : List String := []
@@ -427,7 +357,6 @@ def Raw.failure (r : Raw) (message : String) (getopt : Bool := false) : ParseFai
 
 def chrootWarning : String := "the -R option will be removed in a future version of sudo"
 
-/-- `msg` followed by the usage text (sudo's `sudo_warnx(msg); usage()`). -/
 def usageErr (r : Raw) (msg : String) : String := msg ++ "\n" ++ usageFor r.progname
 
 def exclMsg : String :=
@@ -435,23 +364,19 @@ def exclMsg : String :=
 
 def exclTicketMsg : String := "Only one of the -K, -k or -N options may be specified"
 
-/-- Split `NAME=value` at the first `=`. -/
 def splitEnvar (s : String) : String × String :=
   let l := s.toList
   (String.ofList (l.takeWhile (· != '=')), String.ofList ((l.dropWhile (· != '=')).drop 1))
 
-/-- `strtok(list, ",")`: comma separated, empty tokens skipped. -/
 def splitCommas (s : String) : List String :=
   (s.splitOn ",").filter (fun t => !t.isEmpty)
 
-/-- `sudo_strtonum(s, 3, INT_MAX)` restricted to plain decimal digits. -/
 def parseCloseFrom (s : String) : Option Nat :=
   if !s.isEmpty && s.toList.all Char.isDigit then
     let n := s.toNat!
     if 3 ≤ n && n ≤ 2147483647 then some n else none
   else none
 
-/-- Apply one recognised option (`key` as in sudo's `switch (ch)`). -/
 def applyOpt (r : Raw) (key : Char) (arg : Option String) : Except ParseFailure Raw :=
   let usage : Except ParseFailure Raw := .error (r.failure (usageFor r.progname))
   let excl : Except ParseFailure Raw := .error (r.failure (usageErr r exclMsg))
@@ -527,12 +452,8 @@ def applyOpt (r : Raw) (key : Char) (arg : Option String) : Except ParseFailure 
   | 'V' =>
     if r.selected.isSome && r.selected != some .version && !r.sudoedit then excl
     else .ok { r with selected := some .version }
-  -- BSD authentication and login classes are not compiled in.
   | _ => usage
 
-/-- Process a bundle of short options (the characters after the leading `-`).
-`next` is the following command-line argument, `alone` whether the whole argument
-was exactly `-h`. Returns the new state and whether `next` was consumed. -/
 def shortCluster (r : Raw) (next : Option String) (alone : Bool) :
     List Char → Except ParseFailure (Raw × Bool)
   | [] => .ok (r, false)
@@ -549,8 +470,6 @@ def shortCluster (r : Raw) (next : Option String) (alone : Bool) :
         | none => .error (r.failure (usageErr r s!"option requires an argument -- '{c}'") true)
       else do return (← applyOpt r c (some (String.ofList cs)), false)
     | some .opt =>
-      -- only `-h` has an optional argument; it must be attached (`-hhost`), except
-      -- that a lone `-h` followed by a non-option, non-`VAR=value` word takes it
       if cs.isEmpty then
         match next with
         | some a =>
@@ -560,7 +479,6 @@ def shortCluster (r : Raw) (next : Option String) (alone : Bool) :
         | none => do return (← applyOpt r c none, false)
       else do return (← applyOpt r c (some (String.ofList cs)), false)
 
-/-- Process `--name[=value]` (`body` = the characters after `--`). -/
 def longOpt (r : Raw) (next : Option String) (body : List Char) : Except ParseFailure (Raw × Bool) :=
   let name := body.takeWhile (· != '=')
   let hasArg := body.contains '='
@@ -588,8 +506,6 @@ def longOpt (r : Raw) (next : Option String) (body : List Char) : Except ParseFa
     .error (r.failure (usageErr r (s!"option '{full}' is ambiguous; possibilities:" ++
       String.join (os.map fun o => s!" '--{o.name}'"))) true)
 
-/-- getopt_long loop with sudo's `VAR=value` interleaving. Returns the final state and
-the operands. -/
 def scan : List String → Raw → Except ParseFailure (Raw × List String)
   | [], r => .ok (r, [])
   | a :: rest, r =>
@@ -611,16 +527,11 @@ def scan : List String → Raw → Except ParseFailure (Raw × List String)
 termination_by args => args.length
 decreasing_by all_goals (simp only [List.length_tail, List.length_cons]; omega)
 
-/-! ## Validation (the tail of sudo's `parse_args`) -/
-
-/-- The mode sudo settles on (`-k` alone becomes `resetTimestamp`). -/
 def Raw.effMode (r : Raw) (ops : List String) : Mode :=
   match r.selected with
   | some m => m
   | none => if r.ignoreTicket && ops.isEmpty && !(r.shell || r.login) then .resetTimestamp else .run
 
-/-- sudo's `(flags & valid_flags) != flags` check. Flags: `-b -E -H -i -n -P -s`
-and the second `-l`. -/
 def Raw.flagsValid (r : Raw) (m : Mode) : Bool :=
   match m with
   | .run => true
@@ -629,7 +540,6 @@ def Raw.flagsValid (r : Raw) (m : Mode) : Bool :=
   | _ => !(r.background || r.preserveAll || r.setHome || r.login || r.nonInteractive ||
       r.preserveGroups || r.shell || r.listVerbose > 1)
 
-/-- sudo's post-scan checks, in order: (violated?, error text). -/
 def Raw.rules (r : Raw) (ops : List String) : List (Bool × String) :=
   let m := r.effMode ops
   let usage := usageFor r.progname
@@ -646,7 +556,6 @@ def Raw.rules (r : Raw) (ops : List String) : List (Bool × String) :=
     ((ops.isEmpty && m == .edit) || (!ops.isEmpty && !(m == .run || m == .edit || m == .list)),
       usage) ]
 
-/-- First validation error, if any. -/
 def Raw.check (r : Raw) (ops : List String) : Option String :=
   ((r.rules ops).find? (·.1)).map (·.2)
 
@@ -666,46 +575,31 @@ def finish (r : Raw) (ops : List String) : Except Diagnostic Options :=
   | some e => .error { message := e }
   | none => .ok (r.build ops)
 
-/-- Parse `argv[1..]` using the original `argv[0]` and caller environment.
-Warnings are produced only when their option is reached and accepted, never by a
-second scan of the argument vector. The empty environment default is for pure
-callers; the runtime supplies its captured environment. -/
 def parseArgs (argv0 : String) (args : List String)
     (env : List (String × String) := []) : ParseResult :=
   match scan args (Raw.init argv0 env) with
   | .error e => { warnings := e.warnings, result := .error e.diagnostic }
   | .ok (r, ops) => { warnings := r.warnings, result := finish r ops }
 
-/-! ## Shell mode (`-s` / `-i`) -/
-
-/-- Characters sudo leaves unescaped when building `shell -c "..."`. -/
 def shellSafe (c : Char) : Bool :=
   c.isAlphanum || c == '_' || c == '-' || c == '$'
 
-/-- Backslash-escape every character that is not `shellSafe`. -/
 def escapeChars : List Char → List Char
   | [] => []
   | c :: cs => if shellSafe c then c :: escapeChars cs else '\\' :: c :: escapeChars cs
 
-/-- Escape every word and join them with single spaces. -/
 def escapeJoin : List String → List Char
   | [] => []
   | [w] => escapeChars w.toList
   | w :: ws => escapeChars w.toList ++ ' ' :: escapeJoin ws
 
-/-- The `-c` argument sudo builds from the command words. -/
 def shellEscape (command : List String) : String := String.ofList (escapeJoin command)
 
 structure ShellCmd where
-  /-- path to execute -/
   path : String
-  /-- full argv including argv[0] -/
   argv : List String
   deriving Repr, DecidableEq, Inhabited
 
-/-- The command executed for `-s` (`login = false`) or `-i` (`login = true`).
-`shell` is the shell path (`-s`: the invoking user's `$SHELL` or passwd shell;
-`-i`: the target user's passwd shell). -/
 def shellCommand (shell : String) (login : Bool) (command : List String) : ShellCmd :=
   let argv0 := if login then "-" ++ Policy.baseOf shell else shell
   { path := shell
@@ -713,7 +607,6 @@ def shellCommand (shell : String) (login : Bool) (command : List String) : Shell
       [argv0] ++ (if login && Policy.baseOf shell == "bash" then ["--login"] else []) ++
         ["-c", shellEscape command] }
 
-/-- Empty environment and passwd shells fall back exactly as sudo's get_user_info. -/
 def userShell (envShell : Option String) (passwdShell : String) : String :=
   match envShell with
   | some s => if s.isEmpty then (if passwdShell.isEmpty then "/bin/sh" else passwdShell) else s

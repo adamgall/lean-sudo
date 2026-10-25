@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a shell snippet as USER inside a fresh pty session and script it.
+USAGE = """Run a shell snippet as USER inside a fresh pty session and script it.
 
 usage: ptyrun.py [-t SECS] USER SNIPPET [-e REGEX -s TEXT | -e REGEX | -s TEXT]...
 
@@ -30,7 +30,7 @@ def main() -> int:
         timeout = float(args[1])
         args = args[2:]
     if len(args) < 2:
-        print(__doc__, file=sys.stderr)
+        print(USAGE, file=sys.stderr)
         return 2
     user, snippet, steps = args[0], args[1], args[2:]
     script = []
@@ -57,7 +57,7 @@ def main() -> int:
     }
 
     pid, fd = pty.fork()
-    if pid == 0:  # child: session leader with the pty as controlling tty
+    if pid == 0:
         try:
             os.fchown(0, pw.pw_uid, -1)
             os.initgroups(pw.pw_name, pw.pw_gid)
@@ -69,7 +69,7 @@ def main() -> int:
             os._exit(127)
 
     buf = bytearray()
-    pos = 0  # expectations only match output after the previous match
+    pos = 0
     eof = False
     status = 0
 

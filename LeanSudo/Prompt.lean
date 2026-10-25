@@ -1,11 +1,3 @@
-/-!
-# Password prompt expansion
-
-sudo's `expand_prompt`: `%u` invoking user, `%U` target user, `%h` / `%H` host name,
-`%p` the user whose password is requested, `%%` a literal `%`. Any other `%x` (and a
-trailing `%`) is copied unchanged.
--/
-
 namespace LeanSudo
 
 def expandPromptL (u U h p : List Char) : List Char → List Char
@@ -18,11 +10,9 @@ def expandPromptL (u U h p : List Char) : List Char → List Char
   | '%' :: '%' :: r => '%' :: expandPromptL u U h p r
   | c :: r => c :: expandPromptL u U h p r
 
-/-- Expand a `passprompt` / `-p` format string. -/
 def expandPrompt (fmt : String) (user target host authUser : String) : String :=
   String.ofList (expandPromptL user.toList target.toList host.toList authUser.toList fmt.toList)
 
-/-- A format without `%` is returned unchanged. -/
 theorem expandPromptL_no_percent (u U h p l : List Char) (hl : '%' ∉ l) :
     expandPromptL u U h p l = l := by
   induction l with

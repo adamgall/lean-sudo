@@ -1,51 +1,3 @@
-/*
- * Job-control and tty-size handling follows sudo's suspend_parent.c and
- * ttysize.c. Copyright (c) 2009-2023 Todd C. Miller <Todd.Miller@sudo.ws>.
- *
- * Permission to use, copy, modify, and distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
- */
-/*
- * c/exec.c — command execution for lean-sudo (owned by LeanSudo/Sys/Exec.lean).
- *
- * Responsibilities: fork, privilege drop (with verification), execve, signal relay,
- * wait, job-control (stop/continue) propagation, and the optional pty mode.
- * No policy lives here: every decision about *what* to run with *which* ids has
- * already been made by the verified Lean core; this file only carries it out and
- * fails closed (the child `_exit(127)`s without exec'ing) if any step does not take.
- *
- * Process structure
- *   non-pty:   sudo ── command                (command shares sudo's pgrp/session)
- *   pty:       sudo ── monitor ── command     (monitor = session leader of the pty,
- *                                             command = own pgrp in that session)
- *   The monitor exists so that the command's process group is not orphaned (a
- *   process group whose parent is in another session would ignore terminal stop
- *   signals) and so that job-control events can be relayed back to sudo.
- *
- * Invariants
- *   - Everything that runs after fork() in a child is async-signal-safe: all memory
- *     the child needs (argv/envp arrays, group buffers) is allocated before fork.
- *   - The child resets signal dispositions/mask to the state recorded at process start
- *     (before the Lean runtime initialised), then: setgroups → setresgid → setresuid →
- *     verify (getres[ug]id, getgroups, setuid(0) must fail unless a requested ID is 0) →
- *     chdir → umask →
- *     mark fds >= closefrom close-on-exec → execve.
- *   - Any failure in the child is reported through a CLOEXEC pipe as (errno, stage);
- *     EOF on that pipe means execve succeeded.
- *   - The parent's signal handlers only write a record to a non-blocking self-pipe;
- *     all decisions are taken in the main loop.
- *   - In pty mode the user's terminal is always restored before sudo stops itself and
- *     before runCommand returns.
- */
 #include "shim.h"
 #include "intercept.h"
 #include "intercept_dso.h"
@@ -199,16 +151,8 @@ static int io_channels_drain(void) {
 #define CLOSE_RANGE_CLOEXEC (1U << 2)
 #endif
 
-/* ------------------------------------------------------------------------- */
-/* Startup signal state (like sudo's save_signals/restore_signals).           */
-/* ------------------------------------------------------------------------- */
-
-/* Recorded by a constructor, i.e. before the Lean runtime starts, so that the
- * command inherits the dispositions sudo itself was started with (in particular
- * an ignored/default SIGPIPE) rather than whatever the runtime changed. */
 static unsigned char g_startup_ignored[NSIG];
 static sigset_t g_startup_mask;
-/* stay_setuid retains the invoking real IDs, even if PAM changes credentials. */
 static uid_t g_invoking_uid;
 static gid_t g_invoking_gid;
 static struct rlimit g_core_limit;
@@ -231,8 +175,6 @@ __attribute__((constructor)) static void leansudo_exec_save_signals(void) {
     sigemptyset(&g_startup_mask);
 }
 
-/* Async-signal-safe. Errors for signals that cannot be changed (SIGKILL, SIGSTOP,
- * libc-internal real-time signals) are expected and ignored. */
 static int restore_startup_signals(void) {
   struct sigaction sa;
   memset(&sa, 0, sizeof sa);
@@ -246,16 +188,12 @@ static int restore_startup_signals(void) {
   return sigprocmask(SIG_SETMASK, &g_startup_mask, NULL);
 }
 
-/* ------------------------------------------------------------------------- */
-/* Self-pipe signal relay.                                                    */
-/* ------------------------------------------------------------------------- */
-
 struct sigrec {
   int signo;
-  int code;    /* si_code */
-  pid_t pid;   /* si_pid (meaningful for user-sent signals and SIGCHLD) */
-  pid_t pgrp;  /* sender's process group, -1 if unknown / not user-sent */
-  pid_t sid;   /* sender's session, -1 if unknown / not user-sent */
+  int code;
+  pid_t pid;
+  pid_t pgrp;
+  pid_t sid;
 };
 
 static volatile sig_atomic_t g_sigpipe_wr = -1;
@@ -269,21 +207,17 @@ static void relay_handler(int signo, siginfo_t *si, void *uctx) {
   r.pid = si ? si->si_pid : 0;
   r.pgrp = r.sid = -1;
   if (r.code <= 0 && r.pid > 0) {
-    /* Look the sender up now, while it most likely still exists (a `kill`
-     * process exits right after sending); getpgid/getsid are plain syscalls. */
     r.pgrp = getpgid(r.pid);
     r.sid = getsid(r.pid);
   }
   int fd = g_sigpipe_wr;
   if (fd >= 0) {
-    /* sizeof r < PIPE_BUF: atomic; if the pipe is full the record is dropped. */
     ssize_t n = write(fd, &r, sizeof r);
     (void)n;
   }
   errno = saved;
 }
 
-/* Signals whose handlers we install in the parent. */
 static const int k_relay_sigs[] = {SIGINT,  SIGQUIT, SIGTSTP, SIGTERM, SIGHUP,  SIGALRM,
                                    SIGUSR1, SIGUSR2, SIGPIPE, SIGCHLD, SIGCONT, SIGWINCH};
 #define N_RELAY_SIGS (sizeof k_relay_sigs / sizeof k_relay_sigs[0])
@@ -296,8 +230,6 @@ struct sigstate {
   sigset_t old_mask;
 };
 
-/* Set of everything we handle plus the tty job-control signals; blocked around fork
- * so that no child runs a parent handler before resetting its dispositions. */
 static void relay_block_set(sigset_t *set) {
   sigemptyset(set);
   for (size_t i = 0; i < N_RELAY_SIGS; i++)
@@ -307,7 +239,6 @@ static void relay_block_set(sigset_t *set) {
 }
 
 static int fd_above_stdio(int fd) {
-  /* Keep our private fds off 0..2 so dup2() onto the std fds can never clobber them. */
   if (fd >= 0 && fd <= 2) {
     int nfd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
     int e = errno;
@@ -331,9 +262,6 @@ static int make_pipe(int fds[2], int flags) {
   return 0;
 }
 
-/* Blocks the relay set (old mask saved), creates the self-pipe, installs handlers.
- * `pty` additionally ignores SIGTTIN/SIGTTOU: the pty parent may touch the user's
- * terminal while in the background and must get EIO instead of being stopped. */
 static int sigstate_install(struct sigstate *s, int pty) {
   sigset_t block;
   relay_block_set(&block);
@@ -391,7 +319,6 @@ static void sigstate_restore(struct sigstate *s) {
   sigprocmask(SIG_SETMASK, &s->old_mask, NULL);
 }
 
-/* Reads one record from the (non-blocking) self-pipe; 1 = got one, 0 = none. */
 static int sigpipe_next(int fd, struct sigrec *r) {
   for (;;) {
     ssize_t n = read(fd, r, sizeof *r);
@@ -403,11 +330,8 @@ static int sigpipe_next(int fd, struct sigrec *r) {
   }
 }
 
-/* "Sent by a process" (kill/sigqueue/tgkill) as opposed to generated by the kernel,
- * e.g. by the terminal driver. */
 static int user_sent(const struct sigrec *r) { return r->code <= 0 && r->pid > 0; }
 
-/* Is `signo` one of the signals we relay to the command? */
 static int is_forwarded(int signo) {
   switch (signo) {
   case SIGINT: case SIGQUIT: case SIGTSTP: case SIGTERM: case SIGHUP:
@@ -418,12 +342,6 @@ static int is_forwarded(int signo) {
   }
 }
 
-/* Non-pty forwarding follows signal_cb_nopty: ignore user signals from the
- * command or a group led by sudo/the command; tty-generated INT/QUIT/TSTP/WINCH
- * already reach the command. SIGCONT from the invoking shell must be relayed
- * even when the command moved to a different process group.
- * Pty mode also excludes senders in the command's session.
- * `cmd_pid` is the command (non-pty) or the monitor = pty session id (pty). */
 static int should_forward(const struct sigrec *r, pid_t cmd_pid, int pty) {
   if (!is_forwarded(r->signo))
     return 0;
@@ -446,10 +364,6 @@ static int should_forward(const struct sigrec *r, pid_t cmd_pid, int pty) {
   }
   return 1;
 }
-
-/* ------------------------------------------------------------------------- */
-/* Child side.                                                                */
-/* ------------------------------------------------------------------------- */
 
 enum stage {
   ST_SIGNALS = 1,
@@ -475,28 +389,28 @@ enum stage {
 struct child_err {
   int err;
   int stage;
-  long a, b; /* stage-specific details (observed ids) */
+  long a, b;
 };
 
 struct exec_req {
   const char *path;
-  char **argv;   /* NULL-terminated */
-  char **envp;   /* NULL-terminated */
-  char **shargv; /* "sh", path, argv[1..], NULL — the ENOEXEC fallback */
+  char **argv;
+  char **envp;
+  char **shargv;
   uid_t uid;
   gid_t gid;
   uid_t ruid;
-  gid_t *groups;      /* as given (passed to setgroups) */
-  gid_t *groups_sort; /* sorted copy for comparisons */
+  gid_t *groups;
+  gid_t *groups_sort;
   size_t ngroups;
-  gid_t *scratch; /* getgroups buffer, scratch_cap entries */
+  gid_t *scratch;
   int scratch_cap;
-  const char *cwd; /* NULL = don't chdir */
-  const char *chroot_dir; /* policy-authorized root; applied only in exec child */
+  const char *cwd;
+  const char *chroot_dir;
   const char *noexec_file;
   mode_t umask;
   unsigned closefrom;
-  int errfd; /* write end of the CLOEXEC error pipe */
+  int errfd;
   int cwd_optional;
   unsigned timeout;
   const char *apparmor;
@@ -530,6 +444,13 @@ static void warn_limit(int resource) {
   (void)ignored;
 }
 
+static void restore_core_limit(void) {
+  if (!g_core_saved) return;
+  if (setrlimit(RLIMIT_CORE, &g_core_limit) != 0)
+    warn_limit(RLIMIT_CORE);
+  g_core_saved = 0;
+}
+
 __attribute__((noreturn)) static void child_fail(int errfd, int stage, int err, long a, long b) {
   struct child_err ce;
   memset(&ce, 0, sizeof ce);
@@ -542,7 +463,6 @@ __attribute__((noreturn)) static void child_fail(int errfd, int stage, int err, 
   _exit(127);
 }
 
-/* Shell sort: async-signal-safe (no allocation), fine for group lists. */
 static void sort_gids(gid_t *v, size_t n) {
   for (size_t gap = n / 2; gap > 0; gap /= 2)
     for (size_t i = gap; i < n; i++) {
@@ -554,7 +474,6 @@ static void sort_gids(gid_t *v, size_t n) {
     }
 }
 
-/* Does the current supplementary group list equal r->groups (as a multiset)? */
 static int groups_match(const struct exec_req *r) {
   int n = getgroups(r->scratch_cap, r->scratch);
   if (n < 0 || (size_t)n != r->ngroups)
@@ -567,8 +486,6 @@ static int groups_match(const struct exec_req *r) {
 }
 
 static void drop_privileges(const struct exec_req *r) {
-  /* setgroups needs CAP_SETGID even when nothing changes; skipping it when the list
-   * already matches is safe because the result is verified below either way. */
   if (!groups_match(r) && setgroups(r->ngroups, r->groups) != 0)
     child_fail(r->errfd, ST_SETGROUPS, errno, 0, 0);
   if (setresgid(r->gid, r->gid, r->gid) != 0)
@@ -586,7 +503,6 @@ static void drop_privileges(const struct exec_req *r) {
     child_fail(r->errfd, ST_SETUID, errno, 0, 0);
   if (saved_nproc) (void)setrlimit(RLIMIT_NPROC, &nproc);
 
-  /* Verification: never trust the return codes alone. */
   uid_t ru, eu, su;
   gid_t rg, eg, sg;
   if (getresgid(&rg, &eg, &sg) != 0)
@@ -600,8 +516,6 @@ static void drop_privileges(const struct exec_req *r) {
   if (!groups_match(r))
     child_fail(r->errfd, ST_VERIFY_GROUPS, 0, 0, 0);
   if (r->uid != 0) {
-    /* With stay_setuid a real ID of zero legitimately permits restoring that
-     * effective ID. Do not mutate the verified IDs by probing this case. */
     if (r->ruid != 0 && setuid(0) == 0)
       child_fail(r->errfd, ST_VERIFY_REGAIN_UID, 0, 0, 0);
     if (r->gid != 0 && setgid(0) == 0)
@@ -609,8 +523,6 @@ static void drop_privileges(const struct exec_req *r) {
   }
 }
 
-/* Mark every fd >= from close-on-exec. The error pipe is already CLOEXEC, so it
- * stays usable until execve succeeds and is closed by it. */
 static void cloexec_from(unsigned from) {
   if (syscall(SYS_close_range, from, ~0U, CLOSE_RANGE_CLOEXEC) == 0)
     return;
@@ -622,23 +534,18 @@ static void cloexec_from(unsigned from) {
     (void)fcntl((int)fd, F_SETFD, FD_CLOEXEC);
 }
 
-/* Final part of every command child. Signals must still be blocked on entry. */
 __attribute__((noreturn)) static void child_exec(const struct exec_req *r) {
   if (ls_intercept_trace_child() != 0)
     child_fail(r->errfd, ST_EXEC, errno, 0, 0);
   ls_iolog_child_close();
   if (restore_startup_signals() != 0)
     child_fail(r->errfd, ST_SIGNALS, errno, 0, 0);
-  /* Like sudo, restoration is best-effort: PAM may have lowered the hard
-   * limit, and Linux will not accept PR_SET_DUMPABLE=2. exec resets dumpability. */
-  if (g_core_saved) (void)setrlimit(RLIMIT_CORE, &g_core_limit);
+  restore_core_limit();
   if (g_dumpable >= 0) (void)prctl(PR_SET_DUMPABLE, g_dumpable);
   for (int i = 0; i < RLIM_NLIMITS; i++) {
     if (!r->limit_set[i]) continue;
     struct rlimit lim = r->limits[i];
     if (setrlimit(i, &lim) == 0) continue;
-    /* Containers may lack CAP_SYS_RESOURCE: sudo clamps requested increases
-     * to the invoking user's hard limit and then retries. */
     if (g_user_limit_saved[i]) {
       if (lim.rlim_cur > g_user_limits[i].rlim_max) lim.rlim_cur = g_user_limits[i].rlim_max;
       if (lim.rlim_max > g_user_limits[i].rlim_max) lim.rlim_max = g_user_limits[i].rlim_max;
@@ -670,8 +577,6 @@ __attribute__((noreturn)) static void child_exec(const struct exec_req *r) {
     if (n != (ssize_t)len)
       child_fail(r->errfd, ST_APPARMOR, n < 0 ? e : EIO, 0, 0);
   }
-  /* All identity/NSS and policy work is complete before entering the root.
-   * Resolve privileged fd closing outside it, as sudo's exec_setup does. */
   cloexec_from(r->closefrom);
   if (r->chroot_dir != NULL &&
       (chroot(r->chroot_dir) != 0 || chdir("/") != 0))
@@ -691,7 +596,6 @@ __attribute__((noreturn)) static void child_exec(const struct exec_req *r) {
   if (r->cwd != NULL && chdir(r->cwd) != 0) {
     if (!r->cwd_optional)
       child_fail(r->errfd, ST_CHDIR, errno, 0, 0);
-    /* Warning only for login shells, as sudo's CD_CWD_OPTIONAL. */
     const char *es = strerror(errno);
     struct iovec parts[] = {
       {(void *)"sudo: unable to change directory to ", sizeof("sudo: unable to change directory to ") - 1},
@@ -709,8 +613,6 @@ __attribute__((noreturn)) static void child_exec(const struct exec_req *r) {
   if (ls_intercept_dso_child() != 0)
     child_fail(r->errfd, ST_EXEC, errno, 0, 0);
   if (r->execfd >= 0) {
-    /* Keep binary descriptors close-on-exec. Linux script interpreters need
-     * /dev/fd/N after exec; ENOENT is the kernel's CLOEXEC-script indication. */
     if (fcntl(r->execfd, F_SETFD, FD_CLOEXEC) != 0)
       child_fail(r->errfd, ST_EXEC, errno, 0, 0);
     fexecve(r->execfd, r->argv, r->envp);
@@ -723,16 +625,10 @@ __attribute__((noreturn)) static void child_exec(const struct exec_req *r) {
     execve(r->path, r->argv, r->envp);
   }
   if (r->execfd < 0 && errno == ENOEXEC) {
-    /* Like sudo (and execvp): a file without a recognised header is a shell script. */
     execve("/bin/sh", r->shargv, r->envp);
   }
   child_fail(r->errfd, ST_EXEC, errno, 0, 0);
 }
-
-/* ------------------------------------------------------------------------- */
-/* Parent helpers.                                                            */
-/* ------------------------------------------------------------------------- */
-
 
 static lean_obj_res io_errno(const char *what, int err) {
   ls_plugins_exec_status(SUDO_PLUGIN_SUDO_ERROR, err);
@@ -813,7 +709,6 @@ static void describe_child_err(const struct exec_req *r, const struct child_err 
   }
 }
 
-/* Blocking read of the child's error report. 1 = report read, 0 = EOF (exec ok). */
 static int read_child_err(int fd, struct child_err *ce) {
   size_t got = 0;
   char *p = (char *)ce;
@@ -831,7 +726,6 @@ static int read_child_err(int fd, struct child_err *ce) {
   if (got == 0)
     return 0;
   if (got < sizeof *ce) {
-    /* A partial report still means the child failed before exec: fail closed. */
     memset(ce, 0, sizeof *ce);
     ce->stage = 0;
   }
@@ -866,9 +760,6 @@ static uint32_t encode_status(int status) {
   return (uint32_t)WEXITSTATUS(status);
 }
 
-/* Temporarily give `sig` its default action and deliver it to ourselves (or to our
- * whole process group, like sudo does in pty mode) so that the invoking shell sees
- * sudo stop. Returns once we have been continued. */
 static void stop_self(int sig, int whole_pgrp) {
   struct sigaction dfl, old;
   memset(&dfl, 0, sizeof dfl);
@@ -884,16 +775,11 @@ static void stop_self(int sig, int whole_pgrp) {
   if (whole_pgrp)
     killpg(getpgrp(), sig);
   else
-    /* Lean may execute us on a worker thread. A process-directed kill can
-     * reach another thread after we restore the handler; raise targets this
-     * thread, so the stop has happened before the disposition is restored. */
     raise(sig);
   if (changed)
     sigaction(sig, &old, NULL);
 }
 
-/* Like sudo's tcsetpgrp_nobg: do not steal the tty if sudo lost the foreground
- * between tcgetpgrp and tcsetpgrp. Catch SIGTTOU instead of blocking it. */
 static volatile sig_atomic_t got_sigttou;
 static void record_sigttou(int sig) {
   (void)sig;
@@ -917,12 +803,6 @@ static int tcsetpgrp_nobg(int fd, pid_t pgrp) {
   return ret;
 }
 
-/* ------------------------------------------------------------------------- */
-/* Non-pty mode (cf. sudo exec_nopty.c).                                      */
-/* ------------------------------------------------------------------------- */
-
-/* sudo_suspend_parent(): a separate command pgrp stopped on terminal I/O
- * should get the foreground if sudo owns it; otherwise suspend sudo itself. */
 static void nopty_child_stopped(pid_t child, int sig) {
   int ttyfd = open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
   pid_t saved = ttyfd >= 0 ? tcgetpgrp(ttyfd) : -1;
@@ -952,7 +832,6 @@ static void nopty_child_stopped(pid_t child, int sig) {
   }
 }
 
-/* Returns 1 for a command event, 0 if none, -1 for wait failure, -2 for trace failure. */
 static int reap_next(pid_t child, int *status) {
   for (;;) {
     int tracing = ls_intercept_trace();
@@ -975,8 +854,6 @@ static int64_t monotonic_ms(void) {
   return now < 0 ? 0 : now;
 }
 
-/* sudo terminates timed-out commands with HUP then TERM, followed by KILL
- * after a two-second grace period. Never signal sudo's own process group. */
 static int timeout_poll(struct command_timer *t, pid_t child, int group) {
   if (!t->deadline) return -1;
   int64_t remaining = t->deadline - monotonic_ms();
@@ -1034,7 +911,7 @@ static lean_obj_res nopty_wait(struct sigstate *ss, pid_t child, unsigned timeou
     while (sigpipe_next(ss->pipe_rd, &rec)) {
       ls_plugins_signal(rec.signo);
       if (rec.signo == SIGCHLD)
-        continue; /* reaped at the top of the loop */
+        continue;
       if (should_forward(&rec, child, 0))
         kill(child, rec.signo);
     }
@@ -1044,11 +921,6 @@ static lean_obj_res nopty_wait(struct sigstate *ss, pid_t child, unsigned timeou
   return lean_io_result_mk_ok(lean_box_uint32(encode_status(status)));
 }
 
-/* ------------------------------------------------------------------------- */
-/* Pty mode (cf. sudo exec_pty.c / exec_monitor.c).                           */
-/* ------------------------------------------------------------------------- */
-
-/* Backchannel messages over a SOCK_SEQPACKET socketpair between sudo and monitor. */
 enum { MSG_SIGNAL = 1, MSG_CONT_FG, MSG_CONT_BG, MSG_STOPPED, MSG_EXITED };
 struct bcmsg {
   int type;
@@ -1056,14 +928,14 @@ struct bcmsg {
 };
 
 struct pty_ctx {
-  int ttyfd;  /* our own open of /dev/tty (the user's terminal) */
-  int master; /* O_NONBLOCK */
+  int ttyfd;
+  int master;
   int slave;
-  int ttymask; /* bit i set ⇔ fd i (0..2) is a tty and gets the slave */
-  int fg;      /* we are in the user's terminal foreground pgrp */
-  int raw;     /* user terminal is currently in raw mode (by us) */
+  int ttymask;
+  int fg;
+  int raw;
   struct termios orig;
-  int rows, cols; /* sudo_get_ttysize fallback until the first resize event */
+  int rows, cols;
 };
 
 static int bc_send(int sock, int type, int val) {
@@ -1078,7 +950,6 @@ static int bc_send(int sock, int type, int val) {
   }
 }
 
-/* 1 = message, 0 = EOF/error (peer gone), -1 = would block. */
 static int bc_recv(int sock, struct bcmsg *m) {
   for (;;) {
     ssize_t n = recv(sock, m, sizeof *m, MSG_DONTWAIT);
@@ -1114,8 +985,6 @@ static int tty_dimension(const char *name, int fallback) {
   return *s == '\0' && n != 0 ? (int)n : fallback;
 }
 
-/* Allocate the pty and mirror the user's terminal settings onto it. On failure
- * returns -1 with errno set and nothing left open. */
 static int pty_setup(struct pty_ctx *p) {
   p->ttyfd = p->master = p->slave = -1;
   p->raw = 0;
@@ -1170,7 +1039,6 @@ static void tty_set_raw(struct pty_ctx *p) {
 static void tty_restore(struct pty_ctx *p) {
   if (!p->raw)
     return;
-  /* SIGTTOU is ignored while the pty loop runs, so this cannot stop us. */
   while (tcsetattr(p->ttyfd, TCSADRAIN, &p->orig) != 0 && errno == EINTR)
     ;
   p->raw = 0;
@@ -1189,7 +1057,7 @@ static void write_all(int fd, const char *buf, size_t len) {
         (void)poll(&pfd, 1, 1000);
         continue;
       }
-      return; /* terminal gone: drop output */
+      return;
     }
     buf += n;
     len -= (size_t)n;
@@ -1240,11 +1108,8 @@ static void utmp_finish(struct utmpx *entry, int status) {
   endutxent();
 }
 
-/* Monitor process: session leader of the pty. Never returns. Signals are blocked
- * on entry (inherited from sudo's fork). */
 __attribute__((noreturn)) static void monitor_main(struct pty_ctx *p, int sock, int parent_sigrd, int parent_sigwr,
                                                    const struct exec_req *r) {
-  /* Drop sudo's handlers; the monitor must never be stopped by job control. */
   struct sigaction sa;
   memset(&sa, 0, sizeof sa);
   sigemptyset(&sa.sa_mask);
@@ -1280,13 +1145,12 @@ __attribute__((noreturn)) static void monitor_main(struct pty_ctx *p, int sock, 
   if (cmd < 0)
     child_fail(r->errfd, ST_FORK, errno, 0, 0);
   if (cmd == 0) {
-    /* Command: own pgrp in the pty session, foreground if sudo is. */
     close(sock);
     close(mp[0]);
     close(mp[1]);
     setpgid(0, 0);
     if (p->fg && !r->exec_background)
-      (void)tcsetpgrp(p->slave, getpid()); /* SIGTTOU ignored+blocked here */
+      (void)tcsetpgrp(p->slave, getpid());
     for (int fd = 0; fd <= 2; fd++)
       if ((p->ttymask & (1 << fd)) && dup2(p->slave, fd) < 0)
         child_fail(r->errfd, ST_DUP, errno, 0, 0);
@@ -1304,7 +1168,6 @@ __attribute__((noreturn)) static void monitor_main(struct pty_ctx *p, int sock, 
   ls_iolog_child_close();
   for (int fd = 0; fd < 3; fd++)
     if (io_channels[fd].enabled) close(fd);
-  /* Both sides call setpgid/tcsetpgrp so there is no window either way. */
   setpgid(cmd, cmd);
   if (p->fg && !r->exec_background)
     (void)tcsetpgrp(p->slave, cmd);
@@ -1315,11 +1178,10 @@ __attribute__((noreturn)) static void monitor_main(struct pty_ctx *p, int sock, 
   sigaddset(&un, SIGCHLD);
   sigprocmask(SIG_UNBLOCK, &un, NULL);
 
-  pid_t saved_fg = -1; /* pty foreground pgrp when the command stopped */
+  pid_t saved_fg = -1;
   int sock_open = 1;
   struct command_timer timer = {r->timeout ? monotonic_ms() + (int64_t)r->timeout * 1000 : 0, 0};
   for (;;) {
-    /* Reap first: SIGCHLD may predate the handler being unblocked. */
     int st;
     int w;
     while ((w = reap_next(cmd, &st)) > 0) {
@@ -1328,7 +1190,7 @@ __attribute__((noreturn)) static void monitor_main(struct pty_ctx *p, int sock, 
         if (sock_open)
           bc_send(sock, MSG_STOPPED, WSTOPSIG(st));
         else
-          killpg(cmd, SIGCONT); /* nobody to resume us later */
+          killpg(cmd, SIGCONT);
       } else if (WIFEXITED(st) || WIFSIGNALED(st)) {
         ls_intercept_trace_close();
         close(p->slave);
@@ -1350,7 +1212,7 @@ __attribute__((noreturn)) static void monitor_main(struct pty_ctx *p, int sock, 
       _exit(1);
     struct sigrec rec;
     while (sigpipe_next(mp[0], &rec))
-      ; /* only SIGCHLD is handled: reaped at the top of the loop */
+      ;
     if (sock_open && (pfds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
       struct bcmsg m;
       int got;
@@ -1368,7 +1230,6 @@ __attribute__((noreturn)) static void monitor_main(struct pty_ctx *p, int sock, 
           break;
         }
         case MSG_CONT_BG:
-          /* Monitor owns the pty foreground: the command gets SIGTTIN if it reads. */
           (void)tcsetpgrp(p->slave, getpgrp());
           if (killpg(cmd, SIGCONT) != 0)
             kill(cmd, SIGCONT);
@@ -1378,7 +1239,6 @@ __attribute__((noreturn)) static void monitor_main(struct pty_ctx *p, int sock, 
         }
       }
       if (got == 0) {
-        /* sudo went away: hang up the command, keep reaping it. */
         sock_open = 0;
         close(sock);
         killpg(cmd, SIGHUP);
@@ -1392,18 +1252,16 @@ struct pty_loop {
   struct pty_ctx *p;
   int sock;
   pid_t monitor;
-  char in[4096]; /* user tty → pty master, pending */
+  char in[4096];
   size_t in_len, in_off;
-  int tty_in_ok;   /* user tty still readable */
-  int master_open; /* pty master still readable */
+  int tty_in_ok;
+  int master_open;
   int log_error;
 };
 
-/* The command stopped with `sig` inside the pty. */
 static void pty_cmd_stopped(struct pty_loop *L, int sig) {
   struct pty_ctx *p = L->p;
   if (sig == SIGTTIN || sig == SIGTTOU) {
-    /* It wanted the terminal; if we already own it, just resume in the foreground. */
     check_fg(p);
     if (p->fg) {
       tty_set_raw(p);
@@ -1415,7 +1273,6 @@ static void pty_cmd_stopped(struct pty_loop *L, int sig) {
   if (exec_io_suspend(sig)) { L->log_error = 1; return; }
   stop_self(sig, 1);
   if (exec_io_suspend(SIGCONT)) { L->log_error = 1; return; }
-  /* Resumed: the command follows us into the foreground or background. */
   check_fg(p);
   if (p->fg) {
     tty_set_raw(p);
@@ -1438,7 +1295,7 @@ static void pty_pump_master(struct pty_loop *L) {
       continue;
     if (n < 0 && errno == EAGAIN)
       return;
-    L->master_open = 0; /* EIO: every slave fd is closed */
+    L->master_open = 0;
     return;
   }
 }
@@ -1450,7 +1307,7 @@ static void pty_flush_input(struct pty_loop *L) {
       if (errno == EINTR)
         continue;
       if (errno != EAGAIN)
-        L->in_off = L->in_len; /* pty gone: drop */
+        L->in_off = L->in_len;
       break;
     }
     L->in_off += (size_t)n;
@@ -1459,8 +1316,6 @@ static void pty_flush_input(struct pty_loop *L) {
     L->in_off = L->in_len = 0;
 }
 
-/* Main relay loop. Returns 1 with the command's wait status, 0 if the monitor died
- * without reporting one, -1 on a fatal poll error. */
 static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
   struct pty_ctx *p = L->p;
   int have_status = 0;
@@ -1476,7 +1331,6 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
     if (L->in_len > 0)
       mev |= POLLOUT;
     pfds[2] = (struct pollfd){.fd = mev ? p->master : -1, .events = mev, .revents = 0};
-    /* Read the user's terminal only while we are its foreground job. */
     int want_tty = L->tty_in_ok && p->fg && L->in_len == 0;
     pfds[3] = (struct pollfd){.fd = want_tty ? p->ttyfd : -1, .events = POLLIN, .revents = 0};
     io_channel_poll(pfds + 4);
@@ -1504,7 +1358,7 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
         pty_flush_input(L);
       } else if (n == 0 || (errno != EINTR && errno != EAGAIN)) {
         if (n < 0 && errno == EIO)
-          check_fg(p); /* background read: wait for SIGCONT */
+          check_fg(p);
         else
           L->tty_in_ok = 0;
       }
@@ -1514,15 +1368,13 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
       ls_plugins_signal(rec.signo);
       switch (rec.signo) {
       case SIGCHLD:
-        break; /* the monitor reports through the backchannel */
+        break;
       case SIGWINCH: {
         struct winsize ws;
         if (ioctl(p->ttyfd, TIOCGWINSZ, &ws) == 0 &&
             (ws.ws_row != p->rows || ws.ws_col != p->cols)) {
           if (exec_io_winsize(ws.ws_row, ws.ws_col)) return -1;
           (void)ioctl(p->master, TIOCSWINSZ, &ws);
-          /* TIOCSWINSZ alone may not signal (e.g. an initially zero-sized
-           * terminal). sudo explicitly signals the command pgrp as well. */
           bc_send(L->sock, MSG_SIGNAL, SIGWINCH);
           p->rows = ws.ws_row;
           p->cols = ws.ws_col;
@@ -1530,7 +1382,6 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
         break;
       }
       case SIGCONT: {
-        /* e.g. `fg`/`bg` from the shell after we stopped, or a plain SIGCONT. */
         int was_fg = p->fg;
         check_fg(p);
         if (p->fg && !p->raw) {
@@ -1564,9 +1415,6 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
         sock_open = 0;
     }
   }
-  /* Drain what the command wrote before exiting. EIO arrives once all slave fds are
-   * closed and the buffer is empty; the timeout covers background processes that
-   * still hold the slave open. */
   while (have_status && L->master_open) {
     struct pollfd pfd = {.fd = p->master, .events = POLLIN, .revents = 0};
     int n = poll(&pfd, 1, 100);
@@ -1583,10 +1431,6 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
   return have_status;
 }
 
-/* ------------------------------------------------------------------------- */
-/* Entry points.                                                              */
-/* ------------------------------------------------------------------------- */
-
 static void free_req(struct exec_req *r) {
   free(r->argv);
   free(r->envp);
@@ -1598,10 +1442,8 @@ static void free_req(struct exec_req *r) {
   free((void *)r->apparmor);
 }
 
-
 static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background);
 
-/* Parse policy limits before forking, in setrlimit's native units. */
 static int limit_number(const char *s, char **end, rlim_t *value) {
   if (strncmp(s, "infinity", 8) == 0) {
     *end = (char *)s + 8; *value = RLIM_INFINITY; return 1;
@@ -1647,8 +1489,6 @@ static int prepare_options(struct exec_req *r, b_lean_obj_arg noexec,
     r->limits[resource] = lim;
   }
   if (!lean_is_scalar(apparmor)) {
-    /* sudo's apparmor_is_enabled deliberately checks only this module flag,
-     * not securityfs (which is commonly unavailable inside containers). */
     int fd = open("/sys/module/apparmor/parameters/enabled", O_RDONLY | O_CLOEXEC);
     char enabled = 0;
     if (fd >= 0) {
@@ -1686,7 +1526,6 @@ static int prepare_options(struct exec_req *r, b_lean_obj_arg noexec,
     if (old && strncmp(old, file, filelen) == 0 &&
         (old[filelen] == 0 || old[filelen] == ':'))
       return 1;
-    /* The policy DSO must be first, ahead of any user-supplied preload. */
     if (asprintf(&r->preload, "LD_PRELOAD=%s%s%s", file,
         old && *old ? ":" : "", old ? old : "") < 0) return 0;
     if (!old) {
@@ -1731,11 +1570,11 @@ LEAN_EXPORT lean_obj_res leansudo_exec_initialize(uint8_t disable_core, lean_obj
   }
   return lean_io_result_mk_ok(lean_box(0));
 }
-/* runRaw : (path : @& String) → (argv env : @& Array String) → (uid gid : UInt32) →
- *   (groups : @& Array UInt32) → (cwd : @& Option String) → (umask : UInt32) →
- *   (usePty background : Bool) → (closeFrom : UInt32) → IO UInt32
- * Result: exit code, or 0x10000 | signal. Strings were checked NUL-free and ids
- * range-checked on the Lean side. */
+LEAN_EXPORT lean_obj_res leansudo_exec_restore_core_limit(lean_obj_arg world) {
+  (void)world;
+  restore_core_limit();
+  return lean_io_result_mk_ok(lean_box(0));
+}
 LEAN_EXPORT lean_obj_res leansudo_exec_run(b_lean_obj_arg path, b_lean_obj_arg argv, b_lean_obj_arg env, uint32_t uid,
                                            uint32_t gid, b_lean_obj_arg groups, b_lean_obj_arg cwd, uint32_t umask_,
                                            uint8_t use_pty, uint8_t background, uint32_t closefrom,
@@ -1752,8 +1591,6 @@ LEAN_EXPORT lean_obj_res leansudo_exec_run(b_lean_obj_arg path, b_lean_obj_arg a
   memset(&r, 0, sizeof r);
   r.path = lean_string_cstr(path);
   r.uid = (uid_t)uid;
-  /* sudo's set_user_groups does setegid(target), then setgid(invoking) as
-   * root for stay_setuid. The latter sets all three GIDs to the invoking GID. */
   r.gid = stay_setuid ? g_invoking_gid : (gid_t)gid;
   r.ruid = stay_setuid ? g_invoking_uid : r.uid;
   r.umask = (mode_t)(umask_ & 0777);
@@ -1798,8 +1635,6 @@ LEAN_EXPORT lean_obj_res leansudo_exec_run(b_lean_obj_arg path, b_lean_obj_arg a
     return io_errno("unable to configure command execution", e);
   }
 
-  /* DSO interception modifies only the initial environment. The vector borrows
-   * existing values and has its own two transport variables. */
   char **plain_env = r.envp;
   char **intercept_env = NULL;
   if (ls_intercept_active() && !ls_intercept_trace()) {
@@ -1838,8 +1673,6 @@ static lean_obj_res child_error_result(const struct exec_req *r, const struct ch
 
 static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background) {
   if (background) {
-    /* The original process must not unwind PAM. The forked supervisor returns
-     * through Lean after waiting, and is the sole owner of session cleanup. */
     pid_t bg = fork();
     if (bg < 0)
       return io_errno("unable to fork", errno);
@@ -1868,7 +1701,6 @@ static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background
       close_pty_ctx(&pc);
     }
     if (perr != 0) {
-      /* Fail soft, like sudo: run the command without a pty. */
       char msg[256];
       snprintf(msg, sizeof msg, "sudo: unable to allocate pty: %s\n", strerror(perr));
       write_all(2, msg, strlen(msg));
@@ -1934,7 +1766,6 @@ static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background
     goto out;
   }
   if (pty) {
-    /* Only the monitor owns the tracees; discard our handshake descriptors. */
     ls_intercept_trace_close();
   } else if (ls_intercept_trace()) {
     if (ls_intercept_trace_attach(child) != 0) {
@@ -1947,8 +1778,6 @@ static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background
       res = io_errno("unable to attach command tracer", e);
       goto out;
     }
-    /* The exec-error pipe cannot be read synchronously before servicing the
-     * first seccomp stop. Reap/relay normally, then inspect the error report. */
     res = nopty_wait(&ss, child, r->timeout);
     ls_intercept_trace_close();
     struct child_err trace_error;
@@ -1961,7 +1790,6 @@ static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background
     goto out;
   }
 
-  /* Phase 1: wait for execve (EOF) or a failure report. */
   struct child_err ce;
   int failed = read_child_err(errp[0], &ce);
   close(errp[0]);
@@ -2022,12 +1850,10 @@ out:
   return res;
 }
 
-/* exitRaw : (signal : Bool) → (n : UInt32) → IO Unit — never returns. */
 LEAN_EXPORT lean_obj_res leansudo_exec_exit(uint8_t is_signal, uint32_t n, lean_obj_arg world) {
   (void)world;
   if (is_signal && n >= 1 && n < (uint32_t)NSIG && n != SIGSTOP && n != SIGTSTP && n != SIGTTIN && n != SIGTTOU) {
     int sig = (int)n;
-    /* Re-raise like sudo: default action, unblocked, without dumping our core. */
     struct rlimit rl = {0, 0};
     setrlimit(RLIMIT_CORE, &rl);
     struct sigaction sa;

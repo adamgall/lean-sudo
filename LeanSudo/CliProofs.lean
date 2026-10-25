@@ -1,16 +1,6 @@
 import LeanSudo.Cli
 
-/-!
-# Command-line theorems (DESIGN.md, verified property 7)
-
-The scanner preserves command operands and their order; option conflicts are
-rejected against the caller environment. Shell escaping round-trips the command
-without exposing shell metacharacters. See DESIGN.md for the public guarantees.
--/
-
 namespace LeanSudo.Cli
-
-/-! ## Operands -/
 
 theorem scan_dashdash (rest : List String) (r : Raw) : scan ("--" :: rest) r = .ok (r, rest) := by
   have h : "--".toList = ['-', '-'] := by decide
@@ -82,21 +72,17 @@ theorem parseArgs_eq {p : String} {args : List String} {env : List (String × St
     obtain ⟨hc, rfl⟩ := finish_eq h
     exact ⟨r, ops, hs, hc, rfl⟩
 
-/-- The command vector is exactly the operand list where option scanning stopped. -/
 theorem parseArgs_command {p : String} {args : List String} {env : List (String × String)}
     {o : Options} (h : (parseArgs p args env).result = .ok o) :
     ∃ r, scan args (Raw.init p env) = .ok (r, o.command) := by
   obtain ⟨r, ops, hs, -, rfl⟩ := parseArgs_eq h
   exact ⟨r, hs⟩
 
-/-- The command is a suffix of the arguments: never rewritten, reordered or dropped. -/
 theorem parseArgs_command_suffix {p : String} {args : List String} {env : List (String × String)}
     {o : Options} (h : (parseArgs p args env).result = .ok o) : o.command <:+ args := by
   obtain ⟨r, hs⟩ := parseArgs_command h
   exact scan_suffix _ _ _ _ _ (Nat.le_refl _) hs
 
-/-- `--` stops option processing: everything after it is the command (even words that
-look like options or `VAR=value`). -/
 theorem parseArgs_dashdash {p : String} {rest : List String} {env : List (String × String)}
     {o : Options} (h : (parseArgs p ("--" :: rest) env).result = .ok o) : o.command = rest := by
   obtain ⟨r, hs⟩ := parseArgs_command h
@@ -104,8 +90,6 @@ theorem parseArgs_dashdash {p : String} {rest : List String} {env : List (String
   simp only [Except.ok.injEq, Prod.mk.injEq] at hs
   exact hs.2.symm
 
-/-- A first word that does not start with `-` and is not `VAR=value` is the start of the
-command; no option parsing happens after it. -/
 theorem parseArgs_operand {p cmd : String} {rest : List String} {env : List (String × String)}
     {o : Options} (h1 : cmd.toList.head? ≠ some '-') (h2 : isEnvar cmd = false)
     (h : (parseArgs p (cmd :: rest) env).result = .ok o) : o.command = cmd :: rest := by
@@ -114,7 +98,6 @@ theorem parseArgs_operand {p cmd : String} {rest : List String} {env : List (Str
   simp only [Except.ok.injEq, Prod.mk.injEq] at hs
   exact hs.2.symm
 
-/-- The common special case: no leading `-` and no `=`. -/
 theorem parseArgs_plain_command {p cmd : String} {rest : List String} {env : List (String × String)}
     {o : Options} (h1 : cmd.toList.head? ≠ some '-') (h2 : '=' ∉ cmd.toList)
     (h : (parseArgs p (cmd :: rest) env).result = .ok o) : o.command = cmd :: rest := by
@@ -127,21 +110,17 @@ theorem parseArgs_plain_command {p cmd : String} {rest : List String} {env : Lis
     unfold isEnvarL
     split <;> simp_all
 
-/-- A scanner error cannot erase warnings emitted by the options preceding it. -/
 theorem parseArgs_error_warnings {p : String} {args : List String}
     {env : List (String × String)} {e : ParseFailure}
     (h : scan args (Raw.init p env) = .error e) :
     (parseArgs p args env).warnings = e.warnings := by
   simp [parseArgs, h]
 
-/-- Final validation and help/version selection retain all scanner warnings. -/
 theorem parseArgs_success_warnings {p : String} {args ops : List String}
     {env : List (String × String)} {r : Raw}
     (h : scan args (Raw.init p env) = .ok (r, ops)) :
     (parseArgs p args env).warnings = r.warnings := by
   simp [parseArgs, h]
-
-/-! ## Validation -/
 
 theorem check_none_rules {r : Raw} {ops : List String} (h : r.check ops = none) :
     ∀ c ∈ r.rules ops, c.1 = false := by
@@ -153,7 +132,6 @@ theorem check_none_rules {r : Raw} {ops : List String} (h : r.check ops = none) 
     have := List.find?_eq_none.1 hf c hc
     simpa using this
 
-/-- What a successful validation guarantees about the parser state. -/
 theorem check_none {r : Raw} {ops : List String} (h : r.check ops = none) :
     (r.login && r.shell) = false ∧
     (r.login && r.preserveAll) = false ∧
@@ -180,7 +158,6 @@ theorem build_preserveEnv_all (r : Raw) (ops : List String) :
   simp only [Raw.build]
   cases hpa : r.preserveAll <;> cases hpv : r.preserveVars.isEmpty <;> simp
 
-/-- `-i` and `-s` are mutually exclusive. -/
 theorem parseArgs_login_shell {p : String} {args : List String} {env : List (String × String)}
     {o : Options} (h : (parseArgs p args env).result = .ok o) : ¬(o.login = true ∧ o.shell = true) := by
   obtain ⟨r, ops, -, hc, rfl⟩ := parseArgs_eq h
@@ -190,7 +167,6 @@ theorem parseArgs_login_shell {p : String} {args : List String} {env : List (Str
   simp [hl] at c hs
   simp [c] at hs
 
-/-- `-i` and `-E` are mutually exclusive. -/
 theorem parseArgs_login_preserve {p : String} {args : List String} {env : List (String × String)}
     {o : Options} (h : (parseArgs p args env).result = .ok o) : o.login = true → o.preserveEnv ≠ .all := by
   obtain ⟨r, ops, -, hc, rfl⟩ := parseArgs_eq h
@@ -200,7 +176,6 @@ theorem parseArgs_login_preserve {p : String} {args : List String} {env : List (
   simp only [Raw.build] at hl
   simp [hl, hp] at c
 
-/-- `-i`, `-s`, `-E`, `-H`, `-b`, `-P` are only accepted when running a command. -/
 theorem parseArgs_run_flags {p : String} {args : List String} {env : List (String × String)}
     {o : Options} (h : (parseArgs p args env).result = .ok o)
     (hf : o.login = true ∨ o.shell = true ∨ o.preserveEnv = .all ∨ o.setHome = true ∨
@@ -218,7 +193,6 @@ theorem parseArgs_run_flags {p : String} {args : List String} {env : List (Strin
     simp [hm] at hf
     rcases hf with hf | hf | hf | hf | hf | hf <;> simp [hf] at c
 
-/-- `-U` requires `-l`. -/
 theorem parseArgs_otherUser {p : String} {args : List String} {env : List (String × String)}
     {o : Options} (h : (parseArgs p args env).result = .ok o)
     (hu : o.otherUser.isSome = true) : o.mode = .list := by
@@ -227,7 +201,6 @@ theorem parseArgs_otherUser {p : String} {args : List String} {env : List (Strin
   simp only [Raw.build] at hu ⊢
   simpa [hu] using c
 
-/-- `-A` and `-S` are mutually exclusive. -/
 theorem parseArgs_askpass_stdin {p : String} {args : List String} {env : List (String × String)}
     {o : Options} (h : (parseArgs p args env).result = .ok o) : ¬(o.stdin = true ∧ o.askpass = true) := by
   obtain ⟨r, ops, -, hc, rfl⟩ := parseArgs_eq h
@@ -236,7 +209,6 @@ theorem parseArgs_askpass_stdin {p : String} {args : List String} {env : List (S
   simp only [Raw.build] at h1 h2
   simp [h1, h2] at c
 
-/-- Edit mode needs at least one file and accepts no environment. -/
 theorem parseArgs_edit {p : String} {args : List String} {env : List (String × String)}
     {o : Options} (h : (parseArgs p args env).result = .ok o) (he : o.mode = .edit) :
     o.command ≠ [] ∧ o.preserveEnv = .none ∧ o.envVars = [] := by
@@ -251,7 +223,6 @@ theorem parseArgs_edit {p : String} {args : List String} {env : List (String × 
   · cases hv : r.preserveVars.isEmpty <;> cases hn : r.envVars.isEmpty <;> simp_all
   · cases hv : r.preserveVars.isEmpty <;> cases hn : r.envVars.isEmpty <;> simp_all
 
-/-- Run mode always has a command or an explicit/implied shell. -/
 theorem parseArgs_run {p : String} {args : List String} {env : List (String × String)}
     {o : Options} (h : (parseArgs p args env).result = .ok o) (hr : o.mode = .run) :
     o.command ≠ [] ∨ o.shell = true ∨ o.login = true := by
@@ -259,7 +230,6 @@ theorem parseArgs_run {p : String} {args : List String} {env : List (String × S
   simp only [Raw.build] at hr ⊢
   cases hs : r.shell <;> cases hl : r.login <;> cases ho : ops <;> simp_all
 
-/-- Only run, edit and list (check) modes take operands. -/
 theorem parseArgs_operands_mode {p : String} {args : List String} {env : List (String × String)}
     {o : Options} (h : (parseArgs p args env).result = .ok o) (hne : o.command ≠ []) :
     o.mode = .run ∨ o.mode = .edit ∨ o.mode = .list := by
@@ -273,11 +243,6 @@ theorem parseArgs_operands_mode {p : String} {args : List String} {env : List (S
     rw [ho] at c
     cases hm : r.effMode (x :: xs) <;> simp_all
 
-/-! ## Shell escaping -/
-
-/-- Scanning left to right, every character is a `shellSafe` character, a separating
-space, or the second half of a backslash escape. In particular no shell metacharacter
-(`;`, `|`, `&`, `$(`, quotes, globs, redirections, newlines, ...) is unescaped. -/
 inductive WellEscaped : List Char → Prop
   | nil : WellEscaped []
   | safe {c : Char} {r : List Char} : shellSafe c = true → WellEscaped r → WellEscaped (c :: r)
@@ -315,8 +280,6 @@ theorem shellEscape_wellEscaped (ws : List String) : WellEscaped (shellEscape ws
   simp only [shellEscape, String.toList_ofList]
   exact escapeJoin_wellEscaped ws
 
-/-- A minimal model of how a POSIX shell splits this restricted language into words:
-backslash quotes the next character, an unquoted space separates words. -/
 def lexAux : List Char → List Char → List (List Char)
   | [], cur => [cur]
   | '\\' :: c :: r, cur => lexAux r (cur ++ [c])
@@ -358,7 +321,6 @@ theorem lexAux_escapeChars (w rest cur : List Char) :
     · rw [List.cons_append, List.cons_append, lexAux_esc, ih]
       simp
 
-/-- Splitting the escaped string gives back exactly the original words (`ws ≠ []`). -/
 theorem lex_escapeJoin (ws : List String) (h : ws ≠ []) :
     lexAux (escapeJoin ws) [] = ws.map String.toList := by
   induction ws with

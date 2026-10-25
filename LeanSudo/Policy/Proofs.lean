@@ -1,24 +1,14 @@
 import LeanSudo.Policy.Eval
 
-/-!
-# Policy theorems
-
-Authorization, last-match precedence, authentication and command-identity guarantees
-for `LeanSudo.Policy.evaluate`. See DESIGN.md §§1–3 for the policy model.
--/
-
 namespace LeanSudo.Policy
 
 open LeanSudo.Sudoers
 
-/-- All match conditions for a (user spec, host entry, command spec) triple. -/
 def SpecMatches (s : Sudoers) (st : Settings) (r : Request) (us : UserSpec) (hc : HostCmnds)
     (cs : CmndSpec) : Prop :=
   userListOk (aliasesOf s) (aliasesOf s).fuel r.user us.users st (some r) = true ∧
   hostListOk (aliasesOf s) (aliasesOf s).fuel r.host hc.hosts st (some r) = true ∧
   specApplies (aliasesOf s) (aliasesOf s).fuel st r cs = true
-
-/-! ## Structural lemmas -/
 
 theorem mem_specsOf {s : Sudoers} {us : UserSpec} : us ∈ specsOf s ↔ Entry.userSpec us ∈ s := by
   induction s with
@@ -46,13 +36,11 @@ theorem mem_usCandidates {al : Aliases} {f : Nat} {st : Settings} {r : Request} 
   · simp only [h, ↓reduceIte, true_and, List.mem_flatMap]
   · simp [h]
 
-/-- A rejected invoking-user list cannot contribute any command candidate. -/
 theorem usCandidates_of_userListOk_false {al : Aliases} {f : Nat} {st : Settings}
     {r : Request} {us : UserSpec} (h : userListOk al f r.user us.users st (some r) = false) :
     usCandidates al f st r us = [] := by
   simp [usCandidates, h]
 
-/-- Inner User_Alias negation excludes bob regardless of the spec's commands. -/
 theorem notbob_alias_no_candidates (st : Settings) (r : Request) (entries : List HostCmnds) :
     usCandidates
       { user := [("NOTBOB", [⟨false, .all⟩, ⟨true, .name "bob"⟩])] } 1 st
@@ -62,7 +50,6 @@ theorem notbob_alias_no_candidates (st : Settings) (r : Request) (entries : List
   simp [userListOk, userListResult, matchList, atomMatches, UserAtom.aliasName,
     lookupAlias, userBase, nameEq]
 
-/-- With no requested group there is no self-rescue for an unspecified user. -/
 theorem runas_allow_no_group_user_match {al : Aliases} {f : Nat} {st : Settings}
     {r : Request} {us : List (Member UserAtom)} {gs : Option (List (Member UserAtom))}
     (hg : r.runasGroup = none)
@@ -123,7 +110,6 @@ theorem judgeListing_allow {pol : PwPolicy} {st : Settings} {cands : List Candid
     cases h
     exact ⟨fun h0 => hne (by rw [h0]; rfl), rfl⟩
 
-/-- An allow always comes from an allowing candidate. -/
 theorem judge_allow_mem {st : Settings} {cmd : Command} {cands : List Candidate} {a : Allowed}
     (h : judge st cmd cands = .allow a) : ∃ c ∈ cands, c.allow = true := by
   cases hr : isRunCmd cmd
@@ -136,12 +122,8 @@ theorem judge_allow_mem {st : Settings} {cmd : Command} {cands : List Candidate}
     obtain ⟨c, hc, hca, _⟩ := judgeRun_allow h
     exact ⟨c, List.mem_of_getLast? hc, hca⟩
 
-/-! ## (1) Default deny -/
-
 theorem evaluate_nil (st : Settings) (r : Request) : evaluate [] st r = .deny := by
   simp [evaluate, candidates, specsOf, candidatesCore, judge_nil]
-
-/-! ## (3) No matching user spec ⇒ deny -/
 
 theorem evaluate_no_user_match {s : Sudoers} {st : Settings} {r : Request}
     (h : ∀ us, Entry.userSpec us ∈ s →
@@ -154,10 +136,6 @@ theorem evaluate_no_user_match {s : Sudoers} {st : Settings} {r : Request}
     simp [h us hus] at hu
   simp [evaluate, this, judge_nil]
 
-/-! ## (2) Soundness -/
-
-/-- Every allow is backed by an applicable spec. Execution additionally requires
-an allowing command match; pseudo-command listing does not execute that command. -/
 theorem evaluate_sound {s : Sudoers} {st : Settings} {r : Request} {a : Allowed}
     (h : evaluate s st r = .allow a) :
     ∃ us hc cs, Entry.userSpec us ∈ s ∧ hc ∈ us.entries ∧ cs ∈ hc.cmnds ∧
@@ -175,9 +153,6 @@ theorem evaluate_sound {s : Sudoers} {st : Settings} {r : Request} {a : Allowed}
     cases he : specCmndResult (aliasesOf s) (aliasesOf s).fuel r cs <;>
       simp_all
 
-/-- For a run request (command or sudoedit), the allow is decided by the **last**
-candidate, whose run-as spec matches and whose command member result allows;
-permissions are taken from it. -/
 theorem evaluate_sound_run {s : Sudoers} {st : Settings} {r : Request} {a : Allowed}
     (hrun : isRunCmd r.command = true) (h : evaluate s st r = .allow a) :
     ∃ c, (candidates s st r).getLast? = some c ∧ c.allow = true ∧ a = allowedOf st c ∧
@@ -199,7 +174,6 @@ theorem evaluate_sound_run {s : Sudoers} {st : Settings} {r : Request} {a : Allo
   cases he : specCmndResult (aliasesOf s) (aliasesOf s).fuel r cs <;>
     simp_all [candidateOf]
 
-/-- A last candidate whose command member denies makes a run request denied. -/
 theorem evaluate_last_deny {s : Sudoers} {st : Settings} {r : Request} {c : Candidate}
     (hrun : isRunCmd r.command = true)
     (hlast : (candidates s st r).getLast? = some c)
@@ -216,7 +190,6 @@ theorem candidate_spec_applies {s : Sudoers} {st : Settings} {r : Request} {c : 
   obtain ⟨_, _, _, _, _, _, hm, rfl⟩ := mem_candidates.mp h
   exact hm.2.2
 
-/-- A non-negated command alias inherits an internal DENY at the last candidate. -/
 theorem evaluate_last_alias_deny {s : Sudoers} {st : Settings} {r : Request}
     {c : Candidate} {name : String} {ms : List (Member CmndAtom)} {f : Nat}
     (hrun : isRunCmd r.command = true)
@@ -244,8 +217,6 @@ theorem matchList_negation {α : Type} (m : α → Option Bool) (a : α) :
     matchList m [⟨true, a⟩] = (m a).map (!·) := by
   simp [matchList]
 
-/-! ## (4) Negation: last match wins -/
-
 theorem aliasesOf_append_userSpec (s : Sudoers) (u : UserSpec) :
     aliasesOf (s ++ [.userSpec u]) = aliasesOf s := by
   induction s with
@@ -262,8 +233,6 @@ theorem candidates_append_userSpec (s : Sudoers) (st : Settings) (r : Request) (
       candidates s st r ++ usCandidates (aliasesOf s) (aliasesOf s).fuel st r u := by
   simp [candidates, candidatesCore, aliasesOf_append_userSpec, specsOf_append, specsOf]
 
-/-- Appending a matching rule with a DENY command result denies, including a
-DENY inherited from inside an alias. -/
 theorem evaluate_append_negated (s : Sudoers) (st : Settings) (r : Request)
     (users : List (Member UserAtom)) (hosts : List (Member HostAtom)) (cs : CmndSpec)
     (hrun : isRunCmd r.command = true)
@@ -302,8 +271,6 @@ theorem atomMatches_host_all (defs : List (String × List (Member HostAtom))) (b
     (f : Nat) : atomMatches HostAtom.aliasName defs base f .all = (if base .all then some true else none) :=
   atomMatches_nonAlias _ _ _ _ _ rfl
 
-/-- Concrete alias body `ALL, !path`: its internal negated last match denies even
-when the referencing command member itself is not negated. -/
 theorem evaluate_last_alias_negated_path {s : Sudoers} {st : Settings} {r : Request}
     {c : Candidate} {name path : String} {f : Nat}
     (hrun : isRunCmd r.command = true)
@@ -358,15 +325,12 @@ theorem specCmndResult_negated_all (al : Aliases) (fuel : Nat) (r : Request)
       rw [atomMatches_nonAlias _ _ _ _ _ rfl]
       cases hcmd : selected.command <;> simp_all [isRunCmd, cmndBase]
 
-/-- `<user> ALL = (ALL : ALL) !ALL` -/
 def denyAllRule (user : String) : Entry :=
   let cs : CmndSpec :=
     { runas := some ⟨some [⟨false, .all⟩], some [⟨false, .all⟩]⟩
       options := {}, tags := {}, cmnd := ⟨true, .all⟩ }
   .userSpec ⟨[⟨false, .name user⟩], [⟨[⟨false, .all⟩], [cs]⟩], none⟩
 
-/-- Concrete instance: `<user> ALL = (ALL : ALL) !ALL` appended at the end of any policy
-denies every command (and sudoedit) the invoking user could ask for. -/
 theorem evaluate_append_deny_all (s : Sudoers) (st : Settings) (r : Request)
     (hrun : isRunCmd r.command = true) :
     evaluate (s ++ [denyAllRule r.user.name]) st r = .deny := by
@@ -381,10 +345,6 @@ theorem evaluate_append_deny_all (s : Sudoers) (st : Settings) (r : Request)
   · apply specCmndResult_negated_all _ _ _ _ hrun rfl
     cases hcmd : r.command <;> cases hr : r.requestedChroot <;> simp [specRoot, hcmd, hr]
 
-/-! ## (5) Authentication -/
-
-/-- A run request is allowed without authentication only if the deciding (last) rule
-is tagged `NOPASSWD`, or it is untagged and `authenticate` is off. -/
 theorem evaluate_noauth_run {s : Sudoers} {st : Settings} {r : Request} {a : Allowed}
     (hrun : isRunCmd r.command = true) (h : evaluate s st r = .allow a)
     (hna : a.needsAuth = false) :
@@ -414,9 +374,6 @@ theorem pwNeedsAuth_false {pol : PwPolicy} {st : Settings} {ok : List Candidate}
     obtain ⟨c, hc, hn⟩ := h
     exact ⟨c, hc, by simpa using hn⟩
 
-/-- `-l`/`-v` are allowed without authentication only if the applicable `listpw`/
-`verifypw` is `never`, or some allowing spec is NOPASSWD (or untagged with
-`!authenticate`). -/
 theorem evaluate_noauth_listing {s : Sudoers} {st : Settings} {r : Request} {a : Allowed}
     (hl : isRunCmd r.command = false) (h : evaluate s st r = .allow a)
     (hna : a.needsAuth = false) :
@@ -432,15 +389,10 @@ theorem evaluate_noauth_listing {s : Sudoers} {st : Settings} {r : Request} {a :
   · obtain ⟨hc, hca⟩ := List.mem_filter.mp hc
     exact .inr ⟨c, hc, by simpa using hca, hn⟩
 
-/-! ## (6) Irrelevant entries -/
-
-/-- Alias definitions and user specifications; everything else (Defaults, include
-directives) is irrelevant to `evaluate`. -/
 def isPolicyRelevant : Entry → Bool
   | .userAlias _ _ | .runasAlias _ _ | .hostAlias _ _ | .cmndAlias _ _ | .userSpec _ => true
   | .defaults _ _ | .include _ | .includeDir _ => false
 
-/-- The judgement only depends on the alias definitions and the user specs. -/
 theorem evaluate_congr {s t : Sudoers} (ha : aliasesOf s = aliasesOf t) (hs : specsOf s = specsOf t)
     (st : Settings) (r : Request) : evaluate s st r = evaluate t st r := by
   simp [evaluate, candidates, ha, hs]
@@ -456,25 +408,17 @@ theorem specsOf_erase (s₁ s₂ : Sudoers) (e : Entry) (he : isPolicyRelevant e
   simp only [specsOf_append]
   cases e <;> simp_all [isPolicyRelevant, specsOf]
 
-/-- Inserting a `Defaults` line or an (already resolved) include directive anywhere does
-not change any judgement. -/
 theorem evaluate_irrelevant (s₁ s₂ : Sudoers) (e : Entry) (he : isPolicyRelevant e = false)
     (st : Settings) (r : Request) :
     evaluate (s₁ ++ e :: s₂) st r = evaluate (s₁ ++ s₂) st r :=
   evaluate_congr (aliasesOf_erase s₁ s₂ e he) (specsOf_erase s₁ s₂ e he) st r
 
-/-! ## (7) Literal command paths never match a different basename -/
-
-/-- A literal (non-directory, non-glob) sudoers path never matches a requested path
-with a different basename, whatever the realpath oracle says (multicall binaries). -/
 theorem pathMatches_literal_basename {canon : String → String} {p path canonical : String}
     {facts : Option Request}
     (hd : endsWithSlash p = false) (hg : Glob.hasGlob p = false)
     (hb : baseOf p ≠ baseOf path) : pathMatches canon p path canonical facts = false := by
   simp [pathMatches, literalPathMatches, pathNamesMatch, hd, hg, hb]
 
-/-- Atom-level form: `command p args` with a literal `p` does not match running a
-command whose basename differs from `p`'s. -/
 theorem cmndBase_literal_basename {canon : String → String} {p path canonical : String}
     {a : CmndArgs} {args : List String} {facts : Option Request}
     (hd : endsWithSlash p = false) (hg : Glob.hasGlob p = false)
@@ -482,7 +426,6 @@ theorem cmndBase_literal_basename {canon : String → String} {p path canonical 
     cmndBase canon (.run path canonical args) (.command p a) facts = false := by
   simp [cmndBase, pathMatches_literal_basename hd hg hb]
 
-/-- Literal authorization requires both the same basename and canonical parent. -/
 theorem literal_match_identity {canon : String → String} {facts : Option Request}
     {p path canonical : String} (hd : endsWithSlash p = false)
     (hg : Glob.hasGlob p = false) (h : pathMatches canon p path canonical facts = true) :
@@ -491,7 +434,6 @@ theorem literal_match_identity {canon : String → String} {facts : Option Reque
     literalPathMatches, pathNamesMatch, Bool.and_eq_true, beq_iff_eq] at h
   exact h.1
 
-/-- MYSELF cannot authorize a different target account. -/
 theorem myself_never_other (al : Aliases) (f : Nat) (st : Settings) (r : Request)
     (gs : Option (List (Member UserAtom))) (h : r.runasUser.name ≠ r.user.name) :
     runasOk al f st r (some ⟨some [⟨false, .myself⟩], gs⟩) = false := by
@@ -500,8 +442,6 @@ theorem myself_never_other (al : Aliases) (f : Nat) (st : Settings) (r : Request
   simp [runasOk, hm]
   cases r.runasGroup <;> simp [h]
 
-/-- A run/checkList command outside its validity window contributes no candidate.
-Own listing/validation deliberately ignore dates, as sudoers lookup.c does. -/
 theorem expired_spec_no_candidate (al : Aliases) (f : Nat) (st : Settings)
     (r : Request) (cs : CmndSpec) (hrun : isRunCmd r.command = true)
     (h : inTimeWindow r.now cs r.localTimeBounds = false) :
@@ -524,7 +464,6 @@ theorem after_window_no_candidate (al : Aliases) (f : Nat) (st : Settings)
   apply expired_spec_no_candidate al f st r cs hrun
   simp [inTimeWindow, resolveTimeBound, hn, hl, Nat.not_le.mpr ht]
 
-/-- Runtime requests cannot authorize a spec with an unresolved local lower bound. -/
 theorem missing_local_notBefore_no_candidate (al : Aliases) (f : Nat) (st : Settings)
     (r : Request) (cs : CmndSpec) (n : Nat) (hn : cs.options.notBefore = some n)
     (hrun : isRunCmd r.command = true) (hl : cs.options.notBeforeLocal = true)
@@ -533,7 +472,6 @@ theorem missing_local_notBefore_no_candidate (al : Aliases) (f : Nat) (st : Sett
   apply expired_spec_no_candidate al f st r cs hrun
   simp [inTimeWindow, resolveTimeBound, hn, hl, hmissing]
 
-/-- Runtime requests cannot authorize a spec with an unresolved local upper bound. -/
 theorem missing_local_notAfter_no_candidate (al : Aliases) (f : Nat) (st : Settings)
     (r : Request) (cs : CmndSpec) (n : Nat) (hn : cs.options.notAfter = some n)
     (hrun : isRunCmd r.command = true) (hl : cs.options.notAfterLocal = true)
@@ -542,7 +480,6 @@ theorem missing_local_notAfter_no_candidate (al : Aliases) (f : Nat) (st : Setti
   apply expired_spec_no_candidate al f st r cs hrun
   simp [inTimeWindow, resolveTimeBound, hn, hl, hmissing]
 
-/-- A resolved local lower bound is enforced against its epoch, including DST gaps. -/
 theorem before_local_window_no_candidate (al : Aliases) (f : Nat) (st : Settings)
     (r : Request) (cs : CmndSpec) (n epoch : Nat) (hn : cs.options.notBefore = some n)
     (hrun : isRunCmd r.command = true) (hl : cs.options.notBeforeLocal = true)
@@ -551,7 +488,6 @@ theorem before_local_window_no_candidate (al : Aliases) (f : Nat) (st : Settings
   apply expired_spec_no_candidate al f st r cs hrun
   simp [inTimeWindow, resolveTimeBound, hn, hl, hresolved, Nat.not_le.mpr ht]
 
-/-- A resolved local upper bound is enforced against its epoch, including DST folds. -/
 theorem after_local_window_no_candidate (al : Aliases) (f : Nat) (st : Settings)
     (r : Request) (cs : CmndSpec) (n epoch : Nat) (hn : cs.options.notAfter = some n)
     (hrun : isRunCmd r.command = true) (hl : cs.options.notAfterLocal = true)
@@ -560,7 +496,6 @@ theorem after_local_window_no_candidate (al : Aliases) (f : Nat) (st : Settings)
   apply expired_spec_no_candidate al f st r cs hrun
   simp [inTimeWindow, resolveTimeBound, hn, hl, hresolved, Nat.not_le.mpr ht]
 
-/-- Actual command applicability implies the resolved local lower bound. -/
 theorem applicable_local_notBefore (al : Aliases) (f : Nat) (st : Settings)
     (r : Request) (cs : CmndSpec) (n epoch : Nat) (hn : cs.options.notBefore = some n)
     (hrun : isRunCmd r.command = true) (hl : cs.options.notBeforeLocal = true)
@@ -569,7 +504,6 @@ theorem applicable_local_notBefore (al : Aliases) (f : Nat) (st : Settings)
   simp only [specApplies_run hrun, inTimeWindow, Bool.and_eq_true] at happly
   simpa [hn, resolveTimeBound, hl, hresolved] using happly.1.1
 
-/-- Actual command applicability implies the resolved local upper bound. -/
 theorem applicable_local_notAfter (al : Aliases) (f : Nat) (st : Settings)
     (r : Request) (cs : CmndSpec) (n epoch : Nat) (hn : cs.options.notAfter = some n)
     (hrun : isRunCmd r.command = true) (hl : cs.options.notAfterLocal = true)
@@ -578,21 +512,17 @@ theorem applicable_local_notAfter (al : Aliases) (f : Nat) (st : Settings)
   simp only [specApplies_run hrun, inTimeWindow, Bool.and_eq_true] at happly
   simpa [hn, resolveTimeBound, hl, hresolved] using happly.1.2
 
-/-- Negation cannot be bypassed by changing the spelling's case. -/
 theorem negated_case_insensitive_name (al : Aliases) (f : Nat) (p : Principal)
     (st : Settings) (facts : Option Request) (name : String)
     (hon : st.caseInsensitiveUser = true) (heq : name.toLower = p.name.toLower) :
     userListResult al f p [⟨false, .all⟩, ⟨true, .name name⟩] st facts = some false := by
   simp [userListResult, matchList, atomMatches_user_name, userBase, nameEq, hon, heq]
 
-/-- A digest spelling never substitutes for matching the actual decoded bytes. -/
 theorem digestMatches_bytes (a b : Digest) (h : digestMatches a b = true) :
     a.bytes = b.bytes := by
   simp only [digestMatches, Bool.and_eq_true] at h
   exact eq_of_beq h.2
 
-/-- A digest-constrained file command cannot match without a verified hash supplied
-by the shell. sudo deliberately ignores digests on the list/sudoedit pseudo-commands. -/
 theorem digest_command_requires_hash (canon : String → String) (cmd : Command)
     (ds : List Digest) (atom : CmndAtom) (r : Request)
     (hp : isPseudoAtom atom = false)
@@ -601,7 +531,6 @@ theorem digest_command_requires_hash (canon : String → String) (cmd : Command)
   simp only [cmndBase, hp, Bool.false_or, Bool.and_eq_true] at h
   simpa only [List.any_eq_true, Option.any_some] using h.1
 
-/-- Every selected jail command comes from that jail's precomputed lookup facts. -/
 theorem specSelection_origin {r : Request} {cs : CmndSpec} {selection : CommandSelection}
     (h : specSelection r cs = some selection) :
     ∃ root facts, (root, facts) ∈ r.rootFacts ∧ selection.root = root ∧
@@ -651,13 +580,11 @@ theorem evaluate_selection_origin {s : Sudoers} {st : Settings} {r : Request}
     rw [ha, hcandidate] at hs
     exact specSelection_origin hs
 
-/-- Root-specific lookup may change the executable path, but not policy arguments. -/
 theorem rootedCommand_arguments (path canonical : String) (args : List String)
     (facts : RootCommandFacts) :
     ∃ p c, rootedCommand (.run path canonical args) facts = .run p c args := by
   cases hf : facts.command <;> simp [rootedCommand, hf]
 
-/-- A fixed CHROOT rule cannot authorize a different user-requested root. -/
 theorem requested_root_mismatch (al : Aliases) (f : Nat) (st : Settings)
     (r : Request) (cs : CmndSpec) (requested configured path canonical : String)
     (args : List String) (hrun : r.command = .run path canonical args)
@@ -666,15 +593,12 @@ theorem requested_root_mismatch (al : Aliases) (f : Nat) (st : Settings)
     specApplies al f st r cs = false := by
   simp [specApplies, hrun, isRunCmd, specCmndResult, specRoot, hr, hc, hstar, hne]
 
-/-- Missing root facts cannot make a negated command disappear from the decision. -/
 theorem missing_root_facts_deny (al : Aliases) (f : Nat) (r : Request)
     (cs : CmndSpec) (root : String) (hr : specRoot r cs = some (some root))
     (hf : r.rootFacts.find? (·.1 == root) = none) :
     specCmndResult al f r cs = some false := by
   simp [specCmndResult, specRequest, hr, hf]
 
-/-- An allowing rooted match is backed by the selected request's actual command
-matcher; neither an incompatible root nor unavailable facts can authorize it. -/
 theorem specCmndResult_allow {al : Aliases} {f : Nat} {r : Request} {cs : CmndSpec}
     (h : specCmndResult al f r cs = some true) :
     ∃ selected, specRequest r cs = some selected ∧
@@ -687,8 +611,6 @@ theorem specCmndResult_allow {al : Aliases} {f : Nat} {r : Request} {cs : CmndSp
     | some selected =>
       exact ⟨selected, rfl, by simpa [specCmndResult, hr, hs] using h⟩
 
-
-/-- A missing stat cannot turn an alternate pathname into a literal match. -/
 theorem literal_missing_stat_requires_same_name (r : Request) (p path : String)
     (hm : (r.fileIds.find? (·.1 == p)).isNone = true ∨
       (r.fileIds.find? (·.1 == path)).isNone = true)

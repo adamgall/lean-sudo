@@ -1,7 +1,3 @@
-/* sudoedit filesystem primitives. Privileged path operations execute only in
- * forked workers with permanently dropped and verified credentials. Directory
- * descriptors pin each checked component; no pathname is re-walked at copyback.
- * Selection, writable-directory refusal and copyback decisions live in Lean. */
 #include "shim.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -19,10 +15,6 @@
 #include <time.h>
 
 struct reply { int err; int value; char name[PATH_MAX]; };
-/* op: 0 directory, 1 read regular (ENOENT is optional), 2 write regular,
- * 3 W_OK directory, 4 mkstemps, 5 unlink, 6 executable regular (follows links),
- * 7 directory following links, 8 read regular following links, 9 write following links.
- * SCM_RIGHTS transfers opened descriptors, never numeric child-local handles. */
 static int worker(uint32_t op, int dir, const char *path, uid_t uid, gid_t gid,
                   b_lean_obj_arg gs, mode_t mask, uint32_t suffixlen, struct reply *out) {
     size_t n = lean_array_size(gs);
@@ -156,8 +148,6 @@ LEAN_EXPORT lean_obj_res leansudo_edit_stat(uint32_t fd) {
     for (size_t i = 0; i < sizeof values / sizeof values[0]; ++i) a = lean_array_push(a, lean_uint64_to_nat(values[i]));
     return lean_io_result_mk_ok(a);
 }
-/* Preserve the original timestamp (epoch for a new file). The caller restats
- * the temp afterwards to account for filesystem timestamp resolution. */
 LEAN_EXPORT lean_obj_res leansudo_edit_times(uint32_t fd, uint64_t sec, uint64_t nsec) {
     if (fd > INT_MAX || nsec >= 1000000000) return ls_errno(EINVAL);
     struct timespec times[2] = {
@@ -201,8 +191,6 @@ static int replace_bytes(int fd, b_lean_obj_arg bytes) {
     if (ftruncate(fd, (off_t)size) || fsync(fd)) return -1;
     return 0;
 }
-/* Write without truncating first. On failure restore the caller's original
- * snapshot; the editable temporary copy is retained by Lean in either case. */
 LEAN_EXPORT lean_obj_res leansudo_edit_write(uint32_t fd, b_lean_obj_arg bytes, b_lean_obj_arg original) {
     if (fd > INT_MAX) return ls_errno(EBADF);
     if (replace_bytes((int)fd, bytes)) {

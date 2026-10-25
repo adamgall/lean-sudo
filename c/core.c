@@ -1,15 +1,3 @@
-/*
- * lean-sudo C shim: users/groups/host/tty/stat/realpath/secure read/environ/syslog
- * (LeanSudo.Sys.Core) and PAM (LeanSudo.Sys.Pam).
- *
- * Conventions:
- *  - Every IO function returns a Lean IO result (no world argument).
- *  - String arguments are borrowed (`@&`); strings containing NUL bytes are rejected
- *    instead of being silently truncated.
- *  - Strings handed to Lean are validated as UTF-8 first.
- *  - No Lean object is retained by C beyond a call.  The PAM handle is an external
- *    object whose data is a plain C struct (it owns C copies of the config strings).
- */
 #include "shim.h"
 #include "locale_scope.h"
 #include "plugins.h"
@@ -47,10 +35,6 @@
 
 extern char **environ;
 
-/* Keep the submitted TZ only for Lean's command-environment construction.
- * libc/PAM and all policy/logging clocks must use the system timezone.
- * Ubuntu's CVE-2026-96512.patch requires unsetenv, not a temporary environ
- * swap: mktime/localtime may consult TZ again after tzset. */
 static char *submitted_tz;
 static bool locale_initialized;
 
@@ -66,24 +50,16 @@ int lean_sudo_initialize_locale(void) {
     return 0;
 }
 
-/* ------------------------------------------------------------------------- */
-/* Helpers                                                                    */
-/* ------------------------------------------------------------------------- */
-
 static lean_obj_res io_errno_path(const char *what, const char *path, int e) {
     char buf[256];
     return ls_errorf("%s %s: %s", what, path, strerror_r(e, buf, sizeof buf));
 }
 
-
 int ls_plugin_utf8_valid(const char *text, size_t size) {
     return ls_utf8_valid(text, size);
 }
 
-
-/* Lossy variant for informational text (PAM messages etc.). */
 static lean_object *mk_str_lossy(const char *s) { return lean_mk_string_from_bytes(s, strlen(s)); }
-
 
 static lean_obj_res mk_some(lean_obj_arg v) {
     lean_object *o = lean_alloc_ctor(1, 1, 0);
@@ -93,17 +69,11 @@ static lean_obj_res mk_some(lean_obj_arg v) {
 
 static lean_obj_res mk_none(void) { return lean_box(0); }
 
-
 static lean_obj_res mk_nat(uint64_t v) { return lean_uint64_to_nat(v); }
-
 
 static int write_str(int fd, const char *s) { return ls_write_all(fd, s, strlen(s)); }
 
 #define NUL_ARG_ERROR "argument contains a NUL byte"
-
-/* ------------------------------------------------------------------------- */
-/* Ids                                                                        */
-/* ------------------------------------------------------------------------- */
 
 LEAN_EXPORT lean_obj_res lean_sudo_getuid(void) { return ls_ok(mk_nat(getuid())); }
 LEAN_EXPORT lean_obj_res lean_sudo_geteuid(void) { return ls_ok(mk_nat(geteuid())); }
@@ -136,7 +106,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_valid_shells(void) {
     return ls_ok(shells);
 }
 
-/* getgroups : IO (Array Nat) */
 LEAN_EXPORT lean_obj_res lean_sudo_getgroups(void) {
     for (int attempt = 0; attempt < 8; attempt++) {
         int n = getgroups(0, NULL);
@@ -147,7 +116,7 @@ LEAN_EXPORT lean_obj_res lean_sudo_getgroups(void) {
         if (m < 0) {
             int e = errno;
             free(g);
-            if (e == EINVAL) continue; /* group list grew between calls */
+            if (e == EINVAL) continue;
             return ls_errno(e);
         }
         lean_object *arr = gid_array(g, (size_t)m);
@@ -157,10 +126,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_getgroups(void) {
     return ls_errno(EINVAL);
 }
 
-/* ------------------------------------------------------------------------- */
-/* passwd / group                                                             */
-/* ------------------------------------------------------------------------- */
-
 #define NSS_BUF_MAX ((size_t)64 << 20)
 
 static size_t nss_initial(int which) {
@@ -169,12 +134,10 @@ static size_t nss_initial(int which) {
     return (size_t)v;
 }
 
-/* "not found" errors as documented in getpwnam_r(3) */
 static bool nss_not_found(int rc) {
     return rc == 0 || rc == ENOENT || rc == ESRCH || rc == EBADF || rc == EPERM;
 }
 
-/* Passwd: ctor 0, fields name uid gid gecos home shell (all boxed). */
 static lean_obj_res pw_lookup(const char *name, uid_t uid) {
     size_t sz = nss_initial(_SC_GETPW_R_SIZE_MAX);
     for (;;) {
@@ -222,7 +185,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_getpwnam(b_lean_obj_arg name) {
 
 LEAN_EXPORT lean_obj_res lean_sudo_getpwuid(uint32_t uid) { return pw_lookup(NULL, (uid_t)uid); }
 
-/* Returns Option (String × Nat) */
 static lean_obj_res gr_lookup(const char *name, gid_t gid) {
     size_t sz = nss_initial(_SC_GETGR_R_SIZE_MAX);
     for (;;) {
@@ -253,7 +215,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_getgrnam(b_lean_obj_arg name) {
 
 LEAN_EXPORT lean_obj_res lean_sudo_getgrgid(uint32_t gid) { return gr_lookup(NULL, (gid_t)gid); }
 
-/* getgrouplist : String → UInt32 → IO (Array Nat) */
 LEAN_EXPORT lean_obj_res lean_sudo_getgrouplist(b_lean_obj_arg user, uint32_t gid) {
     const char *u = ls_cstr(user);
     if (!u) return ls_error(NUL_ARG_ERROR);
@@ -275,10 +236,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_getgrouplist(b_lean_obj_arg user, uint32_t gi
         n = next;
     }
 }
-
-/* ------------------------------------------------------------------------- */
-/* host / tty / environ                                                       */
-/* ------------------------------------------------------------------------- */
 
 LEAN_EXPORT lean_obj_res lean_sudo_gethostname(void) {
     char buf[HOST_NAME_MAX + 2];
@@ -313,7 +270,6 @@ static lean_object *push_env_pair(lean_object *arr, const char *entry, bool proc
         lean_mk_string_from_bytes_unchecked(eq + 1, vlen)));
 }
 
-/* environ : IO (Array (String × String)); drops entries without '=' or not UTF-8 */
 LEAN_EXPORT lean_obj_res lean_sudo_environ(void) {
     lean_object *arr = lean_mk_empty_array();
     for (char **e = environ; e && *e; e++)
@@ -325,11 +281,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_environ(void) {
     return ls_ok(arr);
 }
 
-/* ------------------------------------------------------------------------- */
-/* Files                                                                      */
-/* ------------------------------------------------------------------------- */
-
-/* FileStat: ctor 0, fields dev ino mode uid gid size rdev (all boxed Nat). */
 static lean_obj_res mk_filestat(const struct stat *st) {
     lean_object *o = lean_alloc_ctor(0, 7, 0);
     lean_ctor_set(o, 0, mk_nat((uint64_t)st->st_dev));
@@ -374,7 +325,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_access(b_lean_obj_arg path, uint32_t mode) {
 
 #define READ_CAP ((size_t)16 << 20)
 
-/* readFileNoFollow : String → IO (FileStat × String) */
 static lean_obj_res read_file(b_lean_obj_arg path, bool follow) {
     const char *p = ls_cstr(path);
     if (!p) return ls_error(NUL_ARG_ERROR);
@@ -397,7 +347,7 @@ static lean_obj_res read_file(b_lean_obj_arg path, bool follow) {
         close(fd);
         return ls_errorf("%s: file too large", p);
     }
-    size_t cap = (size_t)st.st_size + 1; /* +1 to detect growth */
+    size_t cap = (size_t)st.st_size + 1;
     char *buf = malloc(cap);
     if (!buf) { close(fd); return ls_errno(ENOMEM); }
     size_t len = 0;
@@ -444,7 +394,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_read_file_follow(b_lean_obj_arg path) {
     return read_file(path, true);
 }
 
-/* listDir : String → IO (Array String) — names excluding . and .., unsorted */
 LEAN_EXPORT lean_obj_res lean_sudo_list_dir(b_lean_obj_arg path) {
     const char *p = ls_cstr(path);
     if (!p) return ls_error(NUL_ARG_ERROR);
@@ -489,7 +438,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_getcwd(void) {
     return ls_ok(s);
 }
 
-/* umask : UInt32 → IO UInt32 — sets the mask, returns the previous one */
 LEAN_EXPORT lean_obj_res lean_sudo_umask(uint32_t mask) {
     return ls_ok(lean_box_uint32((uint32_t)umask((mode_t)(mask & 07777))));
 }
@@ -499,10 +447,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_write_stderr(b_lean_obj_arg s) {
         return ls_errno(errno);
     return ls_ok(lean_box(0));
 }
-
-/* ------------------------------------------------------------------------- */
-/* syslog                                                                     */
-/* ------------------------------------------------------------------------- */
 
 struct name_val { const char *name; int val; };
 
@@ -530,7 +474,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_syslog(b_lean_obj_arg facility, b_lean_obj_ar
     const char *f = ls_cstr(facility), *p = ls_cstr(priority);
     if (!f || !lookup_name(facilities, f, &fac)) return ls_error("unknown syslog facility");
     if (!p || !lookup_name(priorities, p, &pri)) return ls_error("unknown syslog priority");
-    /* A NUL in the message just truncates it, which is harmless for logging. */
     openlog("sudo", LOG_PID, fac);
     syslog(fac | pri, "%s", lean_string_cstr(msg));
     closelog();
@@ -568,9 +511,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_terminal_columns(uint32_t fd) {
     return ls_ok(mk_nat(columns));
 }
 
-/* Recover civil fields encoded without a zone, then let the system timezone
- * resolve this date's DST rules, including gaps/folds, just like gentime.c.
- * The caller's TZ has already been removed by locale initialization. */
 LEAN_EXPORT lean_obj_res lean_sudo_local_civil_epoch(b_lean_obj_arg civil) {
     if (!lean_is_scalar(civil)) return ls_ok(mk_none());
     uint64_t value = lean_unbox(civil);
@@ -589,7 +529,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_architecture(void) {
     if (uname(&u) != 0) return ls_errno(errno);
     return ls_ok(mk_str_lossy(u.machine));
 }
-
 
 LEAN_EXPORT lean_obj_res lean_sudo_no_new_privs(void) {
     return ls_ok(lean_box(prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1));
@@ -716,7 +655,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_event_uuid(void) {
     }
     bytes[7] = (bytes[7] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    /* sudo_uuid_to_string uses a 10-4-4-4-10 layout. */
     char uuid[37], *p = uuid;
     const char hex[] = "0123456789abcdef";
     for (size_t i = 0; i < sizeof(bytes); i++) {
@@ -853,11 +791,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_send_mail(b_lean_obj_arg path, b_lean_obj_arg
     return ls_ok(lean_box(0));
 }
 
-/* ========================================================================= */
-/* PAM                                                                        */
-/* ========================================================================= */
-
-/* Linux-PAM ABI (security/_pam_types.h) */
 typedef struct pam_handle pam_handle_t;
 struct pam_message { int msg_style; const char *msg; };
 struct pam_response { char *resp; int resp_retcode; };
@@ -955,7 +888,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_pam_available(void) {
     return ls_ok(lean_box(pam_ensure_loaded() ? 1 : 0));
 }
 
-/* Conversation error codes (see conv_error_message). */
 enum {
     CONV_OK = 0,
     CONV_ERR_NONINTERACTIVE,
@@ -1002,8 +934,6 @@ typedef struct {
     int interrupted;
 } sudo_pam_t;
 
-/* --- terminal handling during password reads --- */
-
 static volatile sig_atomic_t tty_active;
 static volatile sig_atomic_t tty_interrupted;
 static int tty_fd = -1;
@@ -1016,9 +946,6 @@ static const int tty_sigs[] = {SIGINT, SIGQUIT, SIGTERM, SIGHUP, SIGTSTP, SIGTTI
 #define N_TTY_SIGS (sizeof tty_sigs / sizeof tty_sigs[0])
 static struct sigaction tty_old_actions[N_TTY_SIGS];
 static bool tty_installed[N_TTY_SIGS];
-/* A signal may land on another Lean runtime thread, so EINTR alone cannot
- * wake the thread waiting for a password. Keep one close-on-exec self-pipe
- * for the process lifetime, avoiding close/reuse races with the handler. */
 static int tty_wakeup[2] = {-1, -1};
 
 static int tty_prepare_wakeup(void) {
@@ -1039,13 +966,10 @@ static void tty_install_one(size_t i) {
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = tty_sig_handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0; /* no SA_RESTART: interrupt poll/read so we re-check */
+    sa.sa_flags = 0;
     sigaction(tty_sigs[i], &sa, NULL);
 }
 
-/* Interrupts return through PAM so Lean can report prior failed attempts.
- * Other signals retain their normal action; job-control stops re-arm echo
- * suppression after continuing. Async-signal-safe. */
 static void tty_sig_handler(int sig) {
     int saved_errno = errno;
     if (tty_active) tcsetattr(tty_fd, TCSANOW, &tty_saved);
@@ -1059,7 +983,6 @@ static void tty_sig_handler(int sig) {
     if (sig == SIGINT || sig == SIGQUIT) {
         tty_interrupted = sig;
         const char byte = 0;
-        /* EAGAIN means a wakeup is already queued; the pipe is never closed. */
         while (write(tty_wakeup[1], &byte, 1) < 0 && errno == EINTR) {}
         errno = saved_errno;
         return;
@@ -1074,7 +997,6 @@ static void tty_sig_handler(int sig) {
     sigaddset(&set, sig);
     sigprocmask(SIG_UNBLOCK, &set, NULL);
     raise(sig);
-    /* Only reached for stop signals after SIGCONT. */
     for (size_t i = 0; i < N_TTY_SIGS; i++)
         if (tty_sigs[i] == sig) tty_install_one(i);
     if (tty_active) tcsetattr(tty_fd, TCSANOW, &tty_noecho);
@@ -1085,7 +1007,7 @@ static void tty_install_handlers(void) {
     for (size_t i = 0; i < N_TTY_SIGS; i++) {
         tty_installed[i] = false;
         if (sigaction(tty_sigs[i], NULL, &tty_old_actions[i]) != 0) continue;
-        if (tty_old_actions[i].sa_handler == SIG_IGN) continue; /* keep ignored signals ignored */
+        if (tty_old_actions[i].sa_handler == SIG_IGN) continue;
         tty_install_one(i);
         tty_installed[i] = true;
     }
@@ -1096,8 +1018,6 @@ static void tty_restore_handlers(void) {
         if (tty_installed[i]) sigaction(tty_sigs[i], &tty_old_actions[i], NULL);
 }
 
-
-/* The helper is unprivileged and never receives privileged descriptors. */
 static int read_askpass(sudo_pam_t *st, const char *prompt, char *buf, size_t size) {
     int fds[2];
     if (pipe2(fds, O_CLOEXEC) != 0) return CONV_ERR_READ;
@@ -1156,7 +1076,6 @@ static int plugin_prompt_suspend(void) {
     plugin_conv_stop = 0;
     struct sudo_conv_callback *cb = plugin_conv_callback;
     if (cb->on_suspend && cb->on_suspend(signo, cb->closure) == -1) ret = -1;
-    /* Never execute plugin callbacks from a signal handler. */
     struct sigaction dfl = {0}, old;
     dfl.sa_handler = SIG_DFL;
     sigemptyset(&dfl.sa_mask);
@@ -1167,7 +1086,6 @@ static int plugin_prompt_suspend(void) {
     return ret;
 }
 
-/* Read one line into buf (NUL-terminated, newline stripped). Returns CONV_OK or an error. */
 static int read_password(sudo_pam_t *st, const char *prompt, bool echo, char *buf, size_t size) {
     int in, out, own_fd = -1;
     if (st->askpass) return read_askpass(st, prompt, buf, size);
@@ -1284,7 +1202,6 @@ static int read_password(sudo_pam_t *st, const char *prompt, bool echo, char *bu
         if (feedback) {
             if ((cc_t)c == saved.c_cc[VERASE] || c == 0x7f || c == 0x08) {
                 if (n > 0) {
-                    /* drop one UTF-8 character */
                     while (n > 0 && ((unsigned char)buf[n - 1] & 0xC0) == 0x80) n--;
                     if (n > 0) n--;
                     (void)write_str(out, "\b \b");
@@ -1354,7 +1271,6 @@ int ls_plugin_conversation_config(int bell, const char *askpass) {
     return 0;
 }
 
-/* Share PAM's bounded, signal-safe terminal reader with plugin conversations. */
 int ls_plugin_read_reply(const char *prompt, int type, unsigned timeout,
     int use_stdin, char *buf, size_t size, struct sudo_conv_callback *callback) {
     if (plugin_conv_active) {
@@ -1390,8 +1306,6 @@ static bool is_generic_password_prompt(const char *p) {
     return p && (strcmp(p, "Password:") == 0 || strcmp(p, "Password: ") == 0);
 }
 
-/* sudo auth/pam.c distinguishes the literal sudo prompt from the translated
- * Linux-PAM generic prompt (challenge/response prompts must pass through). */
 static bool is_generic_pam_password_prompt(const char *p) {
     return p && (is_generic_password_prompt(p) ||
         strcmp(p, dgettext("Linux-PAM", "Password:")) == 0 ||
@@ -1481,8 +1395,6 @@ fail:
     return rc;
 }
 
-/* --- external object --- */
-
 static void sudo_pam_free(sudo_pam_t *st) {
     if (st->prompt) {
         explicit_bzero(st->prompt, strlen(st->prompt));
@@ -1522,9 +1434,6 @@ static lean_obj_res pam_start_fail(sudo_pam_t *st, int rc) {
     return res;
 }
 
-/* pamStartRaw (service user : @& String) (useStdin nonInteractive : Bool) (prompt : @& String)
- *   (override pwfeedback : Bool) (timeout : UInt32) (ruser : @& String) (tty : @& Option String) (visiblepw : Bool)
- *   : IO PamHandle */
 LEAN_EXPORT lean_obj_res lean_sudo_pam_start(b_lean_obj_arg service, b_lean_obj_arg user,
                                              uint8_t use_stdin, uint8_t noninteractive,
                                              b_lean_obj_arg prompt, uint8_t override,
@@ -1570,7 +1479,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_pam_interrupted(b_lean_obj_arg h) {
     return ls_ok(lean_box_uint32((uint32_t)pam_data(h)->interrupted));
 }
 
-/* Capture before PAM or sudoedit changes process credentials. */
 static int pam_askpass_identity(sudo_pam_t *st) {
     int n = getgroups(0, NULL);
     if (n < 0) return errno;
@@ -1682,7 +1590,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_pam_set_user(b_lean_obj_arg h, b_lean_obj_arg
     return ls_ok(lean_int_to_int(rc));
 }
 
-/* pamGetEnv : PamHandle → IO (Array (String × String)); invalid entries dropped */
 LEAN_EXPORT lean_obj_res lean_sudo_pam_getenv(b_lean_obj_arg h) {
     sudo_pam_t *st = pam_data(h);
     if (st->ended) return ls_error("PAM handle already ended");
@@ -1698,7 +1605,6 @@ LEAN_EXPORT lean_obj_res lean_sudo_pam_getenv(b_lean_obj_arg h) {
     return ls_ok(arr);
 }
 
-/* Borrowed Int -> C int; false if out of range. */
 static bool int_arg(b_lean_obj_arg i, int *out) {
     if (!lean_is_scalar(i)) return false;
     int64_t v = lean_scalar_to_int64(i);

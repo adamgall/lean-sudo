@@ -2,15 +2,12 @@ import LeanSudo.Sys.Exec
 
 namespace LeanSudo.Sudoedit
 
-/-- Preserve kernel path resolution, including `..`; only reject nonabsolute or
-NUL-containing paths. Empty/dot names are resolved by openat, never folded across links. -/
 def pathParts (path : String) : Option (List String × String) := do
   if !path.startsWith "/" || !Sys.Exec.cSafe path then none
   else
     match (path.splitOn "/").reverse with
     | [] => none
     | name :: dirs => some ((dirs.reverse).filter (· != ""), if name == "" then "." else name)
-
 
 private def unescapeWord : List Char → List Char
   | '\\' :: c :: cs => c :: unescapeWord cs
@@ -44,31 +41,24 @@ private def splitEditor : Nat → List Char → List String
         else bareWord (c :: cs) []
       String.ofList (unescapeWord word) :: splitEditor fuel rest
 
-/-- sudoers wordsplit: quotes delimit only at word start; backslashes quote the
-next character, with no shell expansion. Unmatched quotes remain literal. -/
 def editorWords (source : String) : List String :=
   splitEditor (source.length + 1) source.toList
 
-/-- Preserve the last suffix for editor syntax detection, including dotfiles. -/
 def tempName (name : String) : String :=
   match (name.splitOn ".").reverse with
   | suffix :: rest@(_ :: _) => String.intercalate "." rest.reverse ++ "XXXXXXXX." ++ suffix
   | _ => name ++ ".XXXXXXXX"
 
-/-- sudo_edit compares size and nanosecond mtime, not contents. -/
 def fileChanged (before after : Array Nat) (elapsed : Bool) : Bool :=
   !elapsed || before[3]! != after[3]! || before[4]! != after[4]! || before[5]! != after[5]!
-/-- The editor cannot inject additional sudoedit file operands via `--`. -/
 def editorArgsSafe (words : List String) : Bool :=
   !words.isEmpty && words.all Sys.Exec.cSafe && !(words.drop 1).contains "--"
-
 
 theorem editorWords_no_file_separator (source : String)
     (h : editorArgsSafe (editorWords source) = true) :
     "--" ∉ (editorWords source).drop 1 := by
   simp [editorArgsSafe, Bool.and_eq_true] at h
   simpa using h.2
-/-- Ordered candidate selection from filesystem resolution results. -/
 def selectEditor : List (List String × Option String) → Option (String × List String)
   | [] => none
   | (words, some path) :: _ => some (path, words)
@@ -80,7 +70,6 @@ theorem selectEditor_first (words : List String) (path : String) (rest) :
 theorem selectEditor_skip (words : List String) (rest) :
     selectEditor ((words, none) :: rest) = selectEditor rest := rfl
 
-/-- Every skipped candidate preceding the chosen candidate was unresolved. -/
 theorem selectEditor_prefix (before : List (List String × Option String))
     (h : ∀ c ∈ before, c.2 = none) (words : List String) (path : String) (rest) :
     selectEditor (before ++ (words, some path) :: rest) = some (path, words) := by
@@ -98,7 +87,6 @@ theorem selectEditor_prefix (before : List (List String × Option String))
 
 def tempSafe (regular owned singleLink : Bool) : Bool := regular && owned && singleLink
 
-/-- Copyback is authorized only for a changed, checked temporary file. -/
 def writeBack (changed checked : Bool) : Bool := changed && checked
 
 theorem writeBack_sound {changed checked : Bool} (h : writeBack changed checked = true) :

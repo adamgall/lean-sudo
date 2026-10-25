@@ -1,7 +1,7 @@
-# sudo.ws 1.9.17p2 resolve_cmnd.c, find_path.c and goodpath.c:
-# search all candidates as runas first, then invoking credentials only on a miss;
-# a regular file needs ANY execute bit, not access(X_OK) for the invoking user.
-# These tests are deliberately reference-first; the test author does not run them.
+
+
+
+
 command_lookup_fixture() {
   lookup="$WORK/command-lookup"
   install -d -o root -g root -m 0755 "$lookup" "$lookup/public"
@@ -91,8 +91,8 @@ begin command-lookup-invoker-private-fallback-list && {
 begin command-lookup-invoker-fallback-not-exec-permission && {
   command_lookup_fixture
   printf 'Defaults:alice secure_path="%s/alice:/usr/bin:/bin"\n' "$lookup" >>/etc/sudoers.d/command-lookup
-  # Lookup succeeds as alice, but it must not grant bob directory access or run
-  # with alice's identity. Only execution fails, with the kernel's EACCES.
+
+
   run alice 'sudo -n -u bob lookup-choice'
   expect_rc 1
   expect_out_empty
@@ -128,8 +128,8 @@ begin command-lookup-dot-does-not-fallback && {
   command_lookup_fixture
   install -o root -g root -m 0755 "$lookup/public/admin-only" "$lookup/public/lookup-choice"
   printf 'Defaults:alice secure_path="%s/alice:.:/usr/bin:/bin",ignore_dot\n' "$lookup" >>/etc/sudoers.d/command-lookup
-  # bob cannot search alice's PATH directory but can stat the dot candidate.
-  # NOT_FOUND_DOT is terminal: retrying as alice would wrongly choose her file.
+
+
   run alice "cd '$lookup/public' && sudo -n -u bob lookup-choice"
   expect_rc 1
   expect_out_empty

@@ -25,7 +25,7 @@ $ sudo id -u
 It reads your existing `/etc/sudoers`, `/etc/sudoers.d` and `/etc/sudo.conf`, uses the
 system's PAM stack (`/etc/pam.d/sudo`, `sudo-i`), prints the same prompts and messages
 (translated, like the original), writes the same syslog lines and I/O logs, and passes
-the same 946-test end-to-end suite as the original sudo, byte for byte where it matters.
+the same 912-test end-to-end suite as the original sudo, byte for byte where it matters.
 
 > **"sudo.ws"** in this document means the original sudo: the C implementation
 > written around 1980 and maintained by Todd C. Miller since the 1990s, whose home is
@@ -144,7 +144,7 @@ byte for byte where it matters:
 
 | Suite | sudo.ws 1.9.17p2 | lean-sudo |
 |---|---|---|
-| `sudo` end-to-end: authentication and PAM, run-as users/groups, `!` rules and aliases, globs/regex/digests/netgroups/networks/FQDN hosts, group plugins, SSSD rules (real slapd + sssd), `Defaults` scoping, environment, `-l`/`-ll`/`-U` output, timestamps (interoperating with sudo.ws), `-i`/`-s`/`-b`, exit status, signals and job control, `NOEXEC`, `TIMEOUT`, `CHROOT`, rlimits, `stay_setuid`, utmp, command interception and `log_subcmds`, sudoedit, `sudo.conf` with audit/approval/I/O plugins, `nsswitch.conf`, askpass, mail, audit records, accept/reject/alert events compared in syslog, logfile and JSON, remote log servers (`sudo_logsrvd`, TLS), I/O logs replayed with the system's `sudoreplay`, translations (German, French), command-line errors, security regressions | 946/946 | 946/946 |
+| `sudo` end-to-end: authentication and PAM, run-as users/groups, `!` rules and aliases, globs/regex/digests/netgroups/networks/FQDN hosts, group plugins, SSSD rules (real slapd + sssd), `Defaults` scoping, environment, `-l`/`-ll`/`-U` output, timestamps (interoperating with sudo.ws), `-i`/`-s`/`-b`, exit status, signals and job control, `NOEXEC`, `TIMEOUT`, `CHROOT`, rlimits, `stay_setuid`, utmp, command interception and `log_subcmds`, sudoedit, `sudo.conf` with audit/approval/I/O plugins, `nsswitch.conf`, askpass, mail, audit records, accept/reject/alert events compared in syslog, logfile and JSON, remote log servers (`sudo_logsrvd`, TLS), I/O logs replayed with the system's `sudoreplay`, translations (German, French), command-line errors, security regressions | 912/912 | 912/912 |
 | `visudo` (check mode, edit mode with includes, locking, permissions, export) | 154/154 | 154/154 |
 
 ## Features
@@ -252,7 +252,7 @@ undefined aliases), so it cannot install a policy that lean-sudo would then refu
 
 Formal verification moves trust; it does not remove it. lean-sudo trusts:
 
-* **The C shim** (`c/*.c`, about 10,200 lines): PAM, `libsss_sudo`, sudo plugins (audit, approval, I/O, group), OpenSSL and gzip via `dlopen`, seccomp/ptrace interception, `setgroups` →
+* **The C shim** (`c/*.c`, about 9,700 lines): PAM, `libsss_sudo`, sudo plugins (audit, approval, I/O, group), OpenSSL and gzip via `dlopen`, seccomp/ptrace interception, `setgroups` →
   `setresgid` → `setresuid` (each drop re-checked with `getres[ug]id`, and for a
   non-root target `setuid(0)` must fail before `execve`), fork/exec, signal relay, the
   pty monitor, timestamp file locking, sudoedit's file workers, the I/O log writer
@@ -327,9 +327,22 @@ Core Lean only: no Mathlib, no Batteries. The toolchain is pinned in `lean-toolc
   with every expectation checked against sudo.ws. No `#guard`/`#eval`/`example` checks,
   no test executables that call internal functions, no test-only code paths or hooks
   in the implementation. Properties of internal functions are stated as theorems.
-* **No mocks.** Tests use the real components sudo talks to (PAM, syslog, the mailer,
-  `sudo_logsrvd`, SSSD/LDAP, sudo's plugins, the audit subsystem, real editors and
-  shells), never stand-ins whose behaviour is scripted by the test.
+* **No mocks.** Every component sudo depends on is the real software running in the
+  container: PAM stacks and modules, syslog (rsyslog), the mailer (a real MTA),
+  `sudo_logsrvd`, OpenLDAP + SSSD, sudo plugins (Ubuntu's shipped ones and upstream's
+  sample plugins built from the sudo source), X/askpass, sshd, the kernel audit
+  interface. Nothing is replaced by a stand-in whose behaviour the test scripts.
+  The programs sudo runs on the user's behalf (the command, the editor) are the
+  test's input and may be ordinary scripts, exactly as on a real system. A behaviour
+  that cannot be produced with real software is not tested end to end.
+
+### Code rules
+
+* **No comments** in any code file: Lean, C, shell, Python, Dockerfiles. Code that
+  seems to need an explanation is redesigned until it doesn't; architecture and
+  rationale live in `DESIGN.md`, attribution in `THIRD_PARTY_NOTICES.md`.
+  `scripts/check-no-comments.sh` enforces this (data such as sudoers fixtures is
+  exempt).
 
 ## Repository layout
 
@@ -352,4 +365,5 @@ Core Lean only: no Mathlib, no Batteries. The toolchain is pinned in `lean-toolc
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Licensed under the [Apache License, Version 2.0](LICENSE). Parts derived from sudo are
+under the ISC license; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

@@ -1,12 +1,12 @@
 #!/bin/bash
-# End-to-end visudo tests. Runs INSIDE the test container as root (see
-# `run.sh --visudo`); same image, conventions and TAP output as tests.sh.
-#
-#   visudo-tests.sh VISUDO_BINARY [NAME_FILTER]
-#
-# VISUDO_BINARY is run directly as root (reference: /usr/sbin/visudo.ws).
-# Expectations are shared with Ubuntu's sudo.ws 1.9.17p2, including compatibility
-# export, explicit-include editing, strict checking and stale temporary files.
+
+
+
+
+
+
+
+
 set -u
 
 VISUDO=${1:?usage: visudo-tests.sh VISUDO_BINARY [NAME_FILTER]}
@@ -27,12 +27,12 @@ chmod 0755 "$VISUDO"
 cp -a /etc/sudoers "$WORK/sudoers.orig"
 cp -a /etc/sudoers.d "$WORK/sudoers.d.orig"
 
-# --- editor scripts (the temp file is the last argument) --------------------
+
 ED=$WORK/ed
 mkdir -p "$ED"
 cat >"$ED/append" <<'EOF'
 #!/bin/sh
-# appends $LINE; records its arguments and how often it ran
+
 for a; do f=$a; done
 printf '%s\n' "$*" >>"${EDLOG:-/dev/null}"
 printf '%s\n' "$LINE" >>"$f"
@@ -48,7 +48,7 @@ for a; do f=$a; done
 EOF
 cat >"$ED/wait" <<'EOF'
 #!/bin/sh
-# signals that it runs, then waits (max ~20 s) for the release file
+
 : >"$STARTED"
 i=0
 while [ ! -e "$RELEASE" ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i + 1)); done
@@ -71,15 +71,15 @@ reset_state() {
   : >"$WORK/edlog"
 }
 
-# ---------------------------------------------------------------------------
-# Harness (as in tests.sh)
-# ---------------------------------------------------------------------------
+
+
+
 
 NUM=0 PASSED=0 FAILED=0 SKIPPED=0
 FAILED_NAMES=()
 CUR= CMD= RC= OUT= ERR=
 FAILS=()
-XENV=()   # extra environment for the next `vrun`
+XENV=()
 STDIN=/dev/null
 
 emit() { printf '%s\n' "$*" | tee -a "$TAP" "$LOG"; }
@@ -94,8 +94,8 @@ begin() {
 }
 
 
-# vrun [-u USER] ARGS...: run "$VISUDO ARGS..." as root (or USER) with a clean
-# environment plus XENV, stdin from $STDIN. Sets RC, OUT, ERR.
+
+
 vrun() {
   local user=root
   if [[ ${1:-} == -u ]]; then user=$2; shift 2; fi
@@ -117,7 +117,7 @@ vrun() {
   } >>"$LOG"
 }
 
-# answer TEXT: stdin for the next vrun (the What now? answers)
+
 answer() { printf '%s' "$1" >"$WORK/stdin"; STDIN=$WORK/stdin; }
 
 fail() { FAILS+=("$1"); }
@@ -130,7 +130,7 @@ expect_out_exactly() { [[ $OUT == "$1" ]] || fail "stdout: expected exactly:"$'\
 expect_err_has() { grep -qF -- "$1" <<<"$ERR" || fail "stderr: expected to contain '$1'"; }
 expect_err_match() { grep -qE -- "$1" <<<"$ERR" || fail "stderr: expected to match /$1/"; }
 expect_err_empty() { [[ -z $ERR ]] || fail "stderr: expected empty"; }
-# expect_stat PATH 'MODE OWNER GROUP' (stat -c '%a %U %G')
+
 expect_stat() {
   local got
   got=$(stat -c '%a %U %G' "$1" 2>&1)
@@ -170,8 +170,8 @@ end() {
   fi
 }
 
-# Match every eligible fixture, including fixtures added by sudo's regression suite.
-# Keep an exact output assertion: includedir ignores names containing '.' or ending '~'.
+
+
 STOCK_OK=$(
   printf '/etc/sudoers: parsed OK\n'
   for file in /etc/sudoers.d/*; do
@@ -181,9 +181,9 @@ STOCK_OK=$(
 )
 SYNTAX_LINE=$(($(wc -l </etc/sudoers) + 1))
 
-# ===========================================================================
-# Check mode
-# ===========================================================================
+
+
+
 
 begin check-stock && {
   vrun -c
@@ -230,7 +230,7 @@ begin check-syntax-error-main && {
   expect_rc 1
   expect_out_lacks 'parsed OK'
   expect_err_match "^/etc/sudoers:$SYNTAX_LINE:[0-9]+: syntax error"
-  expect_err_has 'foo bar baz'   # the offending line is echoed
+  expect_err_has 'foo bar baz'
   end
 }
 
@@ -283,7 +283,7 @@ begin check-bad-perms-include && {
 }
 
 begin check-file-option-skips-owner-perms && {
-  # -f disables the owner/mode checks unless -O/-P are given
+
   chmod 0644 /etc/sudoers
   vrun -c -f /etc/sudoers
   expect_rc 0
@@ -341,7 +341,7 @@ begin check-invalid-defaults-value && {
 }
 
 begin check-undefined-alias-is-error && {
-  # Undefined aliases become fatal only under strict checking.
+
   printf 'bob FOO = /usr/bin/id\n' >"$WORK/scratch/s"
   vrun -c -s -f "$WORK/scratch/s"
   expect_rc 1
@@ -349,12 +349,12 @@ begin check-undefined-alias-is-error && {
   end
 }
 
-# ===========================================================================
-# Edit mode
-# ===========================================================================
+
+
+
 
 begin edit-append-valid-line && {
-  chmod 0640 /etc/sudoers   # installation must restore 0440 root:root
+  chmod 0640 /etc/sudoers
   XENV=(EDITOR="$ED/append" LINE='bob ALL=(ALL) /usr/bin/id')
   vrun
   expect_rc 0
@@ -362,7 +362,7 @@ begin edit-append-valid-line && {
   expect_stat /etc/sudoers '440 root root'
   expect_no_tmp
   [[ $(head -n 1 "$WORK/edlog") == *"/etc/sudoers.tmp" ]] || fail "editor not run on /etc/sudoers.tmp: $(cat "$WORK/edlog")"
-  # the result is accepted by a full check
+
   "$VISUDO" -c >/dev/null 2>&1 || fail "visudo -c fails after the edit"
   end
 }
@@ -455,7 +455,7 @@ begin edit-zero-length && {
 }
 
 begin edit-editor-arguments && {
-  # words of $EDITOR are kept; sudo.ws passes "--" before the file
+
   XENV=(EDITOR="$ED/noop -a -b")
   vrun
   expect_rc 0
@@ -482,7 +482,7 @@ begin edit-specified-editor-missing && {
 }
 
 begin edit-no-env-editor-uses-editor-list && {
-  # !env_editor: $EDITOR is ignored unless it is in the editor list
+
   printf 'Defaults !env_editor\nDefaults editor=%s\n' "$ED/append" >>/etc/sudoers
   XENV=(EDITOR="$ED/empty" LINE='bob ALL=/usr/bin/id')
   vrun
@@ -504,7 +504,7 @@ begin edit-no-editor-found && {
 }
 
 begin edit-busy-concurrent && {
-  # a second visudo while the first one's editor is running
+
   XENV=(EDITOR="$ED/wait" STARTED="$WORK/scratch/started" RELEASE="$WORK/scratch/release")
   env -i PATH=/usr/bin:/bin "${XENV[@]}" timeout 30 "$VISUDO" </dev/null >/dev/null 2>&1 &
   first=$!
@@ -523,7 +523,7 @@ begin edit-busy-concurrent && {
 }
 
 begin edit-busy-against-sudo-ws && {
-  # a sudo.ws visudo holds the lock: lean-sudo's visudo must back off
+
   XENV=(EDITOR="$ED/wait" STARTED="$WORK/scratch/started" RELEASE="$WORK/scratch/release")
   env -i PATH=/usr/bin:/bin "${XENV[@]}" timeout 30 "$REFERENCE" </dev/null >/dev/null 2>&1 &
   first=$!
@@ -540,8 +540,8 @@ begin edit-busy-against-sudo-ws && {
 }
 
 begin edit-sudo-ws-busy-against-selected && {
-  # The reverse direction checks that the selected implementation's record lock
-  # conflicts with sudo.ws, independently of any temporary file.
+
+
   XENV=(EDITOR="$ED/wait" STARTED="$WORK/scratch/started" RELEASE="$WORK/scratch/release")
   env -i PATH=/usr/bin:/bin "${XENV[@]}" timeout 30 "$VISUDO" </dev/null >/dev/null 2>&1 &
   first=$!
@@ -622,9 +622,9 @@ begin edit-as-non-root-refused && {
   end
 }
 
-# ===========================================================================
-# Command line
-# ===========================================================================
+
+
+
 
 begin help-exit-0 && {
   vrun -h
@@ -663,7 +663,7 @@ begin missing-option-argument && {
   end
 }
 
-# Exact reference comparison for read-only operations. Only argv[0] differs.
+
 compare_reference() {
   local ours_rc=$RC
   sed 's/visudo\.ws/visudo/g' "$WORK/out" >"$WORK/ours.out"
@@ -688,8 +688,8 @@ for flag in '' -s -q -sq; do
         unused) printf 'Cmnd_Alias C = /bin/ls\nroot ALL = ALL\n' >"$WORK/scratch/s";;
       esac
       vrun -cf "$WORK/scratch/s" ${flag:+"$flag"}
-      # Documented lockout-prevention deviation: lean-sudo enforces the runtime's
-      # alias validation even without -s. Its diagnostic matches reference -s.
+
+
       if [[ $IS_REF == 0 && $kind != unused ]]; then
         expect_rc 1
         compare_reference -csf "$WORK/scratch/s" ${flag:+"$flag"}
@@ -859,8 +859,8 @@ for kind in unknown-default invalid-default duplicate unused-undefined unused-cy
       esac
       printf '%b' "$text" >"$WORK/scratch/s"
       vrun -cf "$WORK/scratch/s" ${flag:+"$flag"}
-      # Upstream ignores invalid unreferenced aliases; lean-sudo's runtime
-      # validates them, so its visudo must refuse them in every mode.
+
+
       if [[ $IS_REF == 0 && $kind == unused-* ]]; then
         expect_rc 1
         expect_out_empty
@@ -999,8 +999,8 @@ begin edit-dash-is-literal-filename && {
 }
 
 begin edit-refused-undefined-alias-keeps-sudo-working && {
-  # Reference needs -s to refuse this policy; lean-sudo must always refuse it
-  # because its runtime rejects undefined aliases before evaluating any command.
+
+
   chown root:root "$SUDO"
   chmod 4755 "$SUDO"
   "$SUDO" -n /usr/bin/true || fail "sudo failed before editing"
@@ -1073,8 +1073,8 @@ EOF
   end
 }
 
-# Callback warnings belong to the applied global/host/user Defaults phase.
-# Merely type-checking a nonmatching, runas, or command scope must not emit them.
+
+
 for scope in global unset user other-user host other-host runas command sudo-user parser-order; do
   for mode in check quiet-check edit quiet-edit; do
     begin "defaults-callback-$scope-$mode" && {
@@ -1111,9 +1111,9 @@ for scope in global unset user other-user host other-host runas command sudo-use
   done
 done
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
+
+
+
 
 emit "1..$NUM"
 emit "# implementation: $LABEL ($VISUDO)"

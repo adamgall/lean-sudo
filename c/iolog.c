@@ -1,4 +1,3 @@
-/* sudo-compatible on-disk I/O logs. Policy and metadata rendering live in Lean. */
 #include "shim.h"
 #include "locale_scope.h"
 #include "logsrv.h"
@@ -42,8 +41,6 @@ static lean_obj_res failure(const char *what) {
   snprintf(msg, sizeof msg, "%s: %s", what, strerror(errno));
   return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(msg)));
 }
-/* Walk from / with openat/O_NOFOLLOW. Never follow a log-path symlink, including
- * intermediate components, and never change permissions of existing ancestors. */
 static int directory(const char *path) {
   if (*path != '/') { errno = EINVAL; return -1; }
   char *copy = strdup(path);
@@ -64,8 +61,6 @@ static int directory(const char *path) {
       err = errno; close(fd); fd = -1; errno = err;
     }
   }
-  /* As sudo does, enforce the configured owner/mode on the final directory,
-   * including a reused session after sequence rollover, not its ancestors. */
   if (fd >= 0 && (fchown(fd, logstate.uid, logstate.gid) || fchmod(fd, mode))) {
     int err = errno; close(fd); fd = -1; errno = err;
   }
@@ -93,7 +88,6 @@ static void reset(void) {
   free(logstate.patterns); logstate.patterns = NULL; logstate.npatterns = 0;
   logstate.active = 0;
 }
-/* Called in the forked command; do not flush the parent's copied gzip buffers. */
 void ls_iolog_child_close(void) {
   ls_logsrv_child_close();
   if (!logstate.active) return;
@@ -181,7 +175,6 @@ int ls_iolog_close(int exit_code, int signal_number) {
   (void)exit_code; (void)signal_number;
   if (!logstate.active) return 0;
   int rc = 0, ignore = logstate.ignore;
-  /* sudoreplay uses cleared timing write bits to distinguish completed logs. */
   if (logstate.fd[5] >= 0 && fchmod(logstate.fd[5], logstate.mode & ~0222)) rc = -1;
   for (int i = 0; i < 6; i++) {
     if (logstate.gz[i]) { if (z_gzclose(logstate.gz[i])) rc = -1; logstate.gz[i] = NULL; }
@@ -270,7 +263,6 @@ bad:
   err = errno ? errno : EINVAL; close(fd); errno = err;
   return failure("I/O log sequence");
 }
-/* Remote sessions reuse the same password filter, but never create local files. */
 LEAN_EXPORT lean_obj_res leansudo_iolog_remote(uint32_t flags,
     b_lean_obj_arg patterns, lean_obj_arg world) {
   (void)world;

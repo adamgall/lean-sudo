@@ -1,4 +1,4 @@
-# sudoers grammar and include semantics, exercised against both implementations.
+
 begin parser-extended-grammar && {
   install -m 0440 /dev/stdin /etc/sudoers.d/parser <<'EOF'
 User_Alias PARSER_USERS = +missingnetgroup, %:external, %:#1234, nick

@@ -1,9 +1,9 @@
-# Real LDAP -> SSSD sudo responder -> libsss_sudo integration, with no network
-# beyond loopback. Run reference first: integration/run.sh reference '^sssd-'.
-# Each case owns fresh slapd data, SSSD caches and services; no systemd required.
-# Expectations come from sudo.ws 1.9.17p2 sssd.c / ldap_util.c / lookup.c and
-# sudo_nss.c. Output (including LDAP role names in -ll) is compared with the
-# installed reference, byte-for-byte; it is never synthesized as files output.
+
+
+
+
+
+
 
 sssd_stop() {
   local pid=$1 i
@@ -22,7 +22,7 @@ sssd_cleanup() {
   sssd_stop "${SSSD_PID:-}"
   sssd_stop "${SSSD_LDAP_PID:-}"
   SSSD_PID= SSSD_LDAP_PID=
-  # Keep service diagnostics in the harness log even on a setup failure.
+
   local f
   for f in "$SSSD_DIR"/*.log; do
     [[ -f $f ]] || continue
@@ -98,8 +98,8 @@ gidNumber: $(gid_of ivan)
 memberUid: ivan
 EOF
   sssd_role defaults 'sudoOption: lecture=never' 'sudoOption: passwd_tries=1' "sudoOption: $auth"
-  # A separate command is a positive end-to-end readiness probe, including for
-  # negative cases: an unavailable server must not make a denial test pass.
+
+
   sssd_role ready 'sudoUser: ivan' 'sudoHost: ALL' 'sudoCommand: /usr/bin/true' \
     'sudoRunAsUser: root' 'sudoOption: !authenticate' 'sudoOrder: 1'
   local users='sudoUser: ivan' hosts='sudoHost: ALL' commands='sudoCommand: /usr/bin/id' runas='sudoRunAsUser: root'
@@ -107,9 +107,9 @@ EOF
   case $scenario in
     deny|nss-notfound-return|nss-notfound-continue) commands='sudoCommand: /usr/bin/printf';;
     command-negation) commands=$'sudoCommand: /usr/bin/id\nsudoCommand: !/usr/bin/id';;
-    # Measured sudo.ws 1.9.17p2 + SSSD 2.12.0 allows this mixed rule.
-    # Do not impose files-style negation precedence on SSSD's returned values:
-    # sudo_sss_check_user stops walking values at its first positive match.
+
+
+
     user-negation) users=$'sudoUser: !ivan\nsudoUser: ALL';;
     host-negation) hosts=$(printf 'sudoHost: ALL\nsudoHost: !%s' "$host");;
     runas-negation) runas=$'sudoRunAsUser: ALL\nsudoRunAsUser: !root';;
@@ -140,13 +140,13 @@ EOF
   sssd_role ldap-policy "${attrs[@]}" "$options" "sudoOrder: $order"
   case $scenario in
     order-deny)
-      # Insert the lower-order role LAST, deliberately opposing insertion order.
+
       sssd_role lower-order 'sudoUser: ivan' 'sudoHost: ALL' 'sudoCommand: /usr/bin/id' 'sudoOrder: 10';;
     order-allow)
       sssd_role lower-order 'sudoUser: ivan' 'sudoHost: ALL' 'sudoCommand: !/usr/bin/id' 'sudoOrder: 10';;
     order-negative)
-      # Upstream's LDAP schema permits signed integer sudoOrder values. A
-      # larger negative order must win, independent of LDAP insertion order.
+
+
       sssd_role lower-order 'sudoUser: ivan' 'sudoHost: ALL' 'sudoCommand: !/usr/bin/id' 'sudoOrder: -20';;
     role-auth-scope)
       sssd_role requires-password 'sudoUser: ivan' 'sudoHost: ALL' 'sudoCommand: /usr/bin/printf' 'sudoOrder: 30';;
@@ -157,8 +157,8 @@ EOF
 
 sssd_setup() {
   local scenario=$1 i CMD_TIMEOUT=3
-  # Do not stop or overwrite an unrelated daemon. The integration image starts
-  # no services; both processes below are foreground children in owned groups.
+
+
   if pgrep -x sssd >/dev/null || pgrep -x slapd >/dev/null; then
     fail 'SSSD fixture requires the throwaway container with sssd/slapd stopped'
     return 1
@@ -173,8 +173,8 @@ sssd_setup() {
   mkdir -p /etc/sssd /var/lib/sss
   mv /etc/sssd "$SSSD_DIR/etc-sssd.orig" || return 1
   mv /var/lib/sss "$SSSD_DIR/lib-sss.orig" || return 1
-  # Preserve package-created ownership/modes (including non-root SSSD builds),
-  # but never reuse the original cache or a previous case's cached rules.
+
+
   cp -a "$SSSD_DIR/lib-sss.orig" /var/lib/sss || return 1
   rm -rf /var/lib/sss/db/* /var/lib/sss/mc/* /var/lib/sss/pipes/*
   mkdir -p /etc/sssd/conf.d /var/lib/sss/db /var/lib/sss/mc \
@@ -199,7 +199,7 @@ directory $SSSD_DIR/data
 index objectClass eq
 access to * by * read
 EOF
-  # Generate isolated cn=config, then load the vendored schema offline.
+
   slapcat -n 0 -f "$SSSD_DIR/slapd.conf" -F "$SSSD_DIR/config" -l "$SSSD_DIR/config.ldif" >"$SSSD_DIR/schema.log" 2>&1 || return 1
   slapadd -n 0 -F "$SSSD_DIR/config" -l /opt/sudo-it/sudo-schema.ldif >>"$SSSD_DIR/schema.log" 2>&1 || return 1
   sssd_fixture "$scenario"
@@ -241,14 +241,14 @@ enumerate = false
 min_id = 1
 EOF
   chmod 0600 /etc/sssd/sssd.conf
-  # Do not include the stock sudoers.d grants. Identity still resolves from the
-  # existing local account; SSSD independently finds its matching LDAP UID/GID.
+
+
   printf 'Defaults !authenticate, lecture=never\n' >/etc/sudoers
   chmod 0440 /etc/sudoers
   sssd_nss sss
-  # Ubuntu's service unit requires SupplementaryGroups=sssd when running the
-  # monitor as root: SSSD drops DAC capabilities before opening its sockets.
-  # Keep package sssd:sssd ownership and private group-only directory access.
+
+
+
   setsid setpriv --groups=sssd -- sssd -i --logger=stderr >"$SSSD_DIR/sssd.log" 2>&1 &
   SSSD_PID=$!
   for ((i=0; i<50; i++)); do
@@ -310,7 +310,7 @@ for sssd_case in allow deny command-negation user-negation host-negation runas-n
             nss-notfound-return) sssd_nss 'sss [NOTFOUND=return] files'; sssd_expected=1;;
             nss-notfound-continue) sssd_nss 'sss files';;
             nss-files-success-return) sssd_nss 'files [SUCCESS=return] sss';;
-            # sudo_nss.c defines SUCCESS as a specified match, including DENY.
+
             nss-sss-success-return) sssd_nss 'sss [SUCCESS=return] files'; sssd_expected=1;;
           esac;;
       esac
@@ -321,8 +321,8 @@ for sssd_case in allow deny command-negation user-negation host-negation runas-n
         runas-user) expect_out_line "$(uid_of bob)";;
         runas-group) expect_out_line 0;;
         role-runas-default)
-          # Measured reference behavior: the rule matches with the initial
-          # root default, then its option changes the execution target to ivan.
+
+
           expect_out_line "$(uid_of ivan)";;
         role-runchroot|role-runchroot-cwd)
           expect_out_line jail-marker

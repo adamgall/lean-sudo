@@ -2,43 +2,10 @@ import LeanSudo.Policy.Defaults
 import LeanSudo.Sss
 import LeanSudo.Cli
 
-/-!
-# `sudo -l` rendering
-
-`listPrivileges` renders sudo 1.9.17p2's short and verbose listing formats:
-
-```
-Matching Defaults entries for alice on host:
-    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/bin
-
-Runas and Command-specific defaults for alice:
-    Defaults>root !set_logname
-
-User alice may run the following commands on host:
-    (ALL : ALL) ALL
-    (root) NOPASSWD: /usr/bin/ls, /usr/bin/cat
-```
-
-* "Matching Defaults entries": global, matching `Defaults@host` and matching
-  `Defaults:user` entries, in file order; omitted when empty.
-* "Runas and Command-specific defaults": every `Defaults>…` then every `Defaults!…`
-  entry (sudo prints them without matching); omitted when empty.
-* Privileges: every command spec of every user spec whose user list matches `user`
-  and whose host list matches `host`. Inherited run-as specs join on a line; an
-  explicit run-as spec starts a new line even if its value is unchanged. Aliases
-  expand with negation composition. Verbose entries retain source filenames.
-* No privileges ⇒ only `User <u> is not allowed to run sudo on <h>.`
-* Output folding shares `Cli.wrapListing` with help text and follows `sudo_lbuf_print`,
-  using separate Defaults and privilege indents; zero columns means unwrapped output.
-
-The result ends with a newline.
--/
-
 namespace LeanSudo.Policy
 
 open LeanSudo.Sudoers
 
-/-- Backslash-escape the given characters. -/
 def escapeChars (special : List Char) (s : String) : String :=
   String.ofList (s.toList.flatMap fun c => if special.contains c then ['\\', c] else [c])
 
@@ -125,7 +92,6 @@ private def renderUserMember (user : String) (m : Member UserAtom) : String :=
   | .myself => neg ++ user
   | a => word (renderUserAtom a)
 
-/-- sudo quotes values containing blanks and escapes sudoers metacharacters otherwise. -/
 def renderDefaultsValue (v : String) : String :=
   if v.toList.any (fun c => c == ' ' || c == '\t') then "\"" ++ escapeChars ['"'] v ++ "\""
   else escapeChars [':', ',', '=', '#', '"'] v
@@ -135,7 +101,6 @@ def renderSetting (d : DefaultsSetting) : String :=
   | .flag _ => opText d.op ++ d.name
   | .assign v | .add v | .remove v => d.name ++ opText d.op ++ renderDefaultsValue v
 
-/-- Expand aliases without losing the polarity inherited from enclosing aliases. -/
 def expandMembers {α : Type} (aliasName : α → Option String)
     (defs : List (String × List (Member α))) : Nat → Bool → List (Member α) → List (Member α)
   | 0, neg, ms => ms.map fun m => { m with negated := m.negated != neg }
@@ -169,7 +134,6 @@ def renderRunas (st : Settings) (rs : Option RunasSpec) (al : Aliases := {})
   let groups := (rs.bind (·.groups)).map fun gs => " : " ++ expandedUsers al user gs
   "(" ++ runasUsers al st user rs ++ groups.getD "" ++ ")"
 
-/-- UTC generalized time, the format sudo uses when displaying time restrictions. -/
 def renderGeneralizedTime (seconds : Nat) : String :=
   let days := seconds / 86400
   let leap (y : Nat) := y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
@@ -186,7 +150,6 @@ def renderGeneralizedTime (seconds : Nat) : String :=
   pad year 4 ++ pad month 2 ++ pad (day + 1) 2 ++
     pad (seconds / 3600 % 24) 2 ++ pad (seconds / 60 % 60) 2 ++ pad (seconds % 60) 2 ++ "Z"
 
-/-- Changed options precede tags, in fmtsudoers.c's order. -/
 def renderOptsTags (prev : Option CmndSpec) (cs : CmndSpec) : String :=
   let changed {β : Type} [BEq β] (get : CmndSpec → Option β) : Option β :=
     match get cs with
@@ -268,8 +231,6 @@ private def sources (s : Sudoers) (located : List Located) : List Located :=
     s.map fun e => { file := "/etc/sudoers", line := 1, entry := e }
   else located
 
-/-- Omit specs whose local bounds lack system-zone facts, rather than rendering
-an unresolved civil timestamp as UTC. Matching and display share the resolver. -/
 private def displaySpec (localTimeBounds : List (Nat × Nat)) (cs : CmndSpec) :
     Option CmndSpec := do
   let resolve (localTime : Bool) : Option Nat → Option (Option Nat)
@@ -280,7 +241,6 @@ private def displaySpec (localTimeBounds : List (Nat × Nat)) (cs : CmndSpec) :
   pure { cs with options := { cs.options with
     notBefore, notAfter, notBeforeLocal := false, notAfterLocal := false } }
 
-/-- Short or verbose privileges. Locations preserve the source filename for `-ll`. -/
 def listPrivileges (s : Sudoers) (st : Settings) (user : Principal) (host : String)
     (verbose : Bool := false) (located : List Located := [])
     (facts : Option Request := none) (columns : Nat := 0) : String :=
@@ -298,7 +258,6 @@ def listPrivileges (s : Sudoers) (st : Settings) (user : Principal) (host : Stri
   let commandBound := ds.filterMap fun
     | (.cmnd cs, ss) => some s!"    Defaults!{", ".intercalate (cs.map (expandedCommands al ", "))} {", ".intercalate (ss.map renderSetting)}"
     | _ => none
-  -- display_bound_defaults_by_type does not insert a newline between the two types.
   let bound := "\n".intercalate runasBound ++ "\n".intercalate commandBound
   let privs := (sources s located).flatMap fun l =>
     match l.entry with
@@ -325,7 +284,6 @@ def listPrivileges (s : Sudoers) (st : Settings) (user : Principal) (host : Stri
         (s!"User {user.name} may run the following commands on {host}:\n" ++ String.join privs)
         columns 8
 
-/-- Display the exact last matching command specification for `sudo -ll command`. -/
 def listCommand (s : Sudoers) (st : Settings) (r : Request) (located : List Located := [])
     (verbose : Bool := false) : String :=
   let al := aliasesOf s

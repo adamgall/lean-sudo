@@ -1,11 +1,3 @@
-/*
- * lean-sudo C shim for visudo (LeanSudo.Visudo.Sys): locking the sudoers file,
- * creation/truncation of the temporary copy, and fixing its owner/mode before it is
- * renamed over the original.
- *
- * Conventions as in core.c: IO functions return a Lean IO result (no world
- * argument), string arguments are borrowed and rejected if they contain NUL.
- */
 #include "shim.h"
 
 #include <errno.h>
@@ -23,14 +15,12 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-
 static lean_obj_res io_errno_path(const char *what, const char *path, int e) {
     char ebuf[256], buf[1024];
     snprintf(buf, sizeof buf, "%s%s%s: %s", what, *what ? " " : "", path,
         strerror_r(e, ebuf, sizeof ebuf));
     return ls_error(buf);
 }
-
 
 LEAN_EXPORT lean_obj_res leansudo_visudo_run_editor(b_lean_obj_arg path,
         b_lean_obj_arg args) {
@@ -70,8 +60,6 @@ LEAN_EXPORT lean_obj_res leansudo_visudo_run_editor(b_lean_obj_arg path,
     return lean_io_result_mk_ok(lean_box(rv != -1 && WIFEXITED(status)));
 }
 
-/* Keep every original descriptor open: OFD locks survive independent reads and
- * conflict with sudo.ws's POSIX record locks. */
 struct locked_file {
     struct locked_file *next;
     char *path;
@@ -81,7 +69,6 @@ struct locked_file {
 };
 static struct locked_file *locked_files;
 
-/* A missing original is created before locking, just as upstream does. */
 LEAN_EXPORT lean_obj_res leansudo_visudo_lock(b_lean_obj_arg path, uint32_t mode) {
     const char *p = ls_cstr(path);
     if (!p) return ls_error("invalid path");
@@ -131,8 +118,6 @@ LEAN_EXPORT lean_obj_res leansudo_visudo_lock(b_lean_obj_arg path, uint32_t mode
     return lean_io_result_mk_ok(lean_box(created ? 2 : 0));
 }
 
-/* An unchanged original may be a symlink. Use the descriptor we already locked,
- * not a fresh O_NOFOLLOW open of the pathname, and avoid needless metadata writes. */
 LEAN_EXPORT lean_obj_res leansudo_visudo_correct_locked_metadata(b_lean_obj_arg path,
         uint32_t uid, uint32_t gid, uint32_t mode, uint8_t owner, uint8_t perms) {
     const char *p = ls_cstr(path);
@@ -148,7 +133,6 @@ LEAN_EXPORT lean_obj_res leansudo_visudo_correct_locked_metadata(b_lean_obj_arg 
     }
     struct stat st;
     if (fd == -1) {
-        /* Different include spellings can refer to the same locked inode. */
         if (stat(p, &st) != 0) return io_errno_path("unable to stat", p, errno);
         for (struct locked_file *l = locked_files; l; l = l->next) {
             if (l->dev == st.st_dev && l->ino == st.st_ino) {
@@ -212,7 +196,6 @@ static bool track_temp(const char *path) {
     return true;
 }
 
-/* Reuse stale temporary files; the original's record lock excludes live edits. */
 LEAN_EXPORT lean_obj_res leansudo_visudo_create_temp(b_lean_obj_arg path, b_lean_obj_arg content) {
     const char *p = ls_cstr(path);
     if (!p) return ls_error("invalid path");
@@ -233,8 +216,6 @@ LEAN_EXPORT lean_obj_res leansudo_visudo_create_temp(b_lean_obj_arg path, b_lean
     return lean_io_result_mk_ok(lean_box(0));
 }
 
-/* Preserve original mtime so an untouched editor buffer is distinguishable from
- * a rewrite with identical bytes. */
 LEAN_EXPORT lean_obj_res leansudo_visudo_temp_time(b_lean_obj_arg original, b_lean_obj_arg temp) {
     const char *p = ls_cstr(original), *t = ls_cstr(temp);
     if (!p || !t) return ls_error("invalid path");
@@ -257,7 +238,6 @@ LEAN_EXPORT lean_obj_res leansudo_visudo_modified(b_lean_obj_arg original, b_lea
     return lean_io_result_mk_ok(lean_box(changed));
 }
 
-/* Upstream's compatibility option deliberately invokes cvtsudoers via PATH. */
 LEAN_EXPORT lean_obj_res leansudo_visudo_export(b_lean_obj_arg input, b_lean_obj_arg output) {
     const char *in = ls_cstr(input), *out = ls_cstr(output);
     if (!in || !out) return ls_error("invalid path");
@@ -265,10 +245,6 @@ LEAN_EXPORT lean_obj_res leansudo_visudo_export(b_lean_obj_arg input, b_lean_obj
     return io_errno_path("unable to execute", "cvtsudoers", errno);
 }
 
-/*
- * Open `path` without following symlinks, require a regular file, then
- * fchown(uid, gid), fchmod(mode) and fsync it.
- */
 LEAN_EXPORT lean_obj_res leansudo_visudo_set_owner_mode(b_lean_obj_arg path, uint32_t uid,
                                                         uint32_t gid, uint32_t mode) {
     const char *p = ls_cstr(path);

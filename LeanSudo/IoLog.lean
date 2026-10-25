@@ -4,7 +4,6 @@ import Lean.Data.Json
 namespace LeanSudo.IoLog
 open Lean
 
-/-- The policy-selected streams; C only writes streams selected here. -/
 structure Plan where
   dir : String
   file : String
@@ -74,7 +73,6 @@ def sequencePath (n : Nat) : String :=
 
 def nextSequence (n maxseq : Nat) : Nat := if n ≥ maxseq then 1 else n + 1
 
-/-- Expanded values cannot inject directories (the sequence deliberately can). -/
 def pathValue (s : String) : String := s.replace "/" "_"
 
 def namedValue (m : Metadata) (seq name : String) : Option String :=
@@ -88,7 +86,6 @@ def namedValue (m : Metadata) (seq name : String) : Option String :=
   | "command" => some (pathValue ((m.command.splitOn "/").getLast!))
   | _ => none
 
-/-- Fold escapes directly, without allocating an intermediate token list. -/
 @[specialize] private def foldEscapes {α : Type} (literal : Char → α → α)
     (named : List Char → α → α) (time : String → α → α) (empty : α) : List Char → α
   | [] => empty
@@ -104,11 +101,9 @@ def namedValue (m : Metadata) (seq name : String) : Option String :=
   | c :: cs => literal c (foldEscapes literal named time empty cs)
 termination_by cs => cs.length
 
-/-- Only the time escapes actually requested need an operating-system oracle. -/
 def timeKeys (cs : List Char) : List String :=
   foldEscapes (fun _ rest => rest) (fun _ rest => rest) List.cons [] cs
 
-/-- Expand sudo's named escapes and strftime escapes using the shell's snapshot. -/
 def expandChars (m : Metadata) (seq : String) (time : List (String × String))
     (cs : List Char) : String :=
   foldEscapes (fun c rest => String.singleton c ++ rest)
@@ -128,8 +123,6 @@ def legacyLog (m : Metadata) (seconds : Nat) : String :=
   m.cwd.replace "\n" " " ++ "\n" ++
   (String.intercalate " " m.argv.toList).replace "\n" " " ++ "\n"
 
-/-- sudoreplay's JSON reader is line-oriented: nested object/array delimiters must
-occupy their own lines, even when a conventional JSON pretty-printer would fit them. -/
 def jsonLog (m : Metadata) (seconds nanoseconds : Nat) : String :=
   let field (key : String) (value : Lean.Json) :=
     "  \"" ++ key ++ "\": " ++ value.compress ++ ",\n"

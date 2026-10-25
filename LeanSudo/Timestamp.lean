@@ -1,43 +1,20 @@
 import LeanSudo.Policy.Types
 
-/-!
-# Timestamp records (pure)
-
-Credential-cache identity, validity, and fixed-slot encoding.
-Runtime uses the bounded `scanStep` raw-slot decoder, `LocatedEntry.recordFor`,
-and `updateEntry`; their theorems cover the same helpers consumed by IO.
-Raw slot matching preserves malformed first matches, while authorization rejects
-invalid timespecs (including global start times). All IO lives in `LeanSudo.Sys.Timestamp`.
-
-Times are `CLOCK_BOOTTIME` nanoseconds; timeouts are seconds (as in sudoers).
--/
-
 namespace LeanSudo.Timestamp
 
-/-- What a cached credential is bound to (sudo's `timestamp_type`). Start times
-(nanoseconds since boot, converted from `/proc/<pid>/stat`) guard against pid reuse. -/
 inductive Scope where
-  /-- terminal device number, session id, start time of the session leader -/
   | tty (dev : Nat) (sid : Nat) (sidStart : Nat)
-  /-- parent process id and its start time -/
   | ppid (pid : Nat) (start : Nat)
   | global
   deriving DecidableEq, Repr, Inhabited
 
 structure Record where
   scope : Scope
-  /-- uid whose credentials were checked: the invoking user, or the target / root
-  user with `targetpw` / `rootpw` -/
   authUid : Nat
-  /-- `CLOCK_BOOTTIME` nanoseconds at successful authentication -/
   time : Nat
-  /-- set by `sudo -k` -/
   disabled : Bool
   deriving DecidableEq, Repr, Inhabited
 
-/-- Linux has no kernel tty tickets. Authentication uses sudo's
-`ts_init_key_nonglobal`: `kernel` shares the tty scope, falling back to the
-parent process only without a controlling terminal. -/
 def scopeFor (t : TimestampType) (ttyDev : Option Nat) (sid sidStart ppid ppidStart : Nat) :
     Scope :=
   match t with
@@ -54,7 +31,6 @@ theorem kernel_scope_tty (ttyDev : Nat) (sid sidStart ppid ppidStart : Nat) :
 theorem kernel_scope_no_tty (sid sidStart ppid ppidStart : Nat) :
     scopeFor .kernel none sid sidStart ppid ppidStart = .ppid ppid ppidStart := rfl
 
-/-- A kernel-mode ticket on another tty cannot authorize this request. -/
 theorem kernel_scope_terminal_separation (tty₁ tty₂ sid sidStart ppid ppidStart : Nat)
     (h : tty₁ ≠ tty₂) :
     scopeFor .kernel (some tty₁) sid sidStart ppid ppidStart ≠
@@ -62,13 +38,11 @@ theorem kernel_scope_terminal_separation (tty₁ tty₂ sid sidStart ppid ppidSt
   simpa [scopeFor] using (fun eq => h (Scope.tty.inj eq).1 :
     Scope.tty tty₁ sid sidStart ≠ .tty tty₂ sid sidStart)
 
-/-- Timeout in seconds (`none` = never expires, `some 0` = never cache) → nanoseconds check. -/
 def fresh (now : Nat) (timeout : Option Nat) (time : Nat) : Bool :=
   match timeout with
   | none => true
   | some t => t != 0 && decide (now - time < t * 10 ^ 9)
 
-/-- A record grants authentication for `(scope, authUid)` at time `now`. -/
 def valid (now : Nat) (timeout : Option Nat) (scope : Scope) (authUid : Nat) (r : Record) :
     Bool :=
   !r.disabled && decide (r.scope = scope) && decide (r.authUid = authUid) &&
@@ -77,15 +51,6 @@ def valid (now : Nat) (timeout : Option Nat) (scope : Scope) (authUid : Nat) (r 
 def lookup (now : Nat) (timeout : Option Nat) (scope : Scope) (authUid : Nat)
     (rs : List Record) : Bool :=
   rs.any (valid now timeout scope authUid)
-
-/-! ## Ubuntu64 sudo timestamp v2
-
-The wire layout is sudo 1.9.17p2's little-endian `timestamp_entry`: four
-16-bit header fields, uid and sid (32 bits), two 64-bit seconds/nanoseconds
-pairs, and the 64-bit ttydev/ppid union. There is no file-level count or magic.
-The first entry is the exclusive-allocation lock. Runtime scans retain byte
-offsets, including across foreign records, and never compact a locked file.
--/
 
 def recordSize : Nat := 56
 
@@ -102,7 +67,6 @@ structure DiskEntry where
 structure LocatedEntry where
   offset : Nat
   entry : DiskEntry
-  /-- Raw timespec validity is separate from slot identity. -/
   startValid : Bool := true
   timeValid : Bool := true
   deriving DecidableEq, Repr, Inhabited
@@ -124,8 +88,6 @@ def DiskEntry.toRecord (e : DiskEntry) : Option Record := do
     | _ => none
   return { scope, authUid := e.authUid, time := e.time, disabled := e.flags % 2 == 1 }
 
-/-- Set only TS_DISABLED. The quotient preserves every higher flag bit; runtime
-invalidation writes only these two flag bytes, never re-encodes a raw slot. -/
 def disabledEntry (entry : DiskEntry) : DiskEntry :=
   { entry with flags := entry.flags / 2 * 2 + 1 }
 
@@ -149,9 +111,6 @@ theorem disabledEntry_toRecord_disabled {entry : DiskEntry} {record : Record}
     (h : (disabledEntry entry).toRecord = some record) : record.disabled = true := by
   simpa [disabledEntry_low_flag] using DiskEntry.toRecord_disabled h
 
-/-- Slot identity deliberately ignores SID and disabled status, just like
-`ts_match_record`. SID is checked separately before authorizing a ticket.
-`anyUid` belongs to the search key, never to the stored entry's flags. -/
 def DiskEntry.matches (e : DiskEntry) (scope : Scope) (authUid : Nat)
     (anyUid : Bool := false) : Bool :=
   (anyUid || e.authUid == authUid) &&
@@ -194,8 +153,6 @@ theorem DiskEntry.matches_tty_sid_independent (e : DiskEntry)
     e.matches (.tty dev sid₁ start) uid anyUid =
       e.matches (.tty dev sid₂ start) uid anyUid := rfl
 
-/-- Runtime slot construction retains sudo's nonglobal lock identity in the
-unused fields of a global record. -/
 def entryFor (lockScope : Scope) (sid : Nat) (record : Record) : DiskEntry :=
   let entry := DiskEntry.ofRecord sid record
   if record.scope = .global then
@@ -205,8 +162,6 @@ def entryFor (lockScope : Scope) (sid : Nat) (record : Record) : DiskEntry :=
     | .global => entry
   else entry
 
-/-- Only the authenticated identity and scope of the locked ticket may be written.
-The IO layer additionally checks `Representable` before encoding. -/
 def updateEntry (scope lockScope : Scope) (sid authUid : Nat) (record : Record) :
     Option DiskEntry :=
   if record.scope = scope ∧ record.authUid = authUid then
@@ -247,8 +202,6 @@ theorem updateEntry_wrong_scope (scope lockScope : Scope) (sid uid : Nat) (recor
     (h : record.scope ≠ scope) : updateEntry scope lockScope sid uid record = none := by
   simp [updateEntry, h]
 
-/-- Fixed-width little-endian words; values outside the width are truncated.
-Roundtrip theorems explicitly require representability. -/
 def encNat : Nat → Nat → List UInt8
   | 0, _ => []
   | width + 1, n => UInt8.ofNat (n % 256) :: encNat width (n / 256)
@@ -299,7 +252,6 @@ theorem decTime_encTime (n : Nat) (rest : List UInt8)
   simp [encTime, decTime, List.append_assoc, decNat_encNat _ _ _ hs,
     decNat_encNat _ _ _ hn', h, hn, Nat.mod_add_div]
 
-/-- Bounds of the actual C scalar types, including signed pid_t/time_t. -/
 def DiskEntry.Representable (e : DiskEntry) : Prop :=
   e.kind < 256 ^ 2 ∧ e.flags < 256 ^ 2 ∧ e.authUid < 256 ^ 4 ∧
   e.sid < 2 ^ 31 ∧ e.start / 1000000000 < 2 ^ 63 ∧
@@ -328,7 +280,6 @@ def decEntry (bs : List UInt8) : Option (DiskEntry × List UInt8) := do
     let (start, bs) ← decTime bs
     let (time, bs) ← decTime bs
     let (rawKey, bs) ← decNat 8 bs
-    -- pid_t occupies only the low four bytes; the union's high bytes are padding.
     let key := if kind = 3 then rawKey % 256 ^ 4 else rawKey
     let e : DiskEntry := ⟨kind, flags, authUid, sid, start, time, key⟩
     if e.Representable then some (e, bs) else none
@@ -368,13 +319,10 @@ theorem decodeEntry_encodeEntry (e : DiskEntry) (h : e.Representable) :
   simp only [List.append_nil] at hd
   simp [decodeEntry, encodeEntry, hd]
 
-/-- Read at most eight bytes directly, without allocating lists for runtime slots. -/
 def slotWord (bytes : ByteArray) (offset : Nat) : Nat → Nat
   | 0 => 0
   | width + 1 => bytes[offset]!.toNat + 256 * slotWord bytes (offset + 1) width
 
-/-- Raw v2 decoder: signed SID bits and invalid timespecs still identify a slot.
-Unlike the canonical codec, this must not reject a slot before matching it. -/
 def decodeSlot (bytes : ByteArray) (offset : Nat := 0) : Option LocatedEntry :=
   if bytes.size = recordSize ∧ slotWord bytes 0 2 = 2 ∧
       slotWord bytes 2 2 = recordSize then
@@ -412,9 +360,6 @@ theorem decodeSlot_validity {bytes : ByteArray} {offset : Nat} {located : Locate
     · contradiction
   · contradiction
 
-/-- A bounded chunk is relative to `offset`, while `extent` is the absolute file end.
-Foreign records need only their header; a v2/56 slot requires an exact 56-byte window.
-No SID or timespec error terminates the structural scan. -/
 inductive ScanStep where
   | stop
   | next (offset : Nat) (entry : Option LocatedEntry)
@@ -464,14 +409,11 @@ theorem scanStep_decoded {bytes : ByteArray} {offset extent next : Nat}
 def DiskEntry.forSession (e : DiskEntry) (sid : Nat) : Option Record :=
   if e.kind = 1 ∨ e.sid = sid then e.toRecord else none
 
-/-- Identity matching precedes validity checks. A malformed nonglobal start
-cannot equal a normalized process-incarnation key; global identity ignores it. -/
 def LocatedEntry.matches (located : LocatedEntry) (scope : Scope) (authUid : Nat)
     (anyUid : Bool := false) : Bool :=
   (decide (scope = .global) || located.startValid) &&
     located.entry.matches scope authUid anyUid
 
-/-- sudo's status check validates both timespecs, even for global entries. -/
 def LocatedEntry.forSession (located : LocatedEntry) (sid : Nat) : Option Record :=
   if located.startValid && located.timeValid then located.entry.forSession sid else none
 
@@ -548,8 +490,6 @@ theorem LocatedEntry.recordFor_wrong_sid (located : LocatedEntry)
     (hs : located.entry.sid ≠ sid) : located.recordFor scope uid sid = none := by
   simp [LocatedEntry.recordFor, LocatedEntry.forSession, DiskEntry.forSession, hg, hs]
 
-/-! ## Properties -/
-
 theorem valid_sound {now : Nat} {timeout : Option Nat} {scope : Scope} {authUid : Nat}
     {r : Record} (h : valid now timeout scope authUid r = true) :
     (r.scope = scope ∧ r.authUid = authUid ∧ r.time ≤ now ∧
@@ -562,16 +502,12 @@ theorem valid_sound {now : Nat} {timeout : Option Nat} {scope : Scope} {authUid 
   simp only [Bool.and_eq_true, bne_iff_ne, ne_eq, decide_eq_true_eq] at hf
   exact ⟨Nat.le_of_lt hf.2, hf.1⟩
 
-/-- Finite tickets expire at the exact deadline, not one nanosecond later. -/
 theorem valid_timeout_strict {now timeout : Nat} {scope : Scope} {authUid : Nat}
     {r : Record} (h : valid now (some timeout) scope authUid r = true) :
     now - r.time < timeout * 10 ^ 9 := by
   simp only [valid, fresh, Bool.and_eq_true, decide_eq_true_eq] at h
   exact h.2.2
 
-/-- Runtime authorization connects the selected raw slot to credential identity,
-process/session binding, valid wire timespecs, and the disabled/future/expiry
-checks. It does not reason about an obsolete in-memory update path. -/
 theorem LocatedEntry.authorized_sound {located : LocatedEntry} {scope : Scope}
     {uid sid now : Nat} {timeout : Option Nat} {r : Record}
     (hr : located.recordFor scope uid sid = some r)
@@ -601,7 +537,6 @@ theorem lookup_iff {now : Nat} {timeout : Option Nat} {scope : Scope} {authUid :
     lookup now timeout scope authUid rs = true ↔ ∃ r ∈ rs, valid now timeout scope authUid r = true := by
   simp [lookup]
 
-/-- A successful lookup is witnessed by a record satisfying every validity condition. -/
 theorem lookup_sound {now : Nat} {timeout : Option Nat} {scope : Scope} {authUid : Nat}
     {rs : List Record} (h : lookup now timeout scope authUid rs = true) :
     ∃ r ∈ rs, r.scope = scope ∧ r.authUid = authUid ∧ r.time ≤ now ∧ r.disabled = false ∧
@@ -613,25 +548,21 @@ theorem lookup_sound {now : Nat} {timeout : Option Nat} {scope : Scope} {authUid
 @[simp] theorem lookup_nil (now : Nat) (timeout : Option Nat) (scope : Scope) (authUid : Nat) :
     lookup now timeout scope authUid [] = false := rfl
 
-/-- `timestamp_timeout = 0`: nothing is ever cached. -/
 theorem lookup_timeout_zero (now : Nat) (scope : Scope) (authUid : Nat) (rs : List Record) :
     lookup now (some 0) scope authUid rs = false := by
   simp [lookup, valid, fresh]
 
-/-- Disabling the selected runtime slot prevents authorization. -/
 theorem lookup_invalidateScope (located : LocatedEntry) (scope : Scope)
     (uid sid now : Nat) (timeout : Option Nat) {record : Record}
     (h : (LocatedEntry.recordFor { located with entry := disabledEntry located.entry }
       scope uid sid) = some record) : valid now timeout scope uid record = false :=
   located.disabled_not_valid scope uid sid now timeout h
 
-/-- The runtime invalidation branch leaves every nonmatching slot untouched. -/
 theorem invalidateScope_other (located : LocatedEntry) (scope : Scope)
     (h : located.matches scope 0 true = false) :
     (if located.matches scope 0 true then disabledEntry located.entry else located.entry) =
       located.entry := by simp [h]
 
-/-- A slot written for one authenticated key cannot authorize another key. -/
 theorem lookup_update_other {scope lockScope other : Scope} {sid uid otherUid now : Nat}
     {timeout : Option Nat} {record : Record} {entry : DiskEntry}
     (hw : updateEntry scope lockScope sid uid record = some entry)
@@ -645,22 +576,16 @@ theorem lookup_update_other {scope lockScope other : Scope} {sid uid otherUid no
     exact False.elim (hne (Prod.ext (hv.1.1.symm.trans hs.1)
       (hv.1.2.1.symm.trans hs.2.1)))
 
-/-- The fixed-slot runtime encoder round-trips representable disk entries. -/
 theorem decode_encode (entry : DiskEntry) (h : entry.Representable) :
     decodeEntry (encodeEntry entry) = some entry :=
   decodeEntry_encodeEntry entry h
 
-/-- A future-dated record (e.g. from before a clock reset) is never accepted. -/
 theorem valid_not_future {now : Nat} {timeout : Option Nat} {scope : Scope} {authUid : Nat}
     {r : Record} (h : now < r.time) : valid now timeout scope authUid r = false := by
   simp [valid]
   intros
   omega
 
-/-! ## `/proc` parsing helpers (pure) -/
-
-/-- Fields of `/proc/<pid>/stat` after the `comm` field. `comm` may contain spaces and
-parentheses, so parsing starts after the *last* `)`. Field 3 (`state`) is index 0. -/
 def statTailFields (bs : List UInt8) : Option (List String) :=
   let closeParen : UInt8 := 0x29
   match (bs.reverse.dropWhile (· != closeParen)) with
@@ -671,14 +596,11 @@ def statTailFields (bs : List UInt8) : Option (List String) :=
       (fun c => !c.all (· == 0x20))
     some (chunks.map fun c => String.ofList (c.map fun b => Char.ofNat b.toNat))
 
-/-- Numeric field `n` (1-based, as in `proc(5)`, `n ≥ 3`) of `/proc/<pid>/stat`. -/
 def statField (bs : List UInt8) (n : Nat) : Option Nat := do
   let fs ← statTailFields bs
   let f ← fs[n - 3]?
   f.toNat?
 
-/-- Convert the kernel's `tty_nr` encoding (`/proc/<pid>/stat` field 7) to a glibc
-`dev_t` (`makedev(major, minor)`), i.e. the terminal's `st_rdev`. -/
 def ttyNrToDev (n : Nat) : Nat :=
   let major := (n >>> 8) &&& 0xfff
   let minor := (n &&& 0xff) ||| ((n >>> 12) &&& 0xfff00)
