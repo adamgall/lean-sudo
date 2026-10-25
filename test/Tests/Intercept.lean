@@ -36,6 +36,16 @@ private def rmCtx : Core.Context := { ctx with
 #guard Intercept.environment #["LD_PRELOAD=/untrusted.so", "SUDO_USER=changed", "X=1"] ==
   #["LD_PRELOAD=/untrusted.so", "SUDO_USER=changed", "X=1"]
 
+private def rootedCtx : Core.Context := { ctx with
+  sudoers := policy "alice ALL=(root) CHROOT=/jail INTERCEPT: /usr/bin/id\n",
+  rootFacts := [("/jail", {
+    command := .run "/usr/bin/id" "/usr/bin/id" [], argv := ["/usr/bin/id"],
+    found := true, fileIds := [("/usr/bin/id", 2, 1)] })] }
+#guard (Intercept.decide rootedCtx true false).allowed
+#guard !(Intercept.decide { rootedCtx with rootFacts := [] } true false).allowed
+#guard !(Intercept.decide { rootedCtx with invoking := root } true false).allowed
+#guard !(Intercept.decide { rootedCtx with target := alice } true false).allowed
+
 private def defaults (text : String) : Settings :=
   match Policy.resolveDefaults (policy text) alice "box" (some root) none id with
   | .ok (st, _) => st

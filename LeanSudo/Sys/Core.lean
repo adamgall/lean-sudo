@@ -55,6 +55,8 @@ private def toId? (n : Nat) : Option UInt32 :=
 
 @[extern "lean_sudo_getuid"] opaque getuid : IO Nat
 @[extern "lean_sudo_geteuid"] opaque geteuid : IO Nat
+/-- Permanently set the process's real/effective UID; verify both after setuid. -/
+@[extern "lean_sudo_set_uid"] opaque setUid (uid : UInt32) : IO Unit
 @[extern "lean_sudo_getgid"] opaque getgid : IO Nat
 @[extern "lean_sudo_getegid"] opaque getegid : IO Nat
 

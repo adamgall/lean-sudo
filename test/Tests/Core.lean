@@ -306,6 +306,80 @@ def rootOnlyCtx : Context :=
   { rootedAllowed with selection := some { rootedSelection with root := "~" } } == some "/home/bob"
 #guard commandChroot { ctx with target := carol, policyTarget := some bob, opts := { mode := .edit }, settings := { runchroot := some "~" } }
   rootedAllowed == some "/home/carol"
+#guard (logLine ctx none (some rootedAllowed)).runchroot == some "/jail"
+#guard (failureLog { ctx with opts := { ctx.opts with chroot := some "/jail" } }
+  (warningInfo "denied" "denied") (some { rootedAllowed with chroot := none })).bind (·.runchroot) == none
+
+-- Policy acceptance is distinct from execution acceptance and alert/audit-only failures.
+def event (c : Context) := (decide c).log.map (·.event)
+def reportCtx : Context :=
+  { ctx with mailerAvailable := true, settings := { ctx.settings with mailAlways := true } }
+#guard event reportCtx == some .accept
+#guard event { reportCtx with command := none } == none
+#guard !(decide { reportCtx with command := none }).mail
+#guard (decide { reportCtx with command := none }).audit ==
+  some (.reject "id: command not found")
+#guard event { reportCtx with opts := { ctx.opts with mode := .validate } } == none
+#guard event { reportCtx with opts := { ctx.opts with mode := .list } } == none
+#guard !(decide { reportCtx with opts := { ctx.opts with mode := .list } }).mail
+#guard event { reportCtx with opts := { ctx.opts with timeout := some 5 } } == some .alert
+#guard !(decide { reportCtx with opts := { ctx.opts with timeout := some 5 } }).mail
+#guard (decide { reportCtx with opts := { ctx.opts with timeout := some 5 } }).log.bind (·.reason) ==
+  some "user not allowed to set a command timeout"
+#guard event { reportCtx with
+  commandSetid := true,
+  settings := { reportCtx.settings with intercept := true, interceptAllowSetid := false } } == some .reject
+#guard (decide { reportCtx with
+  commandSetid := true,
+  settings := { reportCtx.settings with intercept := true, interceptAllowSetid := false } }).log.bind (·.reason) ==
+  some "setid command rejected in intercept mode"
+#guard event { reportCtx with
+  invoking := root,
+  settings := { reportCtx.settings with rootSudo := false } } == none
+#guard event { reportCtx with
+  opts := { ctx.opts with impliedShell := true },
+  settings := { reportCtx.settings with shellNoargs := false } } == none
+#guard event { carolCtx with opts := { ctx.opts with envVars := [("LD_PRELOAD", "bad")] } } == some .alert
+#guard (decide { carolCtx with opts := { ctx.opts with envVars := [("LD_PRELOAD", "bad")] } }).audit == none
+
+-- Ordered pre-auth failures carry stage-specific event facts.
+def earlyCtx : Context :=
+  { reportCtx with
+    invoking := root, targetUnknownUid := true,
+    opts := { ctx.opts with host := some "remote", closeFrom := some 5 },
+    settings := { reportCtx.settings with rootSudo := false, requiretty := true } }
+#guard failure earlyCtx == some "sudo: a remote host may only be specified when listing privileges.\n"
+#guard (decide earlyCtx).log.any (fun line => line.event == .alert && !line.commandReady && !line.lookupComplete)
+#guard failure { earlyCtx with opts := { earlyCtx.opts with host := none } } ==
+  some "sudo: sudoers specifies that root is not allowed to sudo\n"
+#guard failure { earlyCtx with invoking := alice, opts := { earlyCtx.opts with host := none } } ==
+  some "sudo: you are not permitted to use the -C option\n"
+#guard failure { ctx with settings := { ctx.settings with requiretty := true, runasCheckShell := true } } ==
+  some "sudo: sorry, you must have a tty to run sudo\n"
+#guard (decide { ctx with settings := { ctx.settings with runasCheckShell := true } }).log.any (fun line =>
+  line.raw && line.msg == "alice : invalid shell for user root: /bin/bash")
+#guard failure { catCtx with command := none, opts := { catCtx.opts with chroot := some "/missing" } } ==
+  some "sudo: you are not permitted to use the -R option with cat\n"
+
+-- sudoedit applies ordinary CWD permission while retaining the original file base.
+def editCwdCtx : Context :=
+  { editCtx with
+    opts := { editCtx.opts with chdir := some "/tmp" },
+    settings := { editCtx.settings with runcwd := some "*" } }
+#guard match (decide editCwdCtx).action with
+  | .edit p => p.cwd == some "/tmp" && !p.cwdOptional &&
+      p.files == ["/home/alice/notes", "/etc/hosts"]
+  | _ => false
+#guard failure { editCwdCtx with settings := { editCwdCtx.settings with runcwd := some "/tmp" } } ==
+  some "sudo: you are not permitted to use the -D option with sudoedit\n"
+#guard match (decide { editCwdCtx with
+    settings := {},
+    sudoers := parsePolicy "alice ALL=(root) CWD=* sudoedit\n" }).action with
+  | .edit p => p.cwd == some "/tmp"
+  | _ => false
+#guard (decide editCwdCtx).log.bind (·.runcwd) == some "/tmp"
+#guard (decide { ctx with opts := { ctx.opts with chdir := some "/forbidden" } }).log.bind (·.runcwd) ==
+  some "/home/alice"
 
 example (c : Context) (p : ExecPlan) (h : (decide c).action = .exec p) :
     p.uid = c.target.uid := (exec_identity c p h).1

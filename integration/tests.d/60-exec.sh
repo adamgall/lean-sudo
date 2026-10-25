@@ -726,3 +726,23 @@ EOF
   rm -rf /srv/lean-sudo-jail /root/exec-chroot-home
   end
 }
+
+# CHROOT=* without -R uses host facts. A literal directory named "*" under the
+# caller's cwd must never alias an allowed host parent onto an attacker path.
+begin exec-chroot-wildcard-caller-tree-cannot-redirect-host && {
+  exec_chroot_files_only
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+ivan ALL = (bob) CHROOT=* NOPASSWD: /usr/bin/ls
+EOF
+  run ivan "mkdir -p './*/tmp' './*/usr'; \
+    ln -s ../tmp './*/usr/bin'; \
+    printf '#!/bin/sh\necho wildcard-escape\n' > './*/tmp/ls'; \
+    chmod 0755 './*/tmp/ls'; cp './*/tmp/ls' /tmp/ls; \
+    printf 'ivanpw\n' | sudo -kS -u bob /tmp/ls"
+  expect_rc 1
+  expect_out_empty
+  expect_err_has "not allowed to execute '/tmp/ls' as bob"
+  rm -rf '/home/ivan/*' /tmp/ls
+  mv /tmp/exec-nsswitch.saved /etc/nsswitch.conf
+  end
+}

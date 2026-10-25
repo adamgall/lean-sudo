@@ -210,7 +210,7 @@ def Time.json (t : Time) (formatted : Bool := true) : JsonValue :=
 
 inductive EventType where
   | accept | reject | alert | exit
-  deriving BEq, Inhabited
+  deriving Repr, BEq, DecidableEq, Inhabited
 
 def EventType.name : EventType → String
   | .accept => "accept" | .reject => "reject" | .alert => "alert" | .exit => "exit"

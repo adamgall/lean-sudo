@@ -54,6 +54,8 @@ def spec (ids : Ids) (path : String) (argv : Array String) : ExecSpec :=
 #guard withinRoot "/srv/jail" "/srv/jail"
 #guard !withinRoot "/srv/jail" "/srv/jail-other/bin/sh"
 #guard !withinRoot "/srv/jail" "/usr/bin/sh"
+#guard commandLookupRoot (some "*") == none
+#guard ((commandLookupRoot (some "*")).map (· ++ "/usr/bin/ls")).getD "/usr/bin/ls" == "/usr/bin/ls"
 
 def fmtStatus : ExitStatus → String
   | .exited c => s!"exited {c}"

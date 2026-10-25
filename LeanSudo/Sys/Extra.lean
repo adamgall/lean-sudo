@@ -33,6 +33,19 @@ audit is a successful no-op, as in sudo's Linux audit backend. -/
 @[extern "leansudo_sys_audit"]
 opaque auditCommand (command tty : @& String) (success : Bool) : IO Bool
 
+/-- A CHROOT wildcard authorizes an explicit root override; it is never a
+filesystem directory. Without an override, lookup remains on the host. -/
+def commandLookupRoot (root : Option String) : Option String :=
+  root.filter (· != "*")
+
+theorem commandLookupRoot_wildcard : commandLookupRoot (some "*") = none := by
+  rfl
+
+/-- In particular, the wildcard cannot prepend a relative `*/` lookup prefix. -/
+theorem wildcard_lookup_path (path : String) :
+    ((commandLookupRoot (some "*")).map (· ++ path)).getD path = path := by
+  rfl
+
 /-- Directory containment uses a component boundary, never a bare string prefix. -/
 def withinRoot (root path : String) : Bool :=
   root == "/" || path == root || path.startsWith (root ++ "/")

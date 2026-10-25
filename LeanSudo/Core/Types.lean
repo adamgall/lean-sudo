@@ -4,6 +4,7 @@ import LeanSudo.Env
 import LeanSudo.Timestamp
 import LeanSudo.IoLog
 import LeanSudo.Nsswitch
+import LeanSudo.EventLog
 
 /-!
 # Decision-core contract (frozen)
@@ -86,7 +87,8 @@ structure Context where
   now : Nat
   /-- timestamp scope of this invocation (`Timestamp.scopeFor settings.timestampType …`) -/
   tsScope : Timestamp.Scope
-  /-- records of the invoking uid's timestamp file (`Timestamp.load`; `[]` on any error) -/
+  /-- Nonblocking snapshot projected by `Timestamp.LocatedEntry.recordFor`; `[]`
+  on cache errors. Authentication rereads the selected slot under its record lock. -/
   tsRecords : List Timestamp.Record
   /-- Current session ID for sudo timestamp interoperability. -/
   tsSessionId : Nat := 0
@@ -95,6 +97,8 @@ structure Context where
   timestampOwnerUid : Nat := 0
   timestampOwnerGid : Nat := 0
   longHost : String := ""
+  /-- Actual submitting hostname, independent of the host selected with -h. -/
+  submitHost : Option String := none
   interfaces : List (IpAddr × IpAddr) := []
   netgroups : List (String × Option String × Option String × Bool) := []
   pluginGroups : List (String × String × Bool) := []
@@ -210,6 +214,17 @@ structure EditPlan where
   editorPath : String := ""
   /-- Root for the editor child only; sudo.ws still accesses original files on the host. -/
   chroot : Option String := none
+  usePty : Bool := false
+  iolog : Option IoLog.Plan := none
+  timeout : Nat := 0
+  rlimits : List (String × String) := []
+  utmpUser : Option String := none
+  closeFrom : Nat := 3
+  execBackground : Bool := false
+  noexecFile : Option String := none
+  apparmorProfile : Option String := none
+  cwd : Option String := none
+  cwdOptional : Bool := false
 
 inductive Action where
   | exec (plan : ExecPlan)
@@ -235,6 +250,17 @@ structure LogLine where
   msg : String
   format : String := "sudo"
   reason : Option String := none
+  event : EventLog.EventType := .accept
+  raw : Bool := false
+  commandReady : Bool := true
+  lookupComplete : Bool := true
+  runcwd : Option String := none
+  runchroot : Option String := none
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+inductive AuditEvent where
+  | accept
+  | reject (reason : String)
   deriving Repr, BEq, DecidableEq, Inhabited
 
 structure Decision where
@@ -245,6 +271,7 @@ structure Decision where
   log : Option LogLine
   adminFlag : Option String := none
   mail : Bool := false
+  audit : Option AuditEvent := none
   deriving Inhabited
 
 end LeanSudo.Core

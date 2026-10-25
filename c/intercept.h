@@ -4,6 +4,7 @@
 int ls_intercept_active(void);
 int ls_intercept_trace(void);
 int ls_intercept_verify(void);
+pid_t ls_intercept_broker_pid(void);
 int ls_intercept_check(const char *, char *const [], char *const [], const char *, pid_t, int);
 int ls_intercept_trace_supported(void);
 int ls_intercept_trace_child(void);

@@ -125,7 +125,7 @@ def mixedFile : ByteArray :=
 #guard scan ⟨#[2, 0, 3, 0]⟩ = []
 #guard scan ⟨#[2, 0, 56, 0]⟩ = []
 #guard scan ⟨(foreignRecord ++ ttyFixture.dropLast).toArray⟩ = []
-#guard scan ⟨((ttyFixture.set 23 128) ++ ttyFixture).toArray⟩ = []
+#guard (scan ⟨((ttyFixture.set 23 128) ++ ttyFixture).toArray⟩).map (·.offset) = [0, 56]
 #guard loadFor 4242 mixedFile =
   [⟨.tty 34817 4242 (3 * sec + 7), 1000, 500 * sec + 9, false⟩, r2]
 #guard loadFor 4243 mixedFile = []
@@ -145,6 +145,102 @@ def largestTime : Nat := (2 ^ 63 - 1) * sec + (sec - 1)
   some { fixtureEntry with key := 2 ^ 64 - 1 }
 #guard decodeEntry (encodeEntry { fixtureEntry with authUid := 2 ^ 32 - 1 }) =
   some { fixtureEntry with authUid := 2 ^ 32 - 1 }
+
+
+/-! ### Raw slots, bounded streaming, and runtime projection -/
+def fixtureScope : Scope := .tty 34817 4242 (3 * sec + 7)
+def negativeSidFixture : List UInt8 :=
+  ttyFixture.take 12 ++ encNat 4 (2 ^ 32 - 1) ++ ttyFixture.drop 16
+def badStartFixture : List UInt8 :=
+  ttyFixture.take 24 ++ encNat 8 sec ++ ttyFixture.drop 32
+def badTimeFixture : List UInt8 :=
+  ttyFixture.take 40 ++ encNat 8 sec ++ ttyFixture.drop 48
+def locatedFixture : LocatedEntry := { offset := 0, entry := fixtureEntry }
+
+#guard decodeSlot ⟨ttyFixture.toArray⟩ = some locatedFixture
+#guard decodeSlot ⟨negativeSidFixture.toArray⟩ 112 =
+  some { locatedFixture with offset := 112, entry := { fixtureEntry with sid := 2 ^ 32 - 1 } }
+#guard (scan ⟨(negativeSidFixture ++ ttyFixture).toArray⟩).map (·.offset) = [0, 56]
+-- The first identity match is selected even though its SID cannot authorize.
+#guard ((scan ⟨(negativeSidFixture ++ ttyFixture).toArray⟩).find?
+  (·.matches fixtureScope 1000)).map (·.offset) = some 0
+#guard ((scan ⟨(negativeSidFixture ++ ttyFixture).toArray⟩).find?
+  (·.matches fixtureScope 1000)).bind (·.recordFor fixtureScope 1000 4242) = none
+#guard (decodeSlot ⟨negativeSidFixture.toArray⟩).map
+  (·.matches fixtureScope 0 true) = some true
+
+-- Invalid time is retained for matching/invalidation, not skipped in favor of
+-- a later valid duplicate. The invalid start cannot alias a normalized start.
+#guard (decodeSlot ⟨badTimeFixture.toArray⟩).map (·.timeValid) = some false
+#guard (decodeSlot ⟨badTimeFixture.toArray⟩).map (·.matches fixtureScope 1000) = some true
+#guard ((scan ⟨(badTimeFixture ++ ttyFixture).toArray⟩).find?
+  (·.matches fixtureScope 1000)).map (·.offset) = some 0
+#guard ((scan ⟨(badTimeFixture ++ ttyFixture).toArray⟩).find?
+  (·.matches fixtureScope 1000)).bind (·.recordFor fixtureScope 1000 4242) = none
+#guard (decodeSlot ⟨badStartFixture.toArray⟩).map (·.startValid) = some false
+#guard (decodeSlot ⟨badStartFixture.toArray⟩).map
+  (·.matches (.tty 34817 4242 (4 * sec)) 1000) = some false
+#guard (decodeSlot ⟨(ttyFixture.set 23 128).toArray⟩).map (·.startValid) = some false
+#guard (decodeSlot ⟨(ttyFixture.set 39 128).toArray⟩).map (·.timeValid) = some false
+-- Global identity ignores start, but sudo timestamp_status still validates it.
+def badGlobalStart : List UInt8 := badStartFixture.set 4 1
+def goodGlobal : List UInt8 := ttyFixture.set 4 1
+#guard (decodeSlot ⟨badGlobalStart.toArray⟩).map (·.matches .global 1000) = some true
+#guard (decodeSlot ⟨badGlobalStart.toArray⟩).bind (·.recordFor .global 1000 9999) = none
+#guard ((scan ⟨(badGlobalStart ++ goodGlobal).toArray⟩).find?
+  (·.matches .global 1000)).bind (·.recordFor .global 1000 9999) = none
+#guard (decodeSlot ⟨goodGlobal.toArray⟩).bind (·.recordFor .global 1000 9999) =
+  some ⟨.global, 1000, 500 * sec + 9, false⟩
+#guard (decodeSlot ⟨((ttyFixture.set 4 3).set 55 255).toArray⟩).map (·.entry.key) =
+  some 34817
+#guard locatedFixture.recordFor fixtureScope 0 4242 = none
+#guard locatedFixture.recordFor (.tty 34817 4242 (3 * sec + 8)) 1000 4242 = none
+#guard locatedFixture.recordFor fixtureScope 1000 4243 = none
+
+-- Chunks are relative to the supplied offset; unknown slots require no body.
+#guard scanStep ⟨ttyFixture.toArray⟩ 112 168 =
+  .next 168 (some { locatedFixture with offset := 112 })
+#guard scanStep ⟨#[9, 0, 0, 16]⟩ 56 4152 = .next 4152 none
+#guard scanStep ⟨#[9, 0, 0, 16]⟩ 56 4151 = .stop
+#guard scanStep ⟨#[2, 0, 56, 0]⟩ 0 56 = .stop
+#guard scanStep ⟨#[2, 0, 3, 0]⟩ 0 56 = .stop
+#guard scanStep ⟨#[2, 0, 56]⟩ 0 56 = .stop
+#guard scanStep ⟨(ttyFixture.set 4 99).toArray⟩ 0 56 = .next 56 none
+#guard scanStep ⟨badTimeFixture.toArray⟩ 0 56 =
+  .next 56 (decodeSlot ⟨badTimeFixture.toArray⟩)
+#guard (scan ⟨(ttyFixture ++ badTimeFixture ++ ttyFixture).toArray⟩).map (·.offset) =
+  [0, 56, 112]
+
+#guard updateEntry ttyS ppidS 4242 1000 r1 = some (DiskEntry.ofRecord 4242 r1)
+#guard updateEntry ttyS ppidS 4242 0 r1 = none
+#guard updateEntry ppidS ppidS 4242 1000 r1 = none
+#guard updateEntry .global (.ppid 4243 12345) 4242 0 r3 =
+  some { DiskEntry.ofRecord 4242 r3 with start := 12345, key := 4243 }
+#guard updateEntry .global (.tty 34817 4242 12345) 4242 0 r3 =
+  some { DiskEntry.ofRecord 4242 r3 with start := 12345, key := 34817 }
+#guard (updateEntry .global ppidS 4242 0 r3).bind (·.toRecord) = some r3
+
+-- Invalidation changes only the low flag bit, even for raw invalid fields.
+#guard disabledEntry { fixtureEntry with flags := 0xfffe, sid := 2 ^ 32 - 1 } =
+  { fixtureEntry with flags := 0xffff, sid := 2 ^ 32 - 1 }
+#guard disabledEntry { fixtureEntry with flags := 0xffff } =
+  { fixtureEntry with flags := 0xffff }
+#guard (disabledEntry fixtureEntry).toRecord =
+  some ⟨fixtureScope, 1000, 500 * sec + 9, true⟩
+#guard (LocatedEntry.recordFor { locatedFixture with entry := disabledEntry fixtureEntry }
+  fixtureScope 1000 4242).map (valid (501 * sec) none fixtureScope 1000) = some false
+
+example {located : LocatedEntry} {scope : Scope} {uid sid now : Nat}
+    {timeout : Option Nat} {record : Record}
+    (hr : located.recordFor scope uid sid = some record)
+    (hv : valid now timeout scope uid record = true) :
+    located.startValid = true ∧ located.timeValid = true :=
+  ⟨(LocatedEntry.authorized_sound hr hv).2.2.1,
+    (LocatedEntry.authorized_sound hr hv).2.2.2.1⟩
+
+example {scope lockScope : Scope} {sid uid : Nat} {record : Record} {entry : DiskEntry}
+    (h : updateEntry scope lockScope sid uid record = some entry) :
+    entry.toRecord = some record := (updateEntry_sound h).2.2.1
 
 example (rs : List Record) (h : ∀ r ∈ rs, r.Representable) :
     decode (encode rs) = some rs := decode_encode rs h

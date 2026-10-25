@@ -81,13 +81,20 @@ private def serverCases : List ServerMessage := [
 #guard decodeClient (encodeClient (.io 5 zero (bytes []))) = none
 #guard decodeClient (encodeClient (.winsize zero (2 ^ 31) 80)) = none
 
--- Unknown varint, fixed64, length-delimited, fixed32 and balanced group fields.
+-- Unknown varint, fixed64, length-delimited and fixed32 fields are skipped.
 #guard decodeServer (bytes [120,1,26,1,120]) = some (.logId "x")
 #guard decodeServer (bytes [121,0,0,0,0,0,0,0,0,26,1,120]) = some (.logId "x")
 #guard decodeServer (bytes [122,2,255,255,26,1,120]) = some (.logId "x")
 #guard decodeServer (bytes [125,0,0,0,0,26,1,120]) = some (.logId "x")
-#guard decodeServer (bytes [123,8,1,124,26,1,120]) = some (.logId "x")
-#guard decodeServer (bytes [123,115,8,1,116,124,26,1,120]) = some (.logId "x")
+-- protobuf-c rejects deprecated group wire types, even balanced groups.
+#guard decodeServer (bytes [123,8,1,124,26,1,120]) = none
+#guard decodeServer (bytes [123,115,8,1,116,124,26,1,120]) = none
+#guard Wire.fieldsArray (bytes [123]) = none
+#guard Wire.fieldsArray (bytes [124]) = none
+#guard decodeClient (bytes [123]) = none
+#guard decodeClient (bytes [124]) = none
+#guard decodeServer (bytes [123]) = none
+#guard decodeServer (bytes [124]) = none
 -- Unknown fields within known messages are skipped too.
 #guard decodeServer (bytes [18,6,8,1,120,9,16,2]) = some (.commit ⟨1,2⟩)
 -- Scalar last-wins and embedded-message merge semantics.
@@ -131,6 +138,51 @@ private def serverCases : List ServerMessage := [
 -- multi-byte lengths without converting payload bytes into encoder list cells.
 private def largeIo : ByteArray := ⟨Array.replicate 65536 255⟩
 #guard decodeClient (encodeClient (.io 1 clock largeIo)) = some (.io 1 clock largeIo)
+
+-- The transport's maximum frame must reject unsupported groups without
+-- allocating a linked list for the entire frame or nesting parser calls.
+private def groupFrame : ByteArray := ⟨Array.replicate (2 * 1024 * 1024) 11⟩
+#guard decodeServer groupFrame = none
+#guard decodeClient groupFrame = none
+
+-- A maximum-size frame of one-byte keys and one-byte varints produces over a
+-- million fields. Run the actual decoder during compilation, checking every
+-- decoded value as well as the count without constructing a second result.
+private def tinyVarintFields : ByteArray := Id.run do
+  let mut body := ByteArray.emptyWithCapacity (2 * 1024 * 1024)
+  for _ in [:1024 * 1024] do
+    body := body.push 8 |>.push 1
+  return body
+#guard tinyVarintFields.size == 2 * 1024 * 1024
+#guard match Wire.fieldsArray tinyVarintFields with
+  | some fields => fields.length == 1024 * 1024 &&
+    fields.all (fun field => field == (1, .number 1))
+  | none => false
+
+-- Many flat fixed-width fields must take linear time and constant stack space.
+private def flatFields : ByteArray := Id.run do
+  let mut body := ByteArray.emptyWithCapacity (131072 * 9 + 3)
+  for _ in [:131072] do
+    body := body.push 121
+    for _ in [:8] do body := body.push 0
+  return body ++ bytes [26,1,120]
+#guard decodeServer flatFields = some (.logId "x")
+
+-- Repeated singular messages merge in wire order without repeatedly copying
+-- all previous bytes. This also exercises a large flat known-field sequence.
+private def mergedFields : ByteArray := Id.run do
+  let mut body := ByteArray.emptyWithCapacity (32768 * 4)
+  for _ in [:32768] do
+    body := body.push 18 |>.push 2 |>.push 8 |>.push 1
+  return body
+#guard decodeServer mergedFields = some (.commit ⟨1,0⟩)
+
+private def packedMany : ClientMessage :=
+  .accept zero [⟨"values", .numbers (List.replicate 65536 0)⟩] false
+#guard match decodeClient (encodeClient packedMany) with
+  | some (.accept _ [⟨"values", .numbers ns⟩] false) =>
+    ns.length == 65536 && ns.all (· == 0)
+  | _ => false
 
 example (n : Nat) (rest : List UInt8) (bound : n < 2 ^ 64) :
     Wire.varint (Wire.encNat n ++ rest) = some (n, rest) := Wire.varint_uint64 n rest bound

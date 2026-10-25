@@ -50,6 +50,8 @@ Root-prefixed canonical command and parent paths must remain inside the selected
 root; an escaping absolute symlink is refused before the command is authorized.
 The shell expands tilde roots using host passwd facts and retains each deciding
 root's command identity, descriptor, digest, arguments, and set-id mode separately.
+An unoverridden `CHROOT=*` is the host namespace for every lookup fact, including
+canonical parents and digests; a caller-created directory named `*` is irrelevant.
 -/
 
 namespace LeanSudo.Sys

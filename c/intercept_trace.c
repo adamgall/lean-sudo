@@ -69,7 +69,7 @@ typedef struct {
 #define TRACE_STRING (2U * 1024U * 1024U)
 struct trace_task {
   pid_t pid;
-  int initial, newborn, denied;
+  int initial, newborn, denied, status;
   char **argv, **env;
   struct stat image;
   struct trace_task *next;
@@ -106,6 +106,40 @@ static void task_remove(pid_t pid) {
     p = &(*p)->next;
   }
 }
+/* Record a consumed stop, including the tid change made by a non-leader exec.
+ * A nonzero status means that no restart request has consumed this stop yet. */
+static struct trace_task *task_stopped(pid_t pid, int status) {
+  struct trace_task *t = task_find(pid);
+  unsigned event = (unsigned)status >> 16;
+  if (event == PTRACE_EVENT_EXEC) {
+    unsigned long oldpid = 0;
+    if (ptrace(PTRACE_GETEVENTMSG, pid, NULL, &oldpid) < 0) return NULL;
+    if (oldpid != (unsigned long)pid) {
+      struct trace_task *old = task_find((pid_t)oldpid);
+      if (!old) return NULL;
+      task_remove(pid); old->pid = pid; t = old;
+    }
+  }
+  if (!t) {
+    if (event != PTRACE_EVENT_STOP) return NULL;
+    t = task_add(pid);
+    if (!t) return NULL;
+    t->newborn = 1;
+  }
+  t->status = status;
+  return t;
+}
+static int task_forked(pid_t pid) {
+  unsigned long child = 0;
+  if (ptrace(PTRACE_GETEVENTMSG, pid, NULL, &child) < 0 || !child || child > INT_MAX)
+    return -1;
+  if (!task_find((pid_t)child)) {
+    struct trace_task *next = task_add((pid_t)child);
+    if (!next) { kill((pid_t)child, SIGKILL); return -1; }
+    next->newborn = 1;
+  }
+  return 0;
+}
 static int proc_path(char *out, size_t cap, pid_t pid, const char *name) {
   int n = snprintf(out, cap, "/proc/%ld/%s", (long)pid, name);
   if (n < 0 || (size_t)n >= cap) { errno = ENAMETOOLONG; return -1; }
@@ -135,6 +169,60 @@ static int remote_read(pid_t pid, uintptr_t addr, void *out, size_t len) {
     memcpy((char *)out + off, (char *)&word + skip, n); off += n;
   }
   return 0;
+}
+static int remote_write(pid_t pid, uintptr_t addr, const void *data, size_t len) {
+  if (!addr || addr > UINTPTR_MAX - len) { errno = EFAULT; return -1; }
+  struct iovec local = {(void *)data, len}, remote = {(void *)addr, len};
+  ssize_t wrote = process_vm_writev(pid, &local, 1, &remote, 1, 0);
+  if (wrote == (ssize_t)len) return 0;
+  /* Credential transitions may require ptrace, as for remote_read().
+   * Preserve adjacent bytes when the first or last native word is partial. */
+  size_t off = wrote > 0 ? (size_t)wrote : 0;
+  while (off < len) {
+    uintptr_t pos = addr + off, aligned = pos & ~(uintptr_t)(sizeof(long) - 1);
+    size_t skip = (size_t)(pos - aligned), n = sizeof(long) - skip;
+    if (n > len - off) n = len - off;
+    long word;
+    if (skip || n != sizeof word) {
+      errno = 0;
+      word = ptrace(PTRACE_PEEKDATA, pid, (void *)aligned, NULL);
+      if (errno) return -1;
+    }
+    memcpy((char *)&word + skip, (const char *)data + off, n);
+    if (ptrace(PTRACE_POKEDATA, pid, (void *)aligned, (void *)(uintptr_t)word) < 0)
+      return -1;
+    off += n;
+  }
+  return 0;
+}
+static int remote_string_matches(pid_t pid, uintptr_t addr, const char *expected) {
+  size_t len = strlen(expected) + 1;
+  if (!addr || addr > UINTPTR_MAX - len) return 0;
+  for (size_t off = 0; off < len;) {
+    char buf[256];
+    size_t n = len - off;
+    if (n > sizeof buf) n = sizeof buf;
+    if (remote_read(pid, addr + off, buf, n) || memcmp(buf, expected + off, n))
+      return 0;
+    off += n;
+  }
+  return 1;
+}
+static int remote_vector_matches(pid_t pid, uintptr_t addr, size_t width,
+    char *const expected[]) {
+  if (!addr) return expected[0] == NULL;
+  for (size_t i = 0;; i++) {
+    uintptr_t p;
+    if (width == sizeof(uint32_t)) {
+      uint32_t ptr32;
+      if (remote_read(pid, addr, &ptr32, sizeof ptr32)) return 0;
+      p = ptr32;
+    } else if (remote_read(pid, addr, &p, sizeof p)) return 0;
+    if (!expected[i]) return p == 0;
+    if (!remote_string_matches(pid, p, expected[i]) || addr > UINTPTR_MAX - width)
+      return 0;
+    addr += width;
+  }
 }
 static char *remote_string(pid_t pid, uintptr_t addr, size_t *budget) {
   char *s = NULL;
@@ -228,9 +316,42 @@ static uintptr_t reg_arg(const trace_regs *r, unsigned n) {
     default: value = r->u.native.rdx; break;
     }
   }
-  return r->abi == ABI_NATIVE ? value : (uint32_t)value;
+  return r->abi == ABI_COMPAT ? (uint32_t)value : value;
 #else
   return r->compat_layout ? r->u.compat.regs[n] : r->u.native.regs[n];
+#endif
+}
+static void set_reg_arg(trace_regs *r, unsigned n, uintptr_t value) {
+#if defined(__x86_64__)
+  if (r->compat_layout) {
+    switch (n) {
+    case 0: r->u.compat.ebx = (uint32_t)value; break;
+    case 1: r->u.compat.ecx = (uint32_t)value; break;
+    default: r->u.compat.edx = (uint32_t)value; break;
+    }
+  } else if (r->abi == ABI_COMPAT) {
+    switch (n) {
+    case 0: r->u.native.rbx = (uint32_t)value; break;
+    case 1: r->u.native.rcx = (uint32_t)value; break;
+    default: r->u.native.rdx = (uint32_t)value; break;
+    }
+  } else {
+    switch (n) {
+    case 0: r->u.native.rdi = value; break;
+    case 1: r->u.native.rsi = value; break;
+    default: r->u.native.rdx = value; break;
+    }
+  }
+#else
+  if (r->compat_layout) r->u.compat.regs[n] = (uint32_t)value;
+  else r->u.native.regs[n] = value;
+#endif
+}
+static uintptr_t reg_sp(const trace_regs *r) {
+#if defined(__x86_64__)
+  return r->compat_layout ? r->u.compat.esp : r->u.native.rsp;
+#else
+  return r->compat_layout ? r->u.compat.regs[13] : r->u.native.sp;
 #endif
 }
 /* Normalize the syscall number only after the seccomp event has identified
@@ -253,21 +374,30 @@ static long reg_syscall(const trace_regs *r) {
   }
   return (long)nr;
 }
-static int deny_exec(struct trace_task *t, trace_regs *r) {
+static int skip_exec(pid_t pid, trace_regs *r) {
 #if defined(__x86_64__)
   if (r->compat_layout) r->u.compat.orig_eax = UINT32_MAX;
   else r->u.native.orig_rax = (unsigned long)-1;
-  if (put_regs(t->pid, r)) return -1;
+  return put_regs(pid, r);
 #else
-  (void)r;
+  /* Unlike x86, ARM preserves x0/r0 when the tracer skips a syscall.
+   * Teardown detaches without a syscall-exit stop to supply the result. */
+  if (r->compat_layout) r->u.compat.regs[0] = (uint32_t)-ENOSYS;
+  else r->u.native.regs[0] = (unsigned long)-ENOSYS;
+  if (put_regs(pid, r)) return -1;
   /* NT_ARM_SYSTEM_CALL controls both the native and ARM EABI syscall. */
   int nr = -1;
   struct iovec iov = {&nr, sizeof nr};
-  if (ptrace(PTRACE_SETREGSET, t->pid, (void *)(uintptr_t)NT_ARM_SYSTEM_CALL, &iov) < 0)
-    return -1;
+  return ptrace(PTRACE_SETREGSET, pid, (void *)(uintptr_t)NT_ARM_SYSTEM_CALL, &iov) < 0
+      ? -1 : 0;
 #endif
+}
+static int deny_exec(struct trace_task *t, trace_regs *r) {
+  if (skip_exec(t->pid, r)) return -1;
   t->denied = 1;
-  return ptrace(PTRACE_SYSCALL, t->pid, NULL, NULL) < 0 ? -1 : 0;
+  if (ptrace(PTRACE_SYSCALL, t->pid, NULL, NULL) < 0) return -1;
+  t->status = 0;
+  return 0;
 }
 static int denied_exit(struct trace_task *t) {
   trace_regs r;
@@ -299,8 +429,15 @@ static int syscall_stat(pid_t pid, const char *raw, struct stat *st) {
 static char *exec_path(const char *raw, const char *cwd) {
   if (!*raw) return NULL;
   if (raw[0] == '/') return strdup(raw);
-  char *path = NULL;
-  if (asprintf(&path, "%s/%s", cwd, raw) < 0) return NULL;
+  char joined[PATH_MAX], parent[PATH_MAX], *path = NULL;
+  int n = snprintf(joined, sizeof joined, "%s/%s", cwd, raw);
+  if (n < 0 || (size_t)n >= sizeof joined) return NULL;
+  char *base = strrchr(joined, '/');
+  if (!base) return NULL;
+  *base++ = '\0';
+  if (!realpath(*joined ? joined : "/", parent)) return NULL;
+  if (asprintf(&path, "%s%s%s", parent, strcmp(parent, "/") ? "/" : "", base) < 0)
+    return NULL;
   return path;
 }
 /* Prepare the kernel's script argv transformation while the requested image
@@ -389,6 +526,35 @@ static int verify_exec(struct trace_task *t) {
   return proc_vector_matches(t->pid, "cmdline", t->argv) &&
       proc_vector_matches(t->pid, "environ", t->env) ? 0 : -1;
 }
+static int rewrite_path(pid_t pid, trace_regs *r, const char *command,
+    char *const argv[], char *const env[], int empty_argv) {
+  /* Match upstream's path_mismatch storage below SP and the amd64 red zone.
+   * The stack pointer itself must not move across the intercepted syscall. */
+  size_t len = strlen(command) + 1;
+  size_t space = (len + sizeof(long) - 1) & ~(sizeof(long) - 1);
+  uintptr_t sp = reg_sp(r);
+  if (sp < 128 || sp - 128 < space) return -1;
+  uintptr_t addr = sp - 128 - space;
+  if (r->abi == ABI_COMPAT && addr > UINT32_MAX) return -1;
+  if (remote_write(pid, addr, command, len)) return -1;
+  set_reg_arg(r, 0, addr);
+  if (put_regs(pid, r)) return -1;
+
+  /* Re-read registers and all arguments after writing, before any resume.
+   * A shared-memory tracee must not turn a successful write into approval of
+   * changed arguments. Post-exec verification still covers the later race. */
+  trace_regs actual;
+  if (get_regs(pid, &actual) || actual.compat_layout != r->compat_layout) return -1;
+  actual.abi = r->abi;
+  if (reg_syscall(&actual) != SYS_execve || reg_arg(&actual, 0) != addr ||
+      reg_arg(&actual, 1) != reg_arg(r, 1) || reg_arg(&actual, 2) != reg_arg(r, 2))
+    return -1;
+  size_t width = r->abi == ABI_NATIVE ? sizeof(uintptr_t) : sizeof(uint32_t);
+  char *empty[] = {NULL};
+  return remote_string_matches(pid, addr, command) &&
+      remote_vector_matches(pid, reg_arg(&actual, 1), width, empty_argv ? empty : argv) &&
+      remote_vector_matches(pid, reg_arg(&actual, 2), width, env) ? 0 : -1;
+}
 static int check_exec(struct trace_task *t) {
   trace_regs r;
   if (get_regs(t->pid, &r)) return -1;
@@ -413,7 +579,8 @@ static int check_exec(struct trace_task *t) {
   char **env = remote_vector(t->pid, reg_arg(&r, 2), width, &budget);
   /* Linux supplies an empty argv[0] when execve receives an empty vector.
    * sudo's policy callback still checks the requested pathname. */
-  if (argv && !argv[0]) {
+  int empty_argv = argv && !argv[0];
+  if (empty_argv) {
     argv[0] = strdup("");
   }
   char cwd[PATH_MAX];
@@ -427,6 +594,8 @@ static int check_exec(struct trace_task *t) {
       (!verify || !stat(command, &expected))) {
     int setid = (st.st_mode & (S_ISUID | S_ISGID)) != 0;
     allow = ls_intercept_check(command, argv, env, cwd, t->pid, setid) == 1;
+    if (allow && raw[0] != '/' && rewrite_path(t->pid, &r, command, argv, env, empty_argv))
+      allow = 0;
     if (allow && verify) {
       if (expected_image(command, raw, cwd, &argv, &t->image, &expected))
         allow = 0;
@@ -510,7 +679,7 @@ int ls_intercept_trace_attach(pid_t pid) {
   t->initial = 1; root_pid = pid;
   unsigned long options = PTRACE_O_TRACESECCOMP | PTRACE_O_TRACEEXEC |
       PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE |
-      PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL;
+      PTRACE_O_TRACESYSGOOD;
   if (ptrace(PTRACE_SEIZE, pid, NULL, (void *)options) < 0) {
     task_remove(pid); kill(pid, SIGKILL); return -1;
   }
@@ -523,6 +692,7 @@ int ls_intercept_trace_attach(pid_t pid) {
 }
 int ls_intercept_trace_wait(pid_t pid, int status) {
   if (!ls_intercept_trace()) return 0;
+  if (pid == ls_intercept_broker_pid()) return 1;
   struct trace_task *t = task_find(pid);
   if (WIFEXITED(status) || WIFSIGNALED(status)) {
     task_remove(pid); return pid == root_pid ? 0 : 1;
@@ -530,22 +700,11 @@ int ls_intercept_trace_wait(pid_t pid, int status) {
   if (!WIFSTOPPED(status)) return pid == root_pid ? 0 : 1;
   unsigned event = (unsigned)status >> 16;
   int sig = WSTOPSIG(status), deliver = 0;
-  /* An exec by a non-leader thread changes its tid to the group leader. */
-  if (event == PTRACE_EVENT_EXEC) {
-    unsigned long oldpid = 0;
-    if (ptrace(PTRACE_GETEVENTMSG, pid, NULL, &oldpid) < 0) goto fail;
-    if (oldpid != (unsigned long)pid) {
-      struct trace_task *old = task_find((pid_t)oldpid);
-      if (!old) goto fail;
-      task_remove(pid); old->pid = pid; t = old;
-    }
-  }
-  if (!t) {
-    if (event != PTRACE_EVENT_STOP) goto fail;
-    t = task_add(pid);
-    if (!t) goto fail;
-    t->newborn = 1;
-  }
+  /* waitpid(-1) also reports unrelated children, notably job-control stops.
+   * Only PTRACE_EVENT_STOP can introduce an automatically attached task. */
+  if (!t && !event) return 1;
+  t = task_stopped(pid, status);
+  if (!t) goto fail;
   if (event == PTRACE_EVENT_SECCOMP) {
     int result = check_exec(t);
     if (result < 0) goto fail;
@@ -556,24 +715,20 @@ int ls_intercept_trace_wait(pid_t pid, int status) {
        * Its real parent still receives the ordinary SIGKILL wait status. */
       kill(pid, SIGKILL);
       (void)ptrace(PTRACE_CONT, pid, NULL, (void *)(intptr_t)SIGKILL);
+      t->status = 0;
       clear_expected(t);
       return 1;
     }
     clear_expected(t);
   } else if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
-    unsigned long child = 0;
-    if (ptrace(PTRACE_GETEVENTMSG, pid, NULL, &child) < 0 || !child || child > INT_MAX) goto fail;
-    if (!task_find((pid_t)child)) {
-      struct trace_task *next = task_add((pid_t)child);
-      if (!next) { kill((pid_t)child, SIGKILL); goto fail; }
-      next->newborn = 1;
-    }
+    if (task_forked(pid)) goto fail;
   } else if (sig == (SIGTRAP | 0x80) && t->denied) {
     if (denied_exit(t)) goto fail;
   } else if (event == PTRACE_EVENT_STOP) {
     if (t->newborn) t->newborn = 0;
     else if (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU) {
       if (ptrace(PTRACE_LISTEN, pid, NULL, NULL) < 0) goto fail;
+      t->status = 0;
       return pid == root_pid ? 0 : 1;
     }
   } else if (!event) {
@@ -582,6 +737,7 @@ int ls_intercept_trace_wait(pid_t pid, int status) {
   if (ptrace(t->denied ? PTRACE_SYSCALL : PTRACE_CONT, pid, NULL, (void *)(intptr_t)deliver) < 0) {
     if (errno != ESRCH) goto fail;
   }
+  t->status = 0;
   return 1;
 fail:
   kill(pid, SIGKILL); errno = EACCES; return -1;
@@ -591,15 +747,66 @@ void ls_intercept_trace_close(void) {
     if (gate[i] >= 0) close(gate[i]);
     gate[i] = -1;
   }
-  for (struct trace_task *t = tasks; t; t = t->next) kill(t->pid, SIGKILL);
+  /* PTRACE_INTERRUPT also wakes PTRACE_LISTEN without manufacturing a
+   * SIGSTOP or losing an existing job stop. Already consumed stops need no
+   * second wait, since the kernel will not report them again. */
+  for (struct trace_task *t = tasks; t; t = t->next) {
+    if (!t->status && ptrace(PTRACE_INTERRUPT, t->pid, NULL, NULL) < 0 && errno != ESRCH)
+      kill(t->pid, SIGKILL);
+  }
   while (tasks) {
-    pid_t pid = tasks->pid; int status;
-    for (;;) {
-      pid_t got = waitpid(pid, &status, __WALL);
-      if (got < 0 && errno == EINTR) continue;
-      if (got < 0 || WIFEXITED(status) || WIFSIGNALED(status)) break;
-      (void)ptrace(PTRACE_CONT, pid, NULL, (void *)(intptr_t)SIGKILL);
+    struct trace_task *t;
+    for (t = tasks; t && !t->status; t = t->next) { }
+    if (!t) {
+      int status;
+      pid_t pid = waitpid(-1, &status, __WALL);
+      if (pid < 0) {
+        if (errno == EINTR) continue;
+        int wait_error = errno;
+        /* ECHILD means all tracees are gone. Any other failure must not
+         * release an image whose post-exec verification is still pending. */
+        while (tasks) {
+          if (wait_error != ECHILD) kill(tasks->pid, SIGKILL);
+          task_remove(tasks->pid);
+        }
+        break;
+      }
+      if (pid == ls_intercept_broker_pid()) continue;
+      if (WIFEXITED(status) || WIFSIGNALED(status)) { task_remove(pid); continue; }
+      if (!WIFSTOPPED(status)) continue;
+      if (!task_find(pid) && !((unsigned)status >> 16)) continue;
+      t = task_stopped(pid, status);
+      if (!t) { kill(pid, SIGKILL); continue; }
     }
+    pid_t pid = t->pid;
+    unsigned event = (unsigned)t->status >> 16;
+    int sig = WSTOPSIG(t->status), deliver = 0, failed = 0;
+    if (event == PTRACE_EVENT_SECCOMP) {
+      /* This stop has already passed RET_TRACE's tracer-presence check.
+       * Explicitly skip it; merely detaching here could execute unchecked.
+       * Subsequent untraced RET_TRACE execs fail with ENOSYS in the kernel. */
+      trace_regs r;
+      failed = get_regs(pid, &r) || skip_exec(pid, &r);
+    } else if (event == PTRACE_EVENT_EXEC) {
+      failed = t->argv && verify_exec(t);
+    } else if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK ||
+        event == PTRACE_EVENT_CLONE) {
+      /* A fork may win the race with INTERRUPT. Its child is already seized
+       * and will report its own initial stop before it executes anything. */
+      failed = task_forked(pid);
+    } else if (!event && sig == (SIGTRAP | 0x80)) {
+      failed = !t->denied || denied_exit(t);
+    } else if (!event) {
+      deliver = sig;
+    } else if (event != PTRACE_EVENT_STOP) {
+      failed = 1;
+    }
+    /* DETACH preserves an existing kernel group-stop; only real signal
+     * delivery stops need reinjection. Never inject synthetic SIGTRAP. */
+    if (failed) kill(pid, SIGKILL);
+    if (ptrace(PTRACE_DETACH, pid, NULL,
+        (void *)(intptr_t)(failed ? SIGKILL : deliver)) < 0 && errno != ESRCH)
+      kill(pid, SIGKILL);
     task_remove(pid);
   }
   root_pid = -1;

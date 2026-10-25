@@ -11,9 +11,9 @@ Signed values use protobuf int64/int32 (two's complement, **not** zigzag).
 The public Int API normalizes values to the schema width. Window dimensions must
 be nonnegative int32 values and stream indices must be in 0..4; an unrepresentable
 window or stream encodes as an empty, hence rejected, message. Decoding validates
-UTF-8, field numbers, lengths, varint overflow, wire types and balanced groups.
-Unknown fields are skipped, including deprecated protobuf groups. Scalar fields
-have proto3 defaults; repeated numeric values accept packed and unpacked forms.
+UTF-8, field numbers, lengths, varint overflow and wire types. Deprecated group
+wire types are rejected, as in protobuf-c. Unknown supported fields are skipped.
+Scalar fields have proto3 defaults; repeated numbers accept packed/unpacked forms.
 
 General roundtrip proofs cover bounded varints, signed scalar normalization,
 arbitrary UTF-8 and binary envelopes, TimeSpec, ClientHello, and the server
@@ -130,13 +130,14 @@ theorem encNat_length_uint64 (n : Nat) (bound : n < 2 ^ 64) :
     (encNat n).length ≤ 10 :=
   encNat_length_le n 10 (by decide) (by omega)
 
-/-- Bounded parser rejects overflow and unterminated ten-byte varints. -/
+/-- List-facing bounded varint primitive; `varintAt` uses the same ten-byte
+`decNat` primitive directly on a bounded byte-array window. -/
 def varint (bs : List UInt8) : Option (Nat × List UInt8) := do
   let (n, rest) ← decNat (bs.take 10)
   if n < 2 ^ 64 then pure (n, rest ++ bs.drop 10) else none
 
-/-- The actual, overflow-checking varint parser preserves arbitrary trailing
-bytes for every uint64 whose canonical representation fits the ten-byte limit. -/
+/-- The overflow-checking list primitive preserves arbitrary trailing bytes for
+every uint64 whose canonical representation fits the ten-byte limit. -/
 theorem varint_encNat (n : Nat) (rest : List UInt8)
     (bound : n < 2 ^ 64) (width : (encNat n).length ≤ 10) :
     varint (encNat n ++ rest) = some (n, rest) := by
@@ -156,12 +157,13 @@ theorem varint_uint64 (n : Nat) (rest : List UInt8) (bound : n < 2 ^ 64) :
     varint (b :: rest) = some (b.toNat, rest) := by
   simpa [encNat, small] using varint_uint64 b.toNat rest (by omega)
 
-/-- Read a length-delimited payload, leaving subsequent fields untouched. -/
+/-- List-facing length primitive, retained with its public roundtrip theorem.
+The indexed field loop checks lengths against the array size instead. -/
 def blob (bs : List UInt8) : Option (List UInt8 × List UInt8) := do
   let (size, rest) ← varint bs
   if size ≤ rest.length then pure (rest.take size, rest.drop size) else none
 
-/-- Arbitrary binary payloads roundtrip through the actual length parser.
+/-- Arbitrary binary payloads roundtrip through the list-facing length primitive.
 The premises express protobuf's uint64 length/ten-byte varint bounds, not a
 decoder-success hypothesis. -/
 theorem blob_roundtrip (payload rest : List UInt8)
@@ -202,40 +204,83 @@ inductive Value where
 
 abbrev Field := Nat × Value
 
-/-- Parse a message or a matched group. Fuel bounds nesting and field count by
-input size; it does not impose an arbitrary limit on valid message sizes. -/
-def fieldsAux : Nat → Nat → List UInt8 → Option (List Field × List UInt8)
-  | 0, _, _ => none
-  | _ + 1, ending, [] => if ending = 0 then some ([], []) else none
-  | fuel + 1, ending, bs => do
-    let (key, rest) ← varint bs
-    let number := key / 8
-    let kind := key % 8
-    if number = 0 ∨ number ≥ 2 ^ 29 then none else do
-      if kind = 4 then
-        if ending = number then pure ([], rest) else none
-      else do
-        let (value, rest) ←
-          if kind = 0 then do
-            let (n, rest) ← varint rest
-            pure (Value.number n, rest)
-          else if kind = 1 then
-            if rest.length ≥ 8 then pure (Value.skipped, rest.drop 8) else none
-          else if kind = 2 then do
-            let (payload, rest) ← blob rest
-            pure (Value.bytes payload, rest)
-          else if kind = 3 then do
-            let (_, rest) ← fieldsAux fuel number rest
-            pure (Value.skipped, rest)
-          else if kind = 5 then
-            if rest.length ≥ 4 then pure (Value.skipped, rest.drop 4) else none
-          else none
-        let (following, rest) ← fieldsAux fuel ending rest
-        pure ((number, value) :: following, rest)
+/-- A bounded window, never a conversion of the remaining frame to a list. -/
+def window (bs : ByteArray) (pos count : Nat) : List UInt8 :=
+  (bs.extract pos (pos + count)).data.toList
 
-def fields (bs : List UInt8) : Option (List Field) := do
-  let (fs, rest) ← fieldsAux (bs.length + 1) 0 bs
-  if rest.isEmpty then pure fs else none
+@[simp] theorem window_eq (bs : ByteArray) (pos count : Nat) :
+    window bs pos count = (bs.data.toList.drop pos).take count := by
+  simp [window]
+
+/-- Only the next ten bytes can be inspected by the varint primitive. Its
+non-tail recursion therefore has a fixed bound independent of the frame. -/
+def varintAt (bs : ByteArray) (pos : Nat) : Option (Nat × Nat) := do
+  let input := window bs pos 10
+  let (n, rest) ← decNat input
+  if n < 2 ^ 64 then pure (n, pos + (input.length - rest.length)) else none
+
+theorem varintAt_encNat (bs : ByteArray) (pos n : Nat) (rest : List UInt8)
+    (suffix : bs.data.toList.drop pos = encNat n ++ rest) (bound : n < 2 ^ 64) :
+    varintAt bs pos = some (n, pos + (encNat n).length) := by
+  have width := encNat_length_uint64 n bound
+  simp [varintAt, suffix, List.take_append, List.take_of_length_le width,
+    decNat_encNat, bound]
+
+/-- Flat wire scanning: each successful step advances a byte index and appends
+one field to an array. There is no group stack, suffix-length scan, or non-tail
+field call. Fuel bounds the loop by the frame size; the cursor guard enforces
+actual progress. The accumulated array is converted to a list only once. -/
+def fieldsAux (bs : ByteArray) : Nat → Nat → Array Field → Option (List Field)
+  | 0, _, _ => none
+  | fuel + 1, pos, acc =>
+    if pos = bs.size then some acc.toList else do
+      let (key, start) ← varintAt bs pos
+      let number := key / 8
+      let kind := key % 8
+      if number = 0 ∨ number ≥ 2 ^ 29 then none else do
+        let (value, next) ←
+          if kind = 0 then do
+            let (n, next) ← varintAt bs start
+            pure (Value.number n, next)
+          else if kind = 1 then
+            if start + 8 ≤ bs.size then pure (Value.skipped, start + 8) else none
+          else if kind = 2 then do
+            let (size, payload) ← varintAt bs start
+            if payload + size ≤ bs.size then
+              pure (Value.bytes (window bs payload size), payload + size)
+            else none
+          else if kind = 5 then
+            if start + 4 ≤ bs.size then pure (Value.skipped, start + 4) else none
+          else none
+        if pos < next ∧ next ≤ bs.size then
+          fieldsAux bs fuel next (acc.push (number, value))
+        else none
+
+def fieldsArray (bs : ByteArray) : Option (List Field) :=
+  fieldsAux bs (bs.size + 1) 0 #[]
+
+/-- List-facing convenience API, using exactly the same indexed decoder. -/
+def fields (bs : List UInt8) : Option (List Field) :=
+  fieldsArray ⟨bs.toArray⟩
+
+@[simp] theorem fieldsArray_toArray (bs : List UInt8) :
+    fieldsArray ⟨bs.toArray⟩ = fields bs := rfl
+
+/-- Group start and end tags are rejected without parsing any following fields.
+This is a theorem about the actual scanning loop, for every cursor and suffix. -/
+theorem fieldsAux_reject_group (bs : ByteArray) (fuel pos key next : Nat)
+    (acc : Array Field) (notEnd : pos ≠ bs.size)
+    (keyParsed : varintAt bs pos = some (key, next))
+    (group : key % 8 = 3 ∨ key % 8 = 4) :
+    fieldsAux bs (fuel + 1) pos acc = none := by
+  rcases group with group | group <;>
+    simp [fieldsAux, notEnd, keyParsed, group]
+
+/-- The varint window has a frame-independent maximum length. -/
+theorem varint_window_bounded (bs : ByteArray) (pos : Nat) :
+    (window bs pos 10).length ≤ 10 := by
+  simpa only [window_eq, List.length_take] using
+    Nat.min_le_left 10 (bs.data.toList.drop pos).length
 
 def number (tag n : Nat) : List UInt8 := encNat (tag * 8) ++ encNat n
 
@@ -282,33 +327,80 @@ def getData (tag : Nat) (fs : List Field) : Option ByteArray := do
   pure ⟨(chunks.getLast?.getD []).toArray⟩
 
 /-- Select a oneof, merging successive occurrences of the same embedded-message
-case. Unknown fields do not reset a oneof. Strings and numeric cases replace. -/
-def oneof (known merge : Nat → Bool) (fs : List Field) : Option Field :=
-  fs.foldl (fun selected f =>
+case. Unknown fields do not reset a oneof. Strings and numeric cases replace.
+Chunks are prepended and flattened once, never appended to a growing prefix. -/
+def oneof (known merge : Nat → Bool) (fs : List Field) : Option Field := do
+  let (selected, chunks) ← fs.foldl (fun selected f =>
     if !known f.1 then selected
-    else match selected, f.2 with
-      | some (tag, .bytes previous), .bytes next =>
-        if tag = f.1 ∧ merge tag then some (tag, .bytes (previous ++ next)) else some f
-      | _, _ => some f) none
+    else
+      let fresh := match f.2 with
+        | .bytes bs => (f, [bs])
+        | _ => (f, [])
+      match selected, f.2 with
+      | some ((tag, .bytes _), chunks), .bytes next =>
+        if tag = f.1 ∧ merge tag then some (f, next :: chunks) else some fresh
+      | _, _ => some fresh) (none : Option (Field × List (List UInt8)))
+  match selected.2 with
+  | .bytes _ => pure (selected.1, .bytes chunks.reverse.flatten)
+  | _ => pure selected
 
-private theorem fieldsAux_bytes_small (fuel tag : Nat) (payload : List UInt8)
-    (positive : 0 < tag) (small : tag < 16) (bound : payload.length < 2 ^ 64) :
-    fieldsAux (fuel + 2) 0 (UInt8.ofNat (tag * 8 + 2) :: encNat payload.length ++ payload) =
-      some ([(tag, .bytes payload)], []) := by
-  have digit : (UInt8.ofNat (tag * 8 + 2)).toNat = tag * 8 + 2 := by
-    simp
+/-- Reading a canonical one-byte key advances the cursor by exactly one. -/
+theorem varintAt_small (bs : ByteArray) (pos n : Nat) (rest : List UInt8)
+    (suffix : bs.data.toList.drop pos = UInt8.ofNat n :: rest) (small : n < 128) :
+    varintAt bs pos = some (n, pos + 1) := by
+  have encoded : encNat n = [UInt8.ofNat n] := by simp [encNat, small]
+  have parsed := varintAt_encNat bs pos n rest (by simpa [encoded] using suffix) (by omega)
+  simpa [encoded] using parsed
+
+private theorem fieldsAux_bytes_small (bs : ByteArray) (fuel pos tag : Nat)
+    (payload : List UInt8) (acc : Array Field)
+    (suffix : bs.data.toList.drop pos =
+      UInt8.ofNat (tag * 8 + 2) :: encNat payload.length ++ payload)
+    (inBounds : pos ≤ bs.size) (positive : 0 < tag) (small : tag < 16)
+    (bound : payload.length < 2 ^ 64) :
+    fieldsAux bs (fuel + 2) pos acc = some (acc.push (tag, .bytes payload)).toList := by
+  have size := congrArg List.length suffix
+  simp only [List.length_drop, Array.length_toList, ByteArray.size_data,
+    List.length_cons, List.length_append] at size
+  have endPos : pos + 1 + (encNat payload.length).length + payload.length = bs.size := by
     omega
-  have keySmall : tag * 8 + 2 < 128 := by omega
-  have payloadParsed : blob (encNat payload.length ++ payload) = some (payload, []) := by
-    simpa using blob_roundtrip payload [] bound (encNat_length_uint64 _ bound)
-  have keyParsed := varint_byte (UInt8.ofNat (tag * 8 + 2))
-    (encNat payload.length ++ payload) (by rw [digit]; exact keySmall)
-  rw [fieldsAux]
-  simp only [List.cons_append]
-  rw [keyParsed]
-  simp only [digit]
-  simp [payloadParsed, fieldsAux]
-  all_goals first | omega | simp [List.cons_append]
+  have notEnd : pos ≠ bs.size := by omega
+  have keyParsed := varintAt_small bs pos (tag * 8 + 2)
+    (encNat payload.length ++ payload) suffix (by omega)
+  have afterKey : bs.data.toList.drop (pos + 1) = encNat payload.length ++ payload := by
+    rw [← List.drop_drop]
+    simp [suffix]
+  have sizeParsed := varintAt_encNat bs (pos + 1) payload.length payload afterKey bound
+  have afterSize : bs.data.toList.drop (pos + 1 + (encNat payload.length).length) =
+      payload := by
+    rw [← List.drop_drop, afterKey]
+    simp
+  have progress : pos < bs.size := by omega
+  simp [fieldsAux, notEnd, keyParsed, sizeParsed, afterSize, endPos, progress,
+    show (tag * 8 + 2) / 8 = tag by omega,
+    show (tag * 8 + 2) % 8 = 2 by omega] <;> omega
+
+/-- The numeric-field step consumes its key and varint before its sole tail call. -/
+theorem fieldsAux_number_step (bs : ByteArray) (fuel pos tag n : Nat)
+    (rest : List UInt8) (acc : Array Field)
+    (suffix : bs.data.toList.drop pos = UInt8.ofNat (tag * 8) :: encNat n ++ rest)
+    (inBounds : pos ≤ bs.size) (positive : 0 < tag) (small : tag < 16)
+    (bound : n < 2 ^ 64) :
+    fieldsAux bs (fuel + 1) pos acc =
+      fieldsAux bs fuel (pos + 1 + (encNat n).length) (acc.push (tag, .number n)) := by
+  have size := congrArg List.length suffix
+  simp only [List.length_drop, Array.length_toList, ByteArray.size_data,
+    List.length_cons, List.length_append] at size
+  have notEnd : pos ≠ bs.size := by omega
+  have keyParsed := varintAt_small bs pos (tag * 8) (encNat n ++ rest) suffix (by omega)
+  have afterKey : bs.data.toList.drop (pos + 1) = encNat n ++ rest := by
+    rw [← List.drop_drop]
+    simp [suffix]
+  have valueParsed := varintAt_encNat bs (pos + 1) n rest afterKey bound
+  have progress : pos < pos + 1 + (encNat n).length ∧
+      pos + 1 + (encNat n).length ≤ bs.size := by omega
+  simp [fieldsAux, notEnd, keyParsed, valueParsed, progress,
+    show (tag * 8) / 8 = tag by omega, show (tag * 8) % 8 = 0 by omega] <;> omega
 
 /-- Every log-server embedded-message tag preserves an arbitrary bounded binary
 payload through the complete field parser, not just the varint primitives. -/
@@ -326,9 +418,10 @@ theorem fields_bytes_roundtrip (tag : Nat) (payload : List UInt8)
       ((encNat payload.length).length + payload.length) + 2 := by
     simp only [List.length_cons, List.length_append]
     omega
-  simp only [fields]
-  rw [size, fieldsAux_bytes_small _ tag payload positive small bound]
-  rfl
+  unfold fields fieldsArray
+  simp only [ByteArray.size, List.size_toArray, size]
+  exact fieldsAux_bytes_small _ _ 0 tag payload #[] (by simp)
+    (by omega) positive small bound
 
 end Wire
 
@@ -345,11 +438,6 @@ private theorem decTime_fields (a b : Nat) :
       some ⟨Wire.signed 64 a, Wire.signed 32 b⟩ := by
   simp [decTime, Wire.getNumber, Wire.values, Wire.asNumber]
 
-private theorem fieldsAux_time (fuel a b : Nat) (ha : a < 2 ^ 64) (hb : b < 2 ^ 64) :
-    Wire.fieldsAux (fuel + 3) 0 (8 :: Wire.encNat a ++ 16 :: Wire.encNat b) =
-      some ([(1, .number a), (2, .number b)], []) := by
-  simp [Wire.fieldsAux, Wire.varint_uint64 a (16 :: Wire.encNat b) ha, hb]
-
 private theorem fields_time (a b : Nat) (ha : a < 2 ^ 64) (hb : b < 2 ^ 64) :
     Wire.fields (Wire.number 1 a ++ Wire.number 2 b) =
       some [(1, .number a), (2, .number b)] := by
@@ -360,13 +448,25 @@ private theorem fields_time (a b : Nat) (ha : a < 2 ^ 64) (hb : b < 2 ^ 64) :
       show Wire.encNat 16 = [16] by decide +kernel]
     rfl
   rw [encoded]
-  have size : (8 :: Wire.encNat a ++ 16 :: Wire.encNat b).length + 1 =
-      ((Wire.encNat a).length + (Wire.encNat b).length) + 3 := by
-    simp only [List.length_cons, List.length_append]
+  let bs : ByteArray := ⟨(8 :: Wire.encNat a ++ 16 :: Wire.encNat b).toArray⟩
+  have size : bs.size = (Wire.encNat a).length + (Wire.encNat b).length + 2 := by
+    simp [bs, ByteArray.size]
     omega
-  simp only [Wire.fields]
-  rw [size, fieldsAux_time _ a b ha hb]
-  rfl
+  have first := Wire.fieldsAux_number_step bs
+    ((Wire.encNat a).length + (Wire.encNat b).length + 2) 0 1 a
+    (16 :: Wire.encNat b) #[] (by simp [bs]) (by omega) (by decide) (by decide) ha
+  have second := Wire.fieldsAux_number_step bs
+    ((Wire.encNat a).length + (Wire.encNat b).length + 1)
+    (0 + 1 + (Wire.encNat a).length) 2 b [] (#[].push (1, .number a))
+    (by
+      have offset : 0 + 1 + (Wire.encNat a).length = (Wire.encNat a).length + 1 := by omega
+      simp [bs, offset])
+    (by omega) (by decide) (by decide) hb
+  change Wire.fieldsAux bs (bs.size + 1) 0 #[] = _
+  rw [size, first, second]
+  have endPos : 0 + 1 + (Wire.encNat a).length + 1 + (Wire.encNat b).length =
+      bs.size := by omega
+  simp [Wire.fieldsAux, endPos]
 
 /-- All representable POSIX time values roundtrip through protobuf's numeric
 field parser, including the negative int32 sign-extension case. -/
@@ -394,18 +494,25 @@ private def encInfo (i : InfoMessage) : List UInt8 :=
   | .numbers ns => Wire.bytes 5 (Wire.bytes 1 ((ns.map (fun n =>
       Wire.encNat (Wire.unsigned 64 n))).flatten))
 
-private def packedNumbers : Nat → List UInt8 → Option (List Int)
-  | 0, _ => none
-  | _ + 1, [] => some []
-  | fuel + 1, bs => do
-    let (n, rest) ← Wire.varint bs
-    let ns ← packedNumbers fuel rest
-    pure (Wire.signed 64 n :: ns)
+/-- Packed numbers share the indexed, ten-byte-bounded varint reader and use a
+reverse accumulator rather than one stack frame per number. -/
+private def packedNumbersAux (bs : ByteArray) : Nat → Nat → List Int → Option (List Int)
+  | 0, _, _ => none
+  | fuel + 1, pos, acc =>
+    if pos = bs.size then some acc.reverse else do
+      let (n, next) ← Wire.varintAt bs pos
+      if pos < next ∧ next ≤ bs.size then
+        packedNumbersAux bs fuel next (Wire.signed 64 n :: acc)
+      else none
+
+private def packedNumbers (input : List UInt8) : Option (List Int) :=
+  let bs : ByteArray := ⟨input.toArray⟩
+  packedNumbersAux bs (bs.size + 1) 0 []
 
 private def decNumbers (fs : List Wire.Field) : Option (List Int) := do
   let chunks ← (Wire.values 1 fs).mapM fun v => match v with
     | .number n => pure [Wire.signed 64 n]
-    | .bytes bs => packedNumbers (bs.length + 1) bs
+    | .bytes bs => packedNumbers bs
     | _ => none
   pure chunks.flatten
 
@@ -507,7 +614,7 @@ theorem encodeClient_io_eq (stream : Nat) (delay : TimeSpec) (data : ByteArray) 
 
 /-- Unknown fields are skipped. No recognized oneof case is a protocol failure. -/
 def decodeClient (body : ByteArray) : Option ClientMessage := do
-  let fs ← Wire.fields body.data.toList
+  let fs ← Wire.fieldsArray body
   let known := fun n => decide (1 ≤ n ∧ n ≤ 13)
   for f in fs do
     if known f.1 then let _ ← decClientField f; pure ()
@@ -541,7 +648,7 @@ private def decServerField (f : Wire.Field) : Option ServerMessage := do
 def encodeServer (m : ServerMessage) : ByteArray := ⟨(encServer m).toArray⟩
 
 def decodeServer (body : ByteArray) : Option ServerMessage := do
-  let fs ← Wire.fields body.data.toList
+  let fs ← Wire.fieldsArray body
   let known := fun n => decide (1 ≤ n ∧ n ≤ 5)
   for f in fs do
     if known f.1 then let _ ← decServerField f; pure ()
@@ -554,7 +661,7 @@ theorem logId_roundtrip (s : String) (bound : s.toUTF8.size < 2 ^ 64) :
     (by decide) (by simpa using bound)
   have utf8 : Wire.asString (.bytes s.toByteArray.data.toList) = some s :=
     Wire.asString_utf8 s
-  simp only [encodeServer, encServer, Wire.text, decodeServer]
+  simp only [encodeServer, encServer, Wire.text, decodeServer, Wire.fieldsArray_toArray]
   rw [parsed]
   simp [Wire.oneof, decServerField, utf8]
 
@@ -564,7 +671,7 @@ theorem error_roundtrip (s : String) (bound : s.toUTF8.size < 2 ^ 64) :
     (by decide) (by simpa using bound)
   have utf8 : Wire.asString (.bytes s.toByteArray.data.toList) = some s :=
     Wire.asString_utf8 s
-  simp only [encodeServer, encServer, Wire.text, decodeServer]
+  simp only [encodeServer, encServer, Wire.text, decodeServer, Wire.fieldsArray_toArray]
   rw [parsed]
   simp [Wire.oneof, decServerField, utf8]
 
@@ -574,7 +681,7 @@ theorem abort_roundtrip (s : String) (bound : s.toUTF8.size < 2 ^ 64) :
     (by decide) (by simpa using bound)
   have utf8 : Wire.asString (.bytes s.toByteArray.data.toList) = some s :=
     Wire.asString_utf8 s
-  simp only [encodeServer, encServer, Wire.text, decodeServer]
+  simp only [encodeServer, encServer, Wire.text, decodeServer, Wire.fieldsArray_toArray]
   rw [parsed]
   simp [Wire.oneof, decServerField, utf8]
 
@@ -597,7 +704,7 @@ theorem clientHello_roundtrip (s : String) (bound : s.toUTF8.size + 11 < 2 ^ 64)
   have decoded : decClientField (13, .bytes (Wire.text 1 s)) = some (.hello s) := by
     simp [decClientField, Wire.asBytes, Wire.text, innerParsed, Wire.getString,
       Wire.values, utf8]
-  simp only [encodeClient, encClient, decodeClient]
+  simp only [encodeClient, encClient, decodeClient, Wire.fieldsArray_toArray]
   rw [outerParsed]
   simp [Wire.oneof, decoded]
 
@@ -622,7 +729,7 @@ theorem commit_roundtrip (t : TimeSpec)
   have decoded : decServerField (2, .bytes (encTime t)) = some (.commit t) := by
     rw [decServerField_commit, time_roundtrip t slo shi nlo nhi]
     rfl
-  simp only [encodeServer, encServer, decodeServer]
+  simp only [encodeServer, encServer, decodeServer, Wire.fieldsArray_toArray]
   rw [parsed]
   simp [Wire.oneof, decoded]
 

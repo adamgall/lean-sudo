@@ -61,8 +61,8 @@ def ttyDevice : IO (Option Nat) := do
 
 @[extern "lean_sudo_ts_open"]
 private opaque tsOpen (directory name : @& String) (uid gid : UInt32) (create : Bool) : IO (Option UInt32)
-@[extern "lean_sudo_ts_read"]
-private opaque tsRead (fd : UInt32) : IO ByteArray
+@[extern "lean_sudo_ts_size"]
+private opaque tsSize (fd : UInt32) : IO UInt64
 @[extern "lean_sudo_ts_read_at"]
 private opaque tsReadAt (fd : UInt32) (offset : UInt64) (length : UInt32) : IO ByteArray
 @[extern "lean_sudo_ts_pwrite"]
@@ -105,19 +105,19 @@ private def headerWord (bytes : ByteArray) (offset : Nat) : Nat :=
   (bytes[offset]?.getD 0).toNat + 256 * (bytes[offset + 1]?.getD 0).toNat
 
 /-- Preserve old lock headers and all subsequent offsets, as timestamp_lock does. -/
-private def initializeHeader (fd : UInt32) (bytes : ByteArray) : IO ByteArray := do
+private def initializeHeader (fd : UInt32) (extent : Nat) : IO Nat := do
+  let bytes ← tsReadAt fd 0 Timestamp.recordSize.toUInt32
   let size := headerWord bytes 2
   let kind := headerWord bytes 4
-  if bytes.size >= 40 && kind == 4 && size >= 8 && size <= bytes.size then return bytes
+  if bytes.size >= 40 && kind == 4 && size >= 8 && size <= extent then return extent
   if bytes.size >= 40 && size == 40 then
     let header := ByteArray.mk #[bytes[0]!, bytes[1]!, 40, 0, 4, 0] ++
       ByteArray.mk (Array.replicate 34 0)
     tsWriteAt fd 0 header
-    return header ++ bytes.extract 40 bytes.size
-  let header := Timestamp.encodeEntry Timestamp.lockEntry
+    return extent
   tsTruncate fd 0
-  tsWriteAt fd 0 header
-  return header
+  tsWriteAt fd 0 (Timestamp.encodeEntry Timestamp.lockEntry)
+  return Timestamp.recordSize
 
 private structure Ticket where
   fd : UInt32
@@ -125,23 +125,32 @@ private structure Ticket where
   key : TimestampKey
   global : Bool
 
-/-- sudo forms a global key by changing its nonglobal lock key's type, retaining
-the otherwise-unused start time and device/parent union fields. -/
-private def diskEntry (key : TimestampKey) (record : Timestamp.Record) : Timestamp.DiskEntry :=
-  let entry := Timestamp.DiskEntry.ofRecord key.sid record
-  if record.scope == .global then
-    match key.lockScope with
-    | .tty dev _ start => { entry with start, key := dev }
-    | .ppid pid start => { entry with start, key := pid }
-    | .global => entry
-  else entry
+/-- Read one bounded window at a time. The same pure step drives in-memory
+scanning and supplies every runtime slot's structural bounds. -/
+private def scanFile (fd : UInt32) (extent : Nat) (initial : α)
+    (step : α → Timestamp.LocatedEntry → IO (ForInStep α)) : IO α := do
+  let mut state := initial
+  let mut offset := 0
+  for _ in [:extent / 4] do
+    let bytes ← tsReadAt fd offset.toUInt64 Timestamp.recordSize.toUInt32
+    match Timestamp.scanStep bytes offset extent with
+    | .stop => break
+    | .next next located =>
+      offset := next
+      if let some located := located then
+        match ← step state located with
+        | .done result => return result
+        | .yield result => state := result
+  return state
 
-private def disabledEntry (key : TimestampKey) (scope : Timestamp.Scope) : Timestamp.DiskEntry :=
-  diskEntry key { scope, authUid := key.authUid, time := 0, disabled := true }
+private def initialEntry (key : TimestampKey) (scope : Timestamp.Scope) : Timestamp.DiskEntry :=
+  Timestamp.entryFor key.lockScope key.sid
+    { scope, authUid := key.authUid, time := 0, disabled := true }
 
-private def findEntry (bytes : ByteArray) (scope : Timestamp.Scope) (authUid : Nat) :
-    Option Timestamp.LocatedEntry :=
-  (Timestamp.scan bytes).find? (fun located => located.entry.matches scope authUid)
+private def findEntry (fd : UInt32) (extent : Nat) (scope : Timestamp.Scope) (authUid : Nat) :
+    IO (Option Timestamp.LocatedEntry) :=
+  scanFile fd extent none fun _ located =>
+    pure (if located.matches scope authUid then .done (some located) else .yield none)
 
 private def openTicket (config : TimestampConfig) (key : TimestampKey) : IO Ticket := do
   if key.lockScope == .global then throw (IO.userError "timestamp lock scope must be terminal or process")
@@ -149,21 +158,20 @@ private def openTicket (config : TimestampConfig) (key : TimestampKey) : IO Tick
   try
     lockRecord fd 0 true
     let (offset, lockOffset) ← try
-      let mut bytes ← initializeHeader fd (← tsRead fd)
-      let lockOffset ← match findEntry bytes key.lockScope key.authUid with
+      let mut extent ← initializeHeader fd (← tsSize fd).toNat
+      let lockOffset ← match ← findEntry fd extent key.lockScope key.authUid with
         | some located => pure located.offset
         | none => do
-          let offset := bytes.size
-          let entry := disabledEntry key key.lockScope
-          writeEntry fd offset entry
-          bytes := bytes ++ Timestamp.encodeEntry entry
+          let offset := extent
+          writeEntry fd offset (initialEntry key key.lockScope)
+          extent := extent + Timestamp.recordSize
           pure offset
       let offset ← if key.scope == .global then
-          match findEntry bytes key.scope key.authUid with
+          match ← findEntry fd extent key.scope key.authUid with
           | some located => pure located.offset
           | none => do
-            writeEntry fd bytes.size (disabledEntry key key.scope)
-            pure bytes.size
+            writeEntry fd extent (initialEntry key key.scope)
+            pure extent
         else pure lockOffset
       pure (offset, lockOffset)
     finally
@@ -178,15 +186,14 @@ private def readTicket (ticket : Ticket) : IO (List Timestamp.Record) := do
   if ticket.global then lockRecord ticket.fd ticket.offset true
   try
     let bytes ← tsReadAt ticket.fd ticket.offset.toUInt64 Timestamp.recordSize.toUInt32
-    let some entry := Timestamp.decodeEntry bytes | return []
-    if !entry.matches ticket.key.scope ticket.key.authUid then return []
-    return (entry.forSession ticket.key.sid).toList
+    let some located := Timestamp.decodeSlot bytes ticket.offset | return []
+    return (located.recordFor ticket.key.scope ticket.key.authUid ticket.key.sid).toList
   finally
     if ticket.global then lockRecord ticket.fd ticket.offset false
 
 private def updateTicket (ticket : Ticket) (record : Timestamp.Record) : IO Unit := do
-  let entry := diskEntry ticket.key record
-  if !entry.matches ticket.key.scope ticket.key.authUid then
+  let some entry := Timestamp.updateEntry ticket.key.scope ticket.key.lockScope
+      ticket.key.sid ticket.key.authUid record |
     throw (IO.userError "timestamp update does not match locked record")
   if ticket.global then lockRecord ticket.fd ticket.offset true
   try writeEntry ticket.fd ticket.offset entry
@@ -199,10 +206,11 @@ lock. Descriptors are never simultaneously reopened (fcntl close rule). -/
 def readTimestamp (config : TimestampConfig) (key : TimestampKey) : IO (List Timestamp.Record) := do
   let some fd ← openTimestamp config false | return []
   try
-    let bytes ← tsRead fd
-    if headerWord bytes 4 != 4 then return []
-    let some located := findEntry bytes key.scope key.authUid | return []
-    return (located.entry.forSession key.sid).toList
+    let extent := (← tsSize fd).toNat
+    let header ← tsReadAt fd 0 8
+    if headerWord header 4 != 4 then return []
+    let some located ← findEntry fd extent key.scope key.authUid | return []
+    return (located.recordFor key.scope key.authUid key.sid).toList
   finally tsClose fd
 
 private def reportCacheError (report : String → IO Unit) (error : IO.Error) : IO Unit :=
@@ -240,10 +248,14 @@ def invalidateTimestamp (config : TimestampConfig) (scope : Timestamp.Scope) : I
   let some fd ← openTimestamp config false | return
   try
     lockRecord fd 0 true
-    let bytes ← tsRead fd
-    for located in Timestamp.scan bytes do
-      if located.entry.matches scope 0 true then
-        writeEntry fd located.offset { located.entry with flags := located.entry.flags ||| 1 }
+    let extent := (← tsSize fd).toNat
+    scanFile fd extent () fun _ located => do
+      if located.matches scope 0 true then
+        -- Never re-encode an invalid SID or timespec merely to disable a slot.
+        let entry := Timestamp.disabledEntry located.entry
+        tsWriteAt fd (located.offset + 6).toUInt64
+          (ByteArray.mk (Timestamp.encNat 2 entry.flags).toArray)
+      pure (.yield ())
   finally tsClose fd
 
 /-- `sudo -K`: unlink the invoking UID's timestamp file, if present. -/

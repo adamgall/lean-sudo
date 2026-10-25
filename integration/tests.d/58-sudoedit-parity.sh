@@ -451,3 +451,201 @@ for escape_kind in editor parent; do
     end
   }
 done
+
+begin sudoedit-execution-default-pty && {
+  sudoedit_parity_setup
+  cat >/usr/local/bin/henry-editor <<'EOF'
+#!/bin/sh
+printf 'editor-tty=%s\n' "$(tty)"
+test "$(tty)" != "$PARENT_TTY"
+EOF
+  pty henry 'PARENT_TTY=$(tty); export PARENT_TTY; printf "parent-tty=%s\n" "$PARENT_TTY"; SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /etc/henryfile'
+  expect_rc 0
+  expect_out_has 'editor-tty=/dev/pts/'
+  expect_out_has 'parent-tty=/dev/pts/'
+  end
+}
+
+for logging in default tag; do
+  begin "sudoedit-execution-iolog-$logging" && {
+    sudoedit_parity_setup
+    dir="$WORK/sudoedit-io-$logging"
+    printf 'Defaults:henry iolog_dir="%s",!compress_io\n' "$dir" >>/etc/sudoers.d/58-sudoedit
+    if [[ $logging == default ]]; then
+      printf 'Defaults:henry log_output\n' >>/etc/sudoers.d/58-sudoedit
+    else
+      printf 'henry ALL=(ALL:ALL) NOPASSWD: LOG_OUTPUT: sudoedit\n' >>/etc/sudoers.d/58-sudoedit
+    fi
+    cat >/usr/local/bin/henry-editor <<'EOF'
+#!/bin/sh
+printf 'editor-output-marker\n'
+printf 'edited\n' >>"$1"
+EOF
+    run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /etc/henryfile'
+    expect_rc 0
+    expect_out_line editor-output-marker
+    if [[ $logging == tag ]]; then
+      # Like CHROOT, command-rule LOG_OUTPUT is not propagated for MODE_EDIT.
+      [[ ! -e "$dir/seq" ]] || fail 'sudoedit unexpectedly honored LOG_OUTPUT tag'
+    else
+      run root "sudoreplay.ws -d '$dir' -l"
+      expect_rc 0
+      expect_out_has ' : henry : '
+      expect_out_has 'COMMAND=/usr/local/bin/henry-editor -- /etc/henryfile'
+      run root "sudoreplay.ws -n -d '$dir' 000001"
+      expect_rc 0
+      expect_out_has editor-output-marker
+      [[ $(cat "$dir/00/00/01/stdout") == editor-output-marker ]] || fail 'editor stdout missing from I/O stream'
+    fi
+    end
+  }
+done
+
+for timeout_kind in default rule; do
+  begin "sudoedit-execution-timeout-$timeout_kind" && {
+    sudoedit_parity_setup
+    if [[ $timeout_kind == default ]]; then
+      printf 'Defaults:henry command_timeout=1\n' >>/etc/sudoers.d/58-sudoedit
+    else
+      printf 'henry ALL=(ALL:ALL) TIMEOUT=1 NOPASSWD: sudoedit\n' >>/etc/sudoers.d/58-sudoedit
+    fi
+    cat >/usr/local/bin/henry-editor <<'EOF'
+#!/bin/sh
+printf 'edited\n' >>"$1"
+exec /bin/sleep 4
+EOF
+    start=$SECONDS
+    run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /etc/henryfile'
+    if [[ $timeout_kind == default ]]; then
+      expect_rc_not 0
+      [[ $((SECONDS - start)) -lt 4 ]] || fail 'editor timeout was not applied'
+    else
+      expect_rc 0
+      [[ $((SECONDS - start)) -ge 3 ]] || fail 'sudoedit unexpectedly honored TIMEOUT rule'
+    fi
+    [[ $(cat /etc/henryfile) == $'original\nedited' ]] || fail 'timed-out editor changes were not copied back'
+    end
+  }
+done
+
+begin sudoedit-execution-resource-limits && {
+  sudoedit_parity_setup
+  printf 'Defaults:henry rlimit_nofile="128,256"\n' >>/etc/sudoers.d/58-sudoedit
+  cat >/usr/local/bin/henry-editor <<'EOF'
+#!/bin/bash
+printf 'soft='; ulimit -Sn
+printf 'hard='; ulimit -Hn
+EOF
+  run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /etc/henryfile'
+  expect_rc 0
+  expect_out_line soft=128
+  expect_out_line hard=256
+  end
+}
+
+for utmp_mode in runas invoking; do
+  begin "sudoedit-execution-utmp-$utmp_mode" && {
+    sudoedit_parity_setup
+    install -m 0664 /dev/null /run/utmp
+    if [[ $utmp_mode == runas ]]; then
+      printf 'Defaults:henry use_pty,set_utmp,utmp_runas\n' >>/etc/sudoers.d/58-sudoedit
+      expected=gina
+    else
+      printf 'Defaults:henry use_pty,set_utmp,!utmp_runas\n' >>/etc/sudoers.d/58-sudoedit
+      expected=henry
+    fi
+    cat >/usr/local/bin/henry-editor <<'EOF'
+#!/usr/bin/python3
+import sys
+data = open('/run/utmp', 'rb').read()
+print('utmp=' + ('present' if sys.argv[1].encode() in data else 'missing'))
+EOF
+    pty henry "SUDO_EDITOR='/usr/local/bin/henry-editor $expected' sudoedit -n -u gina /etc/henryfile"
+    expect_rc 0
+    expect_out_has utmp=present
+    run root "python3 -c 'print(\"cleared\" if b\"$expected\" not in open(\"/run/utmp\", \"rb\").read() else \"present\")'"
+    expect_rc 0
+    expect_out_line cleared
+    end
+  }
+done
+
+for noexec_kind in default tag; do
+  begin "sudoedit-execution-noexec-$noexec_kind" && {
+    sudoedit_parity_setup
+    if [[ $noexec_kind == default ]]; then
+      printf 'Defaults:henry noexec\n' >>/etc/sudoers.d/58-sudoedit
+    else
+      printf 'henry ALL=(ALL:ALL) NOPASSWD: NOEXEC: sudoedit\n' >>/etc/sudoers.d/58-sudoedit
+    fi
+    cat >/usr/local/bin/henry-editor <<'EOF'
+#!/bin/sh
+if /usr/bin/true; then printf 'external-ran\n'; else printf 'external-blocked\n'; fi
+EOF
+    run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /etc/henryfile'
+    expect_rc 0
+    if [[ $noexec_kind == default ]]; then
+      expect_out_line external-blocked
+    else
+      expect_out_line external-ran
+    fi
+    end
+  }
+done
+
+begin sudoedit-execution-closefrom && {
+  sudoedit_parity_setup
+  printf 'Defaults:henry closefrom=4\n' >>/etc/sudoers.d/58-sudoedit
+  printf 'inherited-fd\n' >/tmp/sudoedit-extra-fd
+  cat >/usr/local/bin/henry-editor <<'EOF'
+#!/bin/sh
+read -r value <&3 || exit 91
+printf '%s\n' "$value"
+EOF
+  run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /etc/henryfile 3</tmp/sudoedit-extra-fd'
+  expect_rc 0
+  expect_out_line inherited-fd
+  rm -f /tmp/sudoedit-extra-fd
+  end
+}
+
+for log_format in sudo json; do
+  begin "sudoedit-execution-accept-metadata-$log_format" && {
+    sudoedit_parity_setup
+    log_file="$WORK/sudoedit-event-$log_format"
+    printf 'Defaults:henry logfile="%s",log_format=%s,loglinelen=0\n' "$log_file" "$log_format" >>/etc/sudoers.d/58-sudoedit
+    run henry 'SUDO_EDITOR=/usr/bin/true sudoedit -n /etc/henryfile'
+    expect_rc 0
+    if [[ $log_format == sudo ]]; then
+      grep -qF 'COMMAND=/usr/bin/true -- /etc/henryfile' "$log_file" || fail "accept command metadata differs: $(cat "$log_file")"
+    else
+      python3 - "$log_file" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))['accept']
+assert event['command'] == '/usr/bin/true', event
+assert event['runargv'] == ['/usr/bin/true', '--', '/etc/henryfile'], event
+PY
+      [[ $? == 0 ]] || fail 'JSON accept editor metadata differs'
+    fi
+    end
+  }
+done
+
+begin sudoedit-parity-relative-operand-unchanged && {
+  sudoedit_parity_setup
+  printf 'Defaults:henry runcwd=*\n' >>/etc/sudoers.d/58-sudoedit
+  run henry 'cd /etc && SUDO_EDITOR=/usr/bin/true sudo -ne -D /tmp ./henryfile'
+  expect_rc 0
+  [[ $ERR == 'sudo: ./henryfile unchanged' ]] || fail 'unchanged diagnostic lost original operand spelling'
+  [[ $(cat /etc/henryfile) == original ]] || fail 'editor cwd changed original file resolution'
+  end
+}
+
+begin sudoedit-parity-relative-operand-open-error && {
+  sudoedit_parity_setup
+  ln -s /etc/henryfile /etc/henrylink
+  run henry 'cd /etc && SUDO_EDITOR=/usr/bin/true sudoedit -n ./henrylink'
+  expect_rc 1
+  [[ $ERR == 'sudoedit: ./henrylink: editing symbolic links is not permitted' ]] || fail 'open diagnostic lost original operand spelling'
+  end
+}

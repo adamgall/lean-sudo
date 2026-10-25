@@ -1,284 +1,577 @@
 # lean-sudo — design and module contracts
 
-A drop-in replacement for `sudo` written in Lean 4 (toolchain pinned in
-`lean-toolchain`, core Lean only — no Mathlib/Batteries), with the security-relevant
-logic formally verified.
+Lean 4, with the toolchain pinned in `lean-toolchain`; no Mathlib or Batteries.
+The compatibility reference is sudo.ws 1.9.17p2. Proofs establish the properties
+below of pure Lean functions, not correctness of the OS, FFI, or IO orchestration.
 
-## Architecture: verified functional core, thin imperative shell
+## Architecture: verified functional core, imperative shell
 
+```text
+argv, environment, NSS identities, filesystem/clock facts
+sudo.conf, nsswitch.conf, sudoers files, SSSD attributes, group-provider answers
+                         │
+                         ▼
+Main → Shell ── Context ──► Core.decide ──► Decision (auth, logs, action)
+         │                    │
+         │              Parser / Policy / Env / Timestamp / Cli
+         ▼
+Sys.* → C / PAM → authentication, timestamp locks, execution or sudoedit
+         │
+         ├─ local event/I/O logs or Sys.LogSrv → framed TCP/TLS log server
+         └─ Sys.Intercept → privileged broker → refreshed facts → Intercept.decide
+                              ▲                                  │
+                              └── seccomp/ptrace or sudo DSO ────┘
 ```
-argv, environ ─┐
-getpw*/getgr*  ├─► IO shell (Main.lean) ──► pure core (LeanSudo.Core.decide) ──► Decision
-/etc/sudoers   ┘        │                         uses Parser, Policy, Env, Cli, Timestamp
-                        ▼
-              C shim (c/*.c): PAM, setres[ug]id, fork/execve/wait, pty, termios, stat
-```
 
-* Everything that decides *whether* and *how* a command runs is a total, pure Lean
-  function with theorems about it (see "Verified properties").
-* The IO layer only gathers facts, calls the pure core, and executes its decision.
-* The C shim is the trusted computing base: small, no policy, one syscall concern per
-  function. Each `c/<x>.c` file is owned by exactly one `LeanSudo/Sys/*.lean` module.
-* PAM is `dlopen("libpam.so.0")`ed at runtime (Lean's bundled sysroot cannot link
-  against system libpam, and there are no PAM headers on the build host — the shim
-  declares the stable PAM ABI itself).
+`Core.decide : Context → Decision` is total and pure. It returns an authentication
+requirement, not proof that PAM has succeeded: the trusted shell must satisfy it
+before executing the action. The shell preserves authorization-time settings and
+target facts separately from post-lookup privilege Defaults. It gathers rooted
+command identity, descriptors, digests, regex and group facts; chroot happens only
+in the final command child, after policy, PAM and host NSS lookups.
 
-Gettext catalogs are optional. The shell activates only installed locales and loads
-`sudo` / `sudoers` catalogs from `/usr/share/locale`, then Ubuntu's
-`/usr/share/locale-langpack`, with `LANGUAGE` overriding the selected message locale
-except in C. Every resolved catalog path and ancestor must be root-owned and not
-group/world-writable. Translation occurs only at user-output boundaries: pure
-decisions and audit/log data remain independent of the caller's locale. Log reasons
-use the separate `sudoers_locale` (C by default). Explicit `passprompt` and
-`badpass_message` values are literal; only compiled-in defaults are translated.
-Absent catalogs preserve the original English bytes.
+`Nsswitch` selects ordered `files`/`sss` policies and return actions. `Sys.Sss`
+copies libsss_sudo attributes; pure `Sss` converts them into policy. Group-provider
+answers are exact `(user, group, answer)` facts, not replacements for Unix groups.
+Only a provider return of 1 is affirmative. `%:` requires an affirmative fact;
+ordinary groups also consult the provider under `always_query_group_plugin`.
+Provider load/init failure cannot invent membership, but need not deny an
+independent rule.
+
+The interception broker retains the original principals and selected root and
+refreshes command facts for each exec. Private reply sockets require affirmative
+Lean authorization; malformed or absent replies cannot allow execution.
+`intercept_authenticate` rechecks timestamps and authenticates under the record
+lock. `log_subcmds` alone logs without a second authorization check; subcommand
+environments are preserved. Trace mode skips the initially authorized exec and
+can verify executable/arguments/environment before the new image runs. Its
+verification retains sudo's relative-script/chroot label limitations. The DSO
+backend uses `/usr/libexec/sudo/sudo_intercept.so`, bootstrap sockets, a random
+128-bit token and native-endian length-prefixed protobuf messages. Neither backend
+is a sandbox.
+
+Remote logging replaces local I/O files when `log_servers` is configured. The
+Lean client fails over initial connection establishment, not an established
+session or malformed handshake. It validates server messages and durable commit
+positions; I/O sessions send exit and await final commit, audit-only sessions
+close without exit. Event setup uses `ignore_logfile_errors`; I/O setup/streaming
+uses `ignore_iolog_errors`. Brokers queue encoded events to the original privileged
+relay, which alone owns TCP/TLS state. The C transport bounds DNS/connect/TLS/I/O
+by `log_server_timeout`, honors keepalive, and loads OpenSSL 3 with TLS ≥1.2 and
+peer verification unless explicitly disabled.
+
+The C shim and IO shell are trusted, not formally verified. PAM is dynamically
+loaded from `libpam.so.0`; SSSD, group providers, gzip and TLS also use runtime
+libraries. C implements credential changes, descriptors, relays and transports;
+it does not interpret sudoers policy. Bindings are not one-to-one: `c/core.c`,
+for example, serves both `Sys.Core` and `Sys.Pam`.
+
+Gettext loading accepts installed locale/catalog data only through root-owned,
+non-group/world-writable resolved paths and ancestors. Message catalogs use
+`/usr/share/locale` and Ubuntu's `locale-langpack` fallback; `LANGUAGE` overrides
+non-C message locales. Translation is a presentation boundary; log reasons use
+separate `sudoers_locale` (C by default). Explicit prompts/messages remain literal,
+and missing translations preserve English.
 
 ## Module map
 
-| Module | Contents |
+Paths below are relative to `LeanSudo/` unless otherwise marked. Each row names
+one source module; the C table also lists shared headers.
+
+| Module | Purpose |
 |---|---|
-| `LeanSudo/Sudoers/Ast.lean` | sudoers AST (contract, frozen) |
-| `LeanSudo/Policy/Types.lean` | `Principal`, `Request`, `Command`, `Settings`, `Judgement` (contract, frozen) |
-| `LeanSudo/Sudoers/Parser.lean` | `parse : (file : String) → (text : String) → Except ParseError (List Located)` |
-| `LeanSudo/Util/Glob.lean` | `fnmatch (pattern s : String) (pathname : Bool) : Bool` + proofs |
-| `LeanSudo/Util/Sha2.lean` | pure SHA-224/256/384/512 over `ByteArray`, digest dispatch and output-length proofs; NIST known-answer tests in `Tests.Sha2` |
-| `LeanSudo/Policy/Defaults.lean` | `resolveDefaults` (Defaults → `Settings`) |
-| `LeanSudo/Policy/Eval.lean` | `evaluate : Sudoers → Settings → Request → Judgement`, matching |
-| `LeanSudo/Policy/List.lean` | `sudo -l` rendering |
-| `LeanSudo/Policy/Proofs.lean` | policy theorems |
-| `LeanSudo/Cli.lean` | `parseArgs (argv0 : String) (args : List String) (env : List (String × String) := []) : ParseResult` (`warnings`, `result : Except Diagnostic Options`; getopt-style diagnostics carry the full argv[0]) |
-| `LeanSudo/Env.lean` | `buildEnv` (command environment, sudo's env.c order: rebuild, then explicitly permitted `VAR=value`/`--preserve-env`, then PAM `env_merge`) + proofs |
-| `LeanSudo/Prompt.lean` | `%u %U %h %H %p %%` prompt expansion |
-| `LeanSudo/I18n.lean`, `LeanSudo/I18n/Render.lean` | pure GNU MO parsing, catalog fallback theorem, plural expressions, printf substitution and diagnostic presentation |
-| `LeanSudo/I18n/Load.lean` | root-owned catalog/locale loading; message-locale precedence, Ubuntu langpack fallback, separate `sudoers_locale` log catalog |
-| `LeanSudo/Timestamp.lean` | pure timestamp records, (de)serialisation, validity + proofs |
-| `LeanSudo/IoLog.lean` | pure I/O stream plans (`plan_enabled`), sudo path escapes, base-36 sequence paths, legacy/JSON metadata and timing records |
-| `LeanSudo/EventLog.lean` | pure sudo text wrapping and ordered JSON accept/reject/alert/exit formatting; `@cee:` syslog records, pretty logfile members and compact JSON lines |
-| `LeanSudo/LogSrv.lean` | pure sudo log-server protobuf encoder/decoder, bounded signed/unsigned wire and timestamp round-trip proofs, malformed-message rejection |
-| `LeanSudo/Sys/Core.lean` + `c/core.c` | users/groups/host/tty/stat/realpath/secure read/environ/syslog |
-| `LeanSudo/Sys/Pam.lean` (+ `c/core.c`) | PAM handle + conversation (tty / `-S` stdin / `-n`) |
-| `LeanSudo/Sys/Exec.lean` + `c/exec.c` | privilege drop, fork/execve/wait, signal relay, pty |
-| `LeanSudo/Intercept.lean`, `LeanSudo/Sys/Intercept.lean` + `c/intercept*.c` | pure subcommand authorization, privileged policy broker, Linux seccomp/ptrace monitor and the system sudo-intercept DSO protocol |
-| `LeanSudo/Sys/Timestamp.lean` + `c/ts.c` | timestamp file storage, boot clock, session/process identity |
-| `LeanSudo/Sys/GroupPlugin.lean` + `c/groupplugin.c` | sudo group-provider ABI loading (`dlopen`), version validation, init/query/cleanup; the shell supplies exact `(user, group, answer)` facts to pure policy matching |
-| `LeanSudo/Sys/IoLog.lean` + `c/iolog.c` | fail-closed session creation, locked sequence allocation, owner/mode enforcement, plain/gzip streams, password-prompt filtering; pty and pipe relay hooks in `c/exec.c` |
-| `LeanSudo/Sys/LogSrv.lean` + `c/logsrv.c` | remote event and I/O sessions, initial server failover, durable commits, timed TCP framing and dynamically loaded OpenSSL 3 TLS |
-| `LeanSudo/Core/Types.lean` | decision-core contract: `Context`, `Decision`, `ExecPlan`, `EditPlan`, `Action` |
-| `LeanSudo/Core.lean`, `LeanSudo/CoreProofs.lean` | pure decision core (`decide`) + end-to-end theorems |
-| `LeanSudo/Sudoers/Load.lean` | include resolution + file ownership/mode checks |
-| `Main.lean`, `LeanSudo/Shell.lean` | `sudo` / `sudoedit` entry point; IO shell (gathers the `Context`, runs PAM, executes the `Decision`) |
-| `LeanSudo/Sudoedit.lean`, `LeanSudo/Sudoedit/Check.lean`, `LeanSudo/Sys/Edit.lean` + `c/edit.c` | sudoedit: proved editor selection/copy-back checks; privilege-dropped file workers |
-| `Visudo.lean`, `LeanSudo/Visudo/Core.lean`, `LeanSudo/Visudo/Sys.lean` + `c/visudo.c` | `visudo` entry point; pure CLI/checks; record locks, reusable temp files, owner/mode |
-| `test/` | `Tests` library (`#guard` unit tests, checked by `lake build Tests`) and IO smoke executables |
-| `scripts/AxiomAudit.lean` | checks every `LeanSudo` declaration uses only the standard axioms |
-| `integration/` | Docker-based end-to-end suite (runs as real root in a container) |
+| `Cli.lean` | Pure sudo/sudoedit option scanner, diagnostics, help/version and shell escaping. |
+| `CliProofs.lean` | Operand, mode, warning and shell-escaping invariants. |
+| `Core/Types.lean` | Context, authentication, execution/edit plans, logging and decision contracts. |
+| `Core.lean` | Pure decision, failure classification, authentication requirements and plans. |
+| `CoreProofs.lean` | Authorization, identity, environment, root-selection and event-classification proofs. |
+| `Env.lean` | Environment rebuild, explicit assignments, file sources and PAM merge. |
+| `EnvProofs.lean` | Environment provenance, uniqueness and conditional protected-binding proofs. |
+| `EventLog.lean` | Text/JSON accept, reject, alert and exit formatting and auth-failure predicates. |
+| `I18n.lean` | GNU MO parsing, plural expressions, fallback and safe formatting. |
+| `I18n/Render.lean` | Catalog-based diagnostic presentation without changing policy data. |
+| `I18n/Load.lean` | Trusted locale/catalog discovery and separate message/log translation. |
+| `Insults.lean` | Upstream insult collection and bounded selection. |
+| `Intercept.lean` | Pure subcommand authorization with retained identities and environment. |
+| `IoLog.lean` | Stream plans, sequence/path expansion, metadata and timing formatting. |
+| `LogSrv.lean` | Pure sudo log-server protobuf codec and bounded round-trip proofs. |
+| `Nsswitch.lean` | Ordered files/SSSD source parsing, validation and return-action selection. |
+| `Policy/Types.lean` | Principals, requests, settings, command/root facts and judgements. |
+| `Policy/Defaults.lean` | Typed Defaults application and scope resolution. |
+| `Policy/Eval.lean` | Alias/list, user/host/run-as/command matching and candidate evaluation. |
+| `Policy/List.lean` | Sudo privilege-list rendering and alias expansion. |
+| `Policy/Proofs.lean` | Candidate provenance, last-match, negation, auth and rooted-selection proofs. |
+| `Prompt.lean` | Sudo password-prompt percent expansion. |
+| `Shell.lean` | Trusted sudo orchestration: facts, PAM, locks, logging, broker callbacks and execution. |
+| `Sss.lean` | SSSD attribute conversion, filtering and sudoOrder/negation handling. |
+| `SudoConf.lean` | sudo.conf paths/settings and supported-plugin validation. |
+| `Sudoedit.lean` | Descriptor-based file preparation, editor execution and checked copy-back. |
+| `Sudoedit/Check.lean` | Pure editor selection, separator, temporary-file and write-back checks. |
+| `Sudoers/Ast.lean` | Located sudoers syntax, aliases, Defaults, tags and command options. |
+| `Sudoers/Parser.lean` | Sudoers parser, diagnostics and successful-parse invariants. |
+| `Sudoers/Load.lean` | Include resolution, ordering and source ownership/mode checks. |
+| `Sys/Core.lean` | Identity, filesystem, terminal, environment, event logging and mail bindings. |
+| `Sys/Edit.lean` | Credential-scoped descriptor-relative sudoedit worker operations. |
+| `Sys/Exec.lean` | Checked execution specification and command supervisor bindings. |
+| `Sys/Extra.lean` | System matching/audit oracles and root-containment helpers. |
+| `Sys/GroupPlugin.lean` | Sudo group-provider configuration, load/query/cleanup bindings. |
+| `Sys/Intercept.lean` | Broker request contract and scoped monitor lifecycle. |
+| `Sys/IoLog.lean` | Local I/O session allocation, metadata and stream initialization. |
+| `Sys/LogSrv.lean` | Remote session protocol, failover, relay callbacks and commit validation. |
+| `Sys/Lookup.lean` | Credential-scoped batched path inspection and executable-bit criterion. |
+| `Sys/Pam.lean` | PAM transaction/conversation configuration, lifecycle and diagnostics. |
+| `Sys/Sss.lean` | SSSD defaults/user-rule attribute-query binding. |
+| `Sys/Timestamp.lean` | Sudo-compatible record locking, storage, process identity and clock IO. |
+| `Timestamp.lean` | Timestamp scopes, sudo v2 codec, bounded scanner, validity and update proofs. |
+| `Util/Glob.lean` | Pure pathname-aware glob matcher and literal/star proofs. |
+| `Util/Sha2.lean` | Pure SHA-224/256/384/512 and digest dispatch. |
+| `Visudo/Core.lean` | Pure visudo options, semantic checks and editor-input helpers. |
+| `Visudo/Sys.lean` | Visudo editor, record-lock, temporary-file and metadata bindings. |
+| root `LeanSudo.lean` | Library umbrella importing the implementation and proof modules. |
+| root `Main.lean` | Delegates sudo/sudoedit startup to `Shell.run`. |
+| root `Visudo.lean` | Visudo check/edit/export orchestration and installation. |
+| root `lakefile.lean` | Lean targets, shim compilation/linking and shared-header dependencies. |
+| root `scripts/AxiomAudit.lean` | Audits all imported LeanSudo declarations for nonstandard axioms. |
 
-Remote logging replaces local I/O files when `log_servers` is configured. The
-Lean client chooses initial destinations in configured order and validates server
-messages and acknowledged commit points. Like sudoers 1.9.17p2, it does not
-reconnect an established session: a lost connection stops the command unless
-I/O errors are ignored, in which case the command continues without logging.
-The pure codec also supports RestartMessage, used by sudo_sendlog rather than
-sudoers' live client. An I/O session sends an exit record and waits for the final
-commit; sudo's audit-only client closes without an exit record. Event setup uses
-`ignore_logfile_errors` (enabled by default), while I/O setup and streaming use
-`ignore_iolog_errors` (disabled by default). A server abort is an error, never a
-reason to reconnect. Interception brokers enqueue encoded events over a private
-socketpair; only the original privileged relay touches the TCP/TLS session.
+| C source/header | Purpose |
+|---|---|
+| `c/core.c` | NSS/filesystem/terminal/log/mail primitives and dynamically loaded PAM conversation. |
+| `c/edit.c` | Privilege-dropped sudoedit workers and descriptor reads/writes/restoration. |
+| `c/exec.c` | Credential transitions, exec, pty/pipe relay, signals, deadlines and child setup. |
+| `c/groupplugin.c` | Sudo group-provider ABI validation, initialization, query and cleanup. |
+| `c/intercept.c` | Privileged broker, private request/reply transport and monitor lifecycle. |
+| `c/intercept_trace.c` | Linux seccomp/ptrace exec monitor and optional post-exec verification. |
+| `c/intercept_dso.c` | System sudo-intercept DSO bootstrap/authenticated protobuf transport. |
+| `c/iolog.c` | Local plain/gzip streams, sequence locking, timing and password filtering. |
+| `c/logsrv.c` | Deadline-bounded framed TCP/OpenSSL transport and relay/broker queue bridge. |
+| `c/lookup.c` | Permanently credential-dropped child stat batches without policy selection. |
+| `c/sss.c` | libsss_sudo dynamic ABI and checked attribute copying. |
+| `c/sys.c` | Domain/interface/netgroup/regex/glob/hostname/audit system oracles. |
+| `c/ts.c` | Secure timestamp descriptors, clocks, byte-range locks and positional IO. |
+| `c/visudo.c` | Editor process, record locks, reusable temporary files and owner/mode operations. |
+| `c/intercept.h` | Shared broker/trace monitor interface. |
+| `c/intercept_dso.h` | DSO bootstrap, environment and service lifecycle interface. |
+| `c/logsrv.h` | Framed transport, I/O relay and broker queue interface. |
+| `c/locale_scope.h` | Thread-local sudoers locale enter/leave interface. |
 
-The C transport applies `log_server_timeout` to DNS resolution, connection,
-TLS negotiation and message transfer; DNS runs in a reaped, deadline-bounded
-resolver child. Sockets are close-on-exec and honor `log_server_keepalive`.
-TLS loads `libssl.so.3` and `libcrypto.so.3`, requires TLS 1.2 or later, and checks
-the certificate chain and hostname or connected peer IP unless verification is
-explicitly disabled. A configured CA bundle and optional client certificate/key
-are passed without substituting a different trust store or credential.
+## Sys API contract
 
-## Sys API contract (Lean signatures)
+Names in `Sys.Core`, `Sys.Pam`, `Sys.Exec`, `Sys.Timestamp` and `Sys.Extra`
+are in `LeanSudo.Sys`; the other interfaces below use their named subnamespace.
+The signatures below omit FFI borrowing annotations (`@&`) and private raw
+bindings. Numeric widths are intentional: public wrappers often use `Nat`, while
+descriptors and some raw-facing APIs use `UInt32`. Errors are API-specific:
+`Option` can represent missing facts, PAM returns status codes, and IO failures
+usually throw `IO.Error`; there is no universal “all failures throw” contract.
 
-All in `namespace LeanSudo.Sys`. Numeric ids are `Nat` on the Lean side, `uid_t`/`gid_t`
-in C. Errors are raised as `IO.userError` with `strerror` text unless an `Option`
-is returned.
+### Core
 
-### `LeanSudo.Sys.Core`
+`Passwd` has `name : String`, `uid gid : Nat`, `gecos home shell : String`.
+`FileStat` has `dev ino mode uid gid size rdev : Nat`; `mode` includes file type
+bits, tested by `FileStat.isReg`, `isDir`, and `isLnk`.
+
 ```lean
-structure Passwd where
-  name : String; uid : Nat; gid : Nat; gecos : String; home : String; shell : String
-structure FileStat where
-  dev : Nat; ino : Nat; mode : Nat  -- full st_mode incl. type bits
-  uid : Nat; gid : Nat; size : Nat; rdev : Nat
-def FileStat.isReg / isDir / isLnk : FileStat → Bool
-
-getuid geteuid getgid getegid : IO Nat
-getgroups : IO (List Nat)                       -- supplementary groups of this process
+getuid, geteuid, getgid, getegid : IO Nat
+setUid : UInt32 → IO Unit
+getgroups : IO (List Nat)
 getpwnam : String → IO (Option Passwd)
 getpwuid : Nat → IO (Option Passwd)
 getgrnam : String → IO (Option GroupInfo)
 getgrgid : Nat → IO (Option GroupInfo)
-getgrouplist : (user : String) → (gid : Nat) → IO (List Nat)
-gethostname : IO String
-isatty : (fd : UInt32) → IO Bool
-ttyname : (fd : UInt32) → IO (Option String)
-environ : IO (List (String × String))           -- entries that are not valid UTF-8 or lack '=' are dropped
-stat lstat : String → IO (Option FileStat)
+getgrouplist : String → Nat → IO (List Nat)
+validShells : IO (Array String)
+gethostname, getcwd, architecture : IO String
+isatty : UInt32 → IO Bool
+ttyname : UInt32 → IO (Option String)
+environ : IO (List (String × String))
+stat, lstat : String → IO (Option FileStat)
 realpath : String → IO (Option String)
-access : (path : String) → (mode : UInt32) → IO Bool   -- X_OK etc, as real uid
-/-- open with O_RDONLY|O_NOFOLLOW|O_CLOEXEC, fstat the *opened* fd, read it fully. -/
-readFileNoFollow : String → IO (FileStat × String)
-listDir : String → IO (List String)             -- names, excluding . and ..
-syslog : (facility : String) → (priority : String) → (msg : String) → IO Unit
-getcwd : IO String
-writeStderr : String → IO Unit                   -- unbuffered
+access : String → UInt32 → IO Bool
+readFileFollow : String → IO (FileStat × String)
+openCommand, openReadOnly : String → IO (Nat × FileStat)
+closeDescriptor : UInt32 → IO Unit
+listDir : String → IO (List String)
+syslog : String → String → String → IO Unit
+syslogBytes : String → String → ByteArray → Bool → IO Unit
+writeStderr : String → IO Unit
+umask : UInt32 → IO UInt32
+unixTime : IO Nat
+noNewPrivs : IO Bool
+terminalColumns : UInt32 → IO Nat
+terminalSize : IO (Nat × Nat)
+utcOffset : IO Int
+createAdminFlag : String → Nat → Nat → List Nat → IO Unit
+logTime : Bool → String → IO String
+eventTime : Bool → String → IO EventLog.Time
+eventUuid : IO String
+appendLog, appendJson : String → String → IO Unit
+signalName : UInt32 → IO String
+sendMail : String → Array String → String → IO Unit
 ```
 
-Group-provider membership is separate from NSS/Unix membership. The shell loads
-`group_plugin` relative to `/usr/libexec/sudo` unless its path is absolute, passes
-space/tab-separated arguments to the provider's version-1 ABI, and closes it after
-collecting facts (with a finalizer for exceptional exits). Only a query return of
-exactly `1` becomes an affirmative fact. `%:` atoms require that fact; ordinary
-`%group`/`%#gid` atoms retain Unix membership and additionally consult it when
-`always_query_group_plugin` is enabled. A loader/init error does not itself deny
-independent rules, matching sudo.ws, but can never manufacture plugin membership.
+Sudoers loading follows symlinks and checks the opened regular file; it is not
+an O_NOFOLLOW policy. `openCommand` pins the executable; `openReadOnly` permits
+checking opened-file metadata before reading. Environment entries without `=` or
+valid UTF-8 are dropped. `appendJson` appends members to sudo's pretty JSON object,
+not JSON lines. The module also exposes a no-follow reader for callers that need
+that distinct primitive; it is not the sudoers loader contract.
 
-### `LeanSudo.Sys.Pam`
+### Pam
+
+`PamHandle` is an external-object-backed type with finalizer cleanup. `ConvConfig`
+fields are `useStdin nonInteractive visiblepw override pwfeedback : Bool := false`,
+`prompt : String := "Password: "`, and `timeout : Nat := 0`.
+
 ```lean
-opaque PamHandle : Type        -- NonemptyType-backed external object
-structure ConvConfig where
-  /-- `-S`: read from stdin instead of /dev/tty -/
-  useStdin : Bool
-  /-- `-n`: any prompt fails the conversation -/
-  nonInteractive : Bool
-  /-- expanded passprompt; replaces PAM's "Password: " style prompts when
-  `override` is true or the PAM prompt is the generic one -/
-  prompt : String
-  override : Bool
-  pwfeedback : Bool
-  /-- seconds, 0 = none -/
-  timeout : Nat
-pamStart : (service : String) → (user : String) → ConvConfig → (ruser : String) → (tty : Option String) → IO PamHandle
--- each returns the raw PAM return code (0 = PAM_SUCCESS)
-pamAuthenticate : PamHandle → IO Int
-pamAcctMgmt : PamHandle → IO Int
-pamChauthtok : PamHandle → IO Int               -- PAM_CHANGE_EXPIRED_AUTHTOK
-pamSetcred : PamHandle → (establish : Bool) → IO Int
-pamOpenSession pamCloseSession : PamHandle → IO Int
+pamStart : String → String → ConvConfig → String → Option String → IO PamHandle
+pamConfigure : PamHandle → Bool → Bool → Bool → String → String → String → IO Unit
+pamLecture : PamHandle → String → IO Unit
+pamLectured : PamHandle → IO Bool
+pamAuthenticate, pamAcctMgmt, pamChauthtok : PamHandle → IO Int
+pamSetcred : PamHandle → Bool → IO Int
+pamOpenSession, pamCloseSession : PamHandle → IO Int
+pamSetUser : PamHandle → String → IO Int
 pamGetEnv : PamHandle → IO (List (String × String))
 pamStrerror : PamHandle → Int → IO String
-pamEnd : PamHandle → (status : Int) → IO Unit
+pamEnd : PamHandle → Int → IO Unit
 pamAvailable : IO Bool
+pamLastConvError : PamHandle → IO (Option String)
+pamInterrupted : PamHandle → IO UInt32
 ```
 
-### `LeanSudo.Sys.Exec`
+`pamStart` arguments are service, user, conversation, remote user, tty;
+`pamConfigure` takes silent/sessionSilent/bell and askpass/rhost/promptUser.
+Status 0 is PAM success. `pamEnd` is idempotent; authentication checks `PAM_USER`
+against the requested account. Conversation errors and captured SIGINT/SIGQUIT
+are separate from PAM status. Askpass runs as the invoker; the original environment
+remains available during authentication, before command-environment filtering.
+
+### Exec
+
 ```lean
 structure ExecSpec where
-  path : String            -- absolute path passed to execve
-  argv : Array String      -- including argv[0]
-  env : Array String       -- "KEY=VALUE"
+  path : String
+  argv : Array String
+  env : Array String
   uid : Nat
   gid : Nat
-  groups : Array Nat       -- supplementary groups (setgroups)
-  cwd : Option String      -- chdir after dropping privileges
+  groups : Array Nat
+  cwd : Option String
   umask : Nat
-  usePty : Bool            -- only honoured when a std fd is a tty
-  background : Bool        -- `-b`
+  usePty : Bool
+  background : Bool
   closeFrom : Nat := 3
+  cwdOptional : Bool := false
+  timeout : Nat := 0
+  noexecFile : Option String := none
+  apparmorProfile : Option String := none
+  rlimits : Array (String × String) := #[("rlimit_core", "0,0")]
+  utmpUser : Option String := none
+  execFd : Option Nat := none
+  execBackground : Bool := false
+  staySetuid : Bool := false
+  chroot : Option String := none
 inductive ExitStatus where
-  | exited (code : Nat) | signaled (sig : Nat)
-/-- fork, drop privileges in the child in the order setgroups → setresgid → setresuid,
-verify the drop with getres[ug]id (abort if it did not take), chdir, umask, close fds,
-execve. The parent relays signals, waits, and returns the child's status. A failed
-execve is reported back through a CLOEXEC pipe as an `IO.userError`. -/
+  | exited (code : Nat)
+  | signaled (sig : Nat)
+initializeProcess (disableCoredump : Bool := true) : IO Unit
+lastDumpedCore : IO Bool
 runCommand : ExecSpec → IO ExitStatus
-/-- exit(code) or re-raise the signal on ourselves with default disposition. -/
 exitWith : ExitStatus → IO α
 ```
 
-Interception brackets `runCommand` with `Sys.Intercept.withMonitor`. A privileged
-broker captures the original caller/target context; the shell refreshes command
-identity, regex, digest, group-provider and NSS-source facts for every exec and
-calls `Intercept.decide`. C cannot select a different principal or authorize an
-exec by itself. Trace requests transfer a private reply socket using `SCM_RIGHTS`;
-only a well-formed affirmative Lean response permits execution. Missing replies
-and malformed requests fail closed. `intercept_authenticate` holds the timestamp
-record lock across the fresh cache check, PAM authentication and renewal.
+`Exec.check` requires an absolute path, nonempty argv, NUL-free strings, IDs below
+the unchanged-ID sentinel, umask ≤0777, closeFrom in 3..0x7fffffff, bounded timeout
+and private executable descriptors. Child setup marks fds close-on-exec, optionally
+chroots, drops/verifies credentials, applies cwd/umask and executes. `staySetuid`
+retains the invoking real UID and all GIDs while effective/saved UID use the target;
+normal mode uses the target IDs. Optional login cwd failure warns; required cwd
+failure aborts. The supervisor relays signals/job control, enforces deadlines and
+keeps PAM alive through background command completion. `exitWith` clamps exit codes
+above 255 rather than wrapping success.
 
-The trace backend installs a seccomp filter before dropping credentials, traces
-fork/clone descendants, and skips the initial already-authorized execve.
-`intercept_verify` compares the new executable, arguments and environment while
-stopped before its first instruction. The DSO backend uses Ubuntu's
-`/usr/libexec/sudo/sudo_intercept.so`: an inherited bootstrap socket, a random
-128-bit token, and authenticated loopback connections carrying sudo's protobuf
-messages with the implementation's native-endian 32-bit length prefix. Only the
-bootstrap descriptor survives close-on-exec for the initial handshake.
-Subcommand environments are preserved rather than rebuilt. `log_subcmds` alone
-logs without applying a second sudoers authorization check. Remote subcommand
-records are queued to the parent, never written through a forked TLS state.
-The compatibility boundary is sudo.ws 1.9.17p2's: its trace backend does not
-authorize `execveat`, and DSO interception cannot cover statically linked
-programs or dynamic-loader bypasses. These modes are not a general sandbox.
+### Timestamp
 
-### `LeanSudo.Sys.Timestamp`
 ```lean
-bootTimeNanos : IO Nat                -- CLOCK_BOOTTIME
-getsid getppid : IO Nat
-processStartTime : (pid : Nat) → IO (Option Nat)  -- /proc/<pid>/stat field 22
-/-- open (O_NOFOLLOW, 0600, root-owned dir 0700 created if needed), lock,
-pass contents to `f`, write back the result if `some`. -/
-withTimestampFile : (uid : Nat) → (ByteArray → IO (Option ByteArray × α)) → IO α
-removeTimestampFile : (uid : Nat) → IO Unit
+structure TimestampConfig where
+  directory : String := "/run/sudo/ts"
+  uid : Nat
+  ownerUid : Nat := 0
+  ownerGid : Nat := 0
+structure TimestampKey where
+  scope : Timestamp.Scope
+  lockScope : Timestamp.Scope
+  sid : Nat
+  authUid : Nat
+bootTimeNanos, getsid, getppid : IO Nat
+processStartTime : Nat → IO (Option Nat)
+ttyDevice : IO (Option Nat)
+stateMarker : String → Nat → Bool → IO Bool
+readTimestamp : TimestampConfig → TimestampKey → IO (List Timestamp.Record)
+withTimestampFile (config : TimestampConfig) (key : TimestampKey)
+    (f : List Timestamp.Record → IO (Option Timestamp.Record × α))
+    (report : String → IO Unit := fun _ => pure ()) : IO α
+invalidateTimestamp : TimestampConfig → Timestamp.Scope → IO Unit
+removeTimestampFile : TimestampConfig → IO Unit
 ```
-Timestamp directory: `/run/lean-sudo/ts/<uid>`.
 
-## Verified properties (targets)
+Default storage is `/run/sudo/ts/<uid>`, using sudo's v2 disk format and compatible
+header/per-terminal-or-process byte-range locks, not a private serialized list.
+Foreign records retain their offsets. Global tickets also use a short record lock
+for status/update. `readTimestamp` is only a nonblocking snapshot; authentication
+rechecks under the long-held lock. Cache IO errors are reported and treated as no
+trusted cache, not as authorization; callback errors are not retried. An update
+changes only the selected record. `-k` disables matching records across auth UIDs;
+`-K` unlinks the invoking UID's file. Process start time is nanoseconds converted
+from `/proc` ticks, not raw field-22 jiffies; time uses CLOCK_BOOTTIME. Lecture
+markers are separate from authentication records.
 
-1. **Default deny**: `evaluate [] s r = .deny`; no rule whose user list matches ⇒ deny.
-2. **Soundness**: `evaluate s st r = .allow a` ⇒ there is a user-spec entry in `s` whose
-   user, host, run-as and command lists all match `r` and which is the *last* such
-   match, and it is not negated.
-3. **Negation**: if the last matching command entry is negated ⇒ `.deny`.
-4. **Authentication**: `a.needsAuth = false` ⇒ the deciding rule carries `NOPASSWD`
-   or `authenticate` is off.
-5. **Glob**: `fnmatch` agrees with literal equality on metacharacter-free patterns;
-   `*` with `pathname` never crosses `/`.
-6. **Environment** (sudo's env.c order): with `env_reset`, every output variable is
-   set by sudo, whitelisted (`env_keep`, or `env_check` with a safe value) or comes
-   from a trusted source (`env_file`, PAM); without `SETENV`, `LD_*` and `env_delete`
-   entries never come from the caller, and the caller cannot override `secure_path`;
-   `SUDO_USER/UID/GID/COMMAND` are correct unless an explicitly permitted later write
-   sets them (as in sudo); no duplicate keys.
-7. **CLI**: the command vector is exactly the operands after option parsing; `--`
-   stops option processing; mutually exclusive modes are rejected.
-8. **Timestamp**: a record is accepted only if same uid, same scope (tty/ppid/
-   session identity incl. start time), age ≤ timeout and not in the future; `-k`
-   invalidates every record of the current scope (sudo's `timestamp_remove`).
-9. **Decision core**: `decide` yields `exec` only if the policy allows the request
-   and either authentication succeeded, or no authentication is required (invoker is
-   root, NOPASSWD/`!authenticate`, valid timestamp, or target = invoker without
-   group change); the exec spec's uid/gid/groups equal the target's; its environment
-   is `buildEnv`'s output.
+### Edit, Extra and Lookup
 
-## Fail-closed rules
+In `Sys.Edit`, `Identity` contains `uid gid : UInt32`, `groups : Array UInt32`;
+`Result` contains `name : String`, `value : UInt32`. `noneFd = 0xffffffff` also
+means AT_FDCWD on input.
 
-* Unsupported sudoers constructs are parse errors (see `Ast.lean`).
-* Every sudoers source must be a regular file owned by uid 0, not world-writable,
-  and group-writable only when owned by gid 0. Included directories must be real
-  directories with the same ownership/mode restrictions. Any violation ⇒ refuse
-  to run, including in an included file/directory: skipping it could discard a
-  denial and widen policy. Unlike sudo, insecure includes are fatal, not skipped.
-* `requiretty`, PAM_TTY and log TTY use only a terminal whose device matches the
-  process's controlling terminal, never an unrelated pty supplied on stdin.
-* Timestamp-based authentication waivers are rechecked under the timestamp lock;
-  invalidated or expired records require authentication, including with `-N`.
-  Failed authentication never refreshes a record, and `-N` never writes one.
-* PAM cleanup failures are warnings and preserve the command's exit status.
-* Non-UTF-8 command-line arguments ⇒ refuse to run (Lean `String`s are UTF-8).
-* Not running with euid 0 ⇒ the standard sudo "effective uid is not 0" error.
+```lean
+Edit.identity : Nat → Nat → List Nat → IO Edit.Identity
+Edit.operation (who : Edit.Identity) (op : UInt32) (dir : UInt32 := Edit.noneFd)
+    (path : String := "") (mask : Nat := 0o022) (suffixLen : Nat := 0) : IO Edit.Result
+Edit.close : UInt32 → IO Unit
+Edit.stat : UInt32 → IO (Array Nat)
+Edit.read : UInt32 → IO ByteArray
+Edit.write : UInt32 → ByteArray → ByteArray → IO Unit
+Edit.setTimes : UInt32 → UInt64 → UInt64 → IO Unit
+Edit.clock : IO UInt64
+
+domainName : IO (Option String)
+interfaceAddresses : IO (Array (String × String))
+inNetgroup : String → Option String → Option String → Option String → IO Bool
+regexMatches (pattern text : String) (locale : String := "C") : IO Bool
+globPaths (pattern : String) (locale : String := "C") : IO (List String)
+canonicalHostname : String → IO (Except String String)
+auditCommand : String → String → Bool → IO Bool
+commandLookupRoot : Option String → Option String
+withinRoot : String → String → Bool
+rootPathEscapes : String → String → IO Bool
+
+Lookup.executable : FileStat → Bool
+Lookup.inspectPaths : Array String → Nat → Nat → Array Nat → IO (Array (Option FileStat))
+```
+
+Edit operations run in permanently privilege-dropped workers; callers own returned
+descriptors. Write receives new bytes and the original snapshot for attempted
+restoration on failure. Lookup uses one credential-scoped child per batch, retains
+one stat result per path and rejects malformed/incomplete replies. Its executable
+criterion is regular-file plus any execute bit, not `access(X_OK)`. Regex/glob use
+sudoers locale. Audit unavailability is a successful no-op; an actual audit failure
+returns false. Root containment uses path-component boundaries; `CHROOT=*` without
+an override means host lookup, not a directory called `*`.
+
+### IoLog and LogSrv
+
+```lean
+IoLog.open : LeanSudo.IoLog.Plan → LeanSudo.IoLog.Metadata → String → IO (Option String)
+LogSrv.endpoint : String → Option (String × String × Bool)
+LogSrv.accept : Settings → EventLog.Details → Option LeanSudo.IoLog.Plan → IO Unit
+LogSrv.event (st : Settings) (details : EventLog.Details) (reason : String)
+    (alert : Bool := false) : IO Unit
+LogSrv.subcommand : EventLog.Details → Option String → IO Unit
+LogSrv.finish (exitValue : Nat) (signal : String) (dumpedCore : Bool)
+    (error : String := "") : IO Unit
+LogSrv.close, LogSrv.poll : IO Unit
+LogSrv.subcommandWire : ByteArray → IO Unit
+LogSrv.ioEvent : UInt32 → ByteArray → UInt32 → UInt32 → IO Unit
+```
+
+Local open creates all selected files before execution, returning the session path;
+errors throw unless the plan ignores them. Remote callbacks run in the privileged
+relay, not the command child; `close` also detaches the broker queue. Endpoint
+syntax supports bracketed IPv6 and `(tls)`, with default ports 30343/30344.
+
+### Sss, GroupPlugin and Intercept
+
+```lean
+Sss.query : UInt32 → String → IO (Array LeanSudo.Sss.Rule × Array LeanSudo.Sss.Rule)
+GroupPlugin.splitConfig : String → String × Array String
+GroupPlugin.load : String → IO (Option GroupPlugin.Handle)
+GroupPlugin.query : GroupPlugin.Handle → String → String → IO Bool
+GroupPlugin.close : GroupPlugin.Handle → IO Unit
+
+structure Intercept.Request where
+  command : String
+  cwd : String
+  argv : Array String
+  env : Array String
+  pid : UInt32
+  setid : Bool
+Intercept.withMonitor (trace verify logOnly : Bool)
+    (check : Intercept.Request → IO Bool) (action : IO α) : IO α
+```
+
+SSSD queries global defaults then user rules using the returned domain; rule order
+is retained. Unavailable library/transport yields no rules for that query;
+malformed data, invalid UTF-8 and other server failures throw rather than returning
+partial rules. Group configuration splits only on spaces/tabs; relative libraries
+resolve under `/usr/libexec/sudo`. Handles have explicit and finalizer cleanup.
+Intercept requests deliberately contain no principal identities. `withMonitor`
+brackets the action with broker start/stop, including exceptional exits.
+
+## Verified properties (current theorem targets)
+
+These are conditional statements over supplied facts, not claims that all IO is
+proved. Names are unqualified within the module named in each item.
+
+1. **Default deny and matching** (`Policy/Proofs`): `evaluate_nil` denies an empty
+   policy; `evaluate_no_user_match` denies when every user-spec user list fails.
+   `evaluate_sound` gives a member user/host/command spec satisfying `SpecMatches`.
+   For `isRunCmd = true`, `evaluate_sound_run` additionally identifies the last
+   candidate, `allow = true`, its user/host/run-as matches and positive command
+   result. Listing instead uses positive candidates (`judgeListing_allow`); it is
+   not covered by a universal last-command-wins claim.
+2. **Negation**: `evaluate_last_deny` denies a run command when the last candidate's
+   command result is `some false`; `evaluate_append_deny_all` denies a run command
+   after appending `denyAllRule r.user.name`. Alias-denial theorems require their
+   stated lookup/fuel and inner-match hypotheses.
+3. **Authentication tags**: `evaluate_noauth_run` requires a successful run-command
+   allow and `needsAuth = false`; the last positive candidate then has
+   `passwd = some false`, or `passwd = none` with `authenticate = false`.
+   `evaluate_noauth_listing` instead permits password policy `.never` or a positive
+   candidate whose `specNeedsAuth` is false.
+4. **Glob/parser**: `Glob.fnmatch_literal` equates matching with string equality
+   when `hasMeta = false`; `fnmatch_star_pathname` says `*` matches exactly strings
+   without `/`. `parse_wellFormed`, `parse_command_absolute`,
+   `parse_digest_command_absolute` and `parse_regex_anchored` describe successful
+   parser output, not semantic validity of arbitrary policies.
+5. **Environment** (`EnvProofs`): successful `buildEnv` has unique keys
+   (`buildEnv_nodup`) and documented provenance (`buildEnv_origin`).
+   `buildEnv_reset_whitelist` requires reset mode and either no SETENV or no extra
+   variables. `buildEnv_delete_respected` and `buildEnv_no_LD` allow trusted
+   files/PAM and reset-mode whitelisting; they do not ban every LD variable.
+   `buildEnv_securePath` requires no SETENV and compatible PAM writes;
+   `buildEnv_sudo_vars` requires `BindingSafe` for each protected binding.
+6. **CLI** (`CliProofs`): successful parsing returns exactly the scanner operands
+   (`parseArgs_command`), a suffix of input (`parseArgs_command_suffix`); an initial
+   `--` leaves the rest unchanged (`parseArgs_dashdash`).
+   `parseArgs_login_shell`, `parseArgs_askpass_stdin` and `parseArgs_edit` exclude
+   the stated conflicting modes and require edit files/no environment overrides.
+7. **Timestamp validity/storage** (`Timestamp`): `valid_sound` gives matching scope
+   and auth UID, nonfuture time, non-disabled state and a nonzero finite timeout;
+   `valid_timeout_strict` strengthens finite age to `< timeout * 10^9`.
+   `lookup_invalidateScope` prevents a cache hit for the invalidated scope.
+   `decodeEntry_encodeEntry` and `decode_encode` require representable entries or
+   records. `scanStep_bounds` gives `offset + 4 ≤ next ≤ extent`;
+   `scanStep_decoded` ties emitted entries to `decodeSlot`; `scan_sound` gives each
+   scanned entry a bounded step origin. `scan_timespecs` characterizes the validity
+   flags, not universal validity of scanned records. `LocatedEntry.authorized_sound`
+   additionally requires successful `recordFor` and `valid`, and yields UID/scope,
+   valid timespecs, global-or-matching SID, non-disabled/nonfuture time and strict
+   finite age. `updateEntry_sound` binds updates to the locked scope and auth UID.
+8. **Decision core** (`CoreProofs`): `exec_origin`/`edit_origin` require an execution
+   action and produce a policy allow, correct mode/plan and successful environment
+   construction. `deny_no_execution` excludes both actions on policy denial.
+   `exec_noauth` gives `AuthExemption` when an exec decision has `.auth = .none`;
+   it does not prove PAM success. `exec_identity` fixes UID to target, GID to the
+   invoking real GID under stay-setuid or selected target GID otherwise, and groups
+   to invoking or target groups according to preserve-groups. `exec_environment`
+   fixes the plan's inputs and empty pre-PAM environment, not the final post-PAM
+   bytes. `timestamp_update_allowed` implies policy allow and neither `-N` nor
+   reset; `reset_never_waives_auth` requires `policyNeedsAuth = true`.
+9. **Logging** (`CoreProofs`): `failureLog_ne_accept` says any returned failure log
+   is not `.accept`; `policy_failure_ne_accept` says the same for a policy decision
+   with `decisionFailure = some failure`. `policy_warning_no_mail` says a failure
+   with `denial = false` sets decision mail to false. These distinguish accept from
+   reject/alert without asserting that every failure emits a log.
+10. **Interception and groups**: `Core.exec_intercept_matches_policy` binds the
+    exec plan's interception flag to the deciding tag/Defaults and logSubcmds to
+    settings. `Core.intercept_setid_no_exec` excludes exec for an allowed run request
+    with interception enabled, set-id facts true and `interceptAllowSetid = false`.
+    `Intercept.allowed_only_by_policy` requires enforcement true and yields a
+    positive core policy judgement. `Core.group_plugin_requires_yes` requires a
+    successful non-Unix group match and yields the exact affirmative context fact;
+    `Policy.pluginGroupMatch_requires_yes` gives the corresponding request fact.
+11. **Chroot and command lineage**: `Core.exec_chroot_selection` yields an allow,
+    `chrootPermitted = true`, and plan root equal to `commandChroot`.
+    `exec_user_chroot_requires_wildcard` requires effective `CHROOT=*` for an explicit
+    caller root; `exec_selected_root` binds the plan to the selected root after
+    wildcard filtering/home expansion. `edit_chroot_uses_defaults` and
+    `edit_user_chroot_requires_wildcard` give the separate sudoedit rule.
+    `Policy.evaluate_selection_origin` traces every selected command/path/argv/fd/
+    refusal/set-id fact to `rootFacts`; `Core.exec_fd_is_pinned` traces descriptors
+    to host or root facts. `Sys.commandLookupRoot_wildcard` and
+    `withinRoot_boundary` prove wildcard removal and component-boundary containment.
+12. **LogSrv codec**: `Wire.varint_uint64` requires `< 2^64`;
+    `Wire.signed_unsigned32/64` require the respective signed ranges.
+    `Wire.fields_bytes_roundtrip` requires tags 1..15 and payload length `< 2^64`.
+    `time_roundtrip`/`commit_roundtrip` require int64 seconds/int32 nanoseconds
+    (not normalized wall-clock nanoseconds). `logId_roundtrip`, `error_roundtrip`,
+    `abort_roundtrip` require UTF-8 size `< 2^64`; `clientHello_roundtrip` requires
+    size +11 below that bound. `accept_zero_roundtrip`, `exit_zero_roundtrip`,
+    `io_stream_roundtrip` and `hello_capability_roundtrip` cover only their stated
+    finite/zero families; the I/O theorem uses streams `Fin 5`, zero delay and
+    bytes `[0,128,255]`, not arbitrary messages. `Wire.fieldsAux_reject_group`
+    rejects protobuf group wire types; `Wire.varint_window_bounded` limits lookahead
+    to ten bytes. There is no blanket all-message round-trip theorem.
+13. **Other boundaries**: `Sudoedit.writeBack_sound` requires changed and checked;
+    `tempSafe_sound` requires regular, owned, single-link facts.
+    `Nsswitch.approveSources_supported_only` gives nonempty files/sss-only sources.
+    `Sss.negativesLast_mem` preserves membership and
+    `negativesLast_exclusion_suffix` puts exclusions last. `IoLog.plan_enabled`
+    equates plan presence with stream enablement. `I18n.lookup_absent` preserves
+    the original message when no entry exists.
+
+## Fail-closed rules and compatibility differences
+
+As stated in README's **Fail-closed by design**, where sudo.ws keeps a partial
+policy, lean-sudo stops because a dropped line can be a `!` rule:
+
+* A syntax error anywhere in the policy stops lean-sudo; sudo.ws reports it and
+  continues with the rules it could parse.
+* An insecure or unreadable include stops lean-sudo: an included file or
+  `@includedir` directory that is world-writable, group-writable by a group other
+  than root, or not owned by root, and an `@include` file that is missing or cannot
+  be read. sudo.ws warns and skips them.
+* Undefined aliases and alias cycles are errors (sudo warns), because a
+  `!UNDEFINED` matching nothing would widen access.
+* Invalid Defaults values (for example `timestamp_timeout=abc`) are errors, rather
+  than falling back to defaults that could widen access.
+* Non-UTF-8 command-line arguments are refused; non-UTF-8 environment entries are
+  dropped.
+
+The README's **Other differences from sudo.ws** are:
+
+* Fractional `timestamp_timeout` is rounded down to whole seconds.
+* Chroot lookup rejects host-prefixed canonical commands or parents escaping the
+  selected root. It also avoids three upstream false “command not found” cases:
+  losing a selected command when a later NSS source is empty, dropping privileges
+  before a nested run-as group lookup, and expanding a tilde root after lookup.
+* As in sudo.ws, ptrace interception does not authorize `execveat`; the DSO mode
+  inherits dynamic-loader limitations. Interception is a policy aid, not a sandbox.
+
+These rules do not impose a no-symlink include policy or require an included
+path's spelling to be a “real directory”; loading follows symlinks and checks the
+relevant file/directory metadata.
 
 ## Build
 
+Pure Lean library/proofs/tests build on Linux and macOS. The C shim and executables
+are Linux-only; use Docker from macOS. Lake's default targets are `LeanSudo`,
+`sudo` and `visudo`; the explicit library target avoids building Linux executables.
+
+```sh
+lake build LeanSudo Tests               # library, proofs and compile-time #guard tests
+lake env lean scripts/AxiomAudit.lean   # after building the library
+lake build sudo visudo                 # native Linux executables
+lake build smoke-core smoke-exec smoke-ts  # Linux FFI smoke executables
+integration/build.sh                   # Docker Linux sudo/visudo → .lake/linux/
+integration/run.sh --build              # Docker end-to-end suite
+integration/run.sh reference            # same suite against sudo.ws
+integration/run.sh --visudo .lake/linux/visudo
 ```
-lake build LeanSudo Tests        # library, proofs, unit tests (Linux or macOS)
-lake build sudo visudo           # executables (Linux only; on macOS: integration/build.sh)
-lake env lean scripts/AxiomAudit.lean
-integration/run.sh --build       # docker end-to-end suite (needs docker)
-```
+
+Lake builds the listed shim translation units with `cc`, PIC/O2, warnings as
+errors, stack protection and fortification; all four shared headers participate
+in object dependencies. Linking uses `-ldl -lutil`; optional runtime libraries
+are dynamically loaded. The axiom audit checks every declaration defined in
+imported `LeanSudo` modules, including private/generated definitions, and permits
+only `propext`, `Quot.sound`, and `Classical.choice`. It rejects `sorryAx` and
+`Lean.ofReduceBool`; it does not audit the test library or prove C/IO correctness.

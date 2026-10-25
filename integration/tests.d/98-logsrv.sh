@@ -351,3 +351,98 @@ begin logsrv-tcp-disconnected-stream-ignored && {
   logsrv_disconnect_case true
   end
 }
+
+begin sudoedit-execution-logsrv && {
+  sudoedit_parity_setup
+  logsrv_start
+  printf 'Defaults:henry log_servers="127.0.0.1:30343",log_server_timeout=2,log_output,!ignore_iolog_errors\n' >>/etc/sudoers.d/58-sudoedit
+  cat >/usr/local/bin/henry-editor <<'EOF'
+#!/bin/sh
+printf 'remote-editor-output\n'
+printf 'edited\n' >>"$1"
+EOF
+  run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /etc/henryfile'
+  expect_rc 0
+  expect_out_line remote-editor-output
+  [[ $(cat /etc/henryfile) == $'original\nedited' ]] || fail 'remote-logged editor did not copy back'
+  logsrv_stop
+  logsrv_event accept
+  logsrv_event exit
+  python3 - "$LSRV/io" <<'PY'
+import json, pathlib, sys
+files = list(pathlib.Path(sys.argv[1]).rglob('stdout'))
+assert len(files) == 1, files
+assert files[0].read_bytes() == b'remote-editor-output\n', files[0].read_bytes()
+metadata = json.loads((files[0].parent / 'log.json').read_text())
+assert metadata['submituser'] == 'henry', metadata
+assert metadata['runargv'] == ['/usr/local/bin/henry-editor', '--', '/etc/henryfile'], metadata
+assert (files[0].parent / 'timing').stat().st_mode & 0o222 == 0
+PY
+  [[ $? == 0 ]] || fail 'remote editor stream, metadata or final commit differs'
+  run root "sudoreplay.ws -d '$LSRV/io' -l"
+  expect_rc 0
+  expect_out_has 'COMMAND=/usr/local/bin/henry-editor -- /etc/henryfile'
+  end
+}
+
+logsrv_malformed_case() {
+  local size=3
+  [[ $1 == groups ]] && size=2097152
+  [[ $1 == small-group ]] && size=1
+  logsrv_policy 127.0.0.1:30345 'Defaults log_output'
+  LSRV_BAD="$WORK/logsrv-malformed-$NUM"
+  mkdir -p "$LSRV_BAD"
+  python3 - "$LSRV_BAD" "$1" >"$LSRV_BAD/server.out" 2>&1 <<'PY' &
+import pathlib,socket,struct,sys
+root=pathlib.Path(sys.argv[1])
+with socket.socket() as listener:
+    listener.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+    listener.bind(("127.0.0.1",30345))
+    listener.listen(1)
+    listener.settimeout(10)
+    (root/"ready").touch()
+    connection,_=listener.accept()
+    with connection:
+        connection.settimeout(5)
+        payload={"groups":b"\x0b"*(2*1024*1024),"small-group":b"\x0b","truncated":b"\x1a\x02x"}[sys.argv[2]]
+        connection.sendall(struct.pack("!I",len(payload))+payload)
+        (root/"sent").touch()
+        try:
+            while connection.recv(65536):
+                pass
+        except (ConnectionResetError,socket.timeout):
+            pass
+PY
+  LSRV_BAD_PID=$!
+  for _ in {1..100}; do
+    [[ -e $LSRV_BAD/ready ]] && break
+    kill -0 "$LSRV_BAD_PID" 2>/dev/null || break
+    sleep .02
+  done
+  [[ -e $LSRV_BAD/ready ]] || fail 'malformed-frame fixture did not listen'
+  run alice 'sudo -n /bin/echo must-not-execute'
+  expect_rc 1
+  expect_out_empty
+  expect_err_has 'error initializing I/O plugin sudoers_io'
+  if [[ $LABEL == reference && $1 != truncated ]]; then
+    expect_err_match "^sudo: (unable to unpack ServerMessage size $size|handle_server_message: unexpected type_case value 0)$"
+  else
+    expect_err_has "unable to unpack ServerMessage size $size"
+  fi
+  expect_err_lacks 'Segmentation fault'
+  wait "$LSRV_BAD_PID" || fail 'malformed-frame fixture failed'
+  [[ -e $LSRV_BAD/sent ]] || fail 'fixture did not send the entire frame'
+  python3 -c 'import json,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(json.dumps({"status":int(sys.argv[2]),"stdout":pathlib.Path(sys.argv[3]).read_text(),"stderr":pathlib.Path(sys.argv[4]).read_text()},sort_keys=True,indent=2)+"\n")' "$OUTDIR/$LABEL-$CUR-result.json" "$RC" "$WORK/out" "$WORK/err"
+}
+begin logsrv-malformed-group-frame && {
+  logsrv_malformed_case groups
+  end
+}
+begin logsrv-malformed-truncated-field && {
+  logsrv_malformed_case truncated
+  end
+}
+begin logsrv-malformed-small-group && {
+  logsrv_malformed_case small-group
+  end
+}

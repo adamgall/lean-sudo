@@ -190,8 +190,17 @@ def expandHomePath (targetHome : String) (homes : List (String × String))
 def expandHome (ctx : Context) (p : String) : Option String :=
   expandHomePath ctx.target.home ctx.homes p
 
+def effectiveCwd (ctx : Context) (a : Allowed) : Option String :=
+  match a.cwd with
+  | none => ctx.settings.runcwd
+  | some none => some "*"
+  | some (some path) => some path
+
+def cwdPermitted (ctx : Context) (a : Allowed) : Bool :=
+  ctx.opts.chdir.isNone || effectiveCwd ctx a == some "*"
+
 def configuredCwd (ctx : Context) (a : Allowed) : Option String :=
-  ctx.opts.chdir.or (a.cwd.join.or ctx.settings.runcwd) |>.filter (· != "*")
+  (ctx.opts.chdir.or (effectiveCwd ctx a)).filter (· != "*")
 
 /-- Run commands use their deciding CHROOT option; sudoedit ignores that option
 and applies only Defaults runchroot to its editor child, as sudo.ws does. -/
@@ -292,65 +301,140 @@ def editPlan (ctx : Context) (a : Allowed) : EditPlan :=
     pamSession := ctx.settings.pamSession, pamSetcred := ctx.settings.pamSetcred,
     follow := a.follow.getD ctx.settings.sudoeditFollow, checkdir := ctx.settings.sudoeditCheckdir,
     chroot := commandChroot ctx a,
+    cwd := (configuredCwd ctx a).bind (expandHome ctx), cwdOptional := false,
+    usePty := ctx.settings.usePty,
+    iolog := IoLog.plan ctx.settings {},
+    timeout := ctx.settings.commandTimeout, rlimits := ctx.settings.resourceLimits,
+    utmpUser := if ctx.settings.setUtmp then
+      some (if ctx.settings.utmpRunas then ctx.target.name else ctx.invoking.name) else none,
+    closeFrom := ctx.opts.closeFrom.getD ctx.settings.closefrom.toNat,
+    execBackground := ctx.settings.execBackground,
+    noexecFile := if ctx.settings.noexec then
+      some (ctx.settings.noexecFile.getD "/usr/libexec/sudo/sudo_noexec.so") else none,
+    apparmorProfile := ctx.settings.apparmorProfile,
     editorSources := candidates.map (·.1),
     editorNotFound := (environmentEditors ctx).getLast?.getD ctx.settings.editor,
     editorPath := (if userIsExempt ctx.settings ctx.invoking then none else ctx.settings.securePath).getD
       ((lookup ctx.userEnv "PATH").getD stdPath) }
 
-def notFound (ctx : Context) : Action :=
+def notFoundText (ctx : Context) : String :=
   let command := ctx.opts.command.headD ""
-  .fail (if ctx.commandFoundInDot then
+  if ctx.commandFoundInDot then
     s!"sudo: ignoring \"{command}\" found in '.'\nUse \"sudo ./{command}\" if this is the \"{command}\" you wish to run.\n"
   else
     s!"sudo: {command}: command not found\n" ++
       if command == "cd" then
         "sudo: \"cd\" is a shell built-in command, it cannot be run directly.\n" ++
         "sudo: the -s option may be used to run a privileged shell.\n" ++
-        "sudo: the -D option may be used to run a command in a specific directory.\n" else "") 1
+        "sudo: the -D option may be used to run a command in a specific directory.\n" else ""
 
-/-- Unsupported enforcement never silently drops a deciding rule's restriction. -/
-def enforcementError (ctx : Context) (a : Allowed) : Option String :=
-  if (a.selection.bind (·.refusal)).isSome then a.selection.bind (·.refusal)
-  else if ctx.opts.mode == .run && a.intercept.getD ctx.settings.intercept &&
-      !ctx.settings.interceptAllowSetid && commandSetidFor ctx a then
-    some "setid commands are not permitted in intercept mode"
-  else if ctx.opts.timeout.getD 0 > 0 && !ctx.settings.userCommandTimeouts then
-    some "sorry, you are not allowed set a command timeout"
-  else if ctx.settings.fdexec != "never" && (a.usesDigest || ctx.settings.fdexec == "always") &&
-      (descriptorFor ctx a).isNone then some "unable to execute command: missing command descriptor"
-  else if !chrootPermitted ctx a then
-    some s!"you are not permitted to use the -R option with {((resolvedFor ctx a).map (·.path)).getD "sudoedit"}"
-  else if (selectedChroot ctx a).isSome && (commandChroot ctx a).isNone then
-    some s!"invalid chroot directory: {(selectedChroot ctx a).getD ""}"
-  else if ctx.selinuxEnabled && ((ctx.opts.role.or (a.role.or ctx.settings.role)).isSome ||
-      (ctx.opts.type.or (a.type.or ctx.settings.type)).isSome) then
-    some "unable to set SELinux security context"
-  else if (configuredCwd ctx a).isSome && ((configuredCwd ctx a).bind (expandHome ctx)).isNone then
-    some "unknown user in working directory"
+def notFound (ctx : Context) : Action := .fail (notFoundText ctx) 1
+
+/-- A failing policy check carries its actual warning/rejection/audit effects,
+not an inferred accept event or a classification parsed from diagnostic text. -/
+structure FailureInfo where
+  message : String
+  prefixed : Bool := true
+  reason : Option String := none
+  denial : Bool := false
+  raw : Bool := false
+  commandReady : Bool := true
+  lookupComplete : Bool := true
+  rootApplied : Bool := false
+  cwdApplied : Bool := false
+  auditReason : Option String := none
+  adminFlag : Bool := false
+
+def FailureInfo.action (f : FailureInfo) : Action :=
+  .fail (if f.prefixed then "sudo: " ++ f.message ++ "\n" else f.message) 1
+
+def warningInfo (message reason : String) : FailureInfo :=
+  { message, reason := some reason, auditReason := some reason }
+
+def permissionCommand (ctx : Context) (a : Allowed) : String :=
+  if ctx.opts.mode == .edit then "sudoedit"
+  else ((resolvedFor ctx a).map (·.path)).getD (ctx.opts.command.headD "")
+
+def permissionFailure (ctx : Context) (a : Allowed) : Option FailureInfo :=
+  if !chrootPermitted ctx a then
+    some (warningInfo s!"you are not permitted to use the -R option with {permissionCommand ctx a}"
+      s!"user not allowed to change root directory to {ctx.opts.chroot.getD ""}")
+  else if !cwdPermitted ctx a then
+    some { (warningInfo s!"you are not permitted to use the -D option with {permissionCommand ctx a}"
+      s!"user not allowed to change directory to {ctx.opts.chdir.getD ""}") with rootApplied := true }
   else none
 
-def allowedAction (ctx : Context) (a : Allowed) : Action :=
-  match ctx.opts.mode with
-  | .run => match resolvedFor ctx a with
-    | none => match a.selection.bind (·.refusal) with
-      | some message => .fail ("sudo: " ++ message ++ "\n") 1
-      | none => notFound ctx
-    | some rc =>
-      if (enforcementError ctx a).isSome then
-        .fail ("sudo: " ++ (enforcementError ctx a).getD "" ++ "\n") 1
-      else if ctx.opts.chdir.isSome && a.cwd != some none && ctx.settings.runcwd != some "*" then
-        .fail s!"sudo: you are not permitted to use the -D option with {rc.path}\n" 1
-      else match buildEnv (environment ctx a) with
-        | .error e => .fail ("sudo: " ++ e ++ "\n") 1
-        | .ok _ => .exec (execPlan ctx a rc)
-  | .edit =>
-    if (enforcementError ctx a).isSome then
-      .fail ("sudo: " ++ (enforcementError ctx a).getD "" ++ "\n") 1
-    else if ctx.opts.chdir.isSome then .fail "sudo: the -D option is not supported with sudoedit\n" 1
-    else match buildEnv (environment ctx a) with
-      | .error e => .fail ("sudo: " ++ e ++ "\n") 1
-      | .ok _ => .edit (editPlan ctx a)
-  | .list =>
+def preCommandFailure (ctx : Context) (a : Allowed) : Option FailureInfo :=
+  match permissionFailure ctx a with
+  | some failure => some failure
+  | none =>
+    if let some reason := a.selection.bind (·.refusal) then
+      some { (warningInfo reason reason) with rootApplied := true, cwdApplied := true }
+    else if ctx.opts.mode == .run && a.intercept.getD ctx.settings.intercept &&
+        !ctx.settings.interceptAllowSetid && commandSetidFor ctx a then
+      some {
+        message := "setid commands are not permitted in intercept mode",
+        reason := some "setid command rejected in intercept mode", denial := true,
+        auditReason := some "setid command rejected in intercept mode",
+        rootApplied := true, cwdApplied := true }
+    else none
+
+def postCommandFailure (ctx : Context) (a : Allowed) : Option FailureInfo :=
+  if ctx.opts.timeout.getD 0 > 0 && !ctx.settings.userCommandTimeouts then
+    some { (warningInfo "sorry, you are not allowed set a command timeout"
+      "user not allowed to set a command timeout") with rootApplied := true, cwdApplied := true, adminFlag := true }
+  else if ctx.settings.fdexec != "never" && (a.usesDigest || ctx.settings.fdexec == "always") &&
+      (descriptorFor ctx a).isNone then some { message := "unable to execute command: missing command descriptor" }
+  else if (selectedChroot ctx a).isSome && (commandChroot ctx a).isNone then
+    some { message := s!"invalid chroot directory: {(selectedChroot ctx a).getD ""}" }
+  else if ctx.selinuxEnabled && ((ctx.opts.role.or (a.role.or ctx.settings.role)).isSome ||
+      (ctx.opts.type.or (a.type.or ctx.settings.type)).isSome) then
+    some { message := "unable to set SELinux security context" }
+  else if (configuredCwd ctx a).isSome && ((configuredCwd ctx a).bind (expandHome ctx)).isNone then
+    some { message := "unknown user in working directory" }
+  else none
+
+/-- Command enforcement failures, independent of their display and event classification. -/
+def enforcementError (ctx : Context) (a : Allowed) : Option String :=
+  ((preCommandFailure ctx a).orElse (fun _ => postCommandFailure ctx a)).map (·.message)
+
+def postLookupFailure (ctx : Context) (a : Allowed) : Option FailureInfo :=
+  match postCommandFailure ctx a with
+  | some failure => some failure
+  | none =>
+    if ctx.opts.mode == .run || ctx.opts.mode == .edit then
+      match buildEnv (environment ctx a) with
+      | .ok _ => none
+      | .error message =>
+        if ctx.opts.preserveEnv == .all && !a.setenv then
+          some { (warningInfo message "user not allowed to preserve the environment") with
+            rootApplied := true, cwdApplied := true, adminFlag := true }
+        else some {
+          message, reason := some message, rootApplied := true,
+          cwdApplied := true, adminFlag := true }
+    else none
+
+def allowedFailure (ctx : Context) (a : Allowed) : Option FailureInfo :=
+  match preCommandFailure ctx a with
+  | some failure => some failure
+  | none =>
+    if (ctx.opts.mode == .run || (ctx.opts.mode == .list && !ctx.opts.command.isEmpty)) &&
+        (resolvedFor ctx a).isNone then
+      some {
+        message := notFoundText ctx, prefixed := false, adminFlag := true,
+        auditReason := some (if ctx.commandFoundInDot then "command in current directory"
+          else s!"{ctx.opts.command.headD ""}: command not found") }
+    else postLookupFailure ctx a
+
+def allowedAction (ctx : Context) (a : Allowed)
+    (failure : Option FailureInfo := allowedFailure ctx a) : Action :=
+  match failure, ctx.opts.mode with
+  | some f, _ => f.action
+  | none, .run => match resolvedFor ctx a with
+    | none => notFound ctx
+    | some rc => .exec (execPlan ctx a rc)
+  | none, .edit => .edit (editPlan ctx a)
+  | none, .list =>
     if ctx.opts.command.isEmpty then
       let located := if ctx.listingSources.isEmpty then ctx.locatedSudoers else ctx.listingSources
       let policy := if ctx.listingSources.isEmpty then ctx.sudoers else located.map (·.entry)
@@ -361,8 +445,8 @@ def allowedAction (ctx : Context) (a : Allowed) : Action :=
       | none => notFound ctx
       | some _ => .print (listCommand ctx.sudoers (authorizationSettings ctx) (request ctx)
           ctx.locatedSudoers (ctx.opts.listVerbose > 1)) 0
-  | .validate => .validate
-  | _ => .fail "sudo: invalid policy mode\n" 1
+  | none, .validate => .validate
+  | none, _ => .fail "sudo: invalid policy mode\n" 1
 
 def userMatches (ctx : Context) : Bool :=
   let al := aliasesOf ctx.sudoers
@@ -380,7 +464,8 @@ def denialReason (ctx : Context) : String :=
   else if !hostMatches ctx then "user NOT authorized on host" else "command not allowed"
 
 def denialMail (ctx : Context) : Bool :=
-  (ctx.opts.mode == .run || ctx.opts.mode == .edit) && ctx.mailerAvailable && (ctx.settings.mailAlways ||
+  ctx.mailerAvailable && (ctx.settings.mailAlways ||
+    ((ctx.opts.mode == .run || ctx.opts.mode == .edit) && ctx.settings.mailAllCmnds) ||
     if !userMatches ctx then ctx.settings.mailNoUser
     else if !hostMatches ctx then ctx.settings.mailNoHost else ctx.settings.mailNoPerms)
 
@@ -429,17 +514,34 @@ def logCommand (ctx : Context) : String :=
   | .sudoedit fs => "sudoedit" ++ String.join (fs.map (" " ++ logArgument ·))
   | _ => commandText ctx
 
-def logLine (ctx : Context) (reason : Option String) (allowed : Option Allowed := none) : LogLine :=
+/-- The frontend has already formed shell argv before set_cmnd resolves a path. -/
+def unresolvedLogCommand (ctx : Context) : String × List String :=
+  if ctx.opts.mode == .edit then ("sudoedit", ctx.opts.command)
+  else if ctx.opts.shell || ctx.opts.login || ctx.opts.impliedShell then
+    let shell := Cli.userShell (if ctx.opts.login then none else ctx.userEnv.lookup "SHELL")
+      (if ctx.opts.login then ctx.target.shell else ctx.invoking.shell)
+    let command := Cli.shellCommand shell ctx.opts.login ctx.opts.command
+    (command.path, command.argv.tail)
+  else (ctx.opts.command.headD "", ctx.opts.command.tail)
+
+def logLine (ctx : Context) (reason : Option String) (allowed : Option Allowed := none)
+    (commandOverride : Option (String × List String) := none)
+    (rootApplied : Bool := true) : LogLine :=
   let tty := ctx.ttyName.map fun t =>
     logEscape (if t.startsWith "/dev/" then String.ofList (t.toList.drop 5) else t)
-  let cwd := (ctx.opts.chdir.or (allowed.bind (·.cwd.join))).or ctx.settings.runcwd
-    |>.filter (· != "*")
+  let cwd := (allowed.map (configuredCwd ctx)).getD
+    ((ctx.opts.chdir.or ctx.settings.runcwd).filter (· != "*"))
   let cwd := (cwd.bind (expandHome ctx)).getD (if ctx.opts.login then ctx.target.home else ctx.cwd)
   let chroot := match allowed with
-    | some a => commandChroot ctx a
+    | some a =>
+      if rootApplied then commandChroot ctx a
+      else (configuredChroot ctx a).bind (expandHomePath
+        (if ctx.opts.mode == .edit then ctx.target.home else (ctx.policyTarget.getD ctx.target).home) ctx.homes)
     | none => ((ctx.opts.chroot.or ctx.settings.runchroot).filter (· != "*")).bind (expandHome ctx)
   let commandCtx := (allowed.map (fun a => { ctx with command := resolvedFor ctx a })).getD ctx
   { format := ctx.settings.logFormat, reason,
+    event := if reason.isSome then .reject else .accept,
+    runcwd := some cwd, runchroot := chroot,
     priority := (if reason.isSome then ctx.settings.syslogBadpri else ctx.settings.syslogGoodpri).getD "none",
     msg := logEscape (displayUser ctx).name ++ " : " ++ (reason.map (fun s => logEscape s ++ " ; ")).getD "" ++
       (tty.map (fun t => s!"TTY={t} ; ")).getD "" ++
@@ -448,11 +550,35 @@ def logLine (ctx : Context) (reason : Option String) (allowed : Option Allowed :
       (ctx.targetGroup.map (fun g => s!"GROUP={logEscape g.name} ; ")).getD "" ++
       (if ctx.opts.envVars.isEmpty then "" else
         "ENV=" ++ logEscape (String.intercalate " " (ctx.opts.envVars.map fun (k,v) => k ++ "=" ++ v)) ++ " ; ") ++
-      "COMMAND=" ++ logCommand commandCtx }
+      "COMMAND=" ++ (match commandOverride with
+        | some (path, args) => logEscape path ++
+            (if args.isEmpty then "" else " " ++ String.intercalate " " (args.map logArgument))
+        | none => logCommand commandCtx) }
 
 /-- Event output follows the resolved sudoers format, including JSON. -/
 theorem logLine_format (ctx : Context) (reason : Option String) (allowed : Option Allowed) :
     (logLine ctx reason allowed).format = ctx.settings.logFormat := rfl
+
+/-- Alerts retain the stage's command and directory facts, not requested overrides
+    whose permission checks have not yet succeeded. Raw alerts still name the submitter. -/
+def failureLog (ctx : Context) (failure : FailureInfo)
+    (allowed : Option Allowed := none) : Option LogLine := do
+  let reason ← failure.reason
+  if failure.denial && !ctx.settings.logDenied then none else
+    let eventCtx := { ctx with
+      opts := { ctx.opts with
+        chroot := if failure.rootApplied then ctx.opts.chroot else none
+        chdir := if failure.cwdApplied then ctx.opts.chdir else none }
+      previousUser := none
+      command := if failure.commandReady then ctx.command else none }
+    let line := logLine eventCtx (some reason) allowed
+      (if failure.commandReady then none else some (unresolvedLogCommand ctx))
+      (rootApplied := failure.rootApplied)
+    some { line with
+      event := if failure.denial then .reject else .alert
+      raw := failure.raw, commandReady := failure.commandReady
+      lookupComplete := failure.lookupComplete
+      msg := if failure.raw then logEscape ctx.invoking.name ++ " : " ++ logEscape reason else line.msg }
 
 /-- Only %d and %% are special; other percent sequences pass through unchanged. -/
 def formatAuthFailure (message : String) (attempts : Nat) : String :=
@@ -479,6 +605,42 @@ def successAdminFlag (ctx : Context) : Option String :=
       if p.startsWith "~/" then (displayUser ctx).home ++ String.ofList (p.toList.drop 1) else p
   else none
 
+/-- The pre-authentication checks follow sudoers_check_common: remote host,
+    root_sudo, closefrom, numeric identities, implied shell, requiretty, valid shell. -/
+def earlyFailure (ctx : Context) : Option FailureInfo :=
+  if (Cli.timeoutError ctx.opts).isSome then
+    some { message := s!"sudo: {(Cli.timeoutError ctx.opts).getD ""}\nsudo: error initializing audit plugin sudoers_audit\n", prefixed := false }
+  else if ctx.opts.mode = .edit ∧ (invalidEditFile ctx).isSome then
+    some { message := s!"sudoedit: {(invalidEditFile ctx).getD ""}: path is not absolute or contains a NUL byte, refusing\n", prefixed := false }
+  else if ctx.opts.host.isSome && ctx.opts.mode != .list then
+    some { (warningInfo "a remote host may only be specified when listing privileges."
+      "user not allowed to set remote host for command") with commandReady := false, lookupComplete := false }
+  else if ctx.invoking.uid == 0 && !ctx.settings.rootSudo then
+    some { message := "sudoers specifies that root is not allowed to sudo" }
+  else if ctx.opts.closeFrom.isSome && ctx.opts.closeFrom != some ctx.settings.closefrom.toNat &&
+      !ctx.settings.closefromOverride then
+    some { (warningInfo "you are not permitted to use the -C option"
+      "user not allowed to override closefrom limit") with lookupComplete := false }
+  else if ctx.targetUnknownUid && !ctx.settings.runasAllowUnknownId then
+    let message := s!"unknown user {ctx.target.name}"
+    some (warningInfo message message)
+  else if ctx.targetUnknownGid && !ctx.settings.runasAllowUnknownId then
+    let message := s!"unknown group {(ctx.targetGroup.map (·.name)).getD (ctx.opts.group.getD "")}"
+    some (warningInfo message message)
+  else if ctx.opts.impliedShell && !ctx.settings.shellNoargs then
+    some { message := Cli.usageFor ctx.progname, prefixed := false }
+  else if ctx.settings.requiretty && ctx.ttyName.isNone then
+    some (warningInfo "sorry, you must have a tty to run sudo" "no tty")
+  else if (ctx.opts.mode == .run || (ctx.opts.mode == .list && !ctx.opts.command.isEmpty)) &&
+      ctx.settings.runasCheckShell && !ctx.validShells.contains ctx.target.shell then
+    let message := s!"invalid shell for user {ctx.target.name}: {ctx.target.shell}"
+    some { (warningInfo message message) with raw := true }
+  else if ctx.opts.mode != .list && !ctx.settings.rootpw && ctx.settings.runaspw &&
+      ctx.runasDefaultUser.isNone && ctx.settings.runasDefault != ctx.root.name then
+    let message := s!"unknown user {ctx.settings.runasDefault}"
+    some (warningInfo message message)
+  else none
+
 /-- These modes and failures cannot authorize a privileged operation. -/
 def earlyAction (ctx : Context) : Option Action :=
   match ctx.opts.mode with
@@ -486,33 +648,7 @@ def earlyAction (ctx : Context) : Option Action :=
   | .version => some (.print (Cli.versionFor (ctx.invoking.uid == 0) ctx.settings) 0)
   | .resetTimestamp => some .resetTimestamp
   | .removeTimestamp => some .removeTimestamp
-  | _ =>
-    if (Cli.timeoutError ctx.opts).isSome then
-      some (.fail s!"sudo: {(Cli.timeoutError ctx.opts).getD ""}\nsudo: error initializing audit plugin sudoers_audit\n" 1)
-    else if ctx.opts.mode = .edit ∧ (invalidEditFile ctx).isSome then
-      some (.fail s!"sudoedit: {(invalidEditFile ctx).getD ""}: path is not absolute or contains a NUL byte, refusing\n" 1)
-    else if ctx.targetUnknownUid && !ctx.settings.runasAllowUnknownId then
-      some (.fail s!"sudo: unknown user {ctx.target.name}\n" 1)
-    else if ctx.targetUnknownGid && !ctx.settings.runasAllowUnknownId then
-      some (.fail s!"sudo: unknown group {(ctx.targetGroup.map (·.name)).getD (ctx.opts.group.getD "")}\n" 1)
-    else if (ctx.opts.mode == .run || (ctx.opts.mode == .list && !ctx.opts.command.isEmpty)) &&
-        ctx.settings.runasCheckShell && !ctx.validShells.contains ctx.target.shell then
-      some (.fail s!"sudo: invalid shell for user {ctx.target.name}: {ctx.target.shell}\n" 1)
-    else if ctx.settings.requiretty && ctx.ttyName.isNone then
-      some (.fail "sudo: sorry, you must have a tty to run sudo\n" 1)
-    else if ctx.opts.host.isSome && ctx.opts.mode != .list then
-      some (.fail "sudo: a remote host may only be specified when listing privileges.\n" 1)
-    else if ctx.opts.impliedShell && !ctx.settings.shellNoargs then
-      some (.fail (Cli.usageFor ctx.progname) 1)
-    else if ctx.invoking.uid == 0 && !ctx.settings.rootSudo then
-      some (.fail "sudo: sudoers specifies that root is not allowed to sudo\n" 1)
-    else if ctx.opts.closeFrom.isSome && ctx.opts.closeFrom != some ctx.settings.closefrom.toNat &&
-        !ctx.settings.closefromOverride then
-      some (.fail "sudo: you are not permitted to use the -C option\n" 1)
-    else if ctx.opts.mode != .list && !ctx.settings.rootpw && ctx.settings.runaspw &&
-        ctx.runasDefaultUser.isNone && ctx.settings.runasDefault != ctx.root.name then
-      some (.fail s!"sudo: unknown user {ctx.settings.runasDefault}\n" 1)
-    else none
+  | _ => (earlyFailure ctx).map FailureInfo.action
 
 /-- sudo checks listing authentication independently of `-l command` authorization. -/
 def authJudgement (ctx : Context) (j : Judgement) : Judgement :=
@@ -520,24 +656,54 @@ def authJudgement (ctx : Context) (j : Judgement) : Judgement :=
     evaluate ctx.sudoers ctx.settings { request ctx with user := ctx.invoking, command := .list }
   else j
 
+/-- Directory permission failures precede policy denial and command-not-found
+    diagnostics, so an unauthorized -R never reveals namespace lookup facts. -/
+def decisionFailure (ctx : Context) : Judgement → Option FailureInfo
+  | .allow a => allowedFailure ctx a
+  | .deny => permissionFailure ctx
+      { needsAuth := ctx.settings.authenticate, setenv := ctx.settings.setenv, cwd := none }
+
 def policyDecision (ctx : Context) (j : Judgement) : Decision :=
+  let failure := decisionFailure ctx j
+  let commandMode := ctx.opts.mode == .run || ctx.opts.mode == .edit
+  let allowed := match j with | .allow a => some a | .deny => none
+  let accepted := failure.isNone && commandMode && allowed.isSome
   { auth := authentication ctx (authJudgement ctx j),
-    action := match j with | .allow a => allowedAction ctx a | .deny => deniedAction ctx,
+    action := match j with
+      | .allow a => allowedAction ctx a failure
+      | .deny => (failure.map FailureInfo.action).getD (deniedAction ctx),
     updateTimestamp := policyNeedsAuth ctx (authJudgement ctx j) &&
-      (match j with | .allow _ => true | .deny => false) &&
-      !ctx.opts.noUpdate && !ctx.opts.resetTimestamp,
-    log := match j with
-      | .allow a => if ctx.settings.logAllowed then some (logLine ctx none (some a)) else none
-      | .deny => if ctx.settings.logDenied then some (logLine ctx (some (denialReason ctx))) else none,
-    adminFlag := match j with | .allow _ => successAdminFlag ctx | .deny => none,
-    mail := match j with
-      | .deny => denialMail ctx
-      | .allow a => ctx.mailerAvailable &&
-          (a.mail.getD false || ctx.settings.mailAlways || ctx.settings.mailAllCmnds) }
+      allowed.isSome && !ctx.opts.noUpdate && !ctx.opts.resetTimestamp,
+    log := match failure with
+      | some info => failureLog ctx info allowed
+      | none => match j with
+        | .allow a => if accepted && ctx.settings.logAllowed then some (logLine ctx none (some a)) else none
+        | .deny => if ctx.settings.logDenied then some (logLine ctx (some (denialReason ctx))) else none,
+    audit := match failure with
+      | some info => info.auditReason.map AuditEvent.reject
+      | none => match j with
+        | .allow _ => if accepted && ctx.settings.logAllowed then some .accept else none
+        | .deny => some (.reject (denialReason ctx)),
+    adminFlag := if allowed.isSome && failure.all (·.adminFlag) then successAdminFlag ctx else none,
+    mail := match failure with
+      | some info => info.denial && ctx.mailerAvailable &&
+          (ctx.settings.mailAlways || (commandMode && ctx.settings.mailAllCmnds) ||
+            allowed.any (fun a => a.mail.getD false))
+      | none => match j with
+        | .deny => denialMail ctx
+        | .allow a => accepted && ctx.mailerAvailable &&
+            (a.mail.getD false || ctx.settings.mailAlways || ctx.settings.mailAllCmnds) }
 
 def decide (ctx : Context) : Decision :=
   match earlyAction ctx with
-  | some action => { auth := .none, action, updateTimestamp := false, log := none }
+  | some action =>
+    let failure := match action with | .fail .. => earlyFailure ctx | _ => none
+    let allowed := if failure.any (·.lookupComplete) then
+      match policyJudgement ctx with | .allow a => some a | .deny => none
+      else none
+    { auth := .none, action, updateTimestamp := false,
+      log := failure.bind (fun info => failureLog ctx info allowed),
+      audit := failure.bind (fun info => info.auditReason.map AuditEvent.reject) }
   | none => policyDecision ctx (policyJudgement ctx)
 
 end LeanSudo.Core

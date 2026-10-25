@@ -521,7 +521,7 @@ static bool ts_valid_offset(uint64_t offset) {
         (uint64_t)(off_t)offset == offset;
 }
 
-/* Both entry reads and snapshots are bounded by the requested byte extent. */
+/* Read only the caller's bounded window, never the entire file extent. */
 static lean_obj_res ts_read_extent(uint32_t fd, uint64_t offset, size_t length) {
     if (lean_alloc_sarray_would_overflow(1, length))
         return ts_errno_error("timestamp read", EOVERFLOW);
@@ -548,18 +548,17 @@ static lean_obj_res ts_read_extent(uint32_t fd, uint64_t offset, size_t length) 
     return lean_io_result_mk_ok(arr);
 }
 
-/* Caller holds the header lock while discovering and scanning file extent. */
-LEAN_EXPORT lean_obj_res lean_sudo_ts_read(uint32_t fd, lean_obj_arg w) {
+/* Report the extent without allocating memory proportional to file size. */
+LEAN_EXPORT lean_obj_res lean_sudo_ts_size(uint32_t fd, lean_obj_arg w) {
     (void)w;
     if (!ts_valid_fd(fd))
-        return ts_errno_error("timestamp read", EBADF);
+        return ts_errno_error("timestamp size", EBADF);
     struct stat st;
     if (ts_fstat((int)fd, &st) != 0)
-        return ts_errno_error("timestamp read", errno);
-    if (st.st_size < 0 || (uintmax_t)st.st_size > SIZE_MAX ||
-            !ts_valid_offset((uint64_t)st.st_size))
-        return ts_errno_error("timestamp read", EOVERFLOW);
-    return ts_read_extent(fd, 0, (size_t)st.st_size);
+        return ts_errno_error("timestamp size", errno);
+    if (st.st_size < 0 || !ts_valid_offset((uint64_t)st.st_size))
+        return ts_errno_error("timestamp size", EOVERFLOW);
+    return lean_io_result_mk_ok(lean_box_uint64((uint64_t)st.st_size));
 }
 
 /* Short EOF is returned as a short array, not padded or interpreted here. */

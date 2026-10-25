@@ -24,6 +24,41 @@ static lean_object *policy_callback;
 int ls_intercept_active(void) { return active; }
 int ls_intercept_trace(void) { return active && tracing; }
 int ls_intercept_verify(void) { return active && verifying; }
+pid_t ls_intercept_broker_pid(void) { return broker_pid; }
+
+/* The broker shares sudo's terminal process group but is not a foreground
+ * command. Terminal signals are handled by sudo's command monitor, not by this
+ * policy service. Block around fork so no signal can reach the uninitialized
+ * child before its dispositions have been installed. */
+static pid_t fork_broker(void) {
+  const int signals[] = { SIGINT, SIGQUIT, SIGTSTP, SIGHUP };
+  sigset_t blocked, saved;
+  sigemptyset(&blocked);
+  for (size_t i = 0; i < sizeof signals / sizeof signals[0]; i++)
+    sigaddset(&blocked, signals[i]);
+  if (sigprocmask(SIG_BLOCK, &blocked, &saved) != 0) return -1;
+  pid_t pid = fork();
+  int error = errno;
+  if (pid == 0) {
+    struct sigaction ignore;
+    memset(&ignore, 0, sizeof ignore);
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    for (size_t i = 0; i < sizeof signals / sizeof signals[0]; i++)
+      if (sigaction(signals[i], &ignore, NULL) != 0) _exit(1);
+  }
+  if (sigprocmask(SIG_SETMASK, &saved, NULL) != 0) {
+    if (pid == 0) _exit(1);
+    if (pid > 0) {
+      int status;
+      kill(pid, SIGKILL);
+      while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    }
+    return -1;
+  }
+  errno = error;
+  return pid;
+}
 
 static int utf8_valid(const char *str, size_t n) {
   const unsigned char *s = (const unsigned char *)str;
@@ -220,7 +255,7 @@ lean_obj_res lean_sudo_intercept_start(uint8_t trace, uint8_t verify, uint8_t lo
     ls_intercept_dso_set_log_only(log_only);
     if (ls_intercept_dso_prepare()) { close(pair[0]); close(pair[1]); goto failed; }
   }
-  broker_pid = fork();
+  broker_pid = fork_broker();
   if (broker_pid == 0) {
     close(pair[0]); policy_callback = callback;
     ls_logsrv_detach_child();

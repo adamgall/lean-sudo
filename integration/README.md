@@ -11,7 +11,7 @@ Current full-suite results:
 
 | Suite | sudo.ws | lean-sudo |
 |---|---:|---:|
-| sudo | 728/728 | 728/728 |
+| sudo | 852/852 | 852/852 |
 | visudo | 154/154 | 154/154 |
 
 These are shared compatibility suites, not a claim that every behavior is
@@ -151,14 +151,15 @@ explicitly. The numbered prefixes control source order, not ownership.
 | `58-sudoedit-parity.sh` | `sudoedit-parity-*`: temporary names/mtime, size/mtime copyback decisions, multi-file failures, editor selection/PATH/quoting/injection and diagnostic prefixes. |
 | `59-shell-policy.sh` | `shell-policy-*`: unknown-identity error/event ordering, shell versus sudoedit authorization, non-generic PAM challenges and relative-command spelling/logging. |
 | `60-exec.sh` | `exec-*`: resource limits, closed stdin, cwd failures, NOEXEC, timeouts/escalation, background/pty lifecycle, AppArmor, utmp, stay_setuid, signal relay and job control. |
-| `61-timestamp-interop.sh` | `timestamp-interop-*`: bidirectional sudo.ws credential sharing, exact v2 layout, tty/ppid isolation, timeout and `-k`/`-K`, configured directory/owner, malformed and foreign records. |
+| `61-timestamp-interop.sh` | `timestamp-interop-*`: bidirectional sudo.ws credential sharing, exact v2 layout, tty/ppid isolation, timeout and `-k`/`-K`, configured directory/owner, malformed/foreign records, first-slot validation, bounded dense/sparse scans and `-k command` avoiding all timestamp I/O. |
+| `62-host-alert.sh` | `host-alert-*`: local-host DNS failures use raw startup syslog alerts, remote `-h` failures use stderr only, and early hostname callbacks precede configured logfile/JSON logging. |
 | `70-iolog.sh` | `iolog-*`: unmodified `sudoreplay.ws` interoperability, input/output streams, compression, permissions, error policy, path expansion, sequence wrap and password masking. |
 | `80-i18n.sh` | `i18n-*`: byte-for-byte German/French/C diagnostics, help/listing/prompts, LANGUAGE precedence, missing-locale fallback and literal configured messages. |
 | `85-jsonlog.sh` | `jsonlog-*`: json/json_compact/json_pretty file and syslog records for acceptance, denial, authentication rejection, exit/signal, runas group, repeated events and I/O-log linkage. |
 | `95-coverage.sh` | `coverage-*`: differential CLI, authentication/listpw/verifypw, timestamps, umask, shell/cwd/environment, listing, sudoedit, signal and job-control matrices. |
 | `96-sssd.sh` | `sssd-*`: real LDAP/SSSD roles, allow/deny/negation, runas, signed sudoOrder, global/role options, argument wildcards, short/long listings and NSS source/action ordering. |
 | `97-group-plugin.sh` | `group-plugin-*`: shipped group_file/system_group providers, named/numeric membership, negation, aliases/runas/Defaults/listing, always_query_group_plugin and loader/init/ABI failures. |
-| `98-logsrv.sh` | `logsrv-*`: real sudo_logsrvd TCP/TLS events and I/O, generated CA/client credentials, trust/identity failures, unreachable-server policies, failover, final commits, live disconnect/restart failure policy and serialized intercepted subcommands. |
+| `98-logsrv.sh` | `logsrv-*`: real sudo_logsrvd TCP/TLS events and I/O, generated CA/client credentials, trust/identity failures, unreachable-server policies, failover, final commits, live disconnect/restart failure policy, malformed frames and serialized intercepted subcommands. |
 
 ### Real remote logging fixtures
 
@@ -222,6 +223,7 @@ under **Fail-closed by design** and **Other differences from sudo.ws**:
 * Non-UTF-8 command-line arguments are refused; non-UTF-8 environment entries are
   dropped.
 * A fractional `timestamp_timeout` is rounded down to whole seconds.
+* Group-typed log-server frames fail with `unable to unpack ServerMessage size N`; sudo.ws may instead report `handle_server_message: unexpected type_case value 0`. Both refuse execution.
 
 The integrity cases assert that insecure grants never take effect and check the
 diagnostic; syntax-error cases allow either reference recovery or fail-closed

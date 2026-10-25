@@ -25,6 +25,13 @@ status with exit 1. Editor environment variables are always considered, independ
 of visudo's env_editor setting; lookup uses the policy-rebuilt PATH, while the editor
 itself receives the invoking environment. Quoting/backslash splitting and rejection
 of an editor-supplied `--` happen before any file session is created.
+The resolved editor is selected once before Shell opens local/remote I/O logging;
+log metadata retains its words followed by `--` and the original file operands,
+while execution receives only the checked temporary paths. The normal executor
+applies the editor's cwd, pty, timeout, resource-limit and utmp settings; a changed
+editor cwd never changes how original file operands are resolved. As observed in
+sudo.ws, Defaults log_output/command_timeout/noexec apply, but rule
+LOG_OUTPUT/TIMEOUT/NOEXEC attributes are not propagated to sudoedit.
 
 sudo.ws 1.9.17p2's sudoedit root behavior is deliberately preserved: command-rule
 CHROOT is ignored, while Defaults runchroot (or -R permitted by runchroot=*) changes
@@ -94,6 +101,7 @@ private def resolveEditor (who : Sys.Edit.Identity) (path : String)
 
 private structure Session where
   file : String
+  displayFile : String
   name : String
   parent : UInt32
   temp : String
@@ -107,15 +115,15 @@ private def removeTemp (who : Sys.Edit.Identity) (path : String) : IO Unit := do
 /-- An inaccessible original is skipped; failure to create/copy a temporary is
 fatal for the whole invocation, as in sudo_edit_create_tfiles. -/
 private def prepare (progname : String) (invoker target : Sys.Edit.Identity) (follow checkdir : Bool)
-    (file : String) : IO (Option Session) := do
+    (file displayFile : String) : IO (Option Session) := do
   let some (dirs, name) := pathParts file
-    | warn progname s!"{file}: unsafe edit path"; return none
-  let parent ← try parentDir invoker target checkdir dirs file
+    | warn progname s!"{displayFile}: unsafe edit path"; return none
+  let parent ← try parentDir invoker target checkdir dirs displayFile
     catch e => warn progname e.toString; return none
   let fd ← try pure (← Sys.Edit.operation target (if follow then 8 else 1) parent name).value
     catch e =>
       Sys.Edit.close parent
-      warn progname (fileError file e).toString
+      warn progname (fileError displayFile e).toString
       return none
   let mut temp := ""
   try
@@ -133,7 +141,7 @@ private def prepare (progname : String) (invoker target : Sys.Edit.Identity) (fo
         catch e => warn progname s!"{temp}: {e}"
         Sys.Edit.stat made.value
       finally Sys.Edit.close made.value
-    return some { file, name, parent, temp, original, originalStat, tempStat }
+    return some { file, displayFile, name, parent, temp, original, originalStat, tempStat }
   catch e =>
     Sys.Edit.close parent
     if temp != "" then
@@ -158,26 +166,26 @@ private def copyBack (progname : String) (invoker target : Sys.Edit.Identity) (m
       -- Recheck all ancestors as well as the pinned parent: permissions may have
       -- changed while the editor was running. Require the same parent inode.
       let some (dirs, _) := pathParts s.file | throw (IO.userError "unsafe edit path")
-      let current ← parentDir invoker target checkdir dirs s.file
+      let current ← parentDir invoker target checkdir dirs s.displayFile
       try
         let now ← Sys.Edit.stat current
         let pinned ← Sys.Edit.stat s.parent
         unless now[7]! == pinned[7]! && now[8]! == pinned[8]! do
-          throw (IO.userError s!"{s.file}: directory changed during editing")
+          throw (IO.userError s!"{s.displayFile}: directory changed during editing")
       finally Sys.Edit.close current
       let out ← try pure (← Sys.Edit.operation target (if follow then 9 else 2) s.parent s.name mask).value
-        catch e => throw (fileError s.file e)
+        catch e => throw (fileError s.displayFile e)
       try
         let st ← Sys.Edit.stat out
         unless s.originalStat.isEmpty ||
             (st[7]! == s.originalStat[7]! && st[8]! == s.originalStat[8]! &&
              st[3]! == s.originalStat[3]! && st[4]! == s.originalStat[4]! &&
              st[5]! == s.originalStat[5]!) do
-          throw (IO.userError s!"{s.file}: file changed during editing")
+          throw (IO.userError s!"{s.displayFile}: file changed during editing")
         Sys.Edit.write out bytes s.original
       finally Sys.Edit.close out
     else
-      warn progname s!"{s.file} unchanged"
+      warn progname s!"{s.displayFile} unchanged"
     removeTemp invoker s.temp
     return true
   catch e =>
@@ -185,13 +193,16 @@ private def copyBack (progname : String) (invoker target : Sys.Edit.Identity) (m
     warn progname s!"contents of edit session left in {s.temp}"
     return false
 
-/-- Edit `plan.files`; `env` is the editor's environment (`KEY=VALUE`).
-Diagnostics retain the invoking frontend name, including `sudo` for `sudo -e`. -/
-def run (progname : String) (plan : Core.EditPlan) (env : Array String) : IO Sys.ExitStatus := do
-  let mut sessions : Array Session := #[]
+/-- Resolved once, before opening the local or remote I/O log. File operands stay
+in EditPlan, never in these environment-derived editor words. -/
+structure Editor where
+  path : String
+  words : List String
+
+/-- Resolve and validate the editor before command acceptance and I/O-log setup. -/
+def select (progname : String) (plan : Core.EditPlan) : IO (Option Editor) := do
   try
     let invoker ← Sys.Edit.identity plan.editUid plan.editGid plan.editGroups
-    let target ← Sys.Edit.identity plan.fileUid plan.fileGid plan.fileGroups
     let mut resolved := []
     for (words, source) in plan.editors.zip plan.editorSources do
       let result ← resolveEditor invoker plan.editorPath words
@@ -206,10 +217,24 @@ def run (progname : String) (plan : Core.EditPlan) (env : Array String) : IO Sys
       for candidate in [path, Policy.dirOf path] do
         if ← Sys.rootPathEscapes root candidate then
           throw (IO.userError s!"{path}: command resolves outside the chroot directory")
+    return some { path, words }
+  catch e =>
+    warn progname e.toString
+    return none
+
+/-- Edit `plan.files`; `env` is the editor's environment (`KEY=VALUE`).
+Diagnostics retain the invoking frontend name and raw policy operands, while
+filesystem operations use their absolute paths even when the editor changes cwd. -/
+def run (progname : String) (plan : Core.EditPlan) (editor : Editor)
+    (env : Array String) : IO Sys.ExitStatus := do
+  let mut sessions : Array Session := #[]
+  try
+    let invoker ← Sys.Edit.identity plan.editUid plan.editGid plan.editGroups
+    let target ← Sys.Edit.identity plan.fileUid plan.fileGid plan.fileGroups
     let mut failed := false
     try
-      for file in plan.files do
-        if let some session ← prepare progname invoker target plan.follow plan.checkdir file then
+      for (file, displayFile) in plan.files.zip plan.policyFiles do
+        if let some session ← prepare progname invoker target plan.follow plan.checkdir file displayFile then
           sessions := sessions.push session
     catch e =>
       for s in sessions do
@@ -219,16 +244,24 @@ def run (progname : String) (plan : Core.EditPlan) (env : Array String) : IO Sys
     let started ← Sys.Edit.clock
     let status ← try
         Sys.runCommand {
-          path := path
-          argv := words.toArray ++ sessions.map (·.temp)
+          path := editor.path
+          argv := editor.words.toArray ++ sessions.map (·.temp)
           env := env
           uid := plan.editUid
           gid := plan.editGid
           groups := plan.editGroups.toArray
-          cwd := none
+          cwd := plan.cwd
+          cwdOptional := plan.cwdOptional
           chroot := plan.chroot
           umask := plan.umask
-          usePty := false
+          usePty := plan.usePty
+          timeout := plan.timeout
+          rlimits := plan.rlimits.toArray
+          utmpUser := plan.utmpUser
+          closeFrom := plan.closeFrom
+          execBackground := plan.execBackground
+          noexecFile := plan.noexecFile
+          apparmorProfile := plan.apparmorProfile
           background := false }
       catch e =>
         warn progname e.toString

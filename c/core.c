@@ -188,6 +188,14 @@ LEAN_EXPORT lean_obj_res lean_sudo_geteuid(void) { return io_ok(mk_nat(geteuid()
 LEAN_EXPORT lean_obj_res lean_sudo_getgid(void) { return io_ok(mk_nat(getgid())); }
 LEAN_EXPORT lean_obj_res lean_sudo_getegid(void) { return io_ok(mk_nat(getegid())); }
 
+LEAN_EXPORT lean_obj_res lean_sudo_set_uid(uint32_t uid) {
+    if ((uintmax_t)(uid_t)uid != uid) return io_errno(EINVAL);
+    if (setuid((uid_t)uid) != 0) return io_errno(errno);
+    if (getuid() != (uid_t)uid || geteuid() != (uid_t)uid)
+        return io_errno(EPERM);
+    return io_ok(lean_box(0));
+}
+
 static lean_obj_res gid_array(const gid_t *g, size_t n) {
     lean_object *arr = lean_mk_empty_array_with_capacity(lean_box(n));
     for (size_t i = 0; i < n; i++) arr = lean_array_push(arr, mk_nat(g[i]));
@@ -1065,6 +1073,10 @@ typedef struct {
     char *prompt;
     char *user, *ruser, *askpass, *lecture;
     bool silent, session_silent, bell, lectured;
+    uid_t askpass_uid;
+    gid_t askpass_gid;
+    gid_t *askpass_groups;
+    int askpass_ngroups;
     int conv_error;
     int interrupted;
 } sudo_pam_t;
@@ -1170,11 +1182,13 @@ static int read_askpass(sudo_pam_t *st, const char *prompt, char *buf, size_t si
         if (dup2(fds[1], STDOUT_FILENO) < 0) _exit(126);
         int nullfd = open("/dev/null", O_RDONLY);
         if (nullfd < 0 || dup2(nullfd, STDIN_FILENO) < 0) _exit(126);
-        uid_t uid = getuid();
-        gid_t gid = getgid();
-        if (setresgid(gid, gid, gid) != 0 || setresuid(uid, uid, uid) != 0 ||
+        uid_t uid = st->askpass_uid;
+        gid_t gid = st->askpass_gid;
+        if (setgroups((size_t)st->askpass_ngroups, st->askpass_groups) != 0 ||
+            setresgid(gid, gid, gid) != 0 || setresuid(uid, uid, uid) != 0 ||
             getuid() != uid || geteuid() != uid || getgid() != gid || getegid() != gid)
             _exit(126);
+        if (uid != 0 && setuid(0) == 0) _exit(126);
         long maxfd = sysconf(_SC_OPEN_MAX);
         if (maxfd < 0) _exit(126);
         for (int fd = 3; fd < maxfd; fd++) close(fd);
@@ -1466,6 +1480,7 @@ static void sudo_pam_free(sudo_pam_t *st) {
     free(st->ruser);
     free(st->askpass);
     free(st->lecture);
+    free(st->askpass_groups);
     free(st);
 }
 
@@ -1543,6 +1558,24 @@ LEAN_EXPORT lean_obj_res lean_sudo_pam_interrupted(b_lean_obj_arg h) {
     return io_ok(lean_box_uint32((uint32_t)pam_data(h)->interrupted));
 }
 
+/* Capture before PAM or sudoedit changes process credentials. */
+static int pam_askpass_identity(sudo_pam_t *st) {
+    int n = getgroups(0, NULL);
+    if (n < 0) return errno;
+    gid_t *groups = n ? calloc((size_t)n, sizeof(*groups)) : NULL;
+    if (n && !groups) return ENOMEM;
+    if (n) {
+        n = getgroups(n, groups);
+        if (n < 0) { int error = errno; free(groups); return error; }
+    }
+    free(st->askpass_groups);
+    st->askpass_groups = groups;
+    st->askpass_ngroups = n;
+    st->askpass_uid = getuid();
+    st->askpass_gid = getgid();
+    return 0;
+}
+
 LEAN_EXPORT lean_obj_res lean_sudo_pam_configure(b_lean_obj_arg h, uint8_t silent,
         uint8_t session_silent, uint8_t bell, b_lean_obj_arg askpass, b_lean_obj_arg rhost,
         b_lean_obj_arg prompt_user) {
@@ -1554,6 +1587,10 @@ LEAN_EXPORT lean_obj_res lean_sudo_pam_configure(b_lean_obj_arg h, uint8_t silen
     if (*ap && !copy) return io_errno(ENOMEM);
     char *user_copy = strdup(pu);
     if (!user_copy) { free(copy); return io_errno(ENOMEM); }
+    if (copy) {
+        int error = pam_askpass_identity(st);
+        if (error) { free(copy); free(user_copy); return io_errno(error); }
+    }
     free(st->ruser);
     st->ruser = user_copy;
     free(st->askpass);

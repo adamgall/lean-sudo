@@ -846,3 +846,465 @@ begin cli-core-second-core-login-missing-required-cwd && {
   expect_err_has 'unable to change directory to /cli-second-missing-directory'
   end
 }
+
+# ResidualGaps3 rows 1/2: compare actual logfile bytes and syslog datagrams,
+# including priority and RAW formatting, with the packaged sudo.ws oracle.
+# Source contracts: sudoers_check_common, logging.c vlog_warning/log_denial.
+cli_core_third_event_fixture() {
+  cat >"$WORK/cli-core-third-event.py" <<'PY'
+import json, os, pathlib, pwd, re, shutil, socket, subprocess, sys, tempfile, threading, time
+
+class Pairs(list):
+    pass
+
+def decode(text):
+    return json.loads(text, object_pairs_hook=Pairs)
+
+def normalize_json(value, key=''):
+    if isinstance(value, Pairs):
+        return Pairs((k, normalize_json(v, k)) for k, v in value)
+    if isinstance(value, list):
+        return [normalize_json(v) for v in value]
+    if key in ('seconds', 'nanoseconds'):
+        assert isinstance(value, int) and value >= 0, (key, value)
+        if key == 'nanoseconds': assert value < 1000000000, value
+        return '<time>'
+    if key == 'iso8601':
+        assert re.fullmatch(r'\d{14}Z', value), value
+        return '<utc>'
+    if key == 'localtime':
+        assert re.fullmatch(r'[A-Z][a-z]{2} [ 0-9][0-9] \d\d:\d\d:\d\d', value), value
+        return '<local>'
+    return value
+
+def normalize_identity(value, identity):
+    # UUID is a generated per-invocation identity, not a semantic event field.
+    # Check correspondence before replacing it; never erase source/argv/reason.
+    if isinstance(value, Pairs):
+        result = Pairs()
+        for key, item in value:
+            if key == 'uuid':
+                assert item == identity, (item, identity)
+                result.append((key, '<invocation-uuid>'))
+            else:
+                result.append((key, normalize_identity(item, identity)))
+        return result
+    if isinstance(value, dict):
+        return {k: normalize_identity(v, identity) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(normalize_identity(v, identity) for v in value)
+    return value
+
+def normalize_log(text, fmt):
+    if not text: return [] if fmt != 'sudo' else ''
+    if fmt == 'json_compact':
+        return [normalize_json(decode(line)) for line in text.splitlines()]
+    if fmt != 'sudo': return normalize_json(decode(text))
+    return re.sub(r'(?m)^[A-Z][a-z]{2} [ 0-9][0-9] \d\d:\d\d:\d\d : ', '<time> : ', text)
+
+def normalize_syslog(message):
+    # Keep the complete facility/severity, ident, spacing, body and record count.
+    match = re.fullmatch(r'(<\d+>)[A-Z][a-z]{2} [ 0-9][0-9] \d\d:\d\d:\d\d (sudo)(?:\[\d+\])?: (.*)', message, re.S)
+    assert match, ('unexpected syslog transport', message)
+    prefix = match[1] + '<time> ' + match[2] + '[<pid>]: '
+    if match[3].startswith('@cee:'):
+        return (prefix, normalize_json(decode(match[3][5:])))
+    return prefix + match[3]
+
+def execute(binary, args, user='judy', cwd=None, env=None,
+            logfile='/tmp/cli-core-third-event.log', fmt='sudo'):
+    account = pwd.getpwnam(user)
+    if cwd is None: cwd = account.pw_dir
+    if env is None:
+        env = dict(HOME=account.pw_dir, USER=user, LOGNAME=user, SHELL='/bin/bash',
+                   PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', LANG='C.UTF-8')
+    path = pathlib.Path(logfile)
+    path.unlink(missing_ok=True)
+    saved = None
+    bound = False
+    messages = []
+    errors = []
+    stop = threading.Event()
+    thread = None
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        if os.path.lexists('/dev/log'):
+            fd, saved = tempfile.mkstemp(prefix='cli-core-third-event-log-', dir='/dev')
+            os.close(fd)
+            os.replace('/dev/log', saved)
+        sock.bind('/dev/log')
+        bound = True
+        sock.settimeout(.1)
+        def receive():
+            try:
+                while True:
+                    try: messages.append(sock.recv(262144).decode())
+                    except socket.timeout:
+                        if stop.is_set(): break
+            except BaseException as error: errors.append(error)
+        thread = threading.Thread(target=receive)
+        thread.start()
+        result = subprocess.run(['setpriv', '--reuid=' + str(account.pw_uid),
+            '--regid=' + str(account.pw_gid), '--init-groups', '--',
+            '/bin/bash', '-c', 'exec -a sudo "$@"', 'sh', binary, *args],
+            cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True,
+            start_new_session=True, timeout=20)
+    finally:
+        stop.set()
+        if thread: thread.join(timeout=5)
+        sock.close()
+        if bound: os.unlink('/dev/log')
+        if saved is not None: os.replace(saved, '/dev/log')
+    assert not errors, errors
+    assert thread is not None and not thread.is_alive(), 'syslog receiver did not stop'
+    return dict(rc=result.returncode, out=result.stdout, err=result.stderr,
+        logfile=normalize_log(path.read_text() if path.exists() else '', fmt),
+        syslog=[normalize_syslog(message) for message in messages])
+
+def event_case(fmt, scenario):
+    with tempfile.TemporaryDirectory(prefix='cli-core-third-event-', dir='/tmp') as tmp:
+        root = pathlib.Path(tmp)
+        root.chmod(0o755)
+        logfile = root / 'events.log'
+        mail = root / 'mail'
+        mailer = root / 'mailer'
+        mailer.write_text('#!/bin/sh\ncat >>"' + str(mail) + '"\n')
+        mailer.chmod(0o755)
+        args = ['-n', '/usr/bin/true']
+        user = 'judy'
+        options = []
+        tags = 'NOSETENV:'
+        kind = 'alert'
+        reason = ''
+        if scenario == 'notfound':
+            args = ['-n', 'cli_core_third_event_missing']
+            kind = None
+        elif scenario == 'dot':
+            command = root / 'cli_core_third_event_dot'
+            command.write_text('#!/bin/sh\nexit 0\n')
+            command.chmod(0o755)
+            args = ['-n', command.name]
+            options += ['ignore_dot', 'secure_path=\"/usr/bin:/bin:.\"']
+            kind = None
+        elif scenario == 'preserve':
+            args = ['-n', '-E', '/usr/bin/true']
+            reason = 'user not allowed to preserve the environment'
+        elif scenario == 'variable':
+            args = ['-n', 'LD_PRELOAD=cli-core-forbidden', '/usr/bin/true']
+            reason = 'sorry, you are not allowed to set the following environment variables: LD_PRELOAD'
+        elif scenario == 'timeout':
+            args = ['-n', '-T', '5', '/usr/bin/true']
+            reason = 'user not allowed to set a command timeout'
+        elif scenario in ('cwd', 'chroot'):
+            args = ['-n', '-D' if scenario == 'cwd' else '-R', '/tmp', '/usr/bin/true']
+            reason = 'user not allowed to change ' + ('directory' if scenario == 'cwd' else 'root directory') + ' to /tmp'
+        elif scenario.startswith('setid-'):
+            command = root / 'setid'
+            shutil.copyfile('/usr/bin/id', command)
+            command.chmod(0o4755)
+            args = ['-n', str(command), '-u']
+            options += ['intercept_type=' + scenario[6:], '!intercept_allow_setid']
+            tags += ' INTERCEPT:'
+            kind = 'reject'
+            reason = 'setid command rejected in intercept mode'
+        elif scenario == 'remote-host':
+            args = ['-n', '-h', 'localhost', '/usr/bin/true']
+            reason = 'user not allowed to set remote host for command'
+        elif scenario == 'closefrom':
+            args = ['-n', '-C', '5', '/usr/bin/true']
+            reason = 'user not allowed to override closefrom limit'
+        elif scenario in ('unknown-uid', 'unknown-gid'):
+            args = ['-n', '-u' if scenario == 'unknown-uid' else '-g', '#54321', '/usr/bin/true']
+            options += ['!runas_allow_unknown_id']
+            reason = 'unknown ' + ('user' if scenario == 'unknown-uid' else 'group') + ' #54321'
+        elif scenario == 'impliedshell':
+            args = ['-n']
+            options += ['!shell_noargs']
+            kind = None
+        elif scenario == 'root-sudo':
+            user = 'root'
+            options += ['!root_sudo']
+            kind = None
+        elif scenario == 'requiretty':
+            options += ['requiretty']
+            reason = 'no tty'
+        elif scenario == 'invalidshell':
+            args = ['-n', '-u', 'nobody', '/usr/bin/true']
+            options += ['runas_check_shell']
+            reason = 'invalid shell for user nobody: /usr/sbin/nologin'
+        else: raise AssertionError(scenario)
+        # Reject events legitimately mail under mail_always. All other failed
+        # requests must not accidentally reach the accepted-command mail path.
+        if kind != 'reject': options += ['mail_always', 'mail_all_cmnds']
+        config = root / 'server.conf'
+        remote = root / 'remote.json'
+        listener = socket.socket()
+        listener.bind(('127.0.0.1', 0))
+        port = listener.getsockname()[1]
+        listener.close()
+        config.write_text('[server]\nlisten_address = 127.0.0.1:' + str(port) +
+            '\npid_file = ' + str(root / 'pid') + '\nserver_log = ' + str(root / 'server.log') +
+            '\ntimeout = 2\n[eventlog]\nlog_type = logfile\nlog_format = json\n[logfile]\npath = ' + str(remote) + '\n')
+        policy = pathlib.Path('/etc/sudoers.d/zz-cli-core-third-event')
+        policy.write_text('Defaults !authenticate, !use_pty, !requiretty, !log_exit_status, log_allowed, log_denied, loglinelen=0, syslog_maxlen=9600, syslog=authpriv, syslog_goodpri=notice, syslog_badpri=alert, logfile="' + str(logfile) + '", log_format=' + fmt + ', mailerpath="' + str(mailer) + '", mailerflags="-t", mailto="root", log_servers="127.0.0.1:' + str(port) + '", log_server_timeout=2' +
+            (', ' + ', '.join(options) if options else '') + '\n' +
+            user + ' ALL=(ALL:ALL) NOPASSWD: ' + tags + ' ALL\n')
+        policy.chmod(0o440)
+        def observed(binary):
+            remote.unlink(missing_ok=True)
+            mail.unlink(missing_ok=True)
+            with (root / 'daemon.out').open('wb') as output:
+                daemon = subprocess.Popen(['/usr/sbin/sudo_logsrvd', '-n', '-f', str(config)], stdout=output, stderr=output)
+                try:
+                    for attempt in range(100):
+                        assert daemon.poll() is None, (root / 'daemon.out').read_text()
+                        try:
+                            with socket.create_connection(('127.0.0.1', port), .05): pass
+                            break
+                        except OSError: time.sleep(.02)
+                    else: raise AssertionError('sudo_logsrvd did not listen')
+                    result = execute(binary, args, user=user, cwd=str(root), logfile=logfile, fmt=fmt)
+                    # Event-only clients and mailers are asynchronous. The daemon
+                    # remains live until both dispositions have had time to drain.
+                    time.sleep(.3)
+                finally:
+                    daemon.terminate()
+                    daemon.wait(timeout=5)
+            remote_events = decode(remote.read_text()) if remote.exists() and remote.stat().st_size else Pairs()
+            remote_kinds = [k for k, _ in remote_events]
+            assert 'accept' not in remote_kinds, (binary, remote_events)
+            assert remote_kinds == ([kind] if kind else []), (binary, remote_events)
+            if kind:
+                assert dict(remote_events[0][1])['reason'] == reason, remote_events
+            if kind != 'reject': assert not mail.exists() or not mail.stat().st_size, (binary, mail.read_text())
+            assert result['rc'] == 1 and result['out'] == b'', (binary, result)
+            if scenario == 'notfound': assert b'cli_core_third_event_missing: command not found' in result['err'], result
+            if scenario == 'dot': assert b'ignoring \"cli_core_third_event_dot\" found in' in result['err'], result
+            if kind is None:
+                assert not result['logfile'] and not result['syslog'], (binary, result)
+            else:
+                assert len(result['syslog']) == 1, (binary, result)
+                message = result['syslog'][0]
+                assert (message[0] if isinstance(message, tuple) else message).startswith('<81>'), (binary, message)
+                if fmt == 'sudo':
+                    assert reason in result['logfile'] and reason in message, (binary, result)
+                    if scenario == 'invalidshell':
+                        assert result['logfile'] == '<time> : judy : ' + reason + '\n', result
+                        assert message == '<81><time> sudo[<pid>]:     judy : ' + reason, result
+                else:
+                    records = result['logfile'][0] if fmt == 'json_compact' else result['logfile']
+                    assert [k for k, _ in records] == [kind], records
+                    fields = dict(records[0][1])
+                    assert fields['reason'] == reason and 'alert_time' in fields, fields
+                    if scenario in ('remote-host', 'closefrom'):
+                        assert 'source' not in fields, fields
+                    else:
+                        assert fields['source'] == str(policy) + ':2:43', fields
+                    # Preserve every key/value, including UUID, when checking
+                    # that both local destinations received the same event.
+                    assert message[1] == Pairs([('sudo', records)]), (message, records)
+                    identity = fields['uuid']
+                    assert re.fullmatch(r'[0-9a-f]{10}(?:-[0-9a-f]{4}){3}-[0-9a-f]{10}', identity), identity
+                    result = normalize_identity(result, identity)
+            print(binary, scenario, repr(result), 'remote=' + repr(remote_kinds), flush=True)
+            return result
+        reference = observed('/usr/bin/sudo.ws')
+        actual = observed('/usr/bin/sudo')
+        assert actual == reference, ('event mismatch', reference, actual)
+
+if __name__ == '__main__':
+    event_case(*sys.argv[1:])
+PY
+}
+
+cli_core_third_event_compare() {
+  cli_core_third_event_fixture
+  python3 "$WORK/cli-core-third-event.py" "$1" "$2"
+}
+
+for cli_core_third_event_scenario in notfound dot preserve variable timeout cwd chroot setid-trace setid-dso remote-host closefrom unknown-uid unknown-gid impliedshell root-sudo requiretty invalidshell; do
+  begin "cli-core-third-event-$cli_core_third_event_scenario" && {
+    cli_core_third_event_compare sudo "$cli_core_third_event_scenario" >"$WORK/cli-core-third-event-result" 2>&1 || fail "$(cat "$WORK/cli-core-third-event-result")"
+    cat "$WORK/cli-core-third-event-result" >>"$LOG"
+    end
+  }
+done
+
+for cli_core_third_event_format in json json_compact; do
+  for cli_core_third_event_scenario in notfound preserve variable timeout cwd chroot remote-host closefrom unknown-uid unknown-gid impliedshell root-sudo requiretty invalidshell; do
+    begin "cli-core-third-event-$cli_core_third_event_format-$cli_core_third_event_scenario" && {
+      cli_core_third_event_compare "$cli_core_third_event_format" "$cli_core_third_event_scenario" >"$WORK/cli-core-third-event-result" 2>&1 || fail "$(cat "$WORK/cli-core-third-event-result")"
+      cat "$WORK/cli-core-third-event-result" >>"$LOG"
+      end
+    }
+  done
+done
+
+# ResidualGaps3 rows 4/5 and WaveGReview #10. The shared event fixture captures
+# real /dev/log datagrams and normalizes only timestamps/process identifiers.
+# Keep the reference's complete diagnostics and local event fields in comparison.
+cli_core_third_order_compare() {
+  cli_core_third_event_fixture
+  python3 - "$WORK/cli-core-third-event.py" "$1" "$2" <<'PY'
+import pathlib, pwd, runpy, shutil, sys
+
+capture = runpy.run_path(sys.argv[1])['execute']
+kind, scenario = sys.argv[2:]
+logfile = '/tmp/cli-core-third-event.log'
+policy = pathlib.Path('/etc/sudoers.d/zz-cli-third-order')
+base = ('Defaults !authenticate, lecture=never, !use_pty, !log_exit_status, '
+        'logfile="' + logfile + '", loglinelen=0, syslog=authpriv, '
+        'syslog_goodpri=notice, syslog_badpri=alert, !mail_always, '
+        '!mail_badpass, !mail_no_user, !mail_no_host, !mail_no_perms\n')
+user, cwd, extra = 'ivan', None, {}
+expected_rc, expected_error, expected_output = 1, None, None
+
+def set_policy(settings='', rules='ivan ALL=(ALL:ALL) NOPASSWD: ALL\nroot ALL=(ALL:ALL) NOPASSWD: ALL\n'):
+    policy.write_text(base + settings + rules)
+    policy.chmod(0o440)
+
+if kind == 'order':
+    first, second = scenario.split('-')
+    checks = {first, second}
+    settings = 'Defaults !runas_allow_unknown_id\n'
+    if 'root' in checks:
+        user = 'root'
+        settings += 'Defaults !root_sudo\n'
+    if 'implied' in checks: settings += 'Defaults !shell_noargs\n'
+    if 'tty' in checks: settings += 'Defaults requiretty\n'
+    if 'shell' in checks:
+        assert pwd.getpwnam('nobody').pw_shell not in pathlib.Path('/etc/shells').read_text().splitlines()
+        settings += 'Defaults runas_check_shell\n'
+    args = ['-n']
+    if 'remote' in checks: args += ['-h', 'localhost']
+    if 'close' in checks: args += ['-C', '5']
+    if 'uid' in checks: args += ['-u', '#54321']
+    elif 'shell' in checks: args += ['-u', 'nobody']
+    if 'gid' in checks: args += ['-g', '#54321']
+    if 'implied' not in checks: args += ['/usr/bin/true']
+    set_policy(settings)
+    expected_error = {
+        'remote': 'a remote host may only be specified when listing privileges.',
+        'root': 'sudoers specifies that root is not allowed to sudo',
+        'close': 'you are not permitted to use the -C option',
+        'uid': 'unknown user #54321',
+        'gid': 'unknown group #54321',
+        'implied': 'usage: sudo',
+        'tty': 'sorry, you must have a tty to run sudo',
+    }[first]
+    expected_output = b''
+elif kind == 'editcwd':
+    tree = pathlib.Path('/srv/cli-third-editcwd')
+    invoke, target, other = (tree / name for name in ('invoke', 'target', 'other'))
+    for directory in (tree, invoke, target, other):
+        directory.mkdir(parents=True, exist_ok=True)
+        directory.chmod(0o755)
+    for directory, text in ((invoke, 'invoking operand\n'), (target, 'target operand\n'), (other, 'other operand\n')):
+        (directory / 'operand').write_text(text)
+        (directory / 'operand').chmod(0o644)
+    editor = tree / 'editor'
+    editor.write_text('#!/bin/sh\nprintf "editor-pwd="; pwd\nfor file in "$@"; do\n'
+                      '  [ "$file" = -- ] && continue\n'
+                      '  printf "operand-content="; cat "$file"\ndone\n')
+    editor.chmod(0o755)
+    cwd = str(invoke)
+    extra = {'SUDO_EDITOR': str(editor)}
+    settings, rule = '', 'ivan ALL=(root) NOPASSWD: sudoedit\n'
+    if scenario.startswith('wildcard'): settings = 'Defaults runcwd=*\n'
+    if scenario.startswith('fixed'): settings = 'Defaults runcwd="' + str(target) + '"\n'
+    # Unlike sudoedit's LOG_OUTPUT/TIMEOUT tags, command-rule CWD is honored.
+    if scenario.startswith('rule-wildcard'): rule = 'ivan ALL=(root) CWD=* NOPASSWD: sudoedit\n'
+    if scenario == 'rule-fixed': rule = 'ivan ALL=(root) CWD=' + str(target) + ' NOPASSWD: sudoedit\n'
+    set_policy(settings, rule)
+    args = ['-n', '-e']
+    if scenario not in ('fixed-default', 'rule-fixed'):
+        args += ['-D', str(other if scenario == 'fixed-mismatch' else target)]
+    relative = scenario.endswith('relative')
+    args += ['operand' if relative else str(invoke / 'operand')]
+    # Probe both the editor's cwd and the original selected by a relative operand.
+    # The no-op editor never prints randomized temporary names or mutates files.
+    # sudo.ws opens relative originals in the invoking cwd, then changes only
+    # the editor cwd; its accept record PWD names the editor cwd.
+    if scenario in ('forbidden', 'fixed-equal', 'fixed-mismatch'):
+        expected_error = 'you are not permitted to use the -D option with sudoedit'
+        expected_output = b''
+    else:
+        expected_rc = 0
+        expected_output = ('editor-pwd=' + str(target) + '\noperand-content=invoking operand\n').encode()
+        expected_error = 'unchanged'
+elif kind == 'rootprivacy':
+    tree = pathlib.Path('/srv/cli-third-rootprivacy')
+    root = tree / 'root'
+    tree.mkdir(parents=True, exist_ok=True)
+    tree.chmod(0o755)
+    if root.exists():
+        root.chmod(0o755)
+        shutil.rmtree(root)
+    if scenario != 'missing':
+        (root / 'usr/bin').mkdir(parents=True)
+        shutil.copy2('/usr/bin/true', root / 'usr/bin/true')
+        root.chmod(0 if scenario == 'unreadable' else 0o755)
+    set_policy()
+    args = ['-n', '-R', str(root), '/usr/bin/true']
+    expected_error = 'you are not permitted to use the -R option with /usr/bin/true'
+    expected_output = b''
+else:
+    raise AssertionError(kind)
+
+account = pwd.getpwnam(user)
+extra = dict(HOME=account.pw_dir, USER=user, LOGNAME=user, SHELL='/bin/bash',
+             PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+             LANG='C.UTF-8', **extra)
+reference = capture('/usr/bin/sudo.ws', args, user=user, cwd=cwd, env=extra, logfile=logfile)
+print('reference:', repr(reference), flush=True)
+assert reference['rc'] == expected_rc, reference
+assert expected_error.encode() in reference['err'], reference
+assert reference['out'] == expected_output, reference
+if kind == 'rootprivacy':
+    assert reference['err'] == (
+        'sudo: the -R option will be removed in a future version of sudo\n'
+        'sudo: ' + expected_error + '\n').encode(), reference
+    assert len(reference['logfile'].splitlines()) == 1, reference
+    assert len(reference['syslog']) == 1, reference
+    assert 'user not allowed to change root directory to ' + str(root) in reference['logfile'], reference
+    assert 'user not allowed to change root directory to ' + str(root) in reference['syslog'][0], reference
+actual = capture('/usr/bin/sudo', args, user=user, cwd=cwd, env=extra, logfile=logfile)
+print('actual:', repr(actual), flush=True)
+assert actual == reference, 'stderr/stdout/status/logfile/syslog differ from sudo.ws'
+if kind == 'editcwd':
+    for directory, text in ((invoke, 'invoking operand\n'), (target, 'target operand\n'), (other, 'other operand\n')):
+        assert (directory / 'operand').read_text() == text, directory
+if kind == 'rootprivacy' and root.exists(): root.chmod(0o755)
+PY
+}
+
+for cli_third_first in remote root close; do
+  for cli_third_second in uid gid implied tty shell; do
+    begin "cli-core-third-order-$cli_third_first-$cli_third_second" && {
+      cli_core_third_order_compare order "$cli_third_first-$cli_third_second" >"$WORK/cli-third-order-result" 2>&1 || fail "$(cat "$WORK/cli-third-order-result")"
+      cat "$WORK/cli-third-order-result" >>"$LOG"
+      end
+    }
+  done
+done
+for cli_third_pair in remote-root remote-close root-close uid-tty gid-tty implied-tty tty-shell; do
+  begin "cli-core-third-order-$cli_third_pair" && {
+    cli_core_third_order_compare order "$cli_third_pair" >"$WORK/cli-third-order-result" 2>&1 || fail "$(cat "$WORK/cli-third-order-result")"
+    cat "$WORK/cli-third-order-result" >>"$LOG"
+    end
+  }
+done
+for cli_third_cwd in forbidden wildcard wildcard-relative fixed-equal fixed-mismatch fixed-default rule-wildcard rule-wildcard-relative rule-fixed; do
+  begin "cli-core-third-editcwd-$cli_third_cwd" && {
+    cli_core_third_order_compare editcwd "$cli_third_cwd" >"$WORK/cli-third-order-result" 2>&1 || fail "$(cat "$WORK/cli-third-order-result")"
+    cat "$WORK/cli-third-order-result" >>"$LOG"
+    end
+  }
+done
+for cli_third_root in missing existing unreadable; do
+  begin "cli-core-third-rootprivacy-$cli_third_root" && {
+    cli_core_third_order_compare rootprivacy "$cli_third_root" >"$WORK/cli-third-order-result" 2>&1 || fail "$(cat "$WORK/cli-third-order-result")"
+    cat "$WORK/cli-third-order-result" >>"$LOG"
+    end
+  }
+done

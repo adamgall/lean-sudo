@@ -4,6 +4,10 @@
 # Source: sudo-project/sudo v1.9.17p2 plugins/sudoers/{timestamp.c,timestamp.h}.
 # Every sudo child has argv[0]="sudo" and the SAME real UID. In particular, do
 # not pipe a password into a shell function: that would change sudo's parent.
+# Review regressions below exercise timestamp.c ts_find_record/ts_match_record,
+# timestamp_status and timestamp_remove, plus check.c MODE_IGNORE_TICKET.
+# Slot identity deliberately precedes validity: GLOBAL ignores start_time when
+# matching, but timestamp_status validates BOTH timespecs even for GLOBAL.
 
 timestamp_interop_setup() {
   local scope=$1 timeout=${2:-5} owner=${3:-root} directory=${4:-custom}
@@ -140,6 +144,35 @@ case $action in
       [[ ! -s $out ]] || bad 'interrupted waiter executed the command'
       grep -qF 'a password is required' "$err" || bad 'interrupted lock did not fall back to authentication-required'
     fi
+    ;;
+  review-*)
+    metadata before
+    [[ $action == review-ignore-missing ]] || authenticate /usr/bin/sudo.ws
+    printf 'timestamp-interop-review-ready:%s\n' "$$"
+    IFS= read -r gate
+    [[ $gate == start ]] || bad 'invalid root review gate'
+    case $action in
+      review-negative-sid-followed-valid|review-nonglobal-invalid-start|review-many-records|review-sparse-records)
+        cached "$reader"
+        ;;
+      review-negative-sid-first-duplicate|review-invalid-time-first-duplicate|review-global-invalid-start)
+        denied "$reader"
+        ;;
+      review-negative-sid-k|review-malformed-known-k)
+        call "$reader" 0 -k
+        [[ ! -s $out && ! -s $err ]] || bad '-k emitted unexpected output'
+        ;;
+      review-ignore-missing|review-ignore-existing)
+        # Even an existing CURRENT ticket must not satisfy -k command.
+        call "$reader" 1 -k -n /usr/bin/id -u
+        [[ ! -s $out ]] || bad '-k -n ran without authentication'
+        grep -qF 'a password is required' "$err" || bad '-k -n denial was not authentication-required'
+        call "$reader" 0 -k -S -p 'timestamp-interop-password: ' /usr/bin/id -u <<<'alicepw'
+        [[ $(cat "$out") == 0 ]] || bad '-k authenticated command did not run as root'
+        grep -qF 'timestamp-interop-password: ' "$err" || bad '-k command did not prompt'
+        ;;
+      *) bad "unknown review action $action" ;;
+    esac
     ;;
   probe-denied) denied "$reader" ;;
   probe-cached) cached "$reader" ;;
@@ -389,6 +422,172 @@ elif action == 'locking':
             os.close(fd)
         sys.stdout.write(ready + output)
         sys.stderr.write(errors)
+elif action == 'review':
+    import ctypes
+    import fcntl
+    import select
+    import signal
+    import subprocess
+
+    root, directory, uid, binary, scope, variant = args
+    user = pwd.getpwnam('alice')
+    env = dict(HOME=user.pw_dir, USER=user.pw_name, LOGNAME=user.pw_name,
+               SHELL='/bin/bash', PATH='/usr/bin:/bin', LANG='C.UTF-8')
+    child = subprocess.Popen(
+        ['setpriv', '--reuid=alice', f'--regid={user.pw_gid}', '--init-groups',
+         '--', '/bin/bash', root + '/client.sh', root, 'review-' + variant,
+         '/usr/bin/sudo.ws', binary, scope],
+        cwd=user.pw_dir, env=env, start_new_session=True,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True)
+    fd = watch = None
+    ready = output = errors = ''
+    try:
+        assert select.select([child.stdout], [], [], 15)[0], 'review authentication gate timed out'
+        ready = child.stdout.readline()
+        assert ready == f'timestamp-interop-review-ready:{child.pid}\n', ready
+        path = Path(directory) / uid
+        expected = None
+        selected_offset = None
+        many = variant in ('many-records', 'sparse-records')
+        if variant == 'ignore-missing':
+            assert not Path(directory).exists(), 'fixture unexpectedly created timestamp directory'
+        else:
+            original = path.read_bytes()
+            rows = entries(original)
+            kind = 1 if scope == 'global' else 3
+            selected = [(i * 56, list(row)) for i, row in enumerate(rows)
+                        if row[2] == kind and row[4] == int(uid)]
+            assert len(selected) == 1, rows
+            offset, valid = selected[0]
+            assert valid[3] == 0, valid
+            if scope == 'ppid':
+                assert valid[10] == child.pid, (valid, child.pid)
+            prefix, ticket, suffix = original[:offset], original[offset:offset + 56], original[offset + 56:]
+            bad = valid.copy()
+            disable = []
+            if variant.startswith('negative-sid'):
+                bad[5] = -1  # sudo.ws stores getsid()'s signed failure value.
+                if variant == 'negative-sid-followed-valid':
+                    bad[4] = pwd.getpwnam('bob').pw_uid
+                fixture = prefix + ENTRY.pack(*bad) + ticket + suffix
+                if variant == 'negative-sid-k':
+                    disable = [offset, offset + 56]
+                elif variant == 'negative-sid-followed-valid':
+                    selected_offset = offset + 56
+            elif variant == 'invalid-time-first-duplicate':
+                bad[9] = 1_000_000_000
+                fixture = prefix + ENTRY.pack(*bad) + ticket + suffix
+            elif variant in ('global-invalid-start', 'nonglobal-invalid-start'):
+                bad[7] = 1_000_000_000
+                fixture = prefix + ENTRY.pack(*bad) + ticket + suffix
+                if variant == 'nonglobal-invalid-start':
+                    selected_offset = offset + 56
+            elif variant == 'malformed-known-k':
+                # SID/time are NOT part of identity. -k must disable every
+                # matching UID (TS_ANYUID is on the search key), preserving
+                # the malformed bytes. Unsupported formats are skipped.
+                damaged = []
+                for field, value in ((5, -1), (8, -1), (9, 1_000_000_000)):
+                    row = valid.copy()
+                    row[field] = value
+                    row[4] = pwd.getpwnam('bob').pw_uid
+                    disable.append(offset + len(damaged) * 56)
+                    damaged.append(ENTRY.pack(*row))
+                for field, value in ((0, 3), (2, 99), (7, 1_000_000_000)):
+                    row = valid.copy()
+                    row[field] = value
+                    damaged.append(ENTRY.pack(*row))
+                disable.append(offset + len(damaged) * 56)
+                fixture = prefix + b''.join(damaged) + ticket + suffix
+            elif many:
+                # These are fixture sizes, not format/implementation caps.
+                # Dense records exceed the former 64 KiB cutoff; sparse
+                # extension records force declared-size seeks over 256 MiB.
+                count = 32768 if variant == 'many-records' else 4096
+                stride = 56 if variant == 'many-records' else 65535
+                foreign = valid.copy()
+                foreign[4] = pwd.getpwnam('bob').pw_uid
+                foreign[1] = stride
+                if variant == 'sparse-records':
+                    foreign[0] = 3
+                sentinel = ENTRY.pack(*foreign)
+                with path.open('r+b') as stream:
+                    stream.truncate(0)
+                    stream.write(prefix)
+                    for index in range(count):
+                        stream.seek(offset + index * stride)
+                        stream.write(sentinel)
+                    selected_offset = offset + count * stride
+                    stream.seek(selected_offset)
+                    stream.write(ticket + suffix)
+                expected_size = selected_offset + len(ticket) + len(suffix)
+            else:
+                assert variant == 'ignore-existing', variant
+                fixture = original
+            if not many:
+                path.write_bytes(fixture)
+                expected = bytearray(fixture)
+                for position in disable:
+                    flags, = struct.unpack_from('<H', expected, position + 6)
+                    struct.pack_into('<H', expected, position + 6, flags | 1)
+            if variant == 'ignore-existing':
+                fd = os.open(path, os.O_RDWR)
+                fcntl.lockf(fd, fcntl.LOCK_EX, 56, 0, os.SEEK_SET)
+        if variant in ('ignore-existing', 'ignore-missing'):
+            # inotify complements the held LOCKEXCL: an implementation that
+            # merely opens without locking must fail too. Register AFTER our
+            # own opens; inspect events BEFORE our post-command file reads.
+            libc = ctypes.CDLL(None, use_errno=True)
+            watch = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+            assert watch >= 0, ('inotify_init1', ctypes.get_errno())
+            watched = path if variant == 'ignore-existing' else Path(root)
+            # IN_OPEN | IN_MODIFY | IN_ATTRIB | IN_CREATE | IN_DELETE |
+            # IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF
+            mask = 0x20 | 0x2 | 0x4 | 0x100 | 0x200 | 0x40 | 0x80 | 0x400 | 0x800
+            assert libc.inotify_add_watch(watch, os.fsencode(watched), mask) >= 0, (
+                'inotify_add_watch', ctypes.get_errno())
+        child.stdin.write('start\n')
+        child.stdin.flush()
+        output, errors = child.communicate(timeout=30 if many else 10)
+        assert child.returncode == 0, (child.returncode, output, errors)
+        assert f'timestamp-interop-ok:review-{variant}\n' in output, output
+        if watch is not None:
+            assert not select.select([watch], [], [], 0)[0], '-k command opened/changed timestamp storage'
+        if variant == 'ignore-missing':
+            assert not Path(directory).exists(), '-k command created timestamp storage'
+        elif many:
+            assert path.stat().st_size == expected_size, 'scan appended or truncated a slot'
+            # Keep fixture verification bounded too; never read sparse holes.
+            with path.open('rb') as stream:
+                assert stream.read(len(prefix)) == prefix
+                for index in range(count):
+                    stream.seek(offset + index * stride)
+                    assert stream.read(56) == sentinel, ('foreign record changed', index)
+                stream.seek(selected_offset)
+                refreshed = stream.read(56)
+                assert refreshed[:32] == ticket[:32] and refreshed[48:] == ticket[48:], refreshed.hex()
+                assert stream.read() == suffix
+        else:
+            actual = path.read_bytes()
+            if selected_offset is not None:
+                # Successful cached commands refresh only the chosen ticket's
+                # timestamp. Earlier malformed/foreign slots must stay intact.
+                stamp = slice(selected_offset + 32, selected_offset + 48)
+                expected[stamp] = actual[stamp]
+            assert actual == expected, ('unexpected slot append/rewrite', actual.hex(), expected.hex())
+        print(f'timestamp-interop-review-{variant}-ok')
+    finally:
+        if child.poll() is None:
+            os.killpg(child.pid, signal.SIGKILL)
+        if child.stdout is not None and not child.stdout.closed:
+            output, errors = child.communicate()
+        if watch is not None:
+            os.close(watch)
+        if fd is not None:
+            os.close(fd)
+        sys.stdout.write(ready + output)
+        sys.stderr.write(errors)
 else:
     raise AssertionError(action)
 PY
@@ -519,6 +718,24 @@ for timestamp_interop_variant in foreign-auth-uid unsupported-version unsupporte
       fi
     done
     timestamp_interop_cleanup
+    end
+  }
+done
+
+# Each case is independently filterable, starts with a real sudo.ws ticket,
+# and uses one stable parent while root mutates that parent's private file.
+# Do not use /run/sudo/ts here: cleanup must never touch a host user's ticket.
+for timestamp_interop_review in negative-sid-followed-valid negative-sid-first-duplicate negative-sid-k malformed-known-k invalid-time-first-duplicate global-invalid-start nonglobal-invalid-start ignore-missing ignore-existing many-records sparse-records; do
+  begin "timestamp-interop-review-$timestamp_interop_review" && {
+    timestamp_interop_scope=ppid
+    [[ $timestamp_interop_review == global-invalid-start ]] && timestamp_interop_scope=global
+    for timestamp_interop_binary in /usr/bin/sudo.ws /usr/bin/sudo; do
+      timestamp_interop_setup "$timestamp_interop_scope"
+      run root "python3 '$TI_ROOT/records.py' review '$TI_ROOT' '$TI_STORE' '$TI_UID' '$timestamp_interop_binary' '$timestamp_interop_scope' '$timestamp_interop_review'"
+      expect_rc 0
+      expect_out_has "timestamp-interop-review-$timestamp_interop_review-ok"
+      timestamp_interop_cleanup
+    done
     end
   }
 done

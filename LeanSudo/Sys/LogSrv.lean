@@ -72,14 +72,17 @@ private def sendMessage (message : ClientMessage) : IO Unit := send (encodeClien
 
 private def readMessage (wait : Bool) : IO (Option ServerMessage) := do
   let some bytes ← receive wait | return none
-  let some message := decodeServer bytes | throw (IO.userError "invalid log server message")
+  let some message := decodeServer bytes |
+    throw (IO.userError s!"unable to unpack ServerMessage size {bytes.size}")
   return some message
 
-private def handshake (st : Settings) (server : String) : IO Bool := do
+private def connectServer (st : Settings) (server : String) : IO Unit := do
   let some (host, port, tls) := endpoint server |
     throw (IO.userError ("invalid log server: " ++ server))
   connect host port tls st.logServerTimeout.toUInt32 st.logServerKeepalive st.logServerVerify
     (st.logServerCabundle.getD "") (st.logServerPeerCert.getD "") (st.logServerPeerKey.getD "")
+
+private def handshake : IO Bool := do
   sendMessage (.hello "sudoers 1.9.17p2")
   match ← readMessage true with
   | some (.hello hello) =>
@@ -92,8 +95,9 @@ private def handshake (st : Settings) (server : String) : IO Bool := do
 private def connectFirst (st : Settings) (servers : List String) : IO Bool := do
   let mut cause : Option String := none
   for server in servers do
-    try
-      return ← handshake st server
+    let connected ← try
+      connectServer st server
+      pure true
     catch error =>
       let message := error.toString
       if message.startsWith "TLS connection to " then
@@ -101,6 +105,10 @@ private def connectFirst (st : Settings) (servers : List String) : IO Bool := do
         Sys.writeStderr ("sudo: " ++ lines.headD message ++ "\n")
         cause := (lines.drop 1).head?
       closeTransport
+      pure false
+    -- sudoers fails over connection establishment, not a peer's malformed
+    -- handshake: protocol errors from an established connection are final.
+    if connected then return ← handshake
   for message in cause do Sys.writeStderr ("sudo: " ++ message ++ "\n")
   throw (IO.userError "unable to connect to log server")
 
@@ -134,8 +142,7 @@ private partial def awaitCommit (s : Session) : IO Session := do
 private partial def drain (s : Session) : IO Session := do
   -- sudoers stops logging on an established-session transport failure; only
   -- initial connection setup fails over. RestartMessage belongs to sendlog.
-  let some bytes ← receive false | return s
-  let some message := decodeServer bytes | throw (IO.userError "invalid log server message")
+  let some message ← readMessage false | return s
   drain (← consume s message)
 
 private def failure (s : Session) (error : IO.Error) : IO Unit := do

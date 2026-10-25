@@ -4,8 +4,11 @@ import LeanSudo.Policy.Types
 # Timestamp records (pure)
 
 Pure model of sudo's credential cache ("timestamp") file: record identity (scope),
-validity, update / invalidation, and a versioned binary encoding with a proved
-roundtrip. All IO lives in `LeanSudo.Sys.Timestamp`.
+validity, update / invalidation, and a canonical codec with a proved roundtrip.
+Runtime uses the bounded `scanStep` raw-slot decoder, `LocatedEntry.recordFor`,
+and `updateEntry`; their theorems cover the same helpers consumed by IO.
+Raw slot matching preserves malformed first matches, while authorization rejects
+invalid timespecs (including global start times). All IO lives in `LeanSudo.Sys.Timestamp`.
 
 Times are `CLOCK_BOOTTIME` nanoseconds; timeouts are seconds (as in sudoers).
 -/
@@ -120,6 +123,9 @@ structure DiskEntry where
 structure LocatedEntry where
   offset : Nat
   entry : DiskEntry
+  /-- Raw timespec validity is separate from slot identity. -/
+  startValid : Bool := true
+  timeValid : Bool := true
   deriving DecidableEq, Repr, Inhabited
 
 def lockEntry : DiskEntry := ⟨4, 0, 0, 0, 0, 0, 0⟩
@@ -139,6 +145,31 @@ def DiskEntry.toRecord (e : DiskEntry) : Option Record := do
     | _ => none
   return { scope, authUid := e.authUid, time := e.time, disabled := e.flags % 2 == 1 }
 
+/-- Set only TS_DISABLED. The quotient preserves every higher flag bit; runtime
+invalidation writes only these two flag bytes, never re-encodes a raw slot. -/
+def disabledEntry (entry : DiskEntry) : DiskEntry :=
+  { entry with flags := entry.flags / 2 * 2 + 1 }
+
+theorem disabledEntry_upper_flags (entry : DiskEntry) :
+    (disabledEntry entry).flags / 2 = entry.flags / 2 := by
+  simp only [disabledEntry]
+  omega
+
+theorem disabledEntry_low_flag (entry : DiskEntry) :
+    (disabledEntry entry).flags % 2 = 1 := by
+  simp [disabledEntry, Nat.add_mod]
+
+theorem DiskEntry.toRecord_disabled {entry : DiskEntry} {record : Record}
+    (h : entry.toRecord = some record) :
+    record.disabled = (entry.flags % 2 == 1) := by
+  unfold DiskEntry.toRecord at h
+  split at h <;> simp_all
+  all_goals cases h; rfl
+
+theorem disabledEntry_toRecord_disabled {entry : DiskEntry} {record : Record}
+    (h : (disabledEntry entry).toRecord = some record) : record.disabled = true := by
+  simpa [disabledEntry_low_flag] using DiskEntry.toRecord_disabled h
+
 /-- Slot identity deliberately ignores SID and disabled status, just like
 `ts_match_record`. SID is checked separately before authorizing a ticket.
 `anyUid` belongs to the search key, never to the stored entry's flags. -/
@@ -149,6 +180,10 @@ def DiskEntry.matches (e : DiskEntry) (scope : Scope) (authUid : Nat)
     | .global => e.kind == 1
     | .tty dev _ start => e.kind == 2 && e.key == dev && e.start == start
     | .ppid pid start => e.kind == 3 && e.key == pid && e.start == start
+
+theorem disabledEntry_matches (entry : DiskEntry) (scope : Scope) (uid : Nat)
+    (anyUid : Bool) :
+    (disabledEntry entry).matches scope uid anyUid = entry.matches scope uid anyUid := rfl
 
 theorem DiskEntry.toRecord_ofRecord (sid : Nat) (r : Record) :
     (DiskEntry.ofRecord sid r).toRecord = some r := by
@@ -181,6 +216,59 @@ theorem DiskEntry.matches_tty_sid_independent (e : DiskEntry)
     (dev sid₁ sid₂ start uid : Nat) (anyUid : Bool) :
     e.matches (.tty dev sid₁ start) uid anyUid =
       e.matches (.tty dev sid₂ start) uid anyUid := rfl
+
+/-- Runtime slot construction retains sudo's nonglobal lock identity in the
+unused fields of a global record. -/
+def entryFor (lockScope : Scope) (sid : Nat) (record : Record) : DiskEntry :=
+  let entry := DiskEntry.ofRecord sid record
+  if record.scope = .global then
+    match lockScope with
+    | .tty dev _ start => { entry with start, key := dev }
+    | .ppid pid start => { entry with start, key := pid }
+    | .global => entry
+  else entry
+
+/-- Only the authenticated identity and scope of the locked ticket may be written.
+The IO layer additionally checks `Representable` before encoding. -/
+def updateEntry (scope lockScope : Scope) (sid authUid : Nat) (record : Record) :
+    Option DiskEntry :=
+  if record.scope = scope ∧ record.authUid = authUid then
+    some (entryFor lockScope sid record)
+  else none
+
+theorem entryFor_projection (lockScope : Scope) (sid : Nat) (record : Record) :
+    (entryFor lockScope sid record).toRecord = some record := by
+  obtain ⟨scope, uid, time, disabled⟩ := record
+  cases scope <;> cases lockScope <;> cases disabled <;>
+    simp [entryFor, DiskEntry.ofRecord, DiskEntry.toRecord]
+
+theorem entryFor_matches (lockScope : Scope) (sid : Nat) (record : Record) :
+    (entryFor lockScope sid record).matches record.scope record.authUid = true := by
+  obtain ⟨scope, uid, time, disabled⟩ := record
+  cases scope <;> cases lockScope <;>
+    simp [entryFor, DiskEntry.ofRecord, DiskEntry.matches]
+
+theorem updateEntry_sound {scope lockScope : Scope} {sid uid : Nat}
+    {record : Record} {entry : DiskEntry}
+    (h : updateEntry scope lockScope sid uid record = some entry) :
+    record.scope = scope ∧ record.authUid = uid ∧
+      entry.toRecord = some record ∧ entry.matches scope uid = true := by
+  unfold updateEntry at h
+  split at h
+  · rename_i hk
+    have he := Option.some.inj h
+    subst entry
+    exact ⟨hk.1, hk.2, entryFor_projection _ _ _,
+      by simpa [← hk.1, ← hk.2] using entryFor_matches lockScope sid record⟩
+  · contradiction
+
+theorem updateEntry_wrong_uid (scope lockScope : Scope) (sid uid : Nat) (record : Record)
+    (h : record.authUid ≠ uid) : updateEntry scope lockScope sid uid record = none := by
+  simp [updateEntry, h]
+
+theorem updateEntry_wrong_scope (scope lockScope : Scope) (sid uid : Nat) (record : Record)
+    (h : record.scope ≠ scope) : updateEntry scope lockScope sid uid record = none := by
+  simp [updateEntry, h]
 
 /-- Fixed-width little-endian words; values outside the width are truncated.
 Roundtrip theorems explicitly require representability. -/
@@ -303,6 +391,50 @@ theorem decodeEntry_encodeEntry (e : DiskEntry) (h : e.Representable) :
   simp only [List.append_nil] at hd
   simp [decodeEntry, encodeEntry, hd]
 
+/-- Read at most eight bytes directly, without allocating lists for runtime slots. -/
+def slotWord (bytes : ByteArray) (offset : Nat) : Nat → Nat
+  | 0 => 0
+  | width + 1 => bytes[offset]!.toNat + 256 * slotWord bytes (offset + 1) width
+
+/-- Raw v2 decoder: signed SID bits and invalid timespecs still identify a slot.
+Unlike the canonical codec, this must not reject a slot before matching it. -/
+def decodeSlot (bytes : ByteArray) (offset : Nat := 0) : Option LocatedEntry :=
+  if bytes.size = recordSize ∧ slotWord bytes 0 2 = 2 ∧
+      slotWord bytes 2 2 = recordSize then
+    let kind := slotWord bytes 4 2
+    if 1 ≤ kind ∧ kind ≤ 4 then
+      let startSeconds := slotWord bytes 16 8
+      let startNanos := slotWord bytes 24 8
+      let timeSeconds := slotWord bytes 32 8
+      let timeNanos := slotWord bytes 40 8
+      some {
+        offset
+        entry := {
+          kind, flags := slotWord bytes 6 2, authUid := slotWord bytes 8 4
+          sid := slotWord bytes 12 4
+          start := startNanos + 1000000000 * startSeconds
+          time := timeNanos + 1000000000 * timeSeconds
+          key := slotWord bytes 48 (if kind = 3 then 4 else 8) }
+        startValid := decide (startSeconds < 2 ^ 63 ∧ startNanos < 1000000000)
+        timeValid := decide (timeSeconds < 2 ^ 63 ∧ timeNanos < 1000000000) }
+    else none
+  else none
+
+theorem decodeSlot_validity {bytes : ByteArray} {offset : Nat} {located : LocatedEntry}
+    (h : decodeSlot bytes offset = some located) :
+    located.offset = offset ∧
+      (located.startValid = true ↔
+        slotWord bytes 16 8 < 2 ^ 63 ∧ slotWord bytes 24 8 < 1000000000) ∧
+      (located.timeValid = true ↔
+        slotWord bytes 32 8 < 2 ^ 63 ∧ slotWord bytes 40 8 < 1000000000) := by
+  dsimp only [decodeSlot] at h
+  split at h
+  · split at h
+    · cases Option.some.inj h
+      simp
+    · contradiction
+  · contradiction
+
 /-- A model record is representable iff its canonical disk projection is. -/
 def Record.Representable (r : Record) : Prop := (DiskEntry.ofRecord 0 r).Representable
 
@@ -390,34 +522,172 @@ theorem load_encode (rs : List Record) (h : ∀ r ∈ rs, r.Representable) :
     load (encode rs) = rs := by
   simp [load, decode_encode _ h]
 
-/-- Scan by the on-disk size, not the number of recognized records. A short
-header, size below the header width, truncated body, or malformed known entry
-terminates scanning. Foreign versions/sizes/types are skipped without changing
-subsequent offsets. -/
-def scanFrom (bytes : ByteArray) (offset fuel : Nat) : List LocatedEntry :=
+/-- A bounded chunk is relative to `offset`, while `extent` is the absolute file end.
+Foreign records need only their header; a v2/56 slot requires an exact 56-byte window.
+No SID or timespec error terminates the structural scan. -/
+inductive ScanStep where
+  | stop
+  | next (offset : Nat) (entry : Option LocatedEntry)
+  deriving DecidableEq, Repr, Inhabited
+
+def scanStep (bytes : ByteArray) (offset extent : Nat) : ScanStep :=
+  if bytes.size < 4 then .stop else
+    let version := slotWord bytes 0 2
+    let size := slotWord bytes 2 2
+    if size < 4 ∨ offset + size > extent then .stop else
+      if version = 2 ∧ size = recordSize then
+        if bytes.size ≠ recordSize then .stop else
+          .next (offset + size) (decodeSlot bytes offset)
+      else .next (offset + size) none
+
+theorem scanStep_bounds {bytes : ByteArray} {offset extent next : Nat}
+    {entry : Option LocatedEntry} (h : scanStep bytes offset extent = .next next entry) :
+    offset + 4 ≤ next ∧ next ≤ extent := by
+  dsimp only [scanStep] at h
+  split at h
+  · contradiction
+  · split at h
+    · contradiction
+    · rename_i hb
+      split at h
+      · split at h
+        · contradiction
+        · cases h
+          omega
+      · cases h
+        omega
+
+theorem scanStep_decoded {bytes : ByteArray} {offset extent next : Nat}
+    {entry : LocatedEntry} (h : scanStep bytes offset extent = .next next (some entry)) :
+    decodeSlot bytes offset = some entry := by
+  dsimp only [scanStep] at h
+  split at h
+  · contradiction
+  · split at h
+    · contradiction
+    · split at h
+      · split at h
+        · contradiction
+        · exact (ScanStep.next.inj h).2
+      · cases h
+
+/-- Tail accumulation preserves physical order, including malformed matching
+slots. In particular a rejected first match cannot expose a later duplicate. -/
+def scanAcc (bytes : ByteArray) (offset fuel : Nat) (acc : List LocatedEntry) :
+    List LocatedEntry :=
   match fuel with
-  | 0 => []
+  | 0 => acc.reverse
   | fuel + 1 =>
-    if offset + 4 > bytes.size then [] else
-      let version := bytes[offset]!.toNat + 256 * bytes[offset + 1]!.toNat
-      let size := bytes[offset + 2]!.toNat + 256 * bytes[offset + 3]!.toNat
-      if size < 4 ∨ offset + size > bytes.size then [] else
-        if version = 2 ∧ size = recordSize then
-          let kind := bytes[offset + 4]!.toNat + 256 * bytes[offset + 5]!.toNat
-          if 1 ≤ kind ∧ kind ≤ 4 then
-            match decodeEntry (bytes.extract offset (offset + size)) with
-            | some e => ⟨offset, e⟩ :: scanFrom bytes (offset + size) fuel
-            | none => []
-          else scanFrom bytes (offset + size) fuel
-        else scanFrom bytes (offset + size) fuel
+    match scanStep (bytes.extract offset (offset + recordSize)) offset bytes.size with
+    | .stop => acc.reverse
+    | .next next entry =>
+      scanAcc bytes next fuel (match entry with | some e => e :: acc | none => acc)
+
+def scanFrom (bytes : ByteArray) (offset fuel : Nat) : List LocatedEntry :=
+  scanAcc bytes offset fuel []
 
 def scan (bytes : ByteArray) : List LocatedEntry := scanFrom bytes 0 (bytes.size / 4)
+
+theorem scanAcc_append (bytes : ByteArray) (offset fuel : Nat)
+    (front suffix : List LocatedEntry) :
+    scanAcc bytes offset fuel (front ++ suffix) =
+      suffix.reverse ++ scanAcc bytes offset fuel front := by
+  induction fuel generalizing offset front with
+  | zero => simp [scanAcc, List.reverse_append]
+  | succ fuel ih =>
+    cases hs : scanStep (bytes.extract offset (offset + recordSize)) offset bytes.size with
+    | stop => simp [scanAcc, hs, List.reverse_append]
+    | next next found =>
+      cases found with
+      | none => simpa only [scanAcc, hs] using ih next front
+      | some entry =>
+        simpa only [scanAcc, hs, List.cons_append] using ih next (entry :: front)
+
+/-- Recognition prepends the physical first slot, even if it cannot authorize. -/
+theorem scanFrom_next_some {bytes : ByteArray} {offset next fuel : Nat}
+    {entry : LocatedEntry}
+    (h : scanStep (bytes.extract offset (offset + recordSize)) offset bytes.size =
+      .next next (some entry)) :
+    scanFrom bytes offset (fuel + 1) = entry :: scanFrom bytes next fuel := by
+  simpa [scanFrom, scanAcc, h] using scanAcc_append bytes next fuel [] [entry]
+
+theorem scanFrom_next_none {bytes : ByteArray} {offset next fuel : Nat}
+    (h : scanStep (bytes.extract offset (offset + recordSize)) offset bytes.size =
+      .next next none) :
+    scanFrom bytes offset (fuel + 1) = scanFrom bytes next fuel := by
+  simp only [scanFrom, scanAcc, h]
+
+/-- Every accumulated result originates in an actual bounded scanner step. -/
+theorem scanAcc_origin (bytes : ByteArray) (offset fuel : Nat) (acc : List LocatedEntry)
+    (entry : LocatedEntry) (h : entry ∈ scanAcc bytes offset fuel acc) :
+    entry ∈ acc ∨ ∃ pos next,
+      scanStep (bytes.extract pos (pos + recordSize)) pos bytes.size =
+        .next next (some entry) := by
+  induction fuel generalizing offset acc with
+  | zero =>
+    left
+    simpa [scanAcc] using h
+  | succ fuel ih =>
+    cases hs : scanStep (bytes.extract offset (offset + recordSize)) offset bytes.size with
+    | stop =>
+      left
+      simpa [scanAcc, hs] using h
+    | next next found =>
+      cases found with
+      | none =>
+        exact ih next acc (by simpa [scanAcc, hs] using h)
+      | some located =>
+        have hr := ih next (located :: acc) (by simpa [scanAcc, hs] using h)
+        rcases hr with hm | hw
+        · rcases List.mem_cons.mp hm with he | hm
+          · subst entry
+            exact Or.inr ⟨offset, next, hs⟩
+          · exact Or.inl hm
+        · exact Or.inr hw
+
+theorem scan_sound {bytes : ByteArray} {entry : LocatedEntry} (h : entry ∈ scan bytes) :
+    ∃ pos next,
+      scanStep (bytes.extract pos (pos + recordSize)) pos bytes.size =
+        .next next (some entry) ∧ pos + 4 ≤ next ∧ next ≤ bytes.size := by
+  have ho := scanAcc_origin bytes 0 (bytes.size / 4) [] entry h
+  rcases ho with hm | ⟨pos, next, hs⟩
+  · cases hm
+  · exact ⟨pos, next, hs, scanStep_bounds hs⟩
+
+/-- A scanned slot's validity flags describe the raw bytes, not a normalized
+timestamp reconstructed by the encoder. -/
+theorem scan_timespecs {bytes : ByteArray} {entry : LocatedEntry}
+    (h : entry ∈ scan bytes) :
+    ∃ chunk, decodeSlot chunk entry.offset = some entry ∧
+      (entry.startValid = true ↔
+        slotWord chunk 16 8 < 2 ^ 63 ∧ slotWord chunk 24 8 < 1000000000) ∧
+      (entry.timeValid = true ↔
+        slotWord chunk 32 8 < 2 ^ 63 ∧ slotWord chunk 40 8 < 1000000000) := by
+  obtain ⟨pos, next, hs, _⟩ := scan_sound h
+  have hd := scanStep_decoded hs
+  have hv := decodeSlot_validity hd
+  exact ⟨_, by simpa [hv.1] using hd, hv.2⟩
 
 def DiskEntry.forSession (e : DiskEntry) (sid : Nat) : Option Record :=
   if e.kind = 1 ∨ e.sid = sid then e.toRecord else none
 
+/-- Identity matching precedes validity checks. A malformed nonglobal start
+cannot equal a normalized process-incarnation key; global identity ignores it. -/
+def LocatedEntry.matches (located : LocatedEntry) (scope : Scope) (authUid : Nat)
+    (anyUid : Bool := false) : Bool :=
+  (decide (scope = .global) || located.startValid) &&
+    located.entry.matches scope authUid anyUid
+
+/-- sudo's status check validates both timespecs, even for global entries. -/
+def LocatedEntry.forSession (located : LocatedEntry) (sid : Nat) : Option Record :=
+  if located.startValid && located.timeValid then located.entry.forSession sid else none
+
+def LocatedEntry.recordFor (located : LocatedEntry) (scope : Scope) (authUid sid : Nat) :
+    Option Record :=
+  if located.matches scope authUid then located.forSession sid else none
+
 def loadFor (sid : Nat) (bytes : ByteArray) : List Record :=
-  (scan bytes).filterMap fun located => located.entry.forSession sid
+  (scan bytes).filterMap fun located => located.forSession sid
 
 theorem DiskEntry.forSession_sound {e : DiskEntry} {sid : Nat} {r : Record}
     (h : e.forSession sid = some r) : e.kind = 1 ∨ e.sid = sid := by
@@ -430,6 +700,66 @@ theorem DiskEntry.forSession_wrong_sid (e : DiskEntry) (sid : Nat)
     (hg : e.kind ≠ 1) (hs : e.sid ≠ sid) : e.forSession sid = none := by
   simp [DiskEntry.forSession, hg, hs]
 
+theorem LocatedEntry.matches_uid {located : LocatedEntry} {scope : Scope} {uid : Nat}
+    (h : located.matches scope uid = true) : located.entry.authUid = uid := by
+  simp only [LocatedEntry.matches, Bool.and_eq_true] at h
+  exact DiskEntry.matches_uid h.2
+
+theorem LocatedEntry.matches_tty_start {located : LocatedEntry} {dev sid start uid : Nat}
+    {anyUid : Bool} (h : located.matches (.tty dev sid start) uid anyUid = true) :
+    located.startValid = true ∧ located.entry.kind = 2 ∧
+      located.entry.key = dev ∧ located.entry.start = start := by
+  simp only [LocatedEntry.matches, Bool.and_eq_true] at h
+  exact ⟨by simpa using h.1, DiskEntry.matches_tty_start h.2⟩
+
+theorem LocatedEntry.matches_ppid_start {located : LocatedEntry} {pid start uid : Nat}
+    {anyUid : Bool} (h : located.matches (.ppid pid start) uid anyUid = true) :
+    located.startValid = true ∧ located.entry.kind = 3 ∧
+      located.entry.key = pid ∧ located.entry.start = start := by
+  simp only [LocatedEntry.matches, Bool.and_eq_true] at h
+  exact ⟨by simpa using h.1, DiskEntry.matches_ppid_start h.2⟩
+
+theorem LocatedEntry.forSession_sound {located : LocatedEntry} {sid : Nat} {r : Record}
+    (h : located.forSession sid = some r) :
+    located.startValid = true ∧ located.timeValid = true ∧
+      located.entry.toRecord = some r ∧
+      (located.entry.kind = 1 ∨ located.entry.sid = sid) := by
+  unfold LocatedEntry.forSession at h
+  split at h
+  · rename_i hv
+    have hs := DiskEntry.forSession_sound h
+    simp only [Bool.and_eq_true] at hv
+    exact ⟨hv.1, hv.2,
+      by simpa [DiskEntry.forSession, hs] using h, hs⟩
+  · contradiction
+
+theorem LocatedEntry.recordFor_sound {located : LocatedEntry} {scope : Scope}
+    {uid sid : Nat} {r : Record} (h : located.recordFor scope uid sid = some r) :
+    located.entry.authUid = uid ∧ located.matches scope uid = true ∧
+      located.startValid = true ∧ located.timeValid = true ∧
+      located.entry.toRecord = some r ∧
+      (located.entry.kind = 1 ∨ located.entry.sid = sid) := by
+  unfold LocatedEntry.recordFor at h
+  split at h
+  · rename_i hm
+    exact ⟨LocatedEntry.matches_uid hm, hm, LocatedEntry.forSession_sound h⟩
+  · contradiction
+
+theorem LocatedEntry.recordFor_invalid_start (located : LocatedEntry)
+    (scope : Scope) (uid sid : Nat) (h : located.startValid = false) :
+    located.recordFor scope uid sid = none := by
+  simp [LocatedEntry.recordFor, LocatedEntry.forSession, h]
+
+theorem LocatedEntry.recordFor_invalid_time (located : LocatedEntry)
+    (scope : Scope) (uid sid : Nat) (h : located.timeValid = false) :
+    located.recordFor scope uid sid = none := by
+  simp [LocatedEntry.recordFor, LocatedEntry.forSession, h]
+
+theorem LocatedEntry.recordFor_wrong_sid (located : LocatedEntry)
+    (scope : Scope) (uid sid : Nat) (hg : located.entry.kind ≠ 1)
+    (hs : located.entry.sid ≠ sid) : located.recordFor scope uid sid = none := by
+  simp [LocatedEntry.recordFor, LocatedEntry.forSession, DiskEntry.forSession, hg, hs]
+
 /-- Every runtime-projected record comes from a real scanned slot and is
 global or belongs to the requesting session. -/
 theorem loadFor_sound {sid : Nat} {bytes : ByteArray} {r : Record}
@@ -437,8 +767,8 @@ theorem loadFor_sound {sid : Nat} {bytes : ByteArray} {r : Record}
     ∃ located ∈ scan bytes, located.entry.toRecord = some r ∧
       (located.entry.kind = 1 ∨ located.entry.sid = sid) := by
   obtain ⟨located, hm, hp⟩ := List.mem_filterMap.mp h
-  have hs := DiskEntry.forSession_sound hp
-  exact ⟨located, hm, by simpa [DiskEntry.forSession, hs] using hp, hs⟩
+  have hs := LocatedEntry.forSession_sound hp
+  exact ⟨located, hm, hs.2.2.1, hs.2.2.2⟩
 
 /-! ## Properties -/
 
@@ -460,6 +790,33 @@ theorem valid_timeout_strict {now timeout : Nat} {scope : Scope} {authUid : Nat}
     now - r.time < timeout * 10 ^ 9 := by
   simp only [valid, fresh, Bool.and_eq_true, decide_eq_true_eq] at h
   exact h.2.2
+
+/-- Runtime authorization connects the selected raw slot to credential identity,
+process/session binding, valid wire timespecs, and the disabled/future/expiry
+checks. It does not reason about an obsolete in-memory update path. -/
+theorem LocatedEntry.authorized_sound {located : LocatedEntry} {scope : Scope}
+    {uid sid now : Nat} {timeout : Option Nat} {r : Record}
+    (hr : located.recordFor scope uid sid = some r)
+    (hv : valid now timeout scope uid r = true) :
+    located.entry.authUid = uid ∧ located.matches scope uid = true ∧
+      located.startValid = true ∧ located.timeValid = true ∧
+      (located.entry.kind = 1 ∨ located.entry.sid = sid) ∧
+      r.scope = scope ∧ r.authUid = uid ∧ r.disabled = false ∧ r.time ≤ now ∧
+      ∀ t, timeout = some t → t ≠ 0 ∧ now - r.time < t * 10 ^ 9 := by
+  have hs := LocatedEntry.recordFor_sound hr
+  have ht := valid_sound hv
+  refine ⟨hs.1, hs.2.1, hs.2.2.1, hs.2.2.2.1, hs.2.2.2.2.2,
+    ht.1.1, ht.1.2.1, by simpa using ht.2, ht.1.2.2.1, ?_⟩
+  intro t he
+  exact ⟨(ht.1.2.2.2 t he).2, valid_timeout_strict (by simpa [he] using hv)⟩
+
+theorem LocatedEntry.disabled_not_valid (located : LocatedEntry) (scope : Scope)
+    (uid sid now : Nat) (timeout : Option Nat) {record : Record}
+    (h : (LocatedEntry.recordFor { located with entry := disabledEntry located.entry }
+      scope uid sid) = some record) : valid now timeout scope uid record = false := by
+  have hs := LocatedEntry.recordFor_sound h
+  have hd := disabledEntry_toRecord_disabled hs.2.2.2.2.1
+  simp [valid, hd]
 
 theorem lookup_iff {now : Nat} {timeout : Option Nat} {scope : Scope} {authUid : Nat}
     {rs : List Record} :
