@@ -61,12 +61,16 @@ def execute(binary):
     if not os.path.exists('/dev/log'):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         sock.bind('/dev/log')
-        sock.settimeout(.1)
-        stop = threading.Event()
+        # Send this marker only after sudo has exited. UNIX datagrams preserve
+        # queue order, so consuming it proves all earlier log sends were drained.
+        # A stop flag could terminate the reader with records still queued.
+        drained = b'\x00jsonlog-capture-complete'
         def receive():
-            while not stop.is_set():
-                try: messages.append(sock.recv(262144).decode())
-                except socket.timeout: pass
+            while True:
+                message = sock.recv(262144)
+                if message == drained:
+                    return
+                messages.append(message.decode())
         thread = threading.Thread(target=receive)
         thread.start()
     try:
@@ -80,7 +84,11 @@ def execute(binary):
             assert result.returncode == 0
     finally:
         if sock:
-            stop.set(); thread.join(); sock.close(); os.unlink('/dev/log')
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sender:
+                sender.sendto(drained, '/dev/log')
+            thread.join()
+            sock.close()
+            os.unlink('/dev/log')
     text = path.read_text()
     if fmt == 'json_compact':
         records = [pair for line in text.splitlines() for pair in decode(line)]
