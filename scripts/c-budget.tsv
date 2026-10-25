@@ -2,7 +2,7 @@ c/core.c	27	0
 c/prim_corefacts.c	230	16
 c/prim_corelogs.c	327	7
 c/prim_edit.c	184	18
-c/prim_exec.c	823	63
+c/prim_exec.c	873	68
 c/prim_extra.c	293	7
 c/prim_groupplugin.c	72	4
 c/prim_intercept.c	308	2

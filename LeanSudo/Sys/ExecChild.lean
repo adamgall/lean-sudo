@@ -217,7 +217,7 @@ private def execute (plan : ChildPlan) : IO UInt32 := do
       let error ← Prim.Exec.setrlimit (K.RLIMIT_NPROC ()) maximum maximum
       if error != 0 then warnLimit (K.RLIMIT_NPROC ()) error
   Helper.dropCredentials checked.uid plan.gid.toUInt32 checked.groups
-    (some plan.ruid.toUInt32) true
+    (some plan.ruid.toUInt32) true (threadOnly := true)
   if let some (low, high) := savedNproc then
     discard <| Prim.Exec.setrlimit (K.RLIMIT_NPROC ()) low high
   if let some file := plan.spec.noexecFile then noexec file

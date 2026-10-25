@@ -87,8 +87,7 @@ stock policy and validates them with `visudo.ws -c`. It copies `tests.sh`,
 `ptyrun.py`, all `tests.d/` modules and the vendored `sudo-schema.ldif`.
 
 `run.sh` builds the image and creates a container with
-`--hostname sudo-it --network none --cap-add SYS_PTRACE --cap-add SYS_ADMIN`
-and `--cap-add SYS_RESOURCE`. Only
+`--hostname sudo-it --network none --cap-add SYS_PTRACE --cap-add SYS_ADMIN`. Only
 `integration/out/` is mounted, writable; host binaries and the visudo harness are
 copied in. The container is removed on runner exit. `SYS_PTRACE` allows the audit
 cases to use `strace` across credential transitions and inspect actual Linux
@@ -97,10 +96,6 @@ their exec-interception seccomp filter without `no_new_privs`, which would chang
 set-ID command semantics. No host audit daemon or `AUDIT_CONTROL` capability is
 required: strace observes real kernel audit traffic, not a replacement audit
 service. Likewise, utmp readers and inotify are observation tools, not mocks.
-`SYS_RESOURCE` preserves normal root resource-limit privileges: both implementations
-temporarily raise `RLIMIT_NPROC` around the UID switch and restore it before exec.
-Docker otherwise denies that raise when the caller lowered the hard limit, causing
-the Lean runtime's additional threads to trigger Linux's `PF_NPROC_EXCEEDED` check.
 
 Syslog tests run real rsyslog with imuxsock on `/dev/log`, disabled rate limiting,
 a 256 KiB message limit and no control-character escaping. A shared harness

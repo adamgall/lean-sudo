@@ -139,6 +139,18 @@ opaque waitpid (pid flags : UInt32) : IO (Int64 × UInt32)
 @[extern "leansudo_prim_exec_thread_setresuid"]
 opaque threadSetresuid (r e s : UInt32) : IO Unit
 
+@[extern "leansudo_prim_exec_thread_setgroups"]
+opaque threadSetgroups (groups : @& Array UInt32) : IO Unit
+
+@[extern "leansudo_prim_exec_thread_setresgid"]
+opaque threadSetresgid (r e s : UInt32) : IO Unit
+
+@[extern "leansudo_prim_exec_thread_setuid"]
+opaque threadSetuid (uid : UInt32) : IO UInt32
+
+@[extern "leansudo_prim_exec_thread_setgid"]
+opaque threadSetgid (gid : UInt32) : IO UInt32
+
 @[extern "leansudo_prim_exec_execve"]
 opaque execve (path : @& String) (args env : @& Array String) : IO UInt32
 

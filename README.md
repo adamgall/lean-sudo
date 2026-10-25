@@ -156,7 +156,7 @@ the library would make it fail; it is backed by a source grep for those words an
 
 ```console
 $ lake env lean scripts/AxiomAudit.lean
-12440 declarations (2886 theorems) checked; axioms used ⊆ propext, Quot.sound, Classical.choice
+12444 declarations (2886 theorems) checked; axioms used ⊆ propext, Quot.sound, Classical.choice
 ```
 
 A proof is only as good as its statement, so the statements are written to be read:
@@ -292,7 +292,7 @@ undefined aliases), so it cannot install a policy that lean-sudo would then refu
 
 Formal verification moves trust; it does not remove it. lean-sudo trusts:
 
-* **The C primitives** (`c/*`, about 4,700 lines with about 210 branch statements,
+* **The C primitives** (`c/*`, about 4,700 lines with about 215 branch statements,
   down from 9,700 lines and 2,000 branches): each function is a single system or
   library call with an error check and bounded marshalling, a C-ABI callback that
   forwards to a Lean closure (PAM conversation, sudo plugin callbacks,

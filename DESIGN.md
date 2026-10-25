@@ -314,7 +314,12 @@ Credentialed helpers share Lean's `Helper.dropCredentials`: real/effective/saved
 and filesystem IDs, the sorted supplementary-group multiset, and inability to
 regain root are checked before filesystem work or exec. Command execution supplies
 the separate real-UID/GID selection for `stay_setuid` and stages resource limits
-around the drop.
+around the drop. The command helper changes credentials with raw per-thread
+syscalls on the thread that then calls `execve`, so the Lean runtime's other
+threads are not counted against the target user's `RLIMIT_NPROC` (as with
+single-threaded sudo.ws, a hard limit of one process still allows the command);
+`execve` discards those threads. The other helpers keep glibc's process-wide
+changes because they continue running Lean code after the drop.
 Network and broker log frames share bounded framing, but retain their different
 blocking, TLS and interruption semantics. Syslog policy and C mappings accept
 sudo.ws's facilities: `authpriv`, `auth`, `daemon`, `user`, and `local0`–`local7`.

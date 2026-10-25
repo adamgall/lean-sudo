@@ -380,6 +380,56 @@ LEAN_EXPORT lean_obj_res leansudo_prim_exec_setgroups(b_lean_obj_arg array) {
   return ls_unit();
 }
 
+LEAN_EXPORT lean_obj_res leansudo_prim_exec_thread_setgroups(b_lean_obj_arg array) {
+#ifdef __linux__
+  size_t n = lean_array_size(array);
+  if (n > 65536)
+    return lean_io_result_mk_error(lean_decode_io_error(E2BIG, NULL));
+  gid_t *groups = n ? malloc(n * sizeof *groups) : NULL;
+  if (n && !groups)
+    return lean_io_result_mk_error(lean_decode_io_error(ENOMEM, NULL));
+  for (size_t i = 0; i < n; i++) groups[i] = lean_unbox_uint32(lean_array_get_core(array, i));
+  long result = syscall(SYS_setgroups, n, groups);
+  int error = result != 0 ? errno : 0;
+  free(groups);
+  if (error != 0) return lean_io_result_mk_error(lean_decode_io_error(error, NULL));
+  return ls_unit();
+#else
+  (void)array;
+  return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
+#endif
+}
+
+LEAN_EXPORT lean_obj_res leansudo_prim_exec_thread_setresgid(uint32_t r, uint32_t e,
+    uint32_t s) {
+#ifdef __linux__
+  if (syscall(SYS_setresgid, r, e, s) != 0)
+    return lean_io_result_mk_error(lean_decode_io_error(errno, NULL));
+  return ls_unit();
+#else
+  (void)r; (void)e; (void)s;
+  return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
+#endif
+}
+
+LEAN_EXPORT lean_obj_res leansudo_prim_exec_thread_setuid(uint32_t uid) {
+#ifdef __linux__
+  return ls_ok(lean_box_uint32(syscall(SYS_setuid, uid) == 0 ? 0 : (uint32_t)errno));
+#else
+  (void)uid;
+  return ls_ok(lean_box_uint32(ENOSYS));
+#endif
+}
+
+LEAN_EXPORT lean_obj_res leansudo_prim_exec_thread_setgid(uint32_t gid) {
+#ifdef __linux__
+  return ls_ok(lean_box_uint32(syscall(SYS_setgid, gid) == 0 ? 0 : (uint32_t)errno));
+#else
+  (void)gid;
+  return ls_ok(lean_box_uint32(ENOSYS));
+#endif
+}
+
 LEAN_EXPORT lean_obj_res leansudo_prim_exec_waitpid(uint32_t pid, uint32_t flags) {
   int status = 0;
   pid_t result = waitpid((pid_t)pid, &status, (int)flags);

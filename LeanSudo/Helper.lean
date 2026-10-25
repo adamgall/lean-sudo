@@ -187,7 +187,8 @@ theorem authorize_requires_verification (plan : Credentials) (actual : Verificat
   · contradiction
 
 def dropCredentials (uid gid : UInt32) (groups : Array UInt32)
-    (ruid : Option UInt32 := none) (contextual : Bool := false) : IO Unit := do
+    (ruid : Option UInt32 := none) (contextual : Bool := false)
+    (threadOnly : Bool := false) : IO Unit := do
   let plan : Credentials := { uid, gid, groups, ruid := ruid.getD uid }
   let operation := fun (message : String) (action : IO Unit) => do
     try action catch error =>
@@ -195,10 +196,15 @@ def dropCredentials (uid gid : UInt32) (groups : Array UInt32)
   let mismatch := fun (message : String) => do
     let text ← if contextual then pure message else P.strerror (K.EPERM ())
     throw (IO.userError text)
+  let setGroups := if threadOnly then threadSetgroups else P.setgroups
+  let setGids := if threadOnly then threadSetresgid else P.setresgid
+  let setUids := if threadOnly then P.threadSetresuid else P.setresuid
+  let setUid := if threadOnly then threadSetuid else P.setuid
+  let setGid := if threadOnly then threadSetgid else P.setgid
   if !contextual || !(groupsEqual groups (← P.getgroups)) then
-    operation "unable to set supplementary group IDs" (P.setgroups groups)
-  operation s!"unable to set gid to {gid}" (P.setresgid gid gid gid)
-  operation s!"unable to set uid to {uid}" (P.setresuid plan.ruid uid uid)
+    operation "unable to set supplementary group IDs" (setGroups groups)
+  operation s!"unable to set gid to {gid}" (setGids gid gid gid)
+  operation s!"unable to set uid to {uid}" (setUids plan.ruid uid uid)
   let gids ← P.getresgid
   if gids != (gid, gid, gid) then
     mismatch s!"unable to change to runas gid ({gids.1}, {gids.2.1})"
@@ -211,11 +217,11 @@ def dropCredentials (uid gid : UInt32) (groups : Array UInt32)
   let fsuid ← P.fsuid
   let fsgid ← P.fsgid
   let regainedUid ← if uid != 0 && plan.ruid != 0 then
-      (do pure ((← P.setuid 0) == 0))
+      (do pure ((← setUid 0) == 0))
     else pure false
   if regainedUid then mismatch "unable to drop privileges: uid 0 could be regained"
   let regainedGid ← if uid != 0 && gid != 0 then
-      (do pure ((← P.setgid 0) == 0))
+      (do pure ((← setGid 0) == 0))
     else pure false
   if regainedGid then mismatch "unable to drop privileges: gid 0 could be regained"
   let actual : Verification := {
