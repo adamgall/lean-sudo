@@ -177,6 +177,37 @@ one source module; the C table also lists shared headers.
 | `c/logsrv.h` | Framed transport, I/O relay and broker queue interface. |
 | `c/locale_scope.h` | Thread-local sudoers locale enter/leave interface. |
 
+## Trusted C boundary (target architecture)
+
+A bug in C invalidates the proofs, so C is reduced to code that cannot be written
+in Lean. Every C function must fall into exactly one of these categories; anything
+else (parsing, formatting, protocol encoding, policy, sequencing, retry/fallback
+logic, loops over data, state machines) is Lean.
+
+1. **Primitive wrappers.** One system call or library call per function, arguments
+   already validated in Lean, result or `errno` returned unchanged. The only control
+   flow allowed is the error check and a bounded copy of the result into a Lean value.
+2. **Callback trampolines.** C entry points required by a C ABI (PAM conversation,
+   sudo plugin callbacks, `libsss_sudo`, OpenSSL, zlib) that forward their arguments
+   to a Lean closure and return its answer. `vsnprintf` for printf-style callbacks is
+   the only formatting in C.
+3. **The post-fork stub.** Lean's runtime is multithreaded, so a forked child may only
+   call async-signal-safe functions. The child does exactly one thing: `fexecve` the
+   lean-sudo binary itself (descriptor opened from `/proc/self/exe` at startup) in a
+   helper mode, passing a Lean-serialised plan on a pipe. The fresh, single-threaded
+   Lean helper then performs privilege changes, verification, `chroot`, `chdir`,
+   limits, AppArmor and the final `execve` through primitive wrappers, so all of that
+   logic is Lean. Helper children for the mailer, askpass, sudoedit file access and
+   command lookup use the same mechanism.
+
+Consequences: event loops (pty relay, signal relay via `signalfd`, job control, the
+ptrace tracer, the I/O-log writer, the log-server client, the interception broker)
+are Lean loops over `poll`/`read`/`write`/`waitpid`/`ptrace` primitives. Signals are
+blocked in every thread before the runtime starts additional threads and consumed
+through `signalfd`; there are no C signal handlers. Seccomp BPF programs are built in
+Lean as bytes. Structures crossing the boundary (plugin `command_info`, ptrace
+register sets, timestamp records) are encoded and decoded in Lean.
+
 ## Sys API contract
 
 Names in `Sys.Core`, `Sys.Pam`, `Sys.Exec`, `Sys.Timestamp` and `Sys.Extra`
