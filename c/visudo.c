@@ -1,285 +1,138 @@
-#include "shim.h"
-
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <lean/lean.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <sys/wait.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
-static lean_obj_res io_errno_path(const char *what, const char *path, int e) {
-    char ebuf[256], buf[1024];
-    snprintf(buf, sizeof buf, "%s%s%s: %s", what, *what ? " " : "", path,
-        strerror_r(e, ebuf, sizeof ebuf));
-    return ls_error(buf);
+static lean_obj_res visudo_status(int result) {
+    return lean_io_result_mk_ok(lean_box_uint32(result < 0 ? errno : 0));
 }
 
-LEAN_EXPORT lean_obj_res leansudo_visudo_run_editor(b_lean_obj_arg path,
-        b_lean_obj_arg args) {
-    const char *p = ls_cstr(path);
-    if (!p) return ls_error("invalid editor");
-    size_t argc = lean_array_size(args);
-    char **argv = calloc(argc + 1, sizeof *argv);
-    if (!argv) return ls_error("unable to allocate memory");
-    for (size_t i = 0; i < argc; i++) {
-        argv[i] = (char *)ls_cstr(lean_array_get_core(args, i));
-        if (!argv[i]) {
-            free(argv);
-            return ls_error("invalid editor argument");
-        }
-    }
-    pid_t pid = fork();
-    if (pid == -1) {
-        int e = errno;
-        free(argv);
-        return io_errno_path("unable to execute", p, e);
-    }
-    if (pid == 0) {
-        if (syscall(SYS_close_range, (unsigned int)(STDERR_FILENO + 1), ~0U, 0) != 0) {
-            long maxfd = sysconf(_SC_OPEN_MAX);
-            if (maxfd < 0) _exit(127);
-            for (long fd = STDERR_FILENO + 1; fd < maxfd; fd++) close((int)fd);
-        }
-        execv(p, argv);
-        int ignored = dprintf(STDERR_FILENO, "visudo: unable to run %s: %s\n", p, strerror(errno));
-        (void)ignored;
-        _exit(127);
-    }
-    free(argv);
-    int status;
-    pid_t rv;
-    rv = TEMP_FAILURE_RETRY(waitpid(pid, &status, 0));
-    return lean_io_result_mk_ok(lean_box(rv != -1 && WIFEXITED(status)));
+static lean_obj_res visudo_number(ssize_t result) {
+    int error = result < 0 ? errno : 0;
+    lean_object *pair = lean_alloc_ctor(0, 2, 0);
+    lean_ctor_set(pair, 0, lean_box_uint32(error));
+    lean_ctor_set(pair, 1, lean_box_usize(result < 0 ? 0 : (size_t)result));
+    return lean_io_result_mk_ok(pair);
 }
 
-struct locked_file {
-    struct locked_file *next;
-    char *path;
-    int fd;
-    dev_t dev;
-    ino_t ino;
-};
-static struct locked_file *locked_files;
-
-LEAN_EXPORT lean_obj_res leansudo_visudo_lock(b_lean_obj_arg path, uint32_t mode) {
-    const char *p = ls_cstr(path);
-    if (!p) return ls_error("invalid path");
-    for (struct locked_file *l = locked_files; l; l = l->next)
-        if (!strcmp(l->path, p)) return lean_io_result_mk_ok(lean_box(0));
-    int fd = open(p, O_RDWR | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
-    bool created = false;
-    if (fd < 0 && errno == ENOENT) {
-        fd = open(p, O_RDWR | O_CREAT | O_NONBLOCK | O_NOCTTY | O_CLOEXEC, mode);
-        created = true;
+static lean_obj_res visudo_stat_result(int result, const struct stat *st) {
+    int error = result < 0 ? errno : 0;
+    lean_object *value;
+    if (result < 0) {
+        value = lean_alloc_ctor(0, 1, 0);
+        lean_ctor_set(value, 0, lean_box_uint32(error));
+    } else {
+        lean_object *fields = lean_alloc_ctor(0, 8, 0);
+        lean_ctor_set(fields, 0, lean_uint64_to_nat(st->st_dev));
+        lean_ctor_set(fields, 1, lean_uint64_to_nat(st->st_ino));
+        lean_ctor_set(fields, 2, lean_uint64_to_nat(st->st_mode));
+        lean_ctor_set(fields, 3, lean_uint64_to_nat(st->st_uid));
+        lean_ctor_set(fields, 4, lean_uint64_to_nat(st->st_gid));
+        lean_ctor_set(fields, 5, lean_uint64_to_nat(st->st_size));
+        lean_ctor_set(fields, 6, lean_uint64_to_nat((uint64_t)st->st_mtim.tv_sec));
+        lean_ctor_set(fields, 7, lean_uint64_to_nat(st->st_mtim.tv_nsec));
+        value = lean_alloc_ctor(1, 1, 0);
+        lean_ctor_set(value, 0, fields);
     }
-    if (fd < 0) return io_errno_path("", p, errno);
+    return lean_io_result_mk_ok(value);
+}
+
+LEAN_EXPORT lean_obj_res leansudo_visudo_errno(uint32_t error) {
+    char buffer[1024] = {0};
+    const char *message = strerror_r((int)error, buffer, sizeof(buffer));
+    return lean_io_result_mk_ok(lean_mk_string_from_bytes(message,
+        strnlen(message, sizeof(buffer) - 1)));
+}
+
+LEAN_EXPORT lean_obj_res leansudo_visudo_open(b_lean_obj_arg path, uint32_t flags, uint32_t mode) {
+    return visudo_number(open(lean_string_cstr(path), flags, mode));
+}
+
+LEAN_EXPORT lean_obj_res leansudo_visudo_close(uint32_t fd) {
+    return visudo_status(close(fd));
+}
+
+LEAN_EXPORT lean_obj_res leansudo_visudo_stat(b_lean_obj_arg path) {
     struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
-        close(fd);
-        char buf[1024];
-        snprintf(buf, sizeof buf, "%s is not a regular file", p);
-        return ls_error(buf);
-    }
-    for (struct locked_file *l = locked_files; l; l = l->next) {
-        if (l->dev == st.st_dev && l->ino == st.st_ino) {
-            close(fd);
-            return lean_io_result_mk_ok(lean_box(0));
-        }
-    }
-    struct flock fl;
-    memset(&fl, 0, sizeof fl);
-    fl.l_type = F_WRLCK;
-    fl.l_whence = SEEK_SET;
-    if (fcntl(fd, F_OFD_SETLK, &fl) != 0) {
-        int e = errno;
-        close(fd);
-        if (e == EAGAIN || e == EACCES) return lean_io_result_mk_ok(lean_box(1));
-        return io_errno_path("unable to lock", p, e);
-    }
-    struct locked_file *l = malloc(sizeof *l);
-    if (!l || !(l->path = strdup(p))) {
-        free(l);
-        close(fd);
-        return ls_error("unable to allocate memory");
-    }
-    l->fd = fd;
-    l->dev = st.st_dev;
-    l->ino = st.st_ino;
-    l->next = locked_files;
-    locked_files = l;
-    return lean_io_result_mk_ok(lean_box(created ? 2 : 0));
+    int result = stat(lean_string_cstr(path), &st);
+    return visudo_stat_result(result, &st);
 }
 
-LEAN_EXPORT lean_obj_res leansudo_visudo_correct_locked_metadata(b_lean_obj_arg path,
-        uint32_t uid, uint32_t gid, uint32_t mode, uint8_t owner, uint8_t perms) {
-    const char *p = ls_cstr(path);
-    if (!p) return ls_error("invalid path");
-    if (uid == (uint32_t)-1 || gid == (uint32_t)-1 || (mode & ~07777u) != 0)
-        return ls_error("invalid owner or mode");
-    int fd = -1;
-    for (struct locked_file *l = locked_files; l; l = l->next) {
-        if (!strcmp(l->path, p)) {
-            fd = l->fd;
-            break;
-        }
-    }
+LEAN_EXPORT lean_obj_res leansudo_visudo_fstat(uint32_t fd) {
     struct stat st;
-    if (fd == -1) {
-        if (stat(p, &st) != 0) return io_errno_path("unable to stat", p, errno);
-        for (struct locked_file *l = locked_files; l; l = l->next) {
-            if (l->dev == st.st_dev && l->ino == st.st_ino) {
-                fd = l->fd;
-                break;
-            }
-        }
-    }
-    if (fd == -1) return ls_error("sudoers file is not locked");
-    if (fstat(fd, &st) != 0) return io_errno_path("unable to stat", p, errno);
-    if (owner && (st.st_uid != (uid_t)uid || st.st_gid != (gid_t)gid)) {
-        if (fchown(fd, (uid_t)uid, (gid_t)gid) != 0)
-            return io_errno_path("unable to set (uid, gid) of", p, errno);
-    }
-    if (perms && (st.st_mode & 0777) != mode) {
-        if (fchmod(fd, (mode_t)mode) != 0)
-            return io_errno_path("unable to change mode of", p, errno);
-    }
-    return lean_io_result_mk_ok(lean_box(0));
+    int result = fstat(fd, &st);
+    return visudo_stat_result(result, &st);
 }
 
-struct temporary_file {
-    struct temporary_file *next;
-    char *path;
-};
-static struct temporary_file *temporary_files;
-
-static void cleanup_signal(int signo) {
-    for (struct temporary_file *t = temporary_files; t; t = t->next)
-        unlink(t->path);
-    const char prefix[] = "visudo exiting due to signal: ";
-    const char *name = strsignal(signo);
-    ssize_t ignored = write(STDERR_FILENO, prefix, sizeof prefix - 1);
-    ignored = write(STDERR_FILENO, name, strlen(name));
-    ignored = write(STDERR_FILENO, "\n", 1);
-    (void)ignored;
-    _exit(signo);
+LEAN_EXPORT lean_obj_res leansudo_visudo_ofd_lock(uint32_t fd) {
+    struct flock lock = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
+    return visudo_status(fcntl(fd, F_OFD_SETLK, &lock));
 }
 
-static bool track_temp(const char *path) {
-    for (struct temporary_file *t = temporary_files; t; t = t->next)
-        if (!strcmp(t->path, path)) return true;
-    struct temporary_file *t = malloc(sizeof *t);
-    if (!t || !(t->path = strdup(path))) {
-        free(t);
-        return false;
+LEAN_EXPORT lean_obj_res leansudo_visudo_write(uint32_t fd, b_lean_obj_arg bytes, size_t offset) {
+    size_t size = lean_string_size(bytes) - 1;
+    if (offset > size) {
+        errno = EINVAL;
+        return visudo_number(-1);
     }
-    if (!temporary_files) {
-        struct sigaction sa;
-        memset(&sa, 0, sizeof sa);
-        sigemptyset(&sa.sa_mask);
-        sa.sa_flags = SA_RESTART;
-        sa.sa_handler = cleanup_signal;
-        sigaction(SIGTERM, &sa, NULL);
-        sigaction(SIGHUP, &sa, NULL);
-        sigaction(SIGINT, &sa, NULL);
-        sigaction(SIGQUIT, &sa, NULL);
-    }
-    t->next = temporary_files;
-    temporary_files = t;
-    return true;
+    return visudo_number(write(fd, lean_string_cstr(bytes) + offset, size - offset));
 }
 
-LEAN_EXPORT lean_obj_res leansudo_visudo_create_temp(b_lean_obj_arg path, b_lean_obj_arg content) {
-    const char *p = ls_cstr(path);
-    if (!p) return ls_error("invalid path");
-    if (!track_temp(p)) return ls_error("unable to allocate memory");
-    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_NOCTTY | O_CLOEXEC, 0600);
-    if (fd < 0) return io_errno_path("", p, errno);
-    if (ls_write_all(fd, lean_string_cstr(content), lean_string_size(content) - 1)) {
-        int e = errno;
-        close(fd);
-        unlink(p);
-        return io_errno_path("unable to write to", p, e);
-    }
-    if (fsync(fd) != 0 || close(fd) != 0) {
-        int e = errno;
-        unlink(p);
-        return io_errno_path("unable to write to", p, e);
-    }
-    return lean_io_result_mk_ok(lean_box(0));
+LEAN_EXPORT lean_obj_res leansudo_visudo_sync(uint32_t fd) {
+    return visudo_status(fsync(fd));
 }
 
-LEAN_EXPORT lean_obj_res leansudo_visudo_temp_time(b_lean_obj_arg original, b_lean_obj_arg temp) {
-    const char *p = ls_cstr(original), *t = ls_cstr(temp);
-    if (!p || !t) return ls_error("invalid path");
-    struct stat st;
-    if (stat(p, &st) != 0) return io_errno_path("unable to stat", p, errno);
-    struct timespec times[2] = { st.st_mtim, st.st_mtim };
-    if (utimensat(AT_FDCWD, t, times, 0) != 0)
-        return io_errno_path("unable to set time on", t, errno);
-    return lean_io_result_mk_ok(lean_box(0));
+LEAN_EXPORT lean_obj_res leansudo_visudo_unlink(b_lean_obj_arg path) {
+    return visudo_status(unlink(lean_string_cstr(path)));
 }
 
-LEAN_EXPORT lean_obj_res leansudo_visudo_modified(b_lean_obj_arg original, b_lean_obj_arg temp) {
-    const char *p = ls_cstr(original), *t = ls_cstr(temp);
-    if (!p || !t) return ls_error("invalid path");
-    struct stat a, b;
-    if (stat(p, &a) != 0) return io_errno_path("unable to stat", p, errno);
-    if (stat(t, &b) != 0) return io_errno_path("unable to stat", t, errno);
-    bool changed = a.st_size != b.st_size || a.st_mtim.tv_sec != b.st_mtim.tv_sec ||
-        a.st_mtim.tv_nsec != b.st_mtim.tv_nsec;
-    return lean_io_result_mk_ok(lean_box(changed));
+LEAN_EXPORT lean_obj_res leansudo_visudo_futimens(uint32_t fd, uint64_t sec, uint64_t nsec) {
+    struct timespec times[2] = {
+        { .tv_sec = (time_t)sec, .tv_nsec = (long)nsec },
+        { .tv_sec = (time_t)sec, .tv_nsec = (long)nsec }
+    };
+    return visudo_status(futimens(fd, times));
 }
 
-LEAN_EXPORT lean_obj_res leansudo_visudo_export(b_lean_obj_arg input, b_lean_obj_arg output) {
-    const char *in = ls_cstr(input), *out = ls_cstr(output);
-    if (!in || !out) return ls_error("invalid path");
-    execlp("cvtsudoers", "cvtsudoers", "-f", "json", "-o", out, in, (char *)NULL);
-    return io_errno_path("unable to execute", "cvtsudoers", errno);
+LEAN_EXPORT lean_obj_res leansudo_visudo_chown(uint32_t fd, uint32_t uid, uint32_t gid) {
+    return visudo_status(fchown(fd, uid, gid));
 }
 
-LEAN_EXPORT lean_obj_res leansudo_visudo_set_owner_mode(b_lean_obj_arg path, uint32_t uid,
-                                                        uint32_t gid, uint32_t mode) {
-    const char *p = ls_cstr(path);
-    if (!p) return ls_error("invalid path");
-    if (uid == (uint32_t)-1 || gid == (uint32_t)-1 || (mode & ~07777u) != 0)
-        return ls_error("invalid owner or mode");
-    int fd = open(p, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
-    if (fd < 0) return io_errno_path("unable to open", p, errno);
-    struct stat st;
-    if (fstat(fd, &st) != 0) {
-        int e = errno;
-        close(fd);
-        return io_errno_path("unable to stat", p, e);
-    }
-    if (!S_ISREG(st.st_mode)) {
-        close(fd);
-        char buf[1024];
-        snprintf(buf, sizeof buf, "%s is not a regular file", p);
-        return ls_error(buf);
-    }
-    if (fchown(fd, (uid_t)uid, (gid_t)gid) != 0) {
-        int e = errno;
-        close(fd);
-        return io_errno_path("unable to set (uid, gid) of", p, e);
-    }
-    if (fchmod(fd, (mode_t)mode) != 0) {
-        int e = errno;
-        close(fd);
-        return io_errno_path("unable to change mode of", p, e);
-    }
-    if (fsync(fd) != 0) {
-        int e = errno;
-        close(fd);
-        return io_errno_path("unable to sync", p, e);
-    }
-    close(fd);
-    return lean_io_result_mk_ok(lean_box(0));
+LEAN_EXPORT lean_obj_res leansudo_visudo_chmod(uint32_t fd, uint32_t mode) {
+    return visudo_status(fchmod(fd, mode));
+}
+
+
+LEAN_EXPORT lean_obj_res leansudo_visudo_exit(uint32_t status) {
+    _exit(status);
+}
+
+LEAN_EXPORT lean_obj_res leansudo_visudo_open_max(void) {
+    return lean_io_result_mk_ok(lean_box_uint64((uint64_t)sysconf(_SC_OPEN_MAX)));
+}
+
+LEAN_EXPORT lean_obj_res leansudo_visudo_raise(uint32_t signo) {
+    return lean_io_result_mk_ok(lean_box_uint32(raise(signo)));
+}
+
+LEAN_EXPORT uint8_t leansudo_visudo_wait_exited(uint32_t status) {
+    return WIFEXITED((int)status);
+}
+
+LEAN_EXPORT uint32_t leansudo_visudo_no_uid(lean_obj_arg unit) {
+    (void)unit;
+    return (uid_t)-1;
+}
+
+LEAN_EXPORT uint32_t leansudo_visudo_no_gid(lean_obj_arg unit) {
+    (void)unit;
+    return (gid_t)-1;
 }

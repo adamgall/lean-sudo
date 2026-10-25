@@ -22,6 +22,7 @@ structure Context extends Facts where
   opts : Cli.Options
   invoking : Principal
   host : String
+  architecture : String := ""
   sudoers : Sudoers
   settings : Settings
   target : Principal

@@ -1,4 +1,62 @@
 
+begin background-syslog-exit && {
+  python3 - >"$WORK/background-syslog" 2>&1 <<'PY' || fail "$(cat "$WORK/background-syslog")"
+import os
+import pathlib
+import pwd
+import re
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, '/usr/local/lib')
+from sudo_it_logging import Syslog
+
+policy = pathlib.Path('/etc/sudoers.d/background-syslog')
+policy.write_text('Defaults log_exit_status,syslog_pid,!use_pty\n'
+                  'ivan ALL=(ALL:ALL) NOPASSWD: ALL\n')
+policy.chmod(0o440)
+user = pwd.getpwnam('ivan')
+env = dict(HOME=user.pw_dir, USER='ivan', LOGNAME='ivan', SHELL='/bin/bash',
+           PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', LANG='C')
+
+with tempfile.TemporaryDirectory(prefix='sudo-background-') as directory:
+    os.chown(directory, user.pw_uid, user.pw_gid)
+    child = pathlib.Path(directory) / 'supervisor'
+    command = 'printf "%s\\n" "$PPID" > ' + str(child) + '; exit 7'
+
+    def execute(binary):
+        child.unlink(missing_ok=True)
+        with Syslog() as logger:
+            args = ['setpriv', '--reuid=' + str(user.pw_uid),
+                    '--regid=' + str(user.pw_gid), '--init-groups', '--',
+                    binary, '-n', '-b', '/bin/sh', '-c', command]
+            result = subprocess.Popen(args, cwd=user.pw_dir, env=env,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            output, error = result.communicate(timeout=15)
+            assert result.returncode == 0, (result.returncode, output, error)
+            assert output == b'' and error == b'', (output, error)
+            logger.wait(lambda: child.exists() and child.stat().st_size > 0)
+            supervisor = int(child.read_text())
+            logger.wait(lambda: any(' ; EXIT=7' in msg for msg in logger.messages()))
+            records = []
+            for message in logger.messages():
+                match = re.search(r'sudo\[(\d+)\]:\s+(.*)', message)
+                if match and 'COMMAND=' in match[2]:
+                    records.append((int(match[1]), match[2]))
+        assert len(records) == 2, records
+        assert records[0][0] == result.pid, (records, result.pid)
+        assert records[1][0] == supervisor != result.pid, (records, supervisor, result.pid)
+        assert records[1][1] == records[0][1] + ' ; EXIT=7', records
+        return [text for _, text in records]
+
+    reference = execute('/usr/bin/sudo.ws')
+    actual = execute('/usr/bin/sudo')
+    assert actual == reference, (reference, actual)
+PY
+  end
+}
+
 begin exec-default-core-limit && {
   run root "ulimit -c unlimited; sudo -n /bin/sh -c 'ulimit -c; ulimit -Hc'"
   expect_rc 0

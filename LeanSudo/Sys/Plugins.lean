@@ -1,42 +1,9 @@
 import LeanSudo.Core
 import LeanSudo.SudoConf
+import LeanSudo.Sys.PluginHost
 
 namespace LeanSudo.Sys.Plugins
 
-@[extern "lean_sudo_plugins_load"]
-private opaque loadRaw (symbol path : @& String) (line : UInt32)
-    (options : @& Array String) : IO Unit
-
-@[extern "lean_sudo_plugins_user_info"]
-opaque userInfo (groupSource : @& String) (maxGroups : UInt32) : IO (Array String)
-
-@[extern "lean_sudo_plugins_conversation"]
-opaque configureConversation (useStdin nonInteractive bell : Bool) (askpass : @& String) : IO Unit
-
-@[extern "lean_sudo_plugins_open"]
-opaque openAudit (settings userInfo submitArgv submitEnv : @& Array String)
-    (optind : UInt32) : IO Unit
-
-@[extern "lean_sudo_plugins_check"]
-opaque check (commandInfo argv env : @& Array String) : IO Bool
-
-@[extern "lean_sudo_plugins_check_subcommand"]
-opaque checkSubcommand (commandInfo argv env : @& Array String) (enforce : Bool) : IO Bool
-
-@[extern "lean_sudo_plugins_accept"]
-opaque accept (commandInfo argv env : @& Array String) : IO Bool
-
-@[extern "lean_sudo_plugins_reject"]
-opaque reject (message : @& String) (isError : Bool) (commandInfo : @& Array String) : IO Unit
-
-@[extern "lean_sudo_plugins_version"]
-opaque showVersion (verbose : Bool) (builtinIoLine builtinAuditLine : UInt32) : IO Unit
-
-@[extern "lean_sudo_plugins_close"]
-opaque close (statusType status : UInt32) : IO Unit
-
-@[extern "lean_sudo_plugins_has_io"]
-opaque hasIo : IO Bool
 
 def qualifiedPath (conf : SudoConf.Config) (plugin : SudoConf.Plugin) : String :=
   if plugin.path.startsWith "/" then plugin.path else conf.pluginDir ++ plugin.path

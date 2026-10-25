@@ -99,9 +99,14 @@ def sameSecurityContext (ctx : Context) (a : Allowed) : Bool :=
   (a.privs.or ctx.settings.privs).isNone &&
   (a.limitprivs.or ctx.settings.limitprivs).isNone
 
+def deniedNeedsAuth (ctx : Context) : Bool :=
+  ctx.settings.authenticate && (ctx.opts.mode != .validate ||
+    let st := authorizationSettings ctx
+    pwNeedsAuth st.verifypw st (candidates ctx.sudoers st (request ctx)))
+
 def policyNeedsAuth (ctx : Context) (j : Judgement) : Bool :=
   ctx.invoking.uid != 0 && !userIsExempt ctx.settings ctx.invoking && match j with
-    | .deny => ctx.settings.authenticate
+    | .deny => deniedNeedsAuth ctx
     | .allow a => a.needsAuth && !(sameIdentity ctx && sameSecurityContext ctx a)
 
 def tsValid (ctx : Context) : Bool :=
@@ -575,7 +580,8 @@ def earlyFailure (ctx : Context) : Option FailureInfo :=
 def earlyAction (ctx : Context) : Option Action :=
   match ctx.opts.mode with
   | .help => some (.print (Cli.helpFor ctx.progname) 0)
-  | .version => some (.print (Cli.versionFor (ctx.invoking.uid == 0) ctx.settings) 0)
+  | .version =>
+    some (.print (Cli.versionFor (ctx.invoking.uid == 0) ctx.settings [] ctx.architecture) 0)
   | .resetTimestamp => some .resetTimestamp
   | .removeTimestamp => some .removeTimestamp
   | _ => (earlyFailure ctx).map FailureInfo.action

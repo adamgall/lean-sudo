@@ -765,6 +765,16 @@ begin cli-core-second-core-validate-denial && {
   [[ $(cat /tmp/cli-second-validate-log) == *"command not allowed ;"* ]] || fail 'validation denial reason differs'
   end
 }
+begin cli-core-validate-without-privileges-skips-authentication && {
+  run ivan 'sudo -kS -v'
+  expect_rc 1
+  expect_err_has "Sorry, user ivan may not run sudo on $host."
+  expect_err_lacks 'password'
+  run ivan 'sudo -kS -l'
+  expect_rc 1
+  expect_err_has 'a password is required'
+  end
+}
 begin cli-core-second-core-list-other-denial && {
   printf 'Defaults:ivan logfile="/tmp/cli-second-other-log"\nivan ALL=(ivan) /usr/bin/true\n' > /etc/sudoers.d/40-cli
   chmod 0440 /etc/sudoers.d/40-cli

@@ -12,7 +12,7 @@ services and removing cases without a real substitute):
 
 | Suite | sudo.ws | lean-sudo |
 |---|---:|---:|
-| sudo | 912/912 | 912/912 |
+| sudo | 918/918 | 918/918 |
 | visudo | 154/154 | 154/154 |
 
 These are shared compatibility suites, not a claim that every behavior is
@@ -25,6 +25,10 @@ Dependencies must be real software running in the container. Commands, editors
 and execution-environment probes invoked by sudo are test inputs, not replacement
 dependencies; use a real editor where the scenario is about interactive editing.
 `/etc/hosts` and `/etc/netgroup` entries configure real NSS files backends.
+
+The `background-syslog-exit` regression runs real rsyslog and compares traditional
+`log_exit_status,syslog_pid` records with sudo.ws. The acceptance record identifies
+the invoking sudo process; the EXIT record identifies the background supervisor.
 
 ## Running
 
@@ -83,7 +87,8 @@ stock policy and validates them with `visudo.ws -c`. It copies `tests.sh`,
 `ptyrun.py`, all `tests.d/` modules and the vendored `sudo-schema.ldif`.
 
 `run.sh` builds the image and creates a container with
-`--hostname sudo-it --network none --cap-add SYS_PTRACE --cap-add SYS_ADMIN`. Only
+`--hostname sudo-it --network none --cap-add SYS_PTRACE --cap-add SYS_ADMIN`
+and `--cap-add SYS_RESOURCE`. Only
 `integration/out/` is mounted, writable; host binaries and the visudo harness are
 copied in. The container is removed on runner exit. `SYS_PTRACE` allows the audit
 cases to use `strace` across credential transitions and inspect actual Linux
@@ -92,6 +97,10 @@ their exec-interception seccomp filter without `no_new_privs`, which would chang
 set-ID command semantics. No host audit daemon or `AUDIT_CONTROL` capability is
 required: strace observes real kernel audit traffic, not a replacement audit
 service. Likewise, utmp readers and inotify are observation tools, not mocks.
+`SYS_RESOURCE` preserves normal root resource-limit privileges: both implementations
+temporarily raise `RLIMIT_NPROC` around the UID switch and restore it before exec.
+Docker otherwise denies that raise when the caller lowered the hard limit, causing
+the Lean runtime's additional threads to trigger Linux's `PF_NPROC_EXCEEDED` check.
 
 Syslog tests run real rsyslog with imuxsock on `/dev/log`, disabled rate limiting,
 a 256 KiB message limit and no control-character escaping. A shared harness
@@ -181,6 +190,7 @@ explicitly. The numbered prefixes control source order, not ownership.
 | `61-timestamp-interop.sh` | `timestamp-interop-*`: bidirectional sudo.ws credential sharing, exact v2 layout, tty/ppid isolation, timeout and `-k`/`-K`, configured directory/owner, malformed/foreign records, first-slot validation, bounded dense/sparse scans and `-k command` avoiding all timestamp I/O. |
 | `62-host-alert.sh` | `host-alert-*`: local-host DNS failures use raw startup syslog alerts, remote `-h` failures use stderr only, and early hostname callbacks precede configured logfile/JSON logging. |
 | `63-local-bound-time.sh` | `local-bound-*`: system-zone America/New_York validity bounds, exact short/long UTC listings across winter/summer and historic DST gaps/folds, explicit-zone and caller-TZ isolation, and live NOTBEFORE/NOTAFTER allow/deny; restores `/etc/localtime` after every case and on exit. |
+| `64-helper-mode.sh` | `helper-mode-refuses-*`: an unprivileged caller who runs `sudo --lean-sudo-helper` with a socketpair or pipe of their own on descriptor 63, directly or beneath a waiting sudo process, gets the ordinary usage error and the forged root plan never runs. |
 | `70-iolog.sh` | `iolog-*`: unmodified `sudoreplay.ws` interoperability, input/output streams, compression, permissions, error policy, path expansion, sequence wrap and password masking. |
 | `80-i18n.sh` | `i18n-*`: byte-for-byte German/French/C diagnostics, help/listing/prompts, LANGUAGE precedence, missing-locale fallback and literal configured messages. |
 | `85-jsonlog.sh` | `jsonlog-*`: json/json_compact/json_pretty file and syslog records for acceptance, denial, authentication rejection, exit/signal, runas group, repeated events and I/O-log linkage. |
@@ -319,6 +329,15 @@ Coverage includes:
   compatibility (`-x`/`--export`) is compared both with Ubuntu's missing
   `cvtsudoers` PATH name and with `cvtsudoers.ws` exposed under that name; successful
   JSON output is compared byte-for-byte.
+
+Temporary-copy timestamps are applied with `futimens` before the write descriptor
+is closed, rather than resolving the temporary pathname again. Export command
+lookup stays compatible with the reference's configured `PATH` (including the
+system default when unset), but Lean constructs absolute candidate paths and
+calls `execve` explicitly. A root-configured `PATH` therefore remains trusted;
+this does not pin export to Ubuntu's `cvtsudoers.ws`. Unlike the reference,
+lean-sudo inserts `--` before the input filename so a leading dash cannot become
+a converter option.
 
 Lean-sudo's visudo rejects undefined/cyclic aliases even without `-s`, including
 invalid unused definitions, to avoid installing policy its runtime would refuse.

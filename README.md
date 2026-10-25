@@ -25,7 +25,7 @@ $ sudo id -u
 It reads your existing `/etc/sudoers`, `/etc/sudoers.d` and `/etc/sudo.conf`, uses the
 system's PAM stack (`/etc/pam.d/sudo`, `sudo-i`), prints the same prompts and messages
 (translated, like the original), writes the same syslog lines and I/O logs, and passes
-the same 912-test end-to-end suite as the original sudo, byte for byte where it matters.
+the same 918-test end-to-end suite as the original sudo, byte for byte where it matters.
 
 > **"sudo.ws"** in this document means the original sudo: the C implementation
 > written around 1980 and maintained by Todd C. Miller since the 1990s, whose home is
@@ -90,7 +90,7 @@ flowchart LR
   A["argv, environ,<br/>getpw*/getgr*,<br/>sudoers, sudo.conf,<br/>stat, clock"] --> S["IO shell<br/>(Main, Shell.lean)"]
   S -- "Context" --> D["decide<br/>(pure, proved)"]
   D -- "Decision" --> S
-  S --> C["C shim<br/>PAM, setres[ug]id,<br/>fork/execve, pty,<br/>I/O log"]
+  S --> C["C primitives<br/>one syscall each,<br/>PAM/plugin trampolines,<br/>fexecve stub"]
 ```
 
 | Area | Guarantee | Theorems |
@@ -102,6 +102,8 @@ flowchart LR
 | | `-k` always forces authentication; the timestamp is only refreshed for allowed requests. | `decide_reset_requires_auth`, `timestamp_update_allowed` |
 | | sudoedit writes back exactly the files the policy evaluated. | `edit_allowed`, `edit_files_match_policy` |
 | **Interception** | Every enforced intercepted exec is allowed only by the policy for the original invoking and target users; subcommand environments are preserved, as in sudo.ws. Log-only interception does not restrict subcommands. | `Intercept.allowed_only_by_policy`, `Intercept.request_identities`, `Intercept.environment_preserved`, `exec_intercept_matches_policy` |
+| | The emitted seccomp instruction program traps precisely native, compat and x32 exec syscalls; unsupported architectures are killed. Raw ptrace requests are restricted to the tracer's eight operations. DSO decoding rejects unknown outer policy messages and zero-PID hellos. | `Intercept.Seccomp.instructions_verdict`, `Intercept.Seccomp.trap_syscalls`, `Sys.Prim.Intercept.ptrace_allowed_requests`, `Intercept.Protocol.policy_rejects_unknown_outer`, `Intercept.Protocol.hello_rejects_zero` |
+| | Compat register layouts require the compat ABI and arguments fit its pointer width; authenticated DSO tokens require exactly 16 bytes, and trace policy requests retain the four-MiB string budget. | `Intercept.Registers.valid_x86_compat`, `Intercept.Registers.valid_arm_compat`, `Intercept.Registers.arg_compat_width`, `Intercept.Protocol.tokenMatches_sizes`, `Sys.InterceptTrace.Request.bounded_bytes` |
 | **Policy** (sudoers semantics) | Default deny: the empty policy, or a policy with no rule for you, denies. | `evaluate_nil`, `evaluate_no_user_match` |
 | | Every allow is backed by a rule in the file whose user, host, run-as and command lists all match, and it is the *last* matching rule. | `evaluate_sound`, `evaluate_sound_run` |
 | | Last match wins: a later `!command`, including one *inside a `Cmnd_Alias`*, denies; an inner `!` in a `User_Alias` excludes that user. | `evaluate_last_deny`, `evaluate_last_alias_deny`, `evaluate_append_negated`, `evaluate_append_deny_all`, `notbob_alias_no_candidates` |
@@ -115,9 +117,37 @@ flowchart LR
 | **Credential cache** | A cached authentication is honoured only for the same uid, the same scope (terminal device, session id and the session leader's start time; or parent process and its start time), within the timeout and not from the future; `sudo -k` invalidates the records of the current scope, as in sudo; records for one scope never authorise another. | `lookup_sound`, `lookup_invalidateScope`, `invalidateScope_other`, `lookup_update_other`, `kernel_scope_terminal_separation`, `valid_not_future`, `decode_encode` |
 | **sudoedit** | The chosen editor is the first resolvable candidate; a file is written back only if it changed and passed the safety checks. | `selectEditor_first`, `writeBack_sound`, `tempSafe_sound` |
 | **Parser and config** | Every command path in a parsed rule is absolute; regex commands are anchored; digests always guard a command. Additional `sudo.conf` plugins must be loaded, never silently bypassed; approval plugins can only restrict a policy decision. | `parse_command_absolute`, `parse_regex_anchored`, `parse_digest_command_absolute`, `unknown_plugin_refused`, `approval_only_restricts`, `denied_never_approved` |
+| **Plugin host** | Enforced intercepted commands use the supplied policy metadata without merging an earlier command; registered events must have a callback; loaded ABI versions have major 1 and external policy plugins are refused. | `enforced_subcommand_info`, `validEvent_has_callback`, `compatibleVersion_major`, `policy_plugin_not_supported` |
 | **Globbing, logging, translations** | `fnmatch` agrees with string equality on literal patterns and `*` never crosses `/` with `FNM_PATHNAME`; I/O logging is on exactly when the policy says so; a missing translation falls back to the original English text. | `fnmatch_literal`, `fnmatch_star_pathname`, `plan_enabled`, `lookup_absent` |
 
-In total there are 370 hand-written theorems. `scripts/AxiomAudit.lean` checks mechanically that
+Storage-boundary checks are also proved in Lean:
+`Sys.timestamp_directory_rejects_world_write` rejects world-writable cache
+directories; `Sys.GroupPlugin.accepts_iff` accepts only the plugin's affirmative result;
+`Sys.Sss.requestError_server` preserves a representable SSSD server error.
+`Sys.usableInterface_requires_family`, `Sys.regexCheck_repeated_star`,
+`Sys.regexCaseAdjustment_flags`, `Sys.auditCommandBytes_bounded`, and
+`Sys.auditAcknowledged_kernel_only` cover supported address families, repetition checks,
+matching flags, audit payload bounds, and kernel-origin acknowledgement validation.
+`Sys.auditValue_quoted` and `Sys.auditTerminal_sanitized` establish audit field formatting.
+
+PAM prompt overrides and authenticated-user identity checks are covered by
+`Sys.pamSelectPrompt_override` and `Sys.pamUserAccepted_identity`.
+`Sys.pamMessageCountValid_bounds` bounds accepted conversation batches to 1–32 messages.
+`Sys.Prim.CoreFacts.fileAccepted_regular` and `fileAccepted_bounded` require regular
+files within the read limit; `Sys.CoreLogs.logFileSafe_iff` requires root-owned regular
+log files without group or other write permission.
+
+The helper boundary preserves requested identities (`Sys.Exec.specOfPlan_ids`,
+`Sys.Exec.childPlan_ids`).
+Its pure execution gate accepts only verified credential observations
+(`Helper.authorize_requires_verification`,
+`Sys.Exec.commandAuthorized_requires_verification`). These theorems concern the
+Lean plan and gate; syscall correctness remains an operating-system assumption.
+Credentialed file helpers require regular files (`Sys.Edit.authorizeFile_regular`),
+and lookup's executable and unavailable-error classifications are characterized by
+`Sys.Lookup.executable_iff` and `Sys.Lookup.unavailable_iff`.
+
+In total there are 406 hand-written theorems. `scripts/AxiomAudit.lean` checks mechanically that
 every declaration defined in a `LeanSudo` module (definitions, theorems and instances,
 including private and generated ones) rests only on Lean's three standard axioms
 (`propext`, `Quot.sound`, `Classical.choice`). A `sorry`, `admit` or `native_decide` in
@@ -126,7 +156,7 @@ the library would make it fail; it is backed by a source grep for those words an
 
 ```console
 $ lake env lean scripts/AxiomAudit.lean
-8391 declarations (2511 theorems) checked; axioms used ⊆ propext, Quot.sound, Classical.choice
+12440 declarations (2886 theorems) checked; axioms used ⊆ propext, Quot.sound, Classical.choice
 ```
 
 A proof is only as good as its statement, so the statements are written to be read:
@@ -144,7 +174,7 @@ byte for byte where it matters:
 
 | Suite | sudo.ws 1.9.17p2 | lean-sudo |
 |---|---|---|
-| `sudo` end-to-end: authentication and PAM, run-as users/groups, `!` rules and aliases, globs/regex/digests/netgroups/networks/FQDN hosts, group plugins, SSSD rules (real slapd + sssd), `Defaults` scoping, environment, `-l`/`-ll`/`-U` output, timestamps (interoperating with sudo.ws), `-i`/`-s`/`-b`, exit status, signals and job control, `NOEXEC`, `TIMEOUT`, `CHROOT`, rlimits, `stay_setuid`, utmp, command interception and `log_subcmds`, sudoedit, `sudo.conf` with audit/approval/I/O plugins, `nsswitch.conf`, askpass, mail, audit records, accept/reject/alert events compared in syslog, logfile and JSON, remote log servers (`sudo_logsrvd`, TLS), I/O logs replayed with the system's `sudoreplay`, translations (German, French), command-line errors, security regressions | 912/912 | 912/912 |
+| `sudo` end-to-end: authentication and PAM, run-as users/groups, `!` rules and aliases, globs/regex/digests/netgroups/networks/FQDN hosts, group plugins, SSSD rules (real slapd + sssd), `Defaults` scoping, environment, `-l`/`-ll`/`-U` output, timestamps (interoperating with sudo.ws), `-i`/`-s`/`-b`, exit status, signals and job control, `NOEXEC`, `TIMEOUT`, `CHROOT`, rlimits, `stay_setuid`, utmp, command interception and `log_subcmds`, sudoedit, `sudo.conf` with audit/approval/I/O plugins, `nsswitch.conf`, askpass, mail, audit records, accept/reject/alert events compared in syslog, logfile and JSON, remote log servers (`sudo_logsrvd`, TLS), I/O logs replayed with the system's `sudoreplay`, translations (German, French), command-line errors, security regressions | 918/918 | 918/918 |
 | `visudo` (check mode, edit mode with includes, locking, permissions, export) | 154/154 | 154/154 |
 
 ## Features
@@ -176,6 +206,10 @@ including:
   them. The original host retains plugin state and the initial I/O session across
   subcommands. Configuration parsing preserves sudo's comment, CRLF, escaped
   backslash and per-physical-line indentation rules for continuations.
+  Loading, ABI validation, metadata construction, audit/approval sequencing,
+  environment hooks and event scheduling run in Lean. The C boundary contains
+  only primitive calls and ABI trampolines; relay callbacks consume binary data
+  and signalfd notifications in the parent Lean process.
 * **SSSD-backed rules**: `sudoers: files sss` (any order, with `[NOTFOUND=return]`-style
   actions) in `/etc/nsswitch.conf`, rules fetched through the system's `libsss_sudo`
   with sudo's `sudoOrder`, `sudoOption` and LDAP-style `sudo -l` output, tested against
@@ -191,8 +225,10 @@ including:
 * **Command interception**: `INTERCEPT`/`intercept`, `intercept_authenticate`,
   `intercept_allow_setid`, `intercept_verify`, and `log_subcmds`; Linux
   seccomp/ptrace on x86_64 and aarch64, or the system's `sudo_intercept.so`
-  with sudo's authenticated interception protocol. Every policy check goes to
-  the pure Lean decision function through a privileged broker.
+  with sudo's authenticated interception protocol. The parent Lean event loop
+  decodes requests, invokes the pure policy decision and preserves plugin state.
+  Seccomp construction, register decoding, trace verification and the DSO broker
+  are Lean; C provides only individual operating-system calls.
 * **Logging**: syslog and `logfile` in sudo's text and JSON formats, mail on denials and
   bad passwords, `~/.sudo_as_admin_successful`, and I/O logs in sudo's on-disk format
   (replayable with the `sudoreplay` that ships with Ubuntu's `sudo` package).
@@ -239,6 +275,10 @@ undefined aliases), so it cannot install a policy that lean-sudo would then refu
 ## Other differences from sudo.ws
 
 * A fractional `timestamp_timeout` is rounded down to whole seconds.
+* Plugin environment hooks run on Lean's main thread in the process that loaded
+  the plugins, including sudo's own environment calls between plugin invocations.
+  Other threads and forked children use plain libc environment functions rather
+  than entering the Lean runtime. Plugin callbacks from those contexts are refused.
 * Chroot command lookup rejects paths whose host-prefixed canonical command or parent
   escapes the selected root; it also avoids three upstream lookup bugs that can
   spuriously report "command not found": losing a selected command when a later NSS
@@ -252,17 +292,25 @@ undefined aliases), so it cannot install a policy that lean-sudo would then refu
 
 Formal verification moves trust; it does not remove it. lean-sudo trusts:
 
-* **The C shim** (`c/*.c`, about 9,700 lines): PAM, `libsss_sudo`, sudo plugins (audit, approval, I/O, group), OpenSSL and gzip via `dlopen`, seccomp/ptrace interception, `setgroups` →
-  `setresgid` → `setresuid` (each drop re-checked with `getres[ug]id`, and for a
-  non-root target `setuid(0)` must fail before `execve`), fork/exec, signal relay, the
-  pty monitor, timestamp file locking, sudoedit's file workers, the I/O log writer
-  (gzip via `dlopen`), and thin wrappers for `glob`, `regcomp`, `innetgr`,
-  `getifaddrs`, `getaddrinfo`, utmp and the audit socket. It contains no policy: each
-  function performs one system-call concern, and every argument is range-checked in
-  Lean before it reaches C.
-* **The IO shell** (`Main.lean`, `LeanSudo/Shell.lean` and the logging, mail, askpass
-  and translation glue): written in Lean, so memory safe, but not proved. It gathers
-  facts and executes the decision; the decision itself is made by `decide`.
+* **The C primitives** (`c/*`, about 4,700 lines with about 210 branch statements,
+  down from 9,700 lines and 2,000 branches): each function is a single system or
+  library call with an error check and bounded marshalling, a C-ABI callback that
+  forwards to a Lean closure (PAM conversation, sudo plugin callbacks,
+  `libsss_sudo`, OpenSSL and zlib via `dlopen`), the post-fork stub that only
+  re-executes the pinned lean-sudo binary in helper mode, or the scoped signal handler
+  that lets a blocking timestamp lock be interrupted. `scripts/check-ffi.sh` compiles
+  every C file against the prototypes Lean emits, and `scripts/check-c-boundary.sh`
+  ratchets the size of each file (DESIGN.md, "Trusted C boundary").
+* **The IO shell** (`Main.lean`, `LeanSudo/Shell.lean`, `LeanSudo/Helper.lean`,
+  `LeanSudo/Sys/` and the logging, mail, askpass and translation glue): written in
+  Lean, so memory safe, but not proved end to end. It gathers facts and executes the
+  decision; the decision itself is made by `decide`. It owns what used to be C: the
+  `setgroups` → `setresgid` → `setresuid` drop, re-checked with `getres[ug]id`,
+  `getgroups`, the filesystem IDs and a failing `setuid(0)` before `execve`
+  (`Helper.authorize_requires_verification`); the authenticated helper re-exec; signal
+  relay through `signalfd`, the pty monitor and job control; timestamp records; the
+  I/O log writer; the log-server client; the plugin host; and the interception tracer
+  and broker.
 * **The Lean kernel, compiler and runtime**, glibc, Linux-PAM and its modules, and the
   Linux kernel.
 * **The specification.** The theorems prove the code does what the statements say.
@@ -357,10 +405,12 @@ Core Lean only: no Mathlib, no Batteries. The toolchain is pinned in `lean-toolc
 | `LeanSudo/SudoConf.lean`, `EventLog.lean`, `IoLog.lean`, `I18n*.lean`, `Insults.lean` | sudo.conf, event and I/O log formats, translations, insults |
 | `LeanSudo/Util/` | `fnmatch` and SHA-2 |
 | `LeanSudo/Sudoedit*`, `LeanSudo/Visudo/` | sudoedit and visudo |
-| `LeanSudo/Sys/`, `c/` | the trusted C shim and its Lean bindings |
+| `LeanSudo/Sys/`, `LeanSudo/Helper.lean`, `LeanSudo/Background.lean` | system integration in Lean: execution, relay, PAM, plugin host, interception, storage, helper re-exec |
+| `LeanSudo/Sys/Prim/`, `c/` | the trusted C primitives and their Lean extern declarations |
 | `Main.lean`, `LeanSudo/Shell.lean`, `Visudo.lean` | entry points and IO shell |
 | `integration/` | Docker end-to-end suites (the only tests) and the Linux builder |
 | `scripts/AxiomAudit.lean` | the axiom audit |
+| `scripts/check-ffi.sh`, `scripts/check-c-boundary.sh` | C/Lean ABI check and C size ratchet, run by every Linux build |
 | `DESIGN.md` | architecture, module contracts, verified-property targets |
 
 ## License

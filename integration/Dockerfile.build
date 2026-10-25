@@ -10,7 +10,7 @@ FROM ${BASE} AS build
 
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 PATH=/root/.elan/bin:$PATH
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git build-essential zstd \
+ && apt-get install -y --no-install-recommends ca-certificates curl git build-essential zstd python3 \
  && rm -rf /var/lib/apt/lists/*
 
 
@@ -24,6 +24,8 @@ WORKDIR /src
 
 RUN --mount=type=cache,id=lean-sudo-lake,sharing=locked,target=/src/.lake \
     lake build sudo visudo \
+ && scripts/check-ffi.sh \
+ && scripts/check-c-boundary.sh \
  && mkdir -p /out && cp .lake/build/bin/sudo .lake/build/bin/visudo /out/
 
 

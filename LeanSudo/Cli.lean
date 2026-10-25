@@ -180,7 +180,7 @@ private def octalText (n : Nat) : String :=
   String.ofList [Char.ofNat (48 + n / 64 % 8), Char.ofNat (48 + n / 8 % 8), Char.ofNat (48 + n % 8)]
 
 def versionFor (root : Bool) (s : Settings := {}) (interfaces : List String := [])
-    (architecture : String := "aarch64") : String :=
+    (architecture : String) : String :=
   if !root then versionText else
   let line (label value : String) := label ++ ": " ++ value ++ "\n"
   let flag (enabled : Bool) (text : String) := if enabled then text ++ "\n" else ""

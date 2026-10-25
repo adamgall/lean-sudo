@@ -629,6 +629,7 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
     else pure none
   let ctx : Core.Context := {
     progname, opts, invoking, host, longHost, sudoers := policy, locatedSudoers, settings, target
+    architecture := ← if opts.mode == .version then Sys.architecture else pure ""
     submitHost
     policySources := loadedSources
     commandSetid
@@ -925,7 +926,7 @@ private def session (ctx : Core.Context) (h : Sys.PamHandle) (setcred openSessio
     if credentials then cleanup (checkPam h "unable to delete credentials" (Sys.pamSetcred h false))
 
 private def logExit (ctx : Core.Context) (event : Option EventLog.Event)
-    (started : Nat) (status : Sys.ExitStatus) : IO Unit := do
+    (line : Core.LogLine) (started : Nat) (status : Sys.ExitStatus) : IO Unit := do
   if !ctx.settings.logExitStatus && ctx.settings.logServers.isEmpty then return
   let signal ← match status with
     | .signaled n => pure (some (← Sys.signalName n.toUInt32))
@@ -933,6 +934,11 @@ private def logExit (ctx : Core.Context) (event : Option EventLog.Event)
   let exitValue := match status with | .exited n => n | .signaled n => 128 + n
   cleanup (Sys.LogSrv.finish exitValue (signal.getD "") (← Sys.lastDumpedCore))
   if !ctx.settings.logExitStatus then return
+  if ctx.settings.logFormat == "sudo" then
+    let suffix := (signal.map (s!" ; SIGNAL={·}")).getD "" ++ s!" ; EXIT={exitValue}"
+    discard <| logLine ctx { line with event := .exit, msg := line.msg ++ suffix }
+      (remote := false)
+    return
   let some accepted := event | return
   let elapsed := (← Sys.bootTimeNanos) - started
   let time ← Sys.eventTime ctx.settings.logYear ctx.settings.sudoersLocale
@@ -1114,10 +1120,10 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
     | .exec plan =>
       let details ← jsonDetails ctx true
       let details := if plan.iolog.isSome then { details with runcwd := plan.cwd } else details
-      Sys.LogSrv.accept ctx.settings details plan.iolog
+      Sys.LogSrv.accept ctx.settings details plan.iolog Sys.IoLog.remote
     | .edit plan =>
       let some details := editorDetails | throw (IO.userError "missing editor event metadata")
-      Sys.LogSrv.accept ctx.settings details plan.iolog
+      Sys.LogSrv.accept ctx.settings details plan.iolog Sys.IoLog.remote
     | _ => pure ()
   let openIolog : IO (Option String) := do
     if !ctx.settings.logServers.isEmpty then return none
@@ -1179,9 +1185,13 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
     let status ← session ctx h plan.pamSetcred plan.pamSession do
       if let some .accept := decision.audit then audit ctx true
       let env ← environment plan.envInput h ctx.targetUnknownUid
-      let run := Sys.runCommand {
-        plan.toRunPlan.toSpec plan.path plan.argv.toArray env plan.uid plan.gid plan.groups with
-        background := plan.background, execFd := plan.execFd, staySetuid := plan.staySetuid }
+      let run : IO Sys.ExitStatus := do
+        Sys.Plugins.execBegin
+        let prepared ← Sys.Intercept.prepare env
+        let hooks := Sys.RelayHooks.compose Sys.Plugins.relayHooks
+          (Sys.RelayHooks.compose Sys.IoLog.relayHooks Sys.Intercept.relayHooks)
+        Sys.runCommandPrepared { Sys.Exec.specOfPlan plan env with env := prepared.env }
+          hooks prepared.seccompFilter prepared.trace #[] prepared.keepFds
       if plan.intercept || plan.logSubcmds then
         if plan.intercept then
           let path := plan.execFd.map (fun fd => s!"/proc/self/fd/{fd}") |>.getD
@@ -1193,7 +1203,7 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
           (plan.intercept && ctx.settings.interceptVerify) (!plan.intercept)
           (interceptedCheck ctx plan.chroot plan.intercept plugins) run
       else run
-    logExit ctx event started status
+    logExit ctx event ((editorLine.or decision.log).getD (Core.logLine ctx none)) started status
     return status
   | .edit plan =>
     let some h := h | throw (IO.userError "missing PAM transaction")
@@ -1203,7 +1213,7 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
       throw (IO.userError ("unable to change uid to root (0): " ++ e.toString))
     let status ← session ctx h plan.pamSetcred plan.pamSession do
       Sudoedit.run ctx.progname plan editor (← environment plan.envInput h ctx.targetUnknownUid)
-    logExit ctx event started status
+    logExit ctx event ((editorLine.or decision.log).getD (Core.logLine ctx none)) started status
     return status
   | .print text code =>
     (← IO.getStdout).putStr (← I18n.translate text)
@@ -1306,7 +1316,7 @@ private def configuration : IO SudoConf.Config := do
     Sys.closeDescriptor fd.toUInt32
 
 def run (args : List String) : IO UInt32 := do
-  let mut diagnosticProgname := "sudo"
+  let diagnosticProgname ← IO.mkRef "sudo"
   try
     Sys.initializeProcess false
     I18n.initializeLocale
@@ -1333,9 +1343,9 @@ def run (args : List String) : IO UInt32 := do
     let raw ← IO.FS.readBinFile "/proc/self/cmdline"
     let valid := (String.fromUTF8? raw).isSome
     let first := ByteArray.mk ((raw.data.toList.takeWhile (· != 0)).toArray)
-    let argv0 := (String.fromUTF8? first).getD "sudo"
+    let argv0 := (← Background.originalArgv0).getD ((String.fromUTF8? first).getD "sudo")
     let progname := Cli.programName argv0
-    diagnosticProgname := progname
+    diagnosticProgname.set progname
     let parsed := Cli.parseArgs argv0 args (← Sys.environ)
     for warning in parsed.warnings do
       Sys.writeStderr (← I18n.translate (Cli.formatError argv0 { message := warning }) false)
@@ -1374,7 +1384,7 @@ def run (args : List String) : IO UInt32 := do
       let text ← if (← Sys.getuid) == 0 then do
           let ctx ← context progname opts conf
           let interfaces := (← Sys.interfaceAddresses).toList.map (fun (a, m) => a ++ "/" ++ m)
-          pure (Cli.versionFor true ctx.settings interfaces (← Sys.architecture))
+          pure (Cli.versionFor true ctx.settings interfaces ctx.architecture)
         else pure Cli.versionText
       let text := (text.drop versionHeader.length).toString
       let text := if conf.plugins.isEmpty then text else
@@ -1413,7 +1423,7 @@ def run (args : List String) : IO UInt32 := do
   catch e =>
     if e.toString == "plugin requested usage" then
       cleanup (Sys.Plugins.close 0 0)
-      Sys.writeStderr (Cli.usageFor diagnosticProgname)
+      Sys.writeStderr (Cli.usageFor (← diagnosticProgname.get))
     else
       cleanup (Sys.Plugins.close 3 1)
       warn e.toString

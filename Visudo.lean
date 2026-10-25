@@ -4,10 +4,27 @@ import LeanSudo.Sudoers.Load
 import LeanSudo.Sys.Core
 import LeanSudo.Sys.Extra
 import LeanSudo.I18n.Load
+import LeanSudo.Sys.Exec
+import LeanSudo.Sys.Edit
+import LeanSudo.Sys.Lookup
+import LeanSudo.Sys.PamHelpers
+import LeanSudo.Sys.LogSrv
 
 open LeanSudo LeanSudo.Sys LeanSudo.Sudoers LeanSudo.Policy LeanSudo.Visudo
 
 namespace VisudoMain
+
+namespace P
+export LeanSudo.Sys.Prim.Posix
+  (S_IRUSR S_IRGRP S_IRWXU S_IRWXG S_IRWXO S_ISUID S_ISGID S_ISVTX S_IWUSR)
+end P
+
+private def readMode (_ : Unit) : UInt32 := P.S_IRUSR () ||| P.S_IRGRP ()
+
+private def permissionBits (_ : Unit) : UInt32 := P.S_IRWXU () ||| P.S_IRWXG () ||| P.S_IRWXO ()
+
+private def modeBits (_ : Unit) : UInt32 :=
+  permissionBits () ||| P.S_ISUID () ||| P.S_ISGID () ||| P.S_ISVTX ()
 
 structure LoadState where
   files : Array String := #[]
@@ -213,7 +230,7 @@ def ownerPermProblems (path : String) (owner perms : Bool) : IO (List String) :=
   let some st ← stat path | return []
   let o := if owner && (st.uid != 0 || st.gid != 0) then
       [s!"{path}: wrong owner (uid, gid) should be (0, 0)"] else []
-  let p := if perms && (st.mode &&& 0o7777) != 0o440 then
+  let p := if perms && (st.mode &&& (modeBits ()).toNat) != (readMode ()).toNat then
       [s!"{path}: bad permissions, should be mode 0440"] else []
   pure (o ++ p)
 
@@ -315,8 +332,7 @@ def openEditFile (path : String) (mode : UInt32) : IO EditFile := do
   let created := (← stat path).isNone
   lockOrFail path mode
   let (st, text) ← readFileFollow path
-  createTemp (path ++ ".tmp") (withFinalNewline text)
-  copyFileTime path (path ++ ".tmp")
+  createTemp path (path ++ ".tmp") (withFinalNewline text)
   pure { path, original := st, created }
 
 def supportsLineNumber (editor : String) : Bool :=
@@ -365,7 +381,7 @@ def installFile (o : Options) (f : EditFile) (mainFile : Bool) : IO Unit := do
   let usePerms := o.perms || o.file.isNone
   let uid := if useOwner then 0 else f.original.uid
   let gid := if useOwner then 0 else f.original.gid
-  let mode := if usePerms then 0o440 else f.original.mode &&& 0o777
+  let mode := if usePerms then (readMode ()).toNat else f.original.mode &&& (permissionBits ()).toNat
   if f.modified then
     setOwnerMode f.tmp uid gid mode
     IO.FS.rename f.tmp f.path
@@ -421,7 +437,7 @@ partial def checkEdits (o : Options) (host : String) (session : IO.Ref (Array Ed
   if reparse then checkEdits o host session known editor mode else pure (some files)
 
 def editMode (o : Options) (path : String) : IO UInt32 := do
-  let mode : UInt32 := if o.file.isSome && !o.perms then 0o640 else 0o440
+  let mode := if o.file.isSome && !o.perms then readMode () ||| P.S_IWUSR () else readMode ()
   let files ← IO.mkRef (#[] : Array EditFile)
   try
     let created := (← stat path).isNone
@@ -469,7 +485,7 @@ def editMode (o : Options) (path : String) : IO UInt32 := do
 
 end VisudoMain
 
-def main (args : List String) : IO UInt32 := do
+private def runVisudo (args : List String) : IO UInt32 := do
   I18n.initializeLocale
   match parseArgs args with
   | .error e =>
@@ -493,3 +509,15 @@ def main (args : List String) : IO UInt32 := do
         VisudoMain.eprint s!"visudo: {e}"
       return 1
     if o.check then VisudoMain.checkMode o path else VisudoMain.editMode o path
+
+def main (args : List String) : IO UInt32 := do
+  LeanSudo.Visudo.registerHelpers
+  LeanSudo.Sys.registerExecHelpers
+  LeanSudo.Sys.Edit.registerHelper
+  LeanSudo.Sys.Lookup.register
+  LeanSudo.Sys.PamHelpers.register
+  LeanSudo.Helper.register "logsrv-resolve" LeanSudo.Sys.LogSrv.resolverHelper
+  if let some code ← LeanSudo.Helper.dispatch args then return code
+  LeanSudo.Visudo.initializeSignals
+  try runVisudo args
+  finally LeanSudo.Visudo.shutdownSignals

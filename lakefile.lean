@@ -6,15 +6,18 @@ package «lean-sudo» where
     if System.Platform.isOSX then "-Wl,-export_dynamic" else "-Wl,--export-dynamic"]
 
 def shimSources : Array String := #[
-  "core", "exec", "ts", "visudo", "edit", "sys", "iolog", "lookup", "groupplugin",
-  "plugins", "sss", "logsrv", "intercept", "intercept_trace", "intercept_dso", "shim"]
+  "core", "prim_exec", "prim_timestamp", "visudo", "prim_edit", "sys", "prim_iolog",
+  "prim_visudo",
+  "prim_plugins", "prim_logsrv", "prim_intercept", "prim_lookup",
+  "prim_corefacts", "prim_posix",
+  "prim_pam", "prim_store", "prim_sss", "prim_groupplugin", "prim_extra", "prim_corelogs"]
 
 def shimCFlags : Array String :=
   #["-fPIC", "-O2", "-Wall", "-Wextra", "-Werror", "-D_GNU_SOURCE",
-    "-fstack-protector-strong", "-D_FORTIFY_SOURCE=2"]
+    "-fstack-protector-strong", "-D_FORTIFY_SOURCE=2"] ++
+    (if System.Platform.isOSX then #[] else #["-fstack-clash-protection"])
 
 def shimHeaders : Array String := #[
-  "locale_scope.h", "logsrv.h", "intercept.h", "intercept_dso.h", "plugins.h",
   "sudo_plugin.h", "shim.h"]
 
 extern_lib leansudoshim pkg := do

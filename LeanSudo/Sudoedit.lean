@@ -5,15 +5,9 @@ import LeanSudo.Sys.Extra
 import LeanSudo.Policy.Eval
 import LeanSudo.Sudoedit.Check
 import LeanSudo.I18n.Load
-
-def LeanSudo.Core.RunPlan.toSpec (plan : LeanSudo.Core.RunPlan) (path : String)
-    (argv env : Array String) (uid gid : Nat) (groups : List Nat) : LeanSudo.Sys.ExecSpec := {
-  path, argv, env, uid, gid, groups := groups.toArray,
-  cwd := plan.cwd, cwdOptional := plan.cwdOptional, chroot := plan.chroot,
-  umask := plan.umask, usePty := plan.usePty, timeout := plan.timeout,
-  rlimits := plan.rlimits.toArray, utmpUser := plan.utmpUser, closeFrom := plan.closeFrom,
-  execBackground := plan.execBackground, noexecFile := plan.noexecFile,
-  apparmorProfile := plan.apparmorProfile, background := false }
+import LeanSudo.Sys.Plugins
+import LeanSudo.Sys.IoLog
+import LeanSudo.Sys.Intercept
 
 namespace LeanSudo.Sudoedit
 
@@ -33,19 +27,21 @@ private def writableDir (invoker : Sys.Edit.Identity) (fd : UInt32) : IO Bool :=
 
 private def parentDir (invoker target : Sys.Edit.Identity) (checkdir : Bool)
     (dirs : List String) (file : String) : IO UInt32 := do
-  let mut fd := (← Sys.Edit.operation target 7 Sys.Edit.noneFd "/").value
+  let current ← IO.mkRef (← Sys.Edit.operation target 7 Sys.Edit.noneFd "/").value
   let check := checkdir && invoker.uid != 0
   try
     for dir in dirs do
+      let fd ← current.get
       let nofollow := check && (← writableDir invoker fd)
       let next := (← Sys.Edit.operation target (if nofollow then 0 else 7) fd dir).value
       Sys.Edit.close fd
-      fd := next
+      current.set next
+    let fd ← current.get
     if check && (← writableDir invoker fd) then
       throw (IO.userError s!"{file}: editing files in a writable directory is not permitted")
     return fd
   catch e =>
-    Sys.Edit.close fd
+    Sys.Edit.close (← current.get)
     throw e
 
 private def resolveEditor (who : Sys.Edit.Identity) (path : String)
@@ -94,7 +90,7 @@ private def prepare (progname : String) (invoker target : Sys.Edit.Identity) (fo
       Sys.Edit.close parent
       warn progname (fileError displayFile e).toString
       return none
-  let mut temp := ""
+  let temporary ← IO.mkRef ""
   try
     let (original, originalStat) ← if fd == Sys.Edit.noneFd then pure (ByteArray.empty, #[])
       else try pure (← Sys.Edit.read fd, ← Sys.Edit.stat fd) finally Sys.Edit.close fd
@@ -102,7 +98,8 @@ private def prepare (progname : String) (invoker target : Sys.Edit.Identity) (fo
     let template := tempName name
     let made ← try Sys.Edit.operation invoker 4 Sys.Edit.noneFd s!"/var/tmp/{template}" 0o077 suffixLen
       catch _ => Sys.Edit.operation invoker 4 Sys.Edit.noneFd s!"/tmp/{template}" 0o077 suffixLen
-    temp := made.name
+    let temp := made.name
+    temporary.set temp
     let tempStat ← try
         Sys.Edit.write made.value original ByteArray.empty
         try Sys.Edit.setTimes made.value
@@ -113,6 +110,7 @@ private def prepare (progname : String) (invoker target : Sys.Edit.Identity) (fo
     return some { file, displayFile, name, parent, temp, original, originalStat, tempStat }
   catch e =>
     Sys.Edit.close parent
+    let temp ← temporary.get
     if temp != "" then
       try removeTemp invoker temp catch _ => pure ()
     throw e
@@ -125,7 +123,8 @@ private def copyBack (progname : String) (invoker target : Sys.Edit.Identity) (m
     if fd == Sys.Edit.noneFd then throw (IO.userError s!"{s.temp}: No such file or directory")
     let (bytes, checked, changed) ← try
         let st ← Sys.Edit.stat fd
-        let checked := tempSafe ((st[0]! &&& Sys.S_IFMT) == 0o100000)
+        let checked := tempSafe
+          ((st[0]! &&& (Sys.Prim.Posix.S_IFMT ()).toNat) == (Sys.Prim.Posix.S_IFREG ()).toNat)
           (st[1]! == invoker.uid.toNat) (st[6]! == 1)
         unless checked do throw (IO.userError s!"{s.temp}: unsafe temporary file")
         let changed := fileChanged s.tempStat st elapsed
@@ -188,7 +187,7 @@ def select (progname : String) (plan : Core.EditPlan) : IO (Option Editor) := do
 
 def run (progname : String) (plan : Core.EditPlan) (editor : Editor)
     (env : Array String) : IO Sys.ExitStatus := do
-  let mut sessions : Array Session := #[]
+  let sessions ← IO.mkRef (#[] : Array Session)
   try
     let invoker ← Sys.Edit.identity plan.editUid plan.editGid plan.editGroups
     let target ← Sys.Edit.identity plan.fileUid plan.fileGid plan.fileGroups
@@ -196,28 +195,33 @@ def run (progname : String) (plan : Core.EditPlan) (editor : Editor)
     try
       for (file, displayFile) in plan.files.zip plan.policyFiles do
         if let some session ← prepare progname invoker target plan.follow plan.checkdir file displayFile then
-          sessions := sessions.push session
+          sessions.modify (·.push session)
     catch e =>
-      for s in sessions do
+      for s in (← sessions.get) do
         try removeTemp invoker s.temp catch _ => pure ()
       throw e
-    if sessions.isEmpty then return .exited 1
+    if (← sessions.get).isEmpty then return .exited 1
     let started ← Sys.Edit.clock
     let status ← try
-        Sys.runCommand (plan.toRunPlan.toSpec editor.path
-          (editor.words.toArray ++ sessions.map (·.temp)) env
+        Sys.Plugins.execBegin
+        let prepared ← Sys.Intercept.prepare env
+        let hooks := Sys.RelayHooks.compose Sys.Plugins.relayHooks
+          (Sys.RelayHooks.compose Sys.IoLog.relayHooks Sys.Intercept.relayHooks)
+        Sys.runCommandPrepared (plan.toRunPlan.toSpec editor.path
+          (editor.words.toArray ++ (← sessions.get).map (·.temp)) prepared.env
           plan.editUid plan.editGid plan.editGroups)
+          hooks prepared.seccompFilter prepared.trace #[] prepared.keepFds
       catch e =>
         warn progname e.toString
         pure (.exited 1)
     let elapsed := started != (← Sys.Edit.clock)
-    for s in sessions do
+    for s in (← sessions.get) do
       unless ← copyBack progname invoker target plan.umask plan.follow plan.checkdir elapsed s do failed := true
     return if failed then .exited 1 else status
   catch e =>
     warn progname e.toString
     return .exited 1
   finally
-    for s in sessions do Sys.Edit.close s.parent
+    for s in (← sessions.get) do Sys.Edit.close s.parent
 
 end LeanSudo.Sudoedit

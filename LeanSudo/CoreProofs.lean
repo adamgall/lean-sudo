@@ -274,7 +274,7 @@ theorem exempt_user_no_auth (ctx : Context) (j : Judgement)
 theorem denied_authentication_disabled (ctx : Context)
     (h : ctx.settings.authenticate = false) :
     authentication ctx .deny = .none := by
-  simp [authentication, policyNeedsAuth, h]
+  simp [authentication, policyNeedsAuth, deniedNeedsAuth, h]
 
 private theorem authentication_none (ctx : Context) (a : Allowed)
     (h : authentication ctx (.allow a) = .none) : AuthExemption ctx a := by

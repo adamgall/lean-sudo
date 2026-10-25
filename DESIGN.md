@@ -40,19 +40,24 @@ independent rule.
 
 Front-end audit, approval and additional I/O plugins use sudo's public 1.22 ABI.
 `SudoConf` retains located plugin declarations and options; `Sys.Plugins` builds
-settings and command metadata from the verified decision. The native host loads
-objects, validates their ABI, dispatches callbacks and relays stream data. It does
-not evaluate policy. Approval checks run only after successful policy/authentication;
+settings and command metadata from the verified decision. `Sys.PluginHost` loads
+objects, validates their ABI and sequences lifecycle calls in Lean.
+`Sys.PluginCallbacks` dispatches conversations, environment hooks and events;
+its `RelayHooks` adapter receives stream bytes and signalfd notifications.
+ABI offsets and platform constants come from C `sizeof`/`offsetof` and macro
+values, queried only at runtime; no module initializer invokes a platform extern.
+Background-session re-exec preserves the original submission process's PID and
+parent PID in plugin `user_info`, rather than reporting the helper's identity.
+Approval checks run only after successful policy/authentication;
 `approval_only_restricts` and `denied_never_approved` make the conjunction explicit.
 Audit plugins observe policy/approval/front-end outcomes; I/O plugins open only
 after approval. Close receives the actual command wait status or execution error.
 External policy plugins remain refused: lean-sudo itself supplies the policy.
 Enforced intercepted commands repeat policy audit, approval and front-end audit;
-log-only interception emits only the front-end audit. A private bounded socket
-dispatches these callbacks from the forked Lean broker back to the original host,
-preserving audit/approval state and the original I/O plugin vectors and session.
-An absent or malformed affirmative reply cannot authorize a subcommand, and a
-failed bridge never falls back to the broker's forked plugin state.
+log-only interception emits only the front-end audit. The parent Lean event loop
+dispatches callbacks directly, preserving audit/approval state and the original
+I/O plugin vectors and session. A missing affirmative Lean result cannot
+authorize a subcommand.
 As in sudo 1.9.17p2 `exec_intercept.c`, policy/front-end audit acceptance failures
 are notifications for intercepted commands, not vetoes. Approval's own audit
 acceptance still vetoes on failure (`sudo.c:approval_check`), as do all three
@@ -60,8 +65,8 @@ acceptance stages for initial execution. List/validate audit acceptance failures
 are notifications, matching `sudo.c:policy_list` and `policy_validate`.
 
 The interception broker retains the original principals and selected root and
-refreshes command facts for each exec. Private reply sockets require affirmative
-Lean authorization; malformed or absent replies cannot allow execution.
+refreshes command facts for each exec. The parent Lean tracer and authenticated
+DSO broker require affirmative Lean authorization; malformed requests fail closed.
 `intercept_authenticate` rechecks timestamps and authenticates under the record
 lock. `log_subcmds` alone logs without a second authorization check; subcommand
 environments are preserved. Trace mode skips the initially authorized exec and
@@ -114,6 +119,9 @@ one source module; the C table also lists shared headers.
 | `I18n/Load.lean` | Trusted locale/catalog discovery and separate message/log translation. |
 | `Insults.lean` | Upstream insult collection and bounded selection. |
 | `Intercept.lean` | Pure subcommand authorization with retained identities and environment. |
+| `Intercept/Seccomp.lean` | Seccomp instruction construction, byte encoding and syscall-trap theorem. |
+| `Intercept/Registers.lean` | Native, compat and x32 register decoding and updates. |
+| `Intercept/Protocol.lean` | DSO protobuf codec using the proved log-server wire primitives. |
 | `IoLog.lean` | Stream plans, sequence/path expansion, metadata and timing formatting. |
 | `LogSrv.lean` | Pure sudo log-server protobuf codec and bounded round-trip proofs. |
 | `Nsswitch.lean` | Ordered files/SSSD source parsing, validation and return-action selection. |
@@ -131,24 +139,34 @@ one source module; the C table also lists shared headers.
 | `Sudoers/Ast.lean` | Located sudoers syntax, aliases, Defaults, tags and command options. |
 | `Sudoers/Parser.lean` | Sudoers parser, diagnostics and successful-parse invariants. |
 | `Sudoers/Load.lean` | Include resolution, ordering and source ownership/mode checks. |
-| `Sys/Core.lean` | Identity, filesystem, terminal, environment, event logging and mail bindings. |
+| `Sys/Core.lean` | Identity/filesystem wrappers and helper-backed mail/admin operations. |
+| `Sys/CoreLogs.lean` | Log safety, locking, UUID encoding, time and terminal orchestration. |
+| `Sys/TimeFormat.lean` | Lean date directives over native time fields and locale text. |
+| `Sys/Prim/CoreFacts.lean` | NSS retries, environment decoding and bounded filesystem reads. |
+| `Sys/Prim/Posix.lean` | Runtime platform constants without native-host extern initialization. |
 | `Sys/Edit.lean` | Credential-scoped descriptor-relative sudoedit worker operations. |
 | `Sys/Exec.lean` | Checked execution specification and command supervisor bindings. |
-| `Sys/Extra.lean` | System matching/audit oracles and root-containment helpers. |
-| `Sys/GroupPlugin.lean` | Sudo group-provider configuration, load/query/cleanup bindings. |
-| `Sys/Intercept.lean` | Broker request contract and scoped monitor lifecycle. |
-| `Sys/IoLog.lean` | Local I/O session allocation, metadata and stream initialization. |
+| `Sys/Extra.lean` | Matching validation, locale scopes, native-result walking and audit transport. |
+| `Sys/GroupPlugin.lean` | Group-provider ABI validation, path fallback, lifecycle and result acceptance. |
+| `Sys/Intercept.lean` | Parent-owned monitor lifecycle, execution preparation and relay hooks. |
+| `Sys/InterceptTrace.lean` | Tracee memory, ptrace event decisions, exec verification and detach. |
+| `Sys/InterceptDso.lean` | Authenticated DSO clients, nonblocking broker and environment injection. |
+| `Sys/IoLog.lean` | I/O directories, sequence locks, gzip lifecycle, filtering and relay hooks. |
 | `Sys/LogSrv.lean` | Remote session protocol, failover, relay callbacks and commit validation. |
 | `Sys/Lookup.lean` | Credential-scoped batched path inspection and executable-bit criterion. |
-| `Sys/Pam.lean` | PAM transaction/conversation configuration, lifecycle and diagnostics. |
-| `Sys/Plugins.lean` | Front-end plugin metadata, lifecycle bindings and restriction-only approval theorem. |
-| `Sys/Sss.lean` | SSSD defaults/user-rule attribute-query binding. |
-| `Sys/Timestamp.lean` | Sudo-compatible record locking, storage, process identity and clock IO. |
+| `Sys/Pam.lean` | PAM lifecycle, Lean conversation, terminal/signalfd password loop and diagnostics. |
+| `Sys/PamHelpers.lean` | Re-exec askpass, mailer and admin-flag helper plans and handlers. |
+| `Sys/Plugins.lean` | Front-end metadata and restriction-only approval theorems. |
+| `Sys/PluginHost.lean` | ABI validation, lifecycle/audit/approval sequencing and relay hooks. |
+| `Sys/PluginCallbacks.lean` | Conversation, environment hooks and plugin event state machines. |
+| `Sys/PluginUserInfo.lean` | User, terminal, group and resource-limit metadata collection. |
+| `Sys/Sss.lean` | SSSD dynamic loading, query/error policy and checked attribute/result walking. |
+| `Sys/Timestamp.lean` | Timestamp path checks, effective-UID scopes, locking and record IO. |
 | `Timestamp.lean` | Timestamp scopes, sudo v2 codec, bounded scanner, validity and update proofs. |
 | `Util/Glob.lean` | Pure pathname-aware glob matcher and literal/star proofs. |
 | `Util/Sha2.lean` | Pure SHA-224/256/384/512 and digest dispatch. |
 | `Visudo/Core.lean` | Pure visudo options, semantic checks and editor-input helpers. |
-| `Visudo/Sys.lean` | Visudo editor, record-lock, temporary-file and metadata bindings. |
+| `Visudo/Sys.lean` | Lean storage/editor orchestration and scoped signalfd cleanup. |
 | root `LeanSudo.lean` | Library umbrella importing the implementation and proof modules. |
 | root `Main.lean` | Delegates sudo/sudoedit startup to `Shell.run`. |
 | root `Visudo.lean` | Visudo check/edit/export orchestration and installation. |
@@ -157,25 +175,26 @@ one source module; the C table also lists shared headers.
 
 | C source/header | Purpose |
 |---|---|
-| `c/core.c` | NSS/filesystem/terminal/log/mail primitives and dynamically loaded PAM conversation. |
-| `c/edit.c` | Privilege-dropped sudoedit workers and descriptor reads/writes/restoration. |
-| `c/exec.c` | Credential transitions, exec, pty/pipe relay, signals, deadlines and child setup. |
-| `c/groupplugin.c` | Sudo group-provider ABI validation, initialization, query and cleanup. |
-| `c/plugins.c`, `c/plugins.h`, `c/sudo_plugin.h` | Public sudo plugin ABI, dynamic loader, callbacks, lifecycle and execution-relay bridge. |
-| `c/intercept.c` | Privileged broker, private request/reply transport and monitor lifecycle. |
-| `c/intercept_trace.c` | Linux seccomp/ptrace exec monitor and optional post-exec verification. |
-| `c/intercept_dso.c` | System sudo-intercept DSO bootstrap/authenticated protobuf transport. |
-| `c/iolog.c` | Local plain/gzip streams, sequence locking, timing and password filtering. |
-| `c/logsrv.c` | Deadline-bounded framed TCP/OpenSSL transport and relay/broker queue bridge. |
-| `c/lookup.c` | Permanently credential-dropped child stat batches without policy selection. |
-| `c/sss.c` | libsss_sudo dynamic ABI and checked attribute copying. |
-| `c/sys.c` | Domain/interface/netgroup/regex/glob/hostname/audit system oracles. |
-| `c/ts.c` | Secure timestamp descriptors, clocks, byte-range locks and positional IO. |
-| `c/visudo.c` | Editor process, record locks, reusable temporary files and owner/mode operations. |
-| `c/intercept.h` | Shared broker/trace monitor interface. |
-| `c/intercept_dso.h` | DSO bootstrap, environment and service lifecycle interface. |
-| `c/logsrv.h` | Framed transport, I/O relay and broker queue interface. |
-| `c/locale_scope.h` | Thread-local sudoers locale enter/leave interface. |
+| `c/core.c` | Single-call identity, terminal-presence and umask primitives. |
+| `c/prim_posix.c` | Allocation-free accessors for target-platform constants. |
+| `c/prim_corefacts.c` | NSS, environment, directory and filesystem one-call primitives. |
+| `c/prim_corelogs.c` | One-call calendar, locale-data, syslog and log-file primitives. |
+| `c/prim_pam.c` | PAM ABI trampoline and one-call PAM/terminal/password-I/O primitives. |
+| `c/prim_edit.c` | One-call file and descriptor-transfer primitives; workers and rollback are Lean. |
+| `c/prim_exec.c` | One-call process/terminal primitives, native constants, startup signal block and pinned re-exec stub. |
+| `c/prim_groupplugin.c` | Group-plugin function-pointer primitives and printf-to-Lean trampoline. |
+| `c/prim_plugins.c`, `c/sudo_plugin.h` | Public plugin ABI, one-call primitives and Lean callback trampolines. |
+| `c/prim_intercept.c` | Allowlisted single-call ptrace, bounded memory/socket/descriptor primitives and bounds-checked native ABI metadata; raw errno values are interpreted in Lean. |
+| `c/prim_iolog.c` | One-call filesystem, zlib, regex, terminal and clock primitives. |
+| `c/prim_logsrv.c` | Socket, polling, address lookup and OpenSSL call primitives. |
+| `c/prim_lookup.c` | Native lookup constants; credentialed stat batches run in Lean helpers. |
+| `c/prim_sss.c` | One-call libsss_sudo primitives and bounded native result accessors. |
+| `c/prim_store.c` | Dynamic loading, allocation, native pointer/string and error primitives. |
+| `c/sys.c` | One-call netgroup membership binding. |
+| `c/prim_extra.c` | Matching, locale, address/interface, hostname and netlink primitives. |
+| `c/prim_timestamp.c` | One-call filesystem, clock and process-identity primitives. |
+| `c/visudo.c` | Single-call primitives, platform constants and bounded result/wait-status decoding. |
+| `c/prim_visudo.c` | Native default executable-search path and lookup-error constants. |
 
 ## Trusted C boundary (target architecture)
 
@@ -187,26 +206,98 @@ logic, loops over data, state machines) is Lean.
 1. **Primitive wrappers.** One system call or library call per function, arguments
    already validated in Lean, result or `errno` returned unchanged. The only control
    flow allowed is the error check and a bounded copy of the result into a Lean value.
+   Native constants and structure layouts are exposed by scalar constant accessors;
+   Lean never assumes architecture-specific flag values, sizes or offsets.
 2. **Callback trampolines.** C entry points required by a C ABI (PAM conversation,
    sudo plugin callbacks, `libsss_sudo`, OpenSSL, zlib) that forward their arguments
    to a Lean closure and return its answer. `vsnprintf` for printf-style callbacks is
    the only formatting in C.
-3. **The post-fork stub.** Lean's runtime is multithreaded, so a forked child may only
-   call async-signal-safe functions. The child does exactly one thing: `fexecve` the
-   lean-sudo binary itself (descriptor opened from `/proc/self/exe` at startup) in a
-   helper mode, passing a Lean-serialised plan on a pipe. The fresh, single-threaded
-   Lean helper then performs privilege changes, verification, `chroot`, `chdir`,
-   limits, AppArmor and the final `execve` through primitive wrappers, so all of that
-   logic is Lean. Helper children for the mailer, askpass, sudoedit file access and
-   command lookup use the same mechanism.
+3. **The post-fork boundary.** A multithreaded process's forked child may only call
+   async-signal-safe functions. The stub resolves `_Fork` in the parent and fails
+   closed if unavailable, so no `pthread_atfork` handlers run. It clears
+   close-on-exec on the descriptors Lean listed, moves the plan socket
+   to descriptor 63 and immediately `fexecve`s the pinned lean-sudo binary
+   (`/proc/self/exe`, opened `O_PATH|O_CLOEXEC` above descriptor 2 before runtime
+   startup). The parent never holds an inheritable plan descriptor, so concurrent
+   forks by PAM, NSS or plugins cannot capture it. The Lean-serialised plan travels
+   over one end of an `AF_UNIX` socketpair created by the spawning process. If that
+   process runs with a lowered effective UID, only the calling thread's effective UID
+   is set to the saved UID around `socketpair` (raw per-thread `setresuid`, so no
+   other thread gains it), and a failed restore terminates the process. Before
+   reading any plan byte, dispatch requires descriptor 63 to be a socket whose
+   `SO_PEERCRED` process is the helper's parent and whose credential UID (the
+   creator's effective UID when the pair was made) equals the helper's effective
+   UID. An unprivileged user can run the setuid binary with a socket of their own,
+   even below a waiting sudo process, but that socket carries their own effective
+   UID and is rejected. Only then are the parent PID, effective UID and protocol
+   magic in the envelope checked and a registered helper selected. Unauthenticated
+   helper arguments take the ordinary usage-error path. The fresh helper performs
+   privilege changes and verification, chroot/cwd, limits, AppArmor and final exec
+   through primitives. Mailer, askpass, sudoedit and lookup workers use this same
+   transport.
+   Background execution starts a fresh authenticated session helper with the
+   original argv, environment, pinned cwd and a status pipe. The original process
+   consumes signals without forwarding them and waits until command startup is
+   acknowledged, or returns the session's failure status if it exits first.
+   The helper owns the complete policy/PAM/plugin/log lifecycle and detaches its
+   process group only at the command-execution boundary. There is no post-fork
+   Lean continuation and no assumption that the runtime remains single-threaded.
+
+The sole scoped exception is the timestamp `F_SETLKW` wait primitive. POSIX
+interoperability requires the waiting lock to belong to sudo's own PID, and
+`signalfd` consumption cannot interrupt a blocking `fcntl`. For one `F_SETLKW`
+call in the calling thread, this primitive temporarily installs handlers for the
+specified interrupt signals and unblocks those signals. Each handler only stores
+its signal number in a `volatile sig_atomic_t`. The primitive restores the prior
+mask and dispositions and returns the syscall result, saved errno and signal
+number; Lean owns interruption policy and any retry. As in sudo.ws, inherited
+`SIG_IGN` is temporarily overridden for these lock-interrupt signals, then restored.
+There is an unavoidable check-to-syscall window: a signal delivered after the
+stored-signal check but before `fcntl` enters the kernel can delay interruption
+until the lock is granted, as in sudo.ws. The signal number remains recorded;
+Lean then releases any acquired lock and falls back to authentication. The C
+primitive never synthesizes `EINTR` for a signal received before the syscall.
+
+Primitive signatures match the prototypes emitted by Lean: `BaseIO` returns the
+bare value, while `IO` returns `IO.Result`. Scalar results are unboxed; products
+and options use Lean constructors. Erased world arguments are absent from the C
+signature. Native constants are obtained at runtime, never through module
+initialization that would evaluate a Linux-only extern on another platform.
+
+Every Docker Linux build runs `scripts/check-ffi.sh` after `lake build sudo visudo`.
+It extracts the Lean extern prototypes from generated C, writes
+`.lake/build/ffi/externs.h`, and force-includes that header while compiling every
+`c/*.c` with `-Wall -Wextra -Werror`. Empty argument lists become `(void)` so
+argument-count mismatches cannot hide behind C's unspecified-argument syntax.
+The check also rejects externs without generated prototypes or definitions in C
+or the installed Lean runtime, and non-static C functions without a Lean extern,
+a caller in another C file, or a libc symbol to interpose. Runtime definitions and
+libc interposition names are discovered from library symbol tables, not allowlists.
+
+The same build then runs `scripts/check-c-boundary.sh`, a ratchet over
+`scripts/c-budget.tsv`: every file in `c/` needs a budget entry, and neither its
+line count nor its branch-statement count (`if`/`for`/`while`/`switch`/`do`) may
+exceed it. Process creation (`fork`, `_Fork`, `clone`) is confined to
+`c/prim_exec.c`, signal-disposition changes to `c/prim_exec.c` and the timestamp
+lock primitive, and `pthread_create`, `system` and `popen` are forbidden. Raising a
+budget is a deliberate, reviewed change to the trusted base.
 
 Consequences: event loops (pty relay, signal relay via `signalfd`, job control, the
 ptrace tracer, the I/O-log writer, the log-server client, the interception broker)
 are Lean loops over `poll`/`read`/`write`/`waitpid`/`ptrace` primitives. Signals are
 blocked in every thread before the runtime starts additional threads and consumed
-through `signalfd`; there are no C signal handlers. Seccomp BPF programs are built in
+through `signalfd`, except for the scoped timestamp-lock wait above. Seccomp BPF is built in
 Lean as bytes. Structures crossing the boundary (plugin `command_info`, ptrace
 register sets, timestamp records) are encoded and decoded in Lean.
+Lean removes glibc's internal realtime signals from every execution mask, using
+native kernel and libc realtime minima. Signal-action primitives return the raw
+previous handler, flags and mask; Lean chooses ignore/default policy and restores
+the complete disposition after job-control stops. Execution vector, group and poll
+marshalling uses bounded heap allocations, and native structure access rejects
+incorrect byte-array sizes. Background environment replacement occurs only in the
+authenticated session helper, never in the spawning process.
+Command helpers initialize the inherited locale after re-exec, before formatting
+native errno diagnostics through thread-safe `strerror_r`.
 
 ## Sys API contract
 
@@ -218,12 +309,12 @@ descriptors and some raw-facing APIs use `UInt32`. Errors are API-specific:
 `Option` can represent missing facts, PAM returns status codes, and IO failures
 usually throw `IO.Error`; there is no universal “all failures throw” contract.
 
-The Linux translation units share `c/shim.h`/`c/shim.c` for Lean result and string
-construction, strict UTF-8, vector ownership, exact transfers, clocks and symbol
-loading. Credentialed helper children use one nonallocating drop-and-verify path:
-real/effective/saved and filesystem IDs, the complete sorted supplementary-group
-multiset, and inability to regain root are checked before filesystem work or exec.
-Command execution retains its separate staged drop for `stay_setuid` and limits.
+The Linux translation units share the `c/shim.h` inline result-marshalling helpers.
+Credentialed helpers share Lean's `Helper.dropCredentials`: real/effective/saved
+and filesystem IDs, the sorted supplementary-group multiset, and inability to
+regain root are checked before filesystem work or exec. Command execution supplies
+the separate real-UID/GID selection for `stay_setuid` and stages resource limits
+around the drop.
 Network and broker log frames share bounded framing, but retain their different
 blocking, TLS and interruption semantics. Syslog policy and C mappings accept
 sudo.ws's facilities: `authpriv`, `auth`, `daemon`, `user`, and `local0`–`local7`.
@@ -286,10 +377,20 @@ valid UTF-8 are dropped. `appendJson` appends members to sudo's pretty JSON obje
 not JSON lines. The module also exposes a no-follow reader for callers that need
 that distinct primitive; it is not the sudoers loader contract.
 
+Log timestamps use the shared Lean `Sys.TimeFormat` formatter over decoded native
+calendar fields and `nl_langinfo` locale data. Local timestamps retain
+`%b %e %H:%M:%S` with optional ` %Y`; event UTC timestamps retain
+`%Y%m%d%H%M%SZ`. Formatting preserves locale bytes until the original 64-byte
+buffer limit is checked, then decodes UTF-8 lossily. Empty output or output of
+64 bytes or more retains the existing timestamp-format error. C supplies only
+calendar conversion, locale facts and bounded result marshaling.
+
 ### Pam
 
-`PamHandle` is an external-object-backed type with finalizer cleanup. `ConvConfig`
-fields are `useStdin nonInteractive visiblepw override pwfeedback : Bool := false`,
+`PamHandle` owns Lean conversation/lifecycle state and an external native PAM
+handle. Lean closes PAM in `finally`; the native finalizer only releases its
+allocation and retained closure. `ConvConfig` fields are
+`useStdin nonInteractive visiblepw override pwfeedback : Bool := false`,
 `prompt : String := "Password: "`, and `timeout : Nat := 0`.
 
 ```lean
@@ -315,6 +416,19 @@ Status 0 is PAM success. `pamEnd` is idempotent; authentication checks `PAM_USER
 against the requested account. Conversation errors and captured SIGINT/SIGQUIT
 are separate from PAM status. Askpass runs as the invoker; the original environment
 remains available during authentication, before command-environment filtering.
+PAM's C conversation entry point forwards raw message/response pointers to a
+retained Lean closure and returns its answer. Lean validates the bounded message
+count, reads native fields, allocates responses, and erases/frees failed responses.
+Prompt selection, lecture state, stdin/tty/askpass selection, feedback editing,
+deadlines and signal handling are Lean. The password loop consumes blocked signals
+through signalfd and restores terminal attributes on exit. Native termios field
+accessors validate buffers; Lean chooses every edit. Lean also walks PAM environment
+vectors and builds NULL-terminated helper argument vectors.
+Askpass, mail and admin-flag operations use authenticated helper plans; helpers
+verify dropped credentials before touching invoker files or executing a program.
+PAM messages, translated prompts and password responses cross the ABI as raw bytes;
+askpass plans preserve those prompt bytes. The returned PAM user is decoded strictly
+before comparing it with the requested account, so invalid UTF-8 cannot alias an identity.
 
 ### Exec
 
@@ -361,6 +475,17 @@ failure aborts. The supervisor relays signals/job control, enforces deadlines an
 keeps PAM alive through background command completion. `exitWith` clamps exit codes
 above 255 rather than wrapping success.
 
+`RelayHooks` composes plugin hooks before I/O logging and interception. Stream hooks
+receive stdin/stdout/stderr/ttyin/ttyout identities; child hooks receive raw wait
+statuses, and a spawn hook attaches the tracer before releasing the helper gate.
+Stream approval stops at the first `false`; child-event `true` claims the event,
+while `false` falls through to the next hook and then the supervisor. Event hooks
+abort by throwing. A claimed ptrace stop must be resumed or deliberately retained
+by its owning hook.
+The Lean supervisor owns pty/nopty polling, job-control messages, timeouts, terminal
+restoration, utmp records and child-error decoding. Hook failure kills and reaps the
+command before resources are released.
+
 The caller's core limit is restored before PAM credentials and session setup,
 not over PAM's result in the command child. Explicit sudoers resource limits are
 applied afterward; `!rlimit_core` leaves PAM's limit intact, while `!pam_session`
@@ -373,6 +498,15 @@ When a usable mailer will report a policy denial, the redundant bad-password
 event is omitted from both logfile and syslog; the diagnostic still goes to
 stderr. Without that denial mail, `mail_badpass` can produce a file-only
 authentication event even when the mailer is unavailable.
+As in sudo.ws, the mailer's own outcome (exit status, early close of its input)
+never changes sudo's diagnostics or exit status; only a failure to start the mail
+helper is reported.
+
+Background re-execution preserves the original caller's PID in acceptance syslog
+records through `Sys.CoreLogs.setSyslogPidOverride`. Clearing that override at the
+detach boundary restores the supervisor's PID for exit records. When PID output
+is disabled, neither identity includes a PID. Lean retains each `openlog` identity
+string through `closelog`, because libc borrows its storage.
 
 ### Timestamp
 
@@ -409,6 +543,9 @@ changes only the selected record. `-k` disables matching records across auth UID
 `-K` unlinks the invoking UID's file. Process start time is nanoseconds converted
 from `/proc` ticks, not raw field-22 jiffies; time uses CLOCK_BOOTTIME. Lecture
 markers are separate from authentication records.
+Traversal and stale-file replacement keep the currently owned descriptor in an
+`IO.Ref`, so exceptional cleanup closes the latest descriptor rather than a
+pre-`try` snapshot. I/O-log directory traversal follows the same ownership rule.
 
 ### Edit, Extra and Lookup
 
@@ -455,15 +592,18 @@ an override means host lookup, not a directory called `*`.
 
 ```lean
 IoLog.open : LeanSudo.IoLog.Plan → LeanSudo.IoLog.Metadata → String → IO (Option String)
+IoLog.remote : UInt32 → Array String → IO Unit
+IoLog.relayHooks : RelayHooks
 LogSrv.endpoint : String → Option (String × String × Bool)
-LogSrv.accept : Settings → EventLog.Details → Option LeanSudo.IoLog.Plan → IO Unit
+LogSrv.accept : Settings → EventLog.Details → Option LeanSudo.IoLog.Plan →
+    (UInt32 → Array String → IO Unit) → IO Unit
 LogSrv.event (st : Settings) (details : EventLog.Details) (reason : String)
     (alert : Bool := false) : IO Unit
 LogSrv.subcommand : EventLog.Details → Option String → IO Unit
 LogSrv.finish (exitValue : Nat) (signal : String) (dumpedCore : Bool)
     (error : String := "") : IO Unit
 LogSrv.close, LogSrv.poll : IO Unit
-LogSrv.subcommandWire : ByteArray → IO Unit
+LogSrv.withBroker : IO α → IO α
 LogSrv.ioEvent : UInt32 → ByteArray → UInt32 → UInt32 → IO Unit
 ```
 
@@ -471,6 +611,15 @@ Local open creates all selected files before execution, returning the session pa
 errors throw unless the plan ignores them. Remote callbacks run in the privileged
 relay, not the command child; `close` also detaches the broker queue. Endpoint
 syntax supports bracketed IPv6 and `(tls)`, with default ports 30343/30344.
+`accept` receives `IoLog.remote` for password-filter initialization. `IoLog.relayHooks`
+streams local/remote I/O and polls the server; the parent shell sends the final
+exit/commit exchange. DNS resolution runs in the registered `logsrv-resolve` helper,
+with its deadline, cleanup, framing and runtime-native address hints controlled by
+Lean. Lean allocates receive buffers, builds the TLS SIGPIPE mask and sequences
+pending-signal inspection around each TLS call; only newly pending SIGPIPE is
+consumed with a nonblocking wait. Socket byte counts retain `ssize_t` width,
+while TLS counts are checked against its native `int` ABI. Native transfers reject
+out-of-bounds slices before pointer arithmetic or receive-buffer mutation.
 
 ### Sss, GroupPlugin and Intercept
 
@@ -496,7 +645,9 @@ SSSD queries global defaults then user rules using the returned domain; rule ord
 is retained. Unavailable library/transport yields no rules for that query;
 malformed data, invalid UTF-8 and other server failures throw rather than returning
 partial rules. Group configuration splits only on spaces/tabs; relative libraries
-resolve under `/usr/libexec/sudo`. Handles have explicit and finalizer cleanup.
+resolve under `/usr/libexec/sudo`. Lean closes group-plugin handles in `finally`;
+garbage collection never invokes plugin code. Each query owns a reentrant passwd
+lookup buffer until the plugin returns, so plugin lookups cannot overwrite it.
 Intercept requests deliberately contain no principal identities. `withMonitor`
 brackets the action with broker start/stop, including exceptional exits.
 
