@@ -62,3 +62,8 @@ open LeanSudo
   (fun c => c.plugins.map (·.path)) == some ["audit.so", "approval.so"]
 #guard (SudoConf.parse "Plugin audit_x \\\r\n audit.so\r\nPlugin my_approval approval.so").toOption.map
   (fun c => c.plugins.map (fun p => (p.path, p.line))) == some [("audit.so", 2), ("approval.so", 3)]
+#guard (SudoConf.parse "Plugin audit_x audit.so opt=a\\\n    b").toOption.map
+  (fun c => c.plugins.map (·.options)) == some [["opt=ab"]]
+#guard (SudoConf.parse "  Plugin audit_x audit.so opt=a\\\r\n \t b\\\n\tc # comment\\\n Plugin my_approval approval.so").toOption.map
+  (fun c => c.plugins.map (fun p => (p.symbol, p.options, p.line))) ==
+    some [("audit_x", ["opt=abc"], 3), ("my_approval", [], 4)]

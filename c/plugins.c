@@ -78,6 +78,9 @@ static void hooks_free(void);
 
 static int bridge_server = -1, bridge_client = -1;
 static pid_t bridge_owner;
+/* Remains set after transport failure: a forked broker must never fall back
+ * to callbacks against its stale private copy of the host's plugin state. */
+static bool bridge_child_mode;
 static int bridge_dispatch(void);
 static lean_obj_res bridge_request(unsigned op, char **info, char **argv, char **env);
 static lean_obj_res ok(void) { return lean_io_result_mk_ok(lean_box(0)); }
@@ -386,11 +389,15 @@ static bool command_context(b_lean_obj_arg info, b_lean_obj_arg argv, b_lean_obj
 }
 LEAN_EXPORT lean_obj_res lean_sudo_plugins_accept(b_lean_obj_arg info, b_lean_obj_arg argv, b_lean_obj_arg env) {
     if (!command_context(info, argv, env)) return error("unable to allocate plugin context");
-    return boolean(audit_accept("sudoers_policy", SUDO_POLICY_PLUGIN, command_info, run_argv, run_env));
+    (void)audit_accept("sudoers_policy", SUDO_POLICY_PLUGIN, command_info, run_argv, run_env);
+    return boolean(true); /* sudo.c ignores audit failure for list/validate. */
 }
 static lean_obj_res check_current(bool initial, bool enforce) {
-    if (enforce && !audit_accept("sudoers_policy", SUDO_POLICY_PLUGIN,
-            command_info, run_argv, run_env)) return boolean(false);
+    if (enforce) {
+        bool accepted = audit_accept("sudoers_policy", SUDO_POLICY_PLUGIN,
+            command_info, run_argv, run_env);
+        if (initial && !accepted) return boolean(false);
+    }
     for (struct plugin *p = enforce ? plugins : NULL; p; p = p->next) {
         if (p->disabled || p->abi->type != SUDO_APPROVAL_PLUGIN) continue;
         struct approval_plugin *a = (void *)p->abi;
@@ -426,7 +433,10 @@ static lean_obj_res check_current(bool initial, bool enforce) {
             return boolean(false);
         }
     }
-    return boolean(audit_accept("sudo", SUDO_FRONT_END, command_info, run_argv, run_env));
+    bool accepted = audit_accept("sudo", SUDO_FRONT_END, command_info, run_argv, run_env);
+    /* exec_intercept.c treats policy/front-end audit as notification, unlike
+     * initial execution. approval_check still acts on its own audit result. */
+    return boolean(!initial || accepted);
 }
 LEAN_EXPORT lean_obj_res lean_sudo_plugins_check(b_lean_obj_arg info, b_lean_obj_arg argv, b_lean_obj_arg env) {
     if (!command_context(info, argv, env)) return error("unable to allocate plugin context");
@@ -463,6 +473,8 @@ failed:
 
 LEAN_EXPORT lean_obj_res lean_sudo_plugins_check_subcommand(b_lean_obj_arg info,
     b_lean_obj_arg argv, b_lean_obj_arg env, uint8_t enforce) {
+    if (bridge_child_mode && bridge_client < 0)
+        return error("unable to check intercepted command with plugins");
     if (!plugins) return boolean(true);
     char **i = copy_array(info), **a = copy_array(argv), **e = copy_array(env);
     if (!i || !a || !e) {
@@ -478,6 +490,8 @@ LEAN_EXPORT lean_obj_res lean_sudo_plugins_check_subcommand(b_lean_obj_arg info,
 }
 LEAN_EXPORT lean_obj_res lean_sudo_plugins_reject(b_lean_obj_arg message, uint8_t is_error,
     b_lean_obj_arg info) {
+    if (bridge_child_mode && bridge_client < 0)
+        return error("unable to check intercepted command with plugins");
     char **v = copy_array(info);
     if (!v) return error("unable to allocate plugin context");
     if (bridge_client >= 0) {
@@ -516,6 +530,7 @@ int ls_plugins_broker_init(void) {
     return 0;
 }
 void ls_plugins_broker_child(void) {
+    bridge_child_mode = bridge_client >= 0;
     if (bridge_server >= 0) close(bridge_server);
     bridge_server = -1; bridge_owner = 0;
 }

@@ -461,6 +461,33 @@ for plugin_intercept_type in trace dso; do
     [[ $(grep -cx 'io.open' "$PH_DIR/io.log") == 1 ]] || fail 'IO reopened for intercepted command'
     plugin_host_end
   }
+
+  for plugin_audit_name in sudoers_policy sudo sample_approval; do
+    begin "plugin host intercept $plugin_intercept_type audit failure $plugin_audit_name" && {
+      plugin_host_setup
+      printf 'Defaults intercept, intercept_type=%s, !use_pty\n' "$plugin_intercept_type" >>/etc/sudoers.d/plugin-host
+      plugin_host_add sample_audit "$PH_SO log=$PH_DIR/audit.log fail_command=/usr/bin/id fail_name=$plugin_audit_name"
+      plugin_host_add sample_approval "$PH_SO log=$PH_DIR/approval.log"
+      run ivan "sudo -n /bin/sh -c '/usr/bin/id -u'"
+      if [[ $plugin_audit_name == sample_approval ]]; then
+        expect_rc 126; expect_out_empty
+      else
+        expect_rc 0; expect_out_line 0
+      fi
+      expect_err_has 'sample_audit: unable to log accept event: sample audit accept failed'
+      plugin_host_end
+    }
+  done
+
+  begin "plugin host intercept $plugin_intercept_type log-only audit failure is notification" && {
+    plugin_host_setup
+    printf 'Defaults !intercept, log_subcmds, intercept_type=%s, !use_pty\n' "$plugin_intercept_type" >>/etc/sudoers.d/plugin-host
+    plugin_host_add sample_audit "$PH_SO log=$PH_DIR/audit.log fail_command=/usr/bin/id fail_name=sudo"
+    run ivan "sudo -n /bin/sh -c '/usr/bin/id -u'"
+    expect_rc 0; expect_out_line 0
+    expect_err_has 'sample_audit: unable to log accept event: sample audit accept failed'
+    plugin_host_end
+  }
 done
 
 for plugin_line_ending in comment escaped crlf; do
@@ -477,6 +504,43 @@ for plugin_line_ending in comment escaped crlf; do
     expect_err_has 'sample approval denied command name'
     plugin_host_line approval.log 'approval.check'
     plugin_host_line audit.log 'audit.reject name=sample_approval type=4 reason=sample approval denied command name'
+    plugin_host_end
+  }
+done
+
+begin 'plugin host config continuation strips physical line indentation' && {
+  plugin_host_setup
+  printf 'Plugin sample_approval %s log=%s/approval.log deny=i\\\n \t d\n' "$PH_SO" "$PH_DIR" >>/etc/sudo.conf
+  run ivan 'sudo -n /usr/bin/id -u'
+  expect_rc 1; expect_out_empty
+  expect_err_has 'sample approval denied command name'
+  plugin_host_line approval.log 'option=deny=id'
+  plugin_host_end
+}
+
+for plugin_audit_name in sudoers_policy sudo sample_approval; do
+  begin "plugin host initial audit failure $plugin_audit_name refuses execution" && {
+    plugin_host_setup
+    plugin_host_add sample_audit "$PH_SO log=$PH_DIR/audit.log fail_command=/usr/bin/id fail_name=$plugin_audit_name"
+    plugin_host_add sample_approval "$PH_SO log=$PH_DIR/approval.log"
+    run ivan 'sudo -n /usr/bin/id -u'
+    expect_rc 1; expect_out_empty
+    expect_err_has 'sample_audit: unable to log accept event: sample audit accept failed'
+    plugin_host_end
+  }
+done
+
+for plugin_audit_action in list validate; do
+  begin "plugin host $plugin_audit_action audit failure is notification" && {
+    plugin_host_setup
+    plugin_host_add sample_audit "$PH_SO log=$PH_DIR/audit.log fail_command=$plugin_audit_action"
+    if [[ $plugin_audit_action == list ]]; then
+      run ivan 'sudo -n -l'
+    else
+      run ivan 'sudo -n -v'
+    fi
+    expect_rc 0
+    expect_err_has 'sample_audit: unable to log accept event: sample audit accept failed'
     plugin_host_end
   }
 done

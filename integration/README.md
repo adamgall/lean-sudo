@@ -11,7 +11,7 @@ Current full-suite results:
 
 | Suite | sudo.ws | lean-sudo |
 |---|---:|---:|
-| sudo | 894/894 | 894/894 |
+| sudo | 908/908 | 908/908 |
 | visudo | 154/154 | 154/154 |
 
 These are shared compatibility suites, not a claim that every behavior is
@@ -160,7 +160,7 @@ explicitly. The numbered prefixes control source order, not ownership.
 | `96-sssd.sh` | `sssd-*`: real LDAP/SSSD roles, allow/deny/negation, runas, signed sudoOrder, global/role options, argument wildcards, short/long listings and NSS source/action ordering. |
 | `97-group-plugin.sh` | `group-plugin-*`: shipped group_file/system_group providers, named/numeric membership, negation, aliases/runas/Defaults/listing, always_query_group_plugin and loader/init/ABI failures. |
 | `98-logsrv.sh` | `logsrv-*`: real sudo_logsrvd TCP/TLS events and I/O, generated CA/client credentials, trust/identity failures, unreachable-server policies, failover, final commits, live disconnect/restart failure policy, malformed frames and serialized intercepted subcommands. |
-| `99b-plugins.sh` | `plugin host`: shipped audit_json event structure/status, approval restrictions/options, extra I/O streams/terminal/binary data, callback lifecycle, loader failures, plugin version output, trace/DSO intercepted approval and log-only audit, and comment/CRLF/escaped-continuation parsing. The fixture DSO is compiled in a separate Docker build stage. |
+| `99b-plugins.sh` | `plugin host`: shipped audit_json event structure/status, approval restrictions/options, extra I/O streams/terminal/binary data, callback lifecycle, loader failures, plugin version output, trace/DSO intercepted approval and log-only audit, audit-failure veto versus notification, and comment/CRLF/escaped/indented-continuation parsing. The fixture DSO is compiled in a separate Docker build stage. |
 
 ### Real remote logging fixtures
 

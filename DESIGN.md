@@ -51,7 +51,13 @@ Enforced intercepted commands repeat policy audit, approval and front-end audit;
 log-only interception emits only the front-end audit. A private bounded socket
 dispatches these callbacks from the forked Lean broker back to the original host,
 preserving audit/approval state and the original I/O plugin vectors and session.
-An absent or malformed affirmative reply cannot authorize a subcommand.
+An absent or malformed affirmative reply cannot authorize a subcommand, and a
+failed bridge never falls back to the broker's forked plugin state.
+As in sudo 1.9.17p2 `exec_intercept.c`, policy/front-end audit acceptance failures
+are notifications for intercepted commands, not vetoes. Approval's own audit
+acceptance still vetoes on failure (`sudo.c:approval_check`), as do all three
+acceptance stages for initial execution. List/validate audit acceptance failures
+are notifications, matching `sudo.c:policy_list` and `policy_validate`.
 
 The interception broker retains the original principals and selected root and
 refreshes command facts for each exec. Private reply sockets require affirmative

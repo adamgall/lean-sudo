@@ -81,6 +81,7 @@ def parse (text : String) : Except String Config := do
   let (n, pending, c) ← (text.splitOn "\n").foldlM
     (fun (n, pending, c) s => do
       let s := String.ofList ((s.toList.reverse.dropWhile (· == '\r')).reverse)
+      let s := (s.dropWhile fun c => c == ' ' || c == '\t').toString
       let parts := s.splitOn "#"
       let s := parts.headD ""
       if parts.length == 1 && s.endsWith "\\" && !s.endsWith "\\\\" then

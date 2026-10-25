@@ -13,6 +13,7 @@ static struct fixture approval, io, audit;
 static const char *deny, *fail_command;
 static int io_hook_version;
 static unsigned audit_accepts;
+static const char *audit_fail_command, *audit_fail_name;
 
 static const char *value(char *const entries[], const char *key)
 {
@@ -192,6 +193,8 @@ static int audit_open(unsigned int version, sudo_conv_t conversation,
 {
     (void)conversation;
     audit_accepts = 0;
+    audit_fail_command = value(options, "fail_command");
+    audit_fail_name = value(options, "fail_name");
     if (open_fixture(&audit, "audit", version, print, settings, user_info,
             options, errstr) != 1)
         return -1;
@@ -204,12 +207,18 @@ static int audit_open(unsigned int version, sudo_conv_t conversation,
 static int audit_accept(const char *name, unsigned int type, char *const info[],
     char *const argv[], char *const envp[], const char **errstr)
 {
-    (void)errstr;
     audit_accepts++;
     vector(audit.log, "audit.command_info", info);
     vector(audit.log, "audit.run", argv);
     vector(audit.log, "audit.run_env", envp);
     fprintf(audit.log, "audit.accept name=%s type=%u\n", name, type);
+    const char *command = value(info, "command");
+    if (audit_fail_command != NULL && command != NULL &&
+        strcmp(audit_fail_command, command) == 0 &&
+        (audit_fail_name == NULL || strcmp(audit_fail_name, name) == 0)) {
+        *errstr = "sample audit accept failed";
+        return -1;
+    }
     return 1;
 }
 
