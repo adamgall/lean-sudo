@@ -3,26 +3,8 @@ import LeanSudo.Policy.Eval
 /-!
 # Policy theorems
 
-Properties of `LeanSudo.Policy.evaluate`, stated in terms of the matching functions of
-`LeanSudo.Policy.Eval`:
-
-1. `evaluate_nil` — default deny on the empty policy;
-2. `evaluate_sound` / `evaluate_sound_run` — an allow is backed by a user spec in the
-   policy whose user, host and command conditions match; for run requests the
-   command member's tri-state result allows, the *last* matching spec decides,
-   and its permissions are used;
-3. `evaluate_no_user_match` — no user spec matches the invoking user ⇒ deny;
-4. `evaluate_append_negated`, `evaluate_append_deny_all` — last match wins: a final
-   matching negated rule denies;
-5. `evaluate_noauth_run`, `evaluate_noauth_listing` — no authentication only through
-   `NOPASSWD`/`!authenticate` (or `listpw`/`verifypw=never`);
-6. `evaluate_irrelevant`, `evaluate_congr` — entries other than aliases and user specs
-   (Defaults, includes) do not influence the judgement;
-7. `pathMatches_literal_basename`, `cmndBase_literal_basename` — a literal sudoers
-   path never matches a command with a different basename (multicall binaries).
-8. `runas_allow_no_group_user_match` — without `-g`, a run-as user list must allow;
-9. `usCandidates_of_userListOk_false` / `notbob_alias_no_candidates` — a denied
-   invoking user, including a DENY inside User_Alias, contributes no candidates.
+Authorization, last-match precedence, authentication and command-identity guarantees
+for `LeanSudo.Policy.evaluate`. See DESIGN.md §§1–3 for the policy model.
 -/
 
 namespace LeanSudo.Policy
@@ -50,14 +32,9 @@ theorem mem_hcCandidates {al : Aliases} {f : Nat} {st : Settings} {r : Request} 
       ∃ cs, cs ∈ hc.cmnds ∧ specApplies al f st r cs = true ∧ c = candidateOf al f r cs := by
   unfold hcCandidates
   by_cases h : hostListOk al f r.host hc.hosts st (some r) = true
-  · simp only [h, ↓reduceIte, true_and]
-    constructor
-    · intro hm
-      obtain ⟨cs, hcs, rfl⟩ := List.mem_map.mp hm
-      obtain ⟨hcs, ha⟩ := List.mem_filter.mp hcs
-      exact ⟨cs, hcs, ha, rfl⟩
-    · rintro ⟨cs, hcs, ha, rfl⟩
-      exact List.mem_map.mpr ⟨cs, List.mem_filter.mpr ⟨hcs, ha⟩, rfl⟩
+  · simp only [h, ↓reduceIte, true_and, List.mem_map, List.mem_filter, and_assoc]
+    constructor <;> rintro ⟨cs, hcs, ha, heq⟩ <;>
+      exact ⟨cs, hcs, ha, heq.symm⟩
   · simp [h]
 
 theorem mem_usCandidates {al : Aliases} {f : Nat} {st : Settings} {r : Request} {us : UserSpec}
@@ -93,10 +70,7 @@ theorem runas_allow_no_group_user_match {al : Aliases} {f : Nat} {st : Settings}
     runasUserResult al f r.runasUser us st (some r) = some true := by
   cases hu : runasUserResult al f r.runasUser us st (some r) with
   | none => simp [runasOk, hu, hg] at h
-  | some b =>
-    cases b with
-    | false => simp [runasOk, hu] at h
-    | true => rfl
+  | some b => cases b <;> simp_all [runasOk]
 
 theorem mem_candidates {s : Sudoers} {st : Settings} {r : Request} {c : Candidate} :
     c ∈ candidates s st r ↔
@@ -134,15 +108,10 @@ theorem judge_nil (st : Settings) (cmd : Command) : judge st cmd [] = .deny := b
 theorem judgeRun_allow {st : Settings} {cands : List Candidate} {a : Allowed}
     (h : judgeRun st cands = .allow a) :
     ∃ c, cands.getLast? = some c ∧ c.allow = true ∧ a = allowedOf st c := by
-  unfold judgeRun at h
   cases hc : cands.getLast? with
-  | none => rw [hc] at h; cases h
+  | none => simp [judgeRun, hc] at h
   | some c =>
-    rw [hc] at h
-    by_cases ha : c.allow = true
-    · simp only [ha, ↓reduceIte, Judgement.allow.injEq] at h
-      exact ⟨c, rfl, ha, h.symm⟩
-    · simp [ha] at h
+    by_cases ha : c.allow = true <;> simp_all [judgeRun]
 
 theorem judgeListing_allow {pol : PwPolicy} {st : Settings} {cands : List Candidate} {a : Allowed}
     (h : judgeListing pol st cands = .allow a) :
@@ -726,5 +695,5 @@ theorem literal_missing_stat_requires_same_name (r : Request) (p path : String)
     (h : literalFileMatches (some r) p path = true) : p = path := by
   cases hp : r.fileIds.find? (·.1 == p) <;>
     cases hpath : r.fileIds.find? (·.1 == path) <;>
-    simp_all [literalFileMatches]
+    simp_all [literalFileMatches, fileIdMatch]
 end LeanSudo.Policy

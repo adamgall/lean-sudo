@@ -3,20 +3,9 @@ import LeanSudo.Cli
 /-!
 # Command-line theorems (DESIGN.md, verified property 7)
 
-* `parseArgs_command`: the command vector is exactly the operand list the scanner
-  stopped at, and `scan_suffix`: that list is a suffix of `argv[1..]` (sudo never
-  rewrites, reorders or drops command words).
-* `parseArgs_dashdash`: `--` ends option processing; everything after it is the command.
-* `parseArgs_operand`: a first word that is not an option and not `VAR=value` starts the
-  command; nothing after it is parsed as an option.
-* Mutually exclusive options are rejected: `-i`/`-s`, `-i`/`-E`, `-i`/`-s` only with a
-  command run, `-U` only with `-l`, `-A`/`-S`, edit mode needs files and takes no
-  environment, run mode needs a command or a shell.
-  All parser guarantees quantify over the caller environment; named preservation
-  of unset variables contributes no environment in edit mode.
-* `escapeJoin_wellEscaped` / `lex_escapeJoin`: the `-c` string for `-s`/`-i` contains no
-  unescaped shell metacharacter, and splitting it the way the shell does gives back
-  exactly the original words.
+The scanner preserves command operands and their order; option conflicts are
+rejected against the caller environment. Shell escaping round-trips the command
+without exposing shell metacharacters. See DESIGN.md for the public guarantees.
 -/
 
 namespace LeanSudo.Cli
@@ -35,10 +24,9 @@ theorem scan_operand {a : String} {rest : List String} {r : Raw}
   unfold isEnvar at h2
   unfold scan
   split
-  · rename_i heq; rw [heq] at h1; simp at h1
-  · rename_i heq; rw [heq] at h1; simp at h1
-  · rename_i heq; rw [heq] at h1; simp at h1
-  · simp [h2]
+  all_goals first
+    | (rename_i heq; rw [heq] at h1; simp at h1)
+    | simp [h2]
 
 theorem scan_suffix : ∀ (n : Nat) (args : List String) (r r' : Raw) (ops : List String),
     args.length ≤ n → scan args r = .ok (r', ops) → ops <:+ args := by

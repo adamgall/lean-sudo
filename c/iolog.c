@@ -1,5 +1,5 @@
 /* sudo-compatible on-disk I/O logs. Policy and metadata rendering live in Lean. */
-#include <lean/lean.h>
+#include "shim.h"
 #include "locale_scope.h"
 #include "logsrv.h"
 #include <sys/types.h>
@@ -41,16 +41,6 @@ static lean_obj_res failure(const char *what) {
   char msg[512];
   snprintf(msg, sizeof msg, "%s: %s", what, strerror(errno));
   return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(msg)));
-}
-static int write_all(int fd, const void *v, size_t len) {
-  const char *p = v;
-  while (len) {
-    ssize_t n = write(fd, p, len);
-    if (n < 0 && errno == EINTR) continue;
-    if (n <= 0) { if (!n) errno = EIO; return -1; }
-    p += n; len -= (size_t)n;
-  }
-  return 0;
 }
 /* Walk from / with openat/O_NOFOLLOW. Never follow a log-path symlink, including
  * intermediate components, and never change permissions of existing ancestors. */
@@ -127,7 +117,7 @@ static int put(int stream, const void *buf, size_t len) {
     if (logstate.flush && z_gzflush(logstate.gz[stream], 2) != 0) { errno = EIO; return -1; }
     return 0;
   }
-  return write_all(logstate.fd[stream], buf, len);
+  return ls_write_all(logstate.fd[stream], buf, len);
 }
 static int timing(int event, const char *detail) {
   struct timespec now;
@@ -332,7 +322,7 @@ LEAN_EXPORT lean_obj_res leansudo_iolog_start(b_lean_obj_arg path, b_lean_obj_ar
     int fd = log_file(d, i ? "log.json" : "log");
     if (fd < 0) goto bad;
     const char *s = lean_string_cstr(i ? json : legacy);
-    int rc = write_all(fd, s, strlen(s)); int err = errno;
+    int rc = ls_write_all(fd, s, strlen(s)); int err = errno;
     if (close(fd) && !rc) { rc = -1; err = errno; }
     if (rc) { errno = err; goto bad; }
   }

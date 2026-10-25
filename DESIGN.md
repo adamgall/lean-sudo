@@ -187,6 +187,16 @@ descriptors and some raw-facing APIs use `UInt32`. Errors are API-specific:
 `Option` can represent missing facts, PAM returns status codes, and IO failures
 usually throw `IO.Error`; there is no universal “all failures throw” contract.
 
+The Linux translation units share `c/shim.h`/`c/shim.c` for Lean result and string
+construction, strict UTF-8, vector ownership, exact transfers, clocks and symbol
+loading. Credentialed helper children use one nonallocating drop-and-verify path:
+real/effective/saved and filesystem IDs, the complete sorted supplementary-group
+multiset, and inability to regain root are checked before filesystem work or exec.
+Command execution retains its separate staged drop for `stay_setuid` and limits.
+Network and broker log frames share bounded framing, but retain their different
+blocking, TLS and interruption semantics. Syslog policy and C mappings accept
+sudo.ws's facilities: `authpriv`, `auth`, `daemon`, `user`, and `local0`–`local7`.
+
 ### Core
 
 `Passwd` has `name : String`, `uid gid : Nat`, `gecos home shell : String`.
@@ -486,12 +496,13 @@ proved. Names are unqualified within the module named in each item.
 7. **Timestamp validity/storage** (`Timestamp`): `valid_sound` gives matching scope
    and auth UID, nonfuture time, non-disabled state and a nonzero finite timeout;
    `valid_timeout_strict` strengthens finite age to `< timeout * 10^9`.
-   `lookup_invalidateScope` prevents a cache hit for the invalidated scope.
-   `decodeEntry_encodeEntry` and `decode_encode` require representable entries or
-   records. `scanStep_bounds` gives `offset + 4 ≤ next ≤ extent`;
-   `scanStep_decoded` ties emitted entries to `decodeSlot`; `scan_sound` gives each
-   scanned entry a bounded step origin. `scan_timespecs` characterizes the validity
-   flags, not universal validity of scanned records. `LocatedEntry.authorized_sound`
+   `lookup_invalidateScope` rejects a record projected from a disabled runtime slot;
+   `invalidateScope_other` leaves nonmatching slots untouched, and `lookup_update_other`
+   prevents a written record authorizing another key. `decodeEntry_encodeEntry` and
+   `decode_encode` round-trip representable fixed-slot entries.
+   `scanStep_bounds` gives `offset + 4 ≤ next ≤ extent`; `scanStep_decoded` ties emitted
+   entries to `decodeSlot`, whose `decodeSlot_validity` characterizes raw timespec flags.
+   `LocatedEntry.authorized_sound`
    additionally requires successful `recordFor` and `valid`, and yields UID/scope,
    valid timespecs, global-or-matching SID, non-disabled/nonfuture time and strict
    finite age. `updateEntry_sound` binds updates to the locked scope and auth UID.
@@ -579,18 +590,27 @@ The README's **Other differences from sudo.ws** are:
 These rules do not impose a no-symlink include policy or require an included
 path's spelling to be a “real directory”; loading follows symlinks and checks the
 relevant file/directory metadata.
+Runtime and visudo retain separate include walkers: runtime failures abort policy
+loading, while visudo also tracks editable files and distinguishes errors from
+warnings. Both use the same ownership checks and lexical directory-entry sorting.
+Command capture shares descriptor-backed digest collection without merging the
+host/root lookup choices; PAM transactions share configuration and cleanup.
 
 ## Build
 
-Pure Lean library/proofs/tests build on Linux and macOS. The C shim and executables
+Pure Lean library and proofs build on Linux and macOS. The C shim and executables
 are Linux-only; use Docker from macOS. Lake's default targets are `LeanSudo`,
 `sudo` and `visudo`; the explicit library target avoids building Linux executables.
 
+Testing: the only tests are the Docker end-to-end suites in `integration/` (real
+binaries, real system components, expectations checked against sudo.ws). Unit tests,
+`#guard`/`#eval`/`example` checks, test-only hooks and mocks are not allowed; internal
+properties are theorems.
+
 ```sh
-lake build LeanSudo Tests               # library, proofs and compile-time #guard tests
+lake build LeanSudo                    # library and proofs
 lake env lean scripts/AxiomAudit.lean   # after building the library
 lake build sudo visudo                 # native Linux executables
-lake build smoke-core smoke-exec smoke-ts  # Linux FFI smoke executables
 integration/build.sh                   # Docker Linux sudo/visudo → .lake/linux/
 integration/run.sh --build              # Docker end-to-end suite
 integration/run.sh reference            # same suite against sudo.ws
@@ -603,4 +623,4 @@ in object dependencies. Linking uses `-ldl -lutil`; optional runtime libraries
 are dynamically loaded. The axiom audit checks every declaration defined in
 imported `LeanSudo` modules, including private/generated definitions, and permits
 only `propext`, `Quot.sound`, and `Classical.choice`. It rejects `sorryAx` and
-`Lean.ofReduceBool`; it does not audit the test library or prove C/IO correctness.
+`Lean.ofReduceBool`; it does not prove C/IO correctness.

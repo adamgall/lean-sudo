@@ -53,11 +53,6 @@ static int set_flags(int fd, int nonblocking)
         if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1)
             return -1;
     }
-#ifdef SO_NOSIGPIPE
-    int one = 1;
-    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) == -1)
-        return -1;
-#endif
     return 0;
 }
 
@@ -478,11 +473,7 @@ static int read_client(struct client *c)
 static int write_client(struct client *c)
 {
     while (c->used < c->length) {
-        int flags = 0;
-#ifdef MSG_NOSIGNAL
-        flags = MSG_NOSIGNAL;
-#endif
-        ssize_t n = send(c->fd, c->buffer + c->used, c->length - c->used, flags);
+        ssize_t n = send(c->fd, c->buffer + c->used, c->length - c->used, MSG_NOSIGNAL);
         if (n > 0) { c->used += (size_t)n; continue; }
         if (n == -1 && errno == EINTR) continue;
         if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;

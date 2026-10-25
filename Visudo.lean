@@ -42,6 +42,10 @@ abbrev LoadM := StateT LoadState IO
 def addError (e : String) : LoadM Unit := modify fun s => { s with errors := s.errors.push e }
 def addWarning (w : String) : LoadM Unit := modify fun s => { s with warnings := s.warnings.push w }
 
+def lockOrFail (path : String) (mode : UInt32) : IO Unit := do
+  if (← lockFile path mode) == .busy then
+    throw (IO.userError s!"{path} busy, try again later")
+
 def readSudoers (path : String) : IO (Except String String) := do
   match ← (readFileFollow path).toBaseIO with
   | .ok (_, text) => pure (.ok text)
@@ -101,9 +105,7 @@ partial def includeFile (host : String) (depth : Nat) (path : String) : LoadM Un
     addError s!"{path}: too many levels of includes"
   else
     if let some mode := (← get).createMode then
-      match ← lockFile path mode with
-      | .busy => throw (IO.userError s!"{path} busy, try again later")
-      | _ => pure ()
+      lockOrFail path mode
     let source := ((← get).overrides.lookup path).getD path
     match ← readSudoers source with
     | .ok text => loadText host depth path text
@@ -120,14 +122,12 @@ partial def includeDir (host : String) (depth : Nat) (dir : String) : LoadM Unit
     match ← (listDir dir).toBaseIO with
     | .error e => addWarning s!"visudo: {dir}: {e}"
     | .ok names =>
-      for name in sortNames (names.filter includeDirEntryOk) do
+      for name in (names.filter includeDirEntryOk).mergeSort (· < ·) do
         let path := dir ++ "/" ++ name
         let some st ← stat path | continue
         if !st.isReg then continue
         if let some mode := (← get).createMode then
-          match ← lockFile path mode with
-          | .busy => throw (IO.userError s!"{path} busy, try again later")
-          | _ => pure ()
+          lockOrFail path mode
         if depth > maxDepth then
           addError s!"{path}: too many levels of includes"
         else
@@ -353,8 +353,7 @@ def EditFile.tmp (f : EditFile) : String := f.path ++ ".tmp"
 
 def openEditFile (path : String) (mode : UInt32) : IO EditFile := do
   let created := (← stat path).isNone
-  if (← lockFile path mode) == .busy then
-    throw (IO.userError s!"{path} busy, try again later")
+  lockOrFail path mode
   let (st, text) ← readFileFollow path
   createTemp (path ++ ".tmp") (withFinalNewline text)
   copyFileTime path (path ++ ".tmp")
@@ -391,6 +390,15 @@ def promptInclude (path : String) : IO Unit := do
   out.putStr (← I18n.translate s!"press return to edit {path}: ")
   out.flush
   let _ ← (← IO.getStdin).getLine
+
+def editInclude (files : IO.Ref (Array EditFile)) (path : String) (mode : UInt32)
+    (editor : String × String × List String) : IO EditFile := do
+  promptInclude path
+  let f ← openEditFile path mode
+  files.modify (·.push f)
+  let f ← editFile f false editor
+  files.modify fun fs => fs.set! (fs.size - 1) f
+  return f
 
 def installFile (o : Options) (f : EditFile) (mainFile : Bool) : IO Unit := do
   let useOwner := o.owner || o.file.isNone
@@ -449,13 +457,8 @@ partial def checkEdits (o : Options) (host : String) (session : IO.Ref (Array Ed
   known.set (previous ++ a.files.filter (!previous.contains ·))
   for path in a.files do
     unless previous.contains path || files.any (·.path == path) do
-      promptInclude path
-      let f ← openEditFile path mode
-      files := files.push f
-      session.set files
-      let f ← editFile f false editor
-      files := files.set! (files.size - 1) f
-      session.set files
+      let f ← editInclude session path mode editor
+      files ← session.get
       reparse := reparse || f.modified
   if reparse then checkEdits o host session known editor mode else pure (some files)
 
@@ -464,8 +467,7 @@ def editMode (o : Options) (path : String) : IO UInt32 := do
   let files ← IO.mkRef (#[] : Array EditFile)
   try
     let created := (← stat path).isNone
-    if (← lockFile path mode) == .busy then
-      throw (IO.userError s!"{path} busy, try again later")
+    lockOrFail path mode
     let (_, text) ← readFileFollow path
     let host ← shortHost
     let current ← analyze host path text o.strict [] (some mode)
@@ -481,11 +483,7 @@ def editMode (o : Options) (path : String) : IO UInt32 := do
     files.set #[(← editFile first true editor)]
     unless o.noIncludes do
       for includePath in current.editable do
-        promptInclude includePath
-        let f ← openEditFile includePath mode
-        files.modify (·.push f)
-        let f ← editFile f false editor
-        files.modify fun fs => fs.set! (fs.size - 1) f
+        let _ ← editInclude files includePath mode editor
     let known ← IO.mkRef current.files
     let mut exitCode : UInt32 := 0
     let mut retained : Array String := #[]

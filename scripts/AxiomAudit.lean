@@ -10,8 +10,7 @@ in particular `sorryAx` (from `sorry`/`admit`) or `Lean.ofReduceBool` (from
 
   lake build LeanSudo && lake env lean scripts/AxiomAudit.lean
 
-Complements the source-level grep (no `sorry`/`admit`/`native_decide`/`implemented_by`)
-and does not cover the test library (`test/`), whose `#guard`s are evaluated at build time.
+Complements the source-level grep (no `sorry`/`admit`/`native_decide`/`implemented_by`).
 -/
 
 open Lean Elab Command

@@ -88,38 +88,34 @@ def namedValue (m : Metadata) (seq name : String) : Option String :=
   | "command" => some (pathValue ((m.command.splitOn "/").getLast!))
   | _ => none
 
-/-- Only the time escapes actually requested need an operating-system oracle. -/
-def timeKeys : List Char → List String
-  | [] => []
-  | '%' :: '%' :: cs => timeKeys cs
-  | '%' :: '{' :: cs => timeKeys (cs.drop ((cs.takeWhile (· != '}')).length + 1))
-  | '%' :: 'E' :: c :: cs => String.ofList ['E', c] :: timeKeys cs
-  | '%' :: 'O' :: c :: cs => String.ofList ['O', c] :: timeKeys cs
-  | '%' :: c :: cs => String.singleton c :: timeKeys cs
-  | _ :: cs => timeKeys cs
-termination_by cs => cs.length
-
-/-- Expand sudo's named escapes and strftime escapes. The shell supplies a snapshot
-of the local-time strftime table, so the path construction remains pure. -/
-def expandChars (m : Metadata) (seq : String) (time : List (String × String)) :
-    List Char → String
-  | [] => ""
-  | '%' :: '%' :: cs => "%" ++ expandChars m seq time cs
+/-- Fold escapes directly, without allocating an intermediate token list. -/
+@[specialize] private def foldEscapes {α : Type} (literal : Char → α → α)
+    (named : List Char → α → α) (time : String → α → α) (empty : α) : List Char → α
+  | [] => empty
+  | '%' :: '%' :: cs => literal '%' (foldEscapes literal named time empty cs)
   | '%' :: '{' :: cs =>
     let name := cs.takeWhile (· != '}')
-    let rest := cs.drop (name.length + 1)
-    (namedValue m seq (String.ofList name)).getD ("%{" ++ String.ofList name ++ "}") ++
-      expandChars m seq time rest
-  | '%' :: 'E' :: c :: cs =>
-    (time.lookup (String.ofList ['E', c])).getD (String.ofList ['%', 'E', c]) ++
-      expandChars m seq time cs
-  | '%' :: 'O' :: c :: cs =>
-    (time.lookup (String.ofList ['O', c])).getD (String.ofList ['%', 'O', c]) ++
-      expandChars m seq time cs
-  | '%' :: c :: cs =>
-    (time.lookup (String.singleton c)).getD (String.ofList ['%', c]) ++ expandChars m seq time cs
-  | c :: cs => String.singleton c ++ expandChars m seq time cs
+    named name (foldEscapes literal named time empty (cs.drop (name.length + 1)))
+  | '%' :: modifier :: rest@(c :: cs) =>
+    if modifier == 'E' || modifier == 'O' then
+      time (String.ofList [modifier, c]) (foldEscapes literal named time empty cs)
+    else time (String.singleton modifier) (foldEscapes literal named time empty rest)
+  | '%' :: c :: cs => time (String.singleton c) (foldEscapes literal named time empty cs)
+  | c :: cs => literal c (foldEscapes literal named time empty cs)
 termination_by cs => cs.length
+
+/-- Only the time escapes actually requested need an operating-system oracle. -/
+def timeKeys (cs : List Char) : List String :=
+  foldEscapes (fun _ rest => rest) (fun _ rest => rest) List.cons [] cs
+
+/-- Expand sudo's named escapes and strftime escapes using the shell's snapshot. -/
+def expandChars (m : Metadata) (seq : String) (time : List (String × String))
+    (cs : List Char) : String :=
+  foldEscapes (fun c rest => String.singleton c ++ rest)
+    (fun chars rest =>
+      let name := String.ofList chars
+      (namedValue m seq name).getD ("%{" ++ name ++ "}") ++ rest)
+    (fun key rest => (time.lookup key).getD ("%" ++ key) ++ rest) "" cs
 
 def expandPath (m : Metadata) (seq : String) (time : List (String × String))
     (pattern : String) : String := expandChars m seq time pattern.toList

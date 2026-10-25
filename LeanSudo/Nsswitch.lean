@@ -1,3 +1,5 @@
+import LeanSudo.SudoConf
+
 namespace LeanSudo.Nsswitch
 
 /-!
@@ -9,30 +11,6 @@ The source selector retains global Defaults from every source, but never
 consults authorization entries beyond a terminal action.
 -/
 
-private def blank (c : Char) : Bool := c == ' ' || c == '\t'
-
-private def trimStart (s : String) : String :=
-  String.ofList (s.toList.dropWhile blank)
-
-private def trimEnd (s : String) : String :=
-  String.ofList ((s.toList.reverse.dropWhile blank).reverse)
-
-private def physicalLine (s : String) : String × Bool := Id.run do
-  let s := String.ofList ((s.toList.reverse.dropWhile (· == '\r')).reverse)
-  let pieces := s.splitOn "#"
-  let body := pieces.headD ""
-  let continued := pieces.length == 1 && body.endsWith "\\" && !body.endsWith "\\\\"
-  let body := if continued then String.ofList (body.toList.dropLast) else trimEnd body
-  return (trimStart body, continued)
-
-private def joinLines : List String → String → List String
-  | [], pending => if pending.isEmpty then [] else [pending]
-  | line :: rest, pending =>
-    let (body, continued) := physicalLine line
-    if continued then joinLines rest (pending ++ body)
-    else (pending ++ body) :: joinLines rest ""
-
-
 structure Source where
   name : String
   returnIfFound : Bool := false
@@ -43,13 +21,11 @@ structure Source where
 def canContinue (source : Source) (found : Bool) : Bool :=
   !(source.returnIfNotFound && !found || source.returnIfFound && found)
 
-private def rawEntry : List String → List String
-  | [] => ["files"]
-  | line :: rest =>
-    if line.toLower.startsWith "sudoers:" then
-      ((String.ofList (line.toList.drop 8)).splitOn " "
-        |>.flatMap (·.splitOn "\t") |>.filter (!·.isEmpty)).map String.toLower
-    else rawEntry rest
+private def rawEntry (text : String) : List String :=
+  (SudoConf.foldLogicalLinesM (m := Id) true (fun (found : Option (List String)) _ line =>
+    if found.isNone && line.toLower.startsWith "sudoers:" then
+      some ((SudoConf.words (String.ofList (line.toList.drop 8))).map String.toLower)
+    else found) none text).getD ["files"]
 
 private def sourceStep (state : List Source × Bool) (token : String) : List Source × Bool :=
   let (sources, attached) := state
@@ -130,7 +106,7 @@ as in sudo_nss.c; no recognized source means the ordinary files default. -/
 def configure (text : String) : Except String (List Source) :=
   if text.toList.contains '\x00' then
     .error "/etc/nsswitch.conf: invalid NUL in configuration"
-  else .ok (approveSources (rawEntry (joinLines (text.splitOn "\n") "")))
+  else .ok (approveSources (rawEntry text))
 
 /-- The configured runtime chain is nonempty and contains only files/SSSD.
 In particular, an explicit supported SSSD source is not replaced by files. -/

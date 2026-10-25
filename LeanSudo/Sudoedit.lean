@@ -42,6 +42,15 @@ As with exec, an editor or its parent resolving outside the configured root is
 refused before preparation; this is the explicit fail-closed exception to upstream
 root semantics, including absolute symlinks that upstream would follow in the jail.
 -/
+def LeanSudo.Core.RunPlan.toSpec (plan : LeanSudo.Core.RunPlan) (path : String)
+    (argv env : Array String) (uid gid : Nat) (groups : List Nat) : LeanSudo.Sys.ExecSpec := {
+  path, argv, env, uid, gid, groups := groups.toArray,
+  cwd := plan.cwd, cwdOptional := plan.cwdOptional, chroot := plan.chroot,
+  umask := plan.umask, usePty := plan.usePty, timeout := plan.timeout,
+  rlimits := plan.rlimits.toArray, utmpUser := plan.utmpUser, closeFrom := plan.closeFrom,
+  execBackground := plan.execBackground, noexecFile := plan.noexecFile,
+  apparmorProfile := plan.apparmorProfile, background := false }
+
 namespace LeanSudo.Sudoedit
 
 private def warn (progname s : String) : IO Unit := do
@@ -243,26 +252,9 @@ def run (progname : String) (plan : Core.EditPlan) (editor : Editor)
     if sessions.isEmpty then return .exited 1
     let started ← Sys.Edit.clock
     let status ← try
-        Sys.runCommand {
-          path := editor.path
-          argv := editor.words.toArray ++ sessions.map (·.temp)
-          env := env
-          uid := plan.editUid
-          gid := plan.editGid
-          groups := plan.editGroups.toArray
-          cwd := plan.cwd
-          cwdOptional := plan.cwdOptional
-          chroot := plan.chroot
-          umask := plan.umask
-          usePty := plan.usePty
-          timeout := plan.timeout
-          rlimits := plan.rlimits.toArray
-          utmpUser := plan.utmpUser
-          closeFrom := plan.closeFrom
-          execBackground := plan.execBackground
-          noexecFile := plan.noexecFile
-          apparmorProfile := plan.apparmorProfile
-          background := false }
+        Sys.runCommand (plan.toRunPlan.toSpec editor.path
+          (editor.words.toArray ++ sessions.map (·.temp)) env
+          plan.editUid plan.editGid plan.editGroups)
       catch e =>
         warn progname e.toString
         pure (.exited 1)

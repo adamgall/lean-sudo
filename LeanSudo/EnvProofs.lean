@@ -3,20 +3,9 @@ import LeanSudo.Env
 /-!
 # Environment theorems
 
-Headline properties of `buildEnv` (DESIGN.md, verified property 6):
-
-* `buildEnv_nodup`: no duplicate keys.
-* `buildEnv_reset_whitelist`: without SETENV-granted extras, entries are from
-  sudo, trusted files/PAM, or the name/value whitelist (including identity coupling).
-* `buildEnv_delete_respected` / `buildEnv_no_LD`: user-controlled blocked entries
-  require reset-mode whitelisting; trusted PAM and files are separate provenance.
-* `buildEnv_no_bash_fn`: function values have trusted or explicitly authorized
-  provenance. `userPass_unapproved_function` excludes reset-mode functions without
-  a value-qualified match; SETENV and copy-mode policy can authorize functions.
-* `buildEnv_securePath`: without SETENV, successful validation rejects every
-  explicit PATH assignment; only a trusted PAM overwrite can replace secure_path.
-* `buildEnv_securePath_of_bindingSafe` / `buildEnv_sudo_vars`: rebuilt values
-  survive compatible later writes, including explicitly authorized overrides.
+Provenance, filtering, identity preservation and uniqueness for `buildEnv`;
+see DESIGN.md, verified property 6. Shared invariant lemmas cover the construction
+steps without weakening the trusted-source or compatible-write premises.
 -/
 
 namespace LeanSudo
@@ -286,6 +275,10 @@ def Origin (i : EnvInput) (reset : Bool) (extra : EnvList) (kv : String × Strin
   -- set by sudo
   kv ∈ sudoValues i
 
+private theorem origin_of_sudoValues {i : EnvInput} {reset : Bool} {extra : EnvList}
+    (kv : String × String) (h : kv ∈ sudoValues i) : Origin i reset extra kv :=
+  Or.inr (Or.inr (Or.inr (Or.inr (Or.inr h))))
+
 theorem inv_baseEnv (i : EnvInput) (reset : Bool) (extra : EnvList) :
     Inv (Origin i reset extra) (baseEnv i reset) := by
   unfold baseEnv
@@ -304,8 +297,7 @@ theorem baseEnv_user {i : EnvInput} {reset : Bool} {kv : String × String}
 theorem inv_defaultsReset (i : EnvInput) (reset : Bool) (extra : EnvList) :
     Inv (Origin i reset extra) (defaultsReset i (baseEnv i reset)) := by
   have hb := inv_baseEnv i reset extra
-  have sv : ∀ kv ∈ sudoValues i, Origin i reset extra kv := fun kv h => by
-    simp only [Origin]; exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr h))))
+  have sv := @origin_of_sudoValues i reset extra
   have copy : ∀ k k' v, k ∈ ["LOGNAME", "USER"] → (k', v) ∈ baseEnv i reset →
       Origin i reset extra (k, v) := fun k k' v hk hm => by
     have := baseEnv_user hm
@@ -315,33 +307,36 @@ theorem inv_defaultsReset (i : EnvInput) (reset : Bool) (extra : EnvList) :
         setVar (setVar (setVar (baseEnv i reset) "SHELL" i.target.shell) "LOGNAME" i.target.name)
           "USER" i.target.name
       else if i.settings.setLogname then lognameReset i (baseEnv i reset)
-      else setDefault (setDefault (baseEnv i reset) "LOGNAME" i.invoking.name) "USER" i.invoking.name) := by
+      else setDefault (setDefault (baseEnv i reset) "LOGNAME" i.invoking.name)
+        "USER" i.invoking.name) := by
     split
     · exact inv_setVar (inv_setVar (inv_setVar hb (sv _ (by simp [sudoValues])))
         (sv _ (by simp [sudoValues]))) (sv _ (by simp [sudoValues]))
     · split
       · unfold lognameReset
         split
-        · exact inv_setVar (inv_setVar hb (sv _ (by simp [sudoValues]))) (sv _ (by simp [sudoValues]))
+        · exact inv_setVar (inv_setVar hb (sv _ (by simp [sudoValues])))
+            (sv _ (by simp [sudoValues]))
         · rename_i l _ hl _
           exact inv_setVar hb (copy _ _ _ (by simp) (lookup_mem hl))
         · rename_i u _ hu
           exact inv_setVar hb (copy _ _ _ (by simp) (lookup_mem hu))
         · exact hb
-      · exact inv_setDefault (inv_setDefault hb (sv _ (by simp [sudoValues]))) (sv _ (by simp [sudoValues]))
+      · exact inv_setDefault (inv_setDefault hb (sv _ (by simp [sudoValues])))
+          (sv _ (by simp [sudoValues]))
   unfold defaultsReset
   simp only
   split <;> split
   all_goals first
-    | exact inv_setVar (inv_setVar h1 (sv _ (by simp [sudoValues]))) (sv _ (by simp [sudoValues]))
+    | exact inv_setVar (inv_setVar h1 (sv _ (by simp [sudoValues])))
+        (sv _ (by simp [sudoValues]))
     | exact inv_setVar h1 (sv _ (by simp [sudoValues]))
     | exact h1
 
 theorem inv_defaultsCopy (i : EnvInput) (reset : Bool) (extra : EnvList) :
     Inv (Origin i reset extra) (defaultsCopy i (baseEnv i reset)) := by
   have hb := inv_baseEnv i reset extra
-  have sv : ∀ kv ∈ sudoValues i, Origin i reset extra kv := fun kv h => by
-    simp only [Origin]; exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr h))))
+  have sv := @origin_of_sudoValues i reset extra
   unfold defaultsCopy
   simp only
   have h1 : Inv (Origin i reset extra)
@@ -349,7 +344,8 @@ theorem inv_defaultsCopy (i : EnvInput) (reset : Bool) (extra : EnvList) :
         setVar (setVar (baseEnv i reset) "LOGNAME" i.target.name) "USER" i.target.name
        else baseEnv i reset) := by
     split
-    · exact inv_setVar (inv_setVar hb (sv _ (by simp [sudoValues]))) (sv _ (by simp [sudoValues]))
+    · exact inv_setVar (inv_setVar hb (sv _ (by simp [sudoValues])))
+        (sv _ (by simp [sudoValues]))
     · exact hb
   split
   · exact inv_setVar h1 (sv _ (by simp [sudoValues]))
@@ -357,8 +353,7 @@ theorem inv_defaultsCopy (i : EnvInput) (reset : Bool) (extra : EnvList) :
 
 theorem inv_commonDefaults (i : EnvInput) (reset : Bool) (extra : EnvList) {e : EnvList}
     (he : Inv (Origin i reset extra) e) : Inv (Origin i reset extra) (commonDefaults i e) := by
-  have sv : ∀ kv ∈ sudoValues i, Origin i reset extra kv := fun kv h => by
-    simp only [Origin]; exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr h))))
+  have sv := @origin_of_sudoValues i reset extra
   unfold commonDefaults
   simp only
   have h2 := inv_setDefault (inv_setDefault he (sv ("SHELL", i.target.shell) (by simp [sudoValues])))
@@ -373,8 +368,7 @@ theorem inv_commonDefaults (i : EnvInput) (reset : Bool) (extra : EnvList) {e : 
 
 theorem mem_assemble_origin {i : EnvInput} {reset : Bool} {extra : EnvList} {kv : String × String}
     (h : kv ∈ assemble i reset extra) : Origin i reset extra kv ∨ kv ∈ fileVars i := by
-  have sv : ∀ kv ∈ sudoValues i, Origin i reset extra kv := fun kv h => by
-    simp only [Origin]; exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr h))))
+  have sv := @origin_of_sudoValues i reset extra
   have h1 : Inv (Origin i reset extra)
       (if reset then defaultsReset i (baseEnv i reset) else defaultsCopy i (baseEnv i reset)) := by
     split
@@ -493,8 +487,9 @@ theorem sudoValues_key {i : EnvInput} {kv : String × String} (h : kv ∈ sudoVa
   simp only [sudoKeys, List.mem_cons, List.not_mem_nil, or_false]
   rcases h with h | h
   · simp only [List.mem_cons, Prod.mk.injEq, List.not_mem_nil, or_false] at h
-    rcases h with ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ |
-      ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ |
+    rcases h with ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ |
+      ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ |
+      ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ | ⟨rfl, -⟩ |
       ⟨rfl, -⟩ | ⟨rfl, -⟩ <;> simp
   · split at h
     · simp only [List.mem_cons, Prod.mk.injEq, List.not_mem_nil, or_false] at h
@@ -733,15 +728,12 @@ theorem buildEnv_sudo_vars {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok 
   obtain ⟨rfl, -, -⟩ := buildEnv_ok h
   refine ⟨mem_assemble_of_bindingSafe hc ?_, mem_assemble_of_bindingSafe hu ?_,
     mem_assemble_of_bindingSafe hi ?_, mem_assemble_of_bindingSafe hg ?_⟩
-  · unfold sudoVars
-    refine mem_setVar_of_ne (mem_setVar_of_ne (mem_setVar_of_ne (mem_setVar_self _ _ _) ?_) ?_) ?_ <;>
-      (dsimp only; decide)
-  · unfold sudoVars
-    refine mem_setVar_of_ne (mem_setVar_of_ne (mem_setVar_self _ _ _) ?_) ?_ <;> (dsimp only; decide)
-  · unfold sudoVars
-    exact mem_setVar_of_ne (mem_setVar_self _ _ _) (by dsimp only; decide)
-  · unfold sudoVars
-    exact mem_setVar_self _ _ _
+  all_goals
+    unfold sudoVars
+    repeat first
+      | exact mem_setVar_self _ _ _
+      | apply mem_setVar_of_ne
+    all_goals simp
 
 
 /-- Restricted files use user filtering; unrestricted entries come only from the

@@ -8,6 +8,8 @@ sudo's `toke.l`; unsupported execution features are represented in the AST and
 refused by the decision core, not by the grammar. Syntax errors remain fatal.
 Nonfatal syntax deprecations are retained on each located entry for the runtime
 and visudo loaders to render without changing policy semantics.
+Escape decoding, character-class folds, and separated lists share scanners while
+retaining token-specific delimiters, empty-value checks, and error messages.
 
 Termination: every loop runs over a bounded range of `input length + 1` iterations and
 each iteration consumes at least one character (or exits); running out of iterations
@@ -191,8 +193,9 @@ def wordEscape : P (List UInt8) := do
   | x :: _ => advance; return charBytes x.c
   | [] => err "unterminated escape"
 
-/-- sudo `WORD`: returns the unescaped text and whether any escape was used. -/
-def readWord : P (String × Bool) := do
+/-- Shared WORD/ENVAR escape scanner; retain raw bytes for pre-decoding empty checks. -/
+def escapedRun (breakEscape : Char → Bool) (stop : Bool → Char → Bool) :
+    P (List UInt8 × Bool) := do
   let mut acc : List UInt8 := []
   let mut esc := false
   for _ in [0:(← fuel)] do
@@ -201,16 +204,21 @@ def readWord : P (String × Bool) := do
       if c.c == '\\' then
         match cs with
         | d :: _ =>
-          if d.c == '\n' || d.c == '\t' || isCont cs then break
+          if breakEscape d.c || isCont cs then break
           set cs
           esc := true
           acc := (← wordEscape).reverse ++ acc
         | [] => break
-      else if isWordChar c.c then
+      else if !stop acc.isEmpty c.c then
         set cs
         acc := (charBytes c.c).reverse ++ acc
       else break
     | [] => break
+  return (acc, esc)
+
+/-- sudo `WORD`: returns the unescaped text and whether any escape was used. -/
+def readWord : P (String × Bool) := do
+  let (acc, esc) ← escapedRun (· == '\t') (fun _ c => !isWordChar c)
   return (← decodedWord acc, esc)
 
 /-- INSTR emits standalone backslashes verbatim (including `\xHH`).
@@ -244,20 +252,26 @@ def readQuoted : P String := do
         acc := (charBytes c.c).reverse ++ acc
   err "unterminated quoted string"
 
-/-- Decimal number (for `#uid` / `%#gid`); must not run into a word character. -/
-def readNat : P Nat := do
-  let mut n := 0
-  let mut any := false
+/-- Consume a character class without allocating intermediate character lists. -/
+def foldChars (p : Char → Bool) (step : α → Char → α) (init : α) : P α := do
+  let mut acc := init
   for _ in [0:(← fuel)] do
     match (← peek) with
     | some c =>
-      if c.isDigit then
-        advance
-        n := n * 10 + (c.toNat - '0'.toNat)
-        any := true
-      else break
+      if !p c then break
+      advance
+      acc := step acc c
     | none => break
-  if !any then err "expected a numeric id"
+  return acc
+
+/-- Look ahead through a character class, leaving speculative input unconsumed. -/
+def takeChars (p : Char → Bool) (input : List PChar) : List Char :=
+  (input.takeWhile (fun c => p c.c)).map (·.c)
+
+/-- Decimal number (for `#uid` / `%#gid`); must not run into a word character. -/
+def readNat : P Nat := do
+  if (← fuel) == 0 || !(← peek).any Char.isDigit then err "expected a numeric id"
+  let n ← foldChars Char.isDigit (fun n c => n * 10 + (c.toNat - '0'.toNat)) 0
   match (← peek) with
   | some c => if isWordChar c || c == '\\' then err "invalid numeric id" else pure n
   | none => pure n
@@ -265,12 +279,7 @@ def readNat : P Nat := do
 /-- One contiguous `!+` token, followed by optional blanks. -/
 def negCount : P Nat := do
   ws
-  let mut n := 0
-  for _ in [0:(← fuel)] do
-    if (← peek) == some '!' then
-      advance
-      n := n + 1
-    else break
+  let n ← foldChars (· == '!') (fun n _ => n + 1) 0
   ws
   return n
 
@@ -279,17 +288,20 @@ def member (atom : P α) : P (Member α) := do
   let a ← atom
   return ⟨n % 2 == 1, a⟩
 
-/-- `item (, item)*` with optional blanks around the commas. -/
-def list1 (item : P α) : P (List α) := do
+/-- Nonempty separated lists, preserving each caller's exhaustion diagnostic. -/
+def sepBy1 (sep : Char) (item : P α) (tooLong : String) : P (List α) := do
   let mut acc := [← item]
   for _ in [0:(← fuel)] do
     ws
-    if (← peek) == some ',' then
+    if (← peek) == some sep then
       advance
       ws
       acc := (← item) :: acc
     else return acc.reverse
-  err "list too long"
+  err tooLong
+
+/-- `item (, item)*` with optional blanks around the commas. -/
+def list1 (item : P α) : P (List α) := sepBy1 ',' item "list too long"
 
 /-! ## Atoms -/
 
@@ -425,9 +437,9 @@ def hostAtom : P HostAtom := do
     if w.isEmpty then err "empty netgroup"
     return .netgroup w
   let inp ← get
-  let candidate := inp.takeWhile fun c =>
-    !isBlank c.c && c.c != '\n' && c.c != ',' && c.c != '=' && c.c != '#'
-  if let some net := network (String.ofList (candidate.map (·.c))) then
+  let candidate := takeChars (fun c =>
+    !isBlank c && c != '\n' && c != ',' && c != '=' && c != '#') inp
+  if let some net := network (String.ofList candidate) then
     set (inp.drop candidate.length)
     return net
   let pos ← curPos
@@ -606,9 +618,9 @@ def readDigests : P (List Digest) := do
     set rest
     ws
     let inp ← get
-    let chars := inp.takeWhile fun c => (base64Digit c.c).isSome || c.c == '='
+    let chars := takeChars (fun c => (base64Digit c).isSome || c == '=') inp
     set (inp.drop chars.length)
-    let spelling := String.ofList (chars.map (·.c))
+    let spelling := String.ofList chars
     let some bytes := decodeDigest spelling size | err "invalid digest"
     ds := { algo, bytes, spelling } :: ds
     ws
@@ -665,32 +677,19 @@ def groupAtom : P UserAtom := do
 def runasSpec : P RunasSpec := do
   expect '('
   ws
-  match (← peek) with
-  | some ')' =>
+  let p ← peek
+  let implicitUser := p == some ')' || p == some ':'
+  let users ← if implicitUser then pure [⟨false, .myself⟩] else list1 (member userAtom)
+  ws
+  let mut groups := none
+  if (← peek) == some ':' then
     advance
-    return { users := some [⟨false, .myself⟩], groups := none }
-  | some ':' =>
-    advance
     ws
-    if (← peek) == some ')' then
-      advance
-      return { users := some [⟨false, .myself⟩], groups := none }
-    let g ← list1 (member groupAtom)
-    ws
-    expect ')'
-    return { users := some [⟨false, .myself⟩], groups := some g }
-  | _ =>
-    let u ← list1 (member userAtom)
-    ws
-    if (← peek) == some ':' then
-      advance
+    if !implicitUser || (← peek) != some ')' then
+      groups := some (← list1 (member groupAtom))
       ws
-      let g ← list1 (member groupAtom)
-      ws
-      expect ')'
-      return { users := some u, groups := some g }
-    expect ')'
-    return { users := some u, groups := none }
+  expect ')'
+  return { users := some users, groups }
 
 /-- State inherited between the commands of one `Cmnd_Spec_List`. -/
 structure Inherit where
@@ -900,15 +899,8 @@ def userSpec : P UserSpec := do
   let before ← get
   let users ← list1 (member userAtom)
   ws
-  let mut entries := [← hostCmnds]
-  for _ in [0:(← fuel)] do
-    ws
-    if (← peek) == some ':' then
-      advance
-      ws
-      entries := (← hostCmnds) :: entries
-    else return { users, entries := entries.reverse, source := some (sourcePosition (← curPos) 0 before) }
-  err "user specification too long"
+  let entries ← sepBy1 ':' hostCmnds "user specification too long"
+  return { users, entries, source := some (sourcePosition (← curPos) 0 before) }
 
 /-! ## Aliases and Defaults -/
 
@@ -919,49 +911,24 @@ def aliasName : P String := do
   let (w, esc) ← readWord
   if w.isEmpty then errAt pos s!"expected an alias name, found {describe p}"
   if esc || !isAliasName w then errAt pos s!"invalid alias name \"{w}\""
-  if (["ALL", "CHROOT", "CWD", "TIMEOUT", "NOTBEFORE", "NOTAFTER", "ROLE",
-      "TYPE", "PRIVS", "LIMITPRIVS", "APPARMOR_PROFILE"] : List String).contains w then
+  if ("ALL" :: optionNames).contains w then
     errAt pos s!"\"{w}\" is a reserved word and cannot be used as an alias name"
   return w
 
 /-- `NAME = list (: NAME = list)*` -/
-def aliasDefs (item : P α) : P (List (String × List α)) := do
-  let name ← aliasName
-  ws
-  expect '='
-  ws
-  let mut acc := [(name, ← list1 item)]
-  for _ in [0:(← fuel)] do
+def aliasDefs (item : P α) : P (List (String × List α)) :=
+  sepBy1 ':' (do
+    let name ← aliasName
     ws
-    if (← peek) == some ':' then
-      advance
-      let name ← aliasName
-      ws
-      expect '='
-      ws
-      acc := (name, ← list1 item) :: acc
-    else return acc.reverse
-  err "alias definition too long"
+    expect '='
+    ws
+    return (name, ← list1 item)) "alias definition too long"
 
 /-- Bare Defaults value (sudo `ENVAR`): no `"` `!` `=` `,` or blanks; `\c` → `c`. -/
 def bareValue : P String := do
-  let mut acc : List UInt8 := []
-  for _ in [0:(← fuel)] do
-    match (← get) with
-    | [] => break
-    | c :: cs =>
-      if c.c == '\\' then
-        if isCont cs then break
-        match cs with
-        | _ :: _ =>
-          set cs
-          acc := (← wordEscape).reverse ++ acc
-        | [] => break
-      else if isBlank c.c || c.c == '\n' || c.c == '"' || c.c == '#' || c.c == '=' ||
-          c.c == ',' || (acc.isEmpty && c.c == '!') then break
-      else
-        set cs
-        acc := (charBytes c.c).reverse ++ acc
+  let (acc, _) ← escapedRun (fun _ => false) fun empty c =>
+    isBlank c || c == '\n' || c == '"' || c == '#' || c == '=' ||
+      c == ',' || (empty && c == '!')
   if acc.isEmpty then err "missing value"
   return (← decodedWord acc)
 
@@ -970,16 +937,8 @@ def defaultsValue : P String := do
   if (← peek) == some '"' then readQuoted else bareValue
 
 def readName : P String := do
-  let mut acc : List Char := []
-  for _ in [0:(← fuel)] do
-    match (← peek) with
-    | some c =>
-      if ('a' ≤ c && c ≤ 'z') || c == '_' then
-        advance
-        acc := c :: acc
-      else break
-    | none => break
-  return String.ofList acc.reverse
+  let chars ← foldChars (fun c => ('a' ≤ c && c ≤ 'z') || c == '_') (fun cs c => c :: cs) []
+  return String.ofList chars.reverse
 
 def defaultsSetting : P DefaultsSetting := do
   let n ← negCount
@@ -1034,22 +993,7 @@ def defaultsEntry : P Entry := do
 def includePath : P String := do
   ws
   if (← peek) == some '"' then return (← readQuoted)
-  let mut acc : List UInt8 := []
-  for _ in [0:(← fuel)] do
-    match (← get) with
-    | [] => break
-    | c :: cs =>
-      if c.c == '\\' then
-        match cs with
-        | d :: _ =>
-          if d.c == '\n' || isCont cs then break
-          set cs
-          acc := (← wordEscape).reverse ++ acc
-        | [] => break
-      else if isBlank c.c || c.c == '\n' then break
-      else
-        set cs
-        acc := (charBytes c.c).reverse ++ acc
+  let (acc, _) ← escapedRun (fun _ => false) (fun _ c => isBlank c || c == '\n')
   if acc.isEmpty then err "missing include path"
   return (← decodedWord acc)
 
@@ -1115,9 +1059,7 @@ def entry : P (List Entry) := do
       return (← aliasDefs (member userAtom)).map fun (n, ms) => .runasAlias n ms,
     try1 "Host_Alias" do
       return (← aliasDefs (member hostAtom)).map fun (n, ms) => .hostAlias n ms,
-    try1 "Cmnd_Alias" do
-      return (← aliasDefs (cmndMember true)).map fun (n, ms) => .cmndAlias n ms,
-    try1 "Cmd_Alias" do
+    ["Cmnd_Alias", "Cmd_Alias"].findSome? fun kw => try1 kw do
       return (← aliasDefs (cmndMember true)).map fun (n, ms) => .cmndAlias n ms]
   match aliases.findSome? id with
   | some k => k
@@ -1221,17 +1163,6 @@ theorem parse_file_eq {file text : String} {es : List Located}
   simp only [Parser.wellFormed, Bool.and_eq_true, beq_iff_eq] at this
   exact this.1.2
 
-/-- The parser never yields a command atom with a non-absolute path. -/
-theorem parse_command_absolute {file text : String} {es : List Located}
-    (h : parse file text = .ok es) :
-    ∀ l ∈ es, ∀ p a, CmndAtom.command p a ∈ Parser.cmndAtoms l.entry →
-      p.toList.head? = some '/' := by
-  intro l hl p a hm
-  have := parse_wellFormed h l hl
-  simp only [Parser.wellFormed, Bool.and_eq_true, List.all_eq_true] at this
-  have := this.2 _ hm
-  simpa [Parser.CmndAtom.pathOk] using this
-
 /-- The same structural guarantee covers nested digest commands and regexes. -/
 theorem parse_atom_safe {file text : String} {es : List Located}
     (h : parse file text = .ok es) :
@@ -1240,6 +1171,14 @@ theorem parse_atom_safe {file text : String} {es : List Located}
   have hw := parse_wellFormed h l hl
   simp only [Parser.wellFormed, Bool.and_eq_true, List.all_eq_true] at hw
   exact hw.2 c hc
+
+/-- The parser never yields a command atom with a non-absolute path. -/
+theorem parse_command_absolute {file text : String} {es : List Located}
+    (h : parse file text = .ok es) :
+    ∀ l ∈ es, ∀ p a, CmndAtom.command p a ∈ Parser.cmndAtoms l.entry →
+      p.toList.head? = some '/' := by
+  intro l hl p a hm
+  simpa [Parser.CmndAtom.pathOk] using parse_atom_safe h l hl _ hm
 
 theorem parse_digest_command_absolute {file text : String} {es : List Located}
     (h : parse file text = .ok es) :

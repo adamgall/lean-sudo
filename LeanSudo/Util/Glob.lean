@@ -197,9 +197,7 @@ theorem matchToks_lits_append (pn : Bool) (cs : List Char) (ts : List Tok) :
     | cons d t =>
       simp only [List.map_cons, List.cons_append, matchToks, charEq, Bool.false_eq_true,
         ↓reduceIte, Bool.and_eq_true, beq_iff_eq, ih, List.cons.injEq]
-      constructor
-      · rintro ⟨rfl, u, rfl, hu⟩; exact ⟨u, ⟨rfl, rfl⟩, hu⟩
-      · rintro ⟨u, ⟨rfl, rfl⟩, hu⟩; exact ⟨rfl, u, rfl, hu⟩
+      grind
 
 theorem matchToks_lits (pn : Bool) (cs t : List Char) :
     matchToks pn false (cs.map Tok.lit) t = (cs == t) := by
@@ -277,11 +275,6 @@ theorem fnmatch_prefix_star_pathname (pre s : String) (h : hasMeta pre = false) 
 
 /-- Special case: with `pathname`, `*` matches exactly the `/`-free strings. -/
 theorem fnmatch_star_pathname (s : String) : fnmatch "*" s true = true ↔ '/' ∉ s.toList := by
-  have := fnmatch_prefix_star_pathname "" s (by decide)
-  simp only [String.empty_append] at this
-  rw [this]
-  constructor
-  · rintro ⟨t, rfl, ht⟩; exact ht
-  · intro hs; exact ⟨s, rfl, hs⟩
+  simpa using fnmatch_prefix_star_pathname "" s (by decide)
 
 end LeanSudo.Glob

@@ -5,7 +5,7 @@
  * Storage semantics follow sudo v1.9.17p2 plugins/sudoers/timestamp.c,
  * boottime.c, set_perms.c and lib/util/{secure_path,gettime,mkdir_parents}.c.
  */
-#include <lean/lean.h>
+#include "shim.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -25,40 +25,20 @@
 #include <time.h>
 #include <unistd.h>
 
-/*
- * Bounded formatting; messages are silently truncated (they only contain paths of
- * bounded length and errno text).
- */
-__attribute__((format(printf, 3, 4)))
-static void ts_fmt(char *buf, size_t len, const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, len, fmt, ap);
-    va_end(ap);
-}
-
-static lean_obj_res ts_user_error(const char *msg) {
-    return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(msg)));
-}
 
 static lean_obj_res ts_errno_error(const char *what, int err) {
     char buf[4608];
-    ts_fmt(buf, sizeof buf, "%s: %s", what, strerror(err));
-    return ts_user_error(buf);
+    snprintf(buf, sizeof buf, "%s: %s", what, strerror(err));
+    return ls_error(buf);
 }
 
 /* ---- clocks and process identity ---------------------------------------- */
 
 static int ts_real_time(struct timespec *ts) {
-    int rc;
-    do {
-        rc = clock_gettime(CLOCK_REALTIME, ts);
-    } while (rc != 0 && errno == EINTR);
+    int rc = TEMP_FAILURE_RETRY(clock_gettime(CLOCK_REALTIME, ts));
     if (rc != 0) {
         struct timeval tv;
-        do {
-            rc = gettimeofday(&tv, NULL);
-        } while (rc != 0 && errno == EINTR);
+        rc = TEMP_FAILURE_RETRY(gettimeofday(&tv, NULL));
         if (rc == 0) {
             ts->tv_sec = tv.tv_sec;
             ts->tv_nsec = tv.tv_usec * 1000L;
@@ -71,29 +51,12 @@ static int ts_real_time(struct timespec *ts) {
 LEAN_EXPORT lean_obj_res lean_sudo_ts_boottime(lean_obj_arg w) {
     (void)w;
     struct timespec ts;
-    int rc;
-#if defined(CLOCK_BOOTTIME)
-    const clockid_t clock = CLOCK_BOOTTIME;
-#elif defined(CLOCK_MONOTONIC_RAW)
-    const clockid_t clock = CLOCK_MONOTONIC_RAW;
-#else
-    const clockid_t clock = CLOCK_MONOTONIC;
-#endif
     static bool use_real_time;
-#ifdef _SC_MONOTONIC_CLOCK
-    if (sysconf(_SC_MONOTONIC_CLOCK) == -1)
+    if (sysconf(_SC_MONOTONIC_CLOCK) == -1) use_real_time = true;
+    int rc = use_real_time ? -1 : TEMP_FAILURE_RETRY(clock_gettime(CLOCK_BOOTTIME, &ts));
+    if (rc != 0) {
         use_real_time = true;
-#endif
-    if (use_real_time) {
         rc = ts_real_time(&ts);
-    } else {
-        do {
-            rc = clock_gettime(clock, &ts);
-        } while (rc != 0 && errno == EINTR);
-        if (rc != 0) {
-            use_real_time = true;
-            rc = ts_real_time(&ts);
-        }
     }
     if (rc != 0)
         return ts_errno_error("timestamp clock", errno);
@@ -141,7 +104,7 @@ static int ts_open_dir(int dirfd, const char *name, const char *display, mode_t 
         if (mkdirat(dirfd, name, mode) == 0) {
             created = true;
         } else if (errno != EEXIST) {
-            ts_fmt(err, errlen, "%s: %s", display, strerror(errno));
+            snprintf(err, errlen, "%s: %s", display, strerror(errno));
             return -1;
         }
     }
@@ -149,28 +112,28 @@ static int ts_open_dir(int dirfd, const char *name, const char *display, mode_t 
     if (fd < 0) {
         int e = errno;
         if (e == ELOOP || e == ENOTDIR)
-            ts_fmt(err, errlen, "%s: not a directory", display);
+            snprintf(err, errlen, "%s: not a directory", display);
         else
-            ts_fmt(err, errlen, "%s: %s", display, strerror(e));
+            snprintf(err, errlen, "%s: %s", display, strerror(e));
         errno = e;
         return -1;
     }
     struct stat st;
     if (fstat(fd, &st) != 0) {
         int e = errno;
-        ts_fmt(err, errlen, "%s: %s", display, strerror(e));
+        snprintf(err, errlen, "%s: %s", display, strerror(e));
         close(fd);
         errno = e;
         return -1;
     }
     if (!S_ISDIR(st.st_mode)) {
-        ts_fmt(err, errlen, "%s: not a directory", display);
+        snprintf(err, errlen, "%s: not a directory", display);
         close(fd);
         errno = ENOTDIR;
         return -1;
     }
     if (st.st_uid != 0) {
-        ts_fmt(err, errlen, "%s is owned by uid %u, should be 0", display,
+        snprintf(err, errlen, "%s is owned by uid %u, should be 0", display,
                  (unsigned)st.st_uid);
         close(fd);
         errno = EPERM;
@@ -178,13 +141,13 @@ static int ts_open_dir(int dirfd, const char *name, const char *display, mode_t 
     }
     if (created && fchmod(fd, mode) != 0) {
         int e = errno;
-        ts_fmt(err, errlen, "%s: %s", display, strerror(e));
+        snprintf(err, errlen, "%s: %s", display, strerror(e));
         close(fd);
         errno = e;
         return -1;
     }
     if (!created && (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
-        ts_fmt(err, errlen, "%s is group or world writable", display);
+        snprintf(err, errlen, "%s is group or world writable", display);
         close(fd);
         errno = EPERM;
         return -1;
@@ -198,7 +161,7 @@ LEAN_EXPORT lean_obj_res lean_sudo_state_marker(b_lean_obj_arg path, uint32_t ui
     (void)w;
     const char *p = lean_string_cstr(path);
     if (strlen(p) != lean_string_size(path) - 1 || p[0] != '/')
-        return ts_user_error("invalid state directory");
+        return ls_error("invalid state directory");
     char *copy = strdup(p);
     if (!copy) return ts_errno_error("state directory", ENOMEM);
     int dir = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -206,20 +169,20 @@ LEAN_EXPORT lean_obj_res lean_sudo_state_marker(b_lean_obj_arg path, uint32_t ui
     char err[4608], *save = NULL;
     for (char *name = strtok_r(copy, "/", &save); name; name = strtok_r(NULL, "/", &save)) {
         if (!strcmp(name, ".") || !strcmp(name, "..")) {
-            close(dir); free(copy); return ts_user_error("invalid state directory component");
+            close(dir); free(copy); return ls_error("invalid state directory component");
         }
         int next = ts_open_dir(dir, name, p, 0700, create, err, sizeof(err));
         close(dir);
         if (next < 0) {
             free(copy);
             if (!create && errno == ENOENT) return lean_io_result_mk_ok(lean_box(0));
-            return ts_user_error(err);
+            return ls_error(err);
         }
         dir = next;
     }
     free(copy);
     char name[16];
-    ts_fmt(name, sizeof(name), "%u", (unsigned)uid);
+    snprintf(name, sizeof(name), "%u", (unsigned)uid);
     int fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK |
         (create ? O_CREAT : 0), 0600);
     int saved = errno;
@@ -232,7 +195,7 @@ LEAN_EXPORT lean_obj_res lean_sudo_state_marker(b_lean_obj_arg path, uint32_t ui
     bool valid = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
         st.st_uid == 0 && !(st.st_mode & 022);
     close(fd);
-    if (!valid) return ts_user_error("unsafe state marker");
+    if (!valid) return ls_error("unsafe state marker");
     return lean_io_result_mk_ok(lean_box(1));
 }
 
@@ -243,22 +206,6 @@ static int ts_close_error(int fd, int error) {
         (void)close(fd);
     errno = error;
     return -1;
-}
-
-static int ts_fstat(int fd, struct stat *st) {
-    int rc;
-    do {
-        rc = fstat(fd, st);
-    } while (rc != 0 && errno == EINTR);
-    return rc;
-}
-
-static int ts_openat(int dir, const char *name, int flags, mode_t mode) {
-    int fd;
-    do {
-        fd = openat(dir, name, flags, mode);
-    } while (fd < 0 && errno == EINTR);
-    return fd;
 }
 
 /* Reject embedded NULs, traversal and the chown/setuid sentinel values. */
@@ -296,7 +243,7 @@ static bool ts_valid_args(b_lean_obj_arg directory, b_lean_obj_arg filename,
  */
 static int ts_check_directory(int fd, uid_t uid, gid_t gid) {
     struct stat st;
-    if (ts_fstat(fd, &st) != 0)
+    if (TEMP_FAILURE_RETRY(fstat(fd, &st)) != 0)
         return ts_close_error(fd, errno);
     if (!S_ISDIR(st.st_mode))
         return ts_close_error(fd, ENOTDIR);
@@ -307,8 +254,8 @@ static int ts_check_directory(int fd, uid_t uid, gid_t gid) {
 }
 
 static int ts_directory(const char *path, uid_t uid, gid_t gid, bool create) {
-    int dir = ts_openat(AT_FDCWD, path,
-        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NONBLOCK, 0);
+    int dir = TEMP_FAILURE_RETRY(openat(AT_FDCWD, path,
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NONBLOCK, 0));
     if (dir >= 0)
         return ts_check_directory(dir, uid, gid);
     if (!create || errno != ENOENT)
@@ -316,7 +263,7 @@ static int ts_directory(const char *path, uid_t uid, gid_t gid, bool create) {
 
     char copy[PATH_MAX];
     memcpy(copy, path, strlen(path) + 1);
-    dir = ts_openat(AT_FDCWD, "/", O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    dir = TEMP_FAILURE_RETRY(openat(AT_FDCWD, "/", O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0));
     if (dir < 0)
         return -1;
     char *save = NULL;
@@ -325,41 +272,35 @@ static int ts_directory(const char *path, uid_t uid, gid_t gid, bool create) {
         char *next = strtok_r(NULL, "/", &save);
         bool final = next == NULL;
         bool created = false;
-        int fd = ts_openat(dir, name,
-            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NONBLOCK, 0);
+        int fd = TEMP_FAILURE_RETRY(openat(dir, name,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NONBLOCK, 0));
         if (fd < 0 && errno == ENOENT) {
             int rc;
-            do {
-                rc = mkdirat(dir, name, 0700);
-            } while (rc != 0 && errno == EINTR);
+            rc = TEMP_FAILURE_RETRY(mkdirat(dir, name, 0700));
             if (rc == 0)
                 created = true;
             else if (errno != EEXIST)
                 return ts_close_error(dir, errno);
-            fd = ts_openat(dir, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC |
-                O_NONBLOCK | (created && !final ? O_NOFOLLOW : 0), 0);
+            fd = TEMP_FAILURE_RETRY(openat(dir, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC |
+                O_NONBLOCK | (created && !final ? O_NOFOLLOW : 0), 0));
         }
         if (fd < 0)
             return ts_close_error(dir, errno);
         (void)close(dir);
         dir = fd;
         struct stat st;
-        if (ts_fstat(dir, &st) != 0)
+        if (TEMP_FAILURE_RETRY(fstat(dir, &st)) != 0)
             return ts_close_error(dir, errno);
         if (!S_ISDIR(st.st_mode))
             return ts_close_error(dir, ENOTDIR);
         /* ts_mkdirs also chowns a final directory created by a racing peer. */
         if (created || final) {
             int rc;
-            do {
-                rc = fchown(dir, uid, gid);
-            } while (rc != 0 && errno == EINTR);
+            rc = TEMP_FAILURE_RETRY(fchown(dir, uid, gid));
             if (rc != 0)
                 return ts_close_error(dir, errno);
             if (created) {
-                do {
-                    rc = fchmod(dir, final ? 0700 : 0711);
-                } while (rc != 0 && errno == EINTR);
+                rc = TEMP_FAILURE_RETRY(fchmod(dir, final ? 0700 : 0711));
                 if (rc != 0)
                     return ts_close_error(dir, errno);
             }
@@ -378,20 +319,16 @@ static int ts_owner_open(int dir, const char *name, uid_t uid, bool create) {
     uid_t saved = geteuid();
     int rc;
     if (saved != uid) {
-        do {
-            rc = seteuid(uid);
-        } while (rc != 0 && errno == EINTR);
+        rc = TEMP_FAILURE_RETRY(seteuid(uid));
         if (rc != 0)
             return -1;
     }
     /* timestamp.c relies on the verified directory and owner credentials. */
-    int fd = ts_openat(dir, name, O_RDWR | O_CLOEXEC |
-        (create ? O_CREAT : 0), 0600);
+    int fd = TEMP_FAILURE_RETRY(openat(dir, name, O_RDWR | O_CLOEXEC |
+        (create ? O_CREAT : 0), 0600));
     int error = errno;
     if (saved != uid) {
-        do {
-            rc = seteuid(saved);
-        } while (rc != 0 && errno == EINTR);
+        rc = TEMP_FAILURE_RETRY(seteuid(saved));
         if (rc != 0)
             return ts_close_error(fd, errno);
     }
@@ -401,7 +338,7 @@ static int ts_owner_open(int dir, const char *name, uid_t uid, bool create) {
 
 /* Linux sudo reads the integer wall-clock boot epoch from /proc/stat. */
 static bool ts_boot_epoch(struct timespec *boot) {
-    int fd = ts_openat(AT_FDCWD, "/proc/stat", O_RDONLY | O_CLOEXEC, 0);
+    int fd = TEMP_FAILURE_RETRY(openat(AT_FDCWD, "/proc/stat", O_RDONLY | O_CLOEXEC, 0));
     if (fd < 0)
         return false;
     FILE *fp = fdopen(fd, "r");
@@ -458,14 +395,6 @@ static bool ts_predates_boot(const struct stat *st) {
     return st->st_mtime < boot.tv_sec;
 }
 
-static int ts_unlinkat(int dir, const char *name) {
-    int rc;
-    do {
-        rc = unlinkat(dir, name, 0);
-    } while (rc != 0 && errno == EINTR);
-    return rc;
-}
-
 LEAN_EXPORT lean_obj_res lean_sudo_ts_open(b_lean_obj_arg directory,
         b_lean_obj_arg filename, uint32_t owner_uid, uint32_t owner_gid,
         uint8_t create, lean_obj_arg w) {
@@ -486,14 +415,14 @@ LEAN_EXPORT lean_obj_res lean_sudo_ts_open(b_lean_obj_arg directory,
         if (fd < 0)
             break;
         struct stat st;
-        if (ts_fstat(fd, &st) != 0) {
+        if (TEMP_FAILURE_RETRY(fstat(fd, &st)) != 0) {
             fd = ts_close_error(fd, errno);
             break;
         }
         if (attempt == 0 && ts_predates_boot(&st)) {
             (void)close(fd);
             fd = -1;
-            if (ts_unlinkat(dir, name) != 0 && errno != ENOENT)
+            if (TEMP_FAILURE_RETRY(unlinkat(dir, name, 0)) != 0 && errno != ENOENT)
                 break;
             /* Reopen only once: never truncate an inode with record locks. */
             continue;
@@ -554,7 +483,7 @@ LEAN_EXPORT lean_obj_res lean_sudo_ts_size(uint32_t fd, lean_obj_arg w) {
     if (!ts_valid_fd(fd))
         return ts_errno_error("timestamp size", EBADF);
     struct stat st;
-    if (ts_fstat((int)fd, &st) != 0)
+    if (TEMP_FAILURE_RETRY(fstat((int)fd, &st)) != 0)
         return ts_errno_error("timestamp size", errno);
     if (st.st_size < 0 || !ts_valid_offset((uint64_t)st.st_size))
         return ts_errno_error("timestamp size", EOVERFLOW);
@@ -609,9 +538,7 @@ LEAN_EXPORT lean_obj_res lean_sudo_ts_truncate(uint32_t fd, uint64_t length,
     if (!ts_valid_offset(length))
         return ts_errno_error("timestamp truncate", EOVERFLOW);
     int rc;
-    do {
-        rc = ftruncate((int)fd, (off_t)length);
-    } while (rc != 0 && errno == EINTR);
+    rc = TEMP_FAILURE_RETRY(ftruncate((int)fd, (off_t)length));
     if (rc != 0)
         return ts_errno_error("timestamp truncate", errno);
     return lean_io_result_mk_ok(lean_box(0));
@@ -722,9 +649,7 @@ restore:
         if (acquired && error != 0) {
             struct flock unlock = *region;
             unlock.l_type = F_UNLCK;
-            do {
-                rc = fcntl(fd, F_SETLK, &unlock);
-            } while (rc != 0 && errno == EINTR);
+            rc = TEMP_FAILURE_RETRY(fcntl(fd, F_SETLK, &unlock));
         }
         ts_is_lock_thread = 0;
         if (caught != 0) {
@@ -778,9 +703,7 @@ LEAN_EXPORT lean_obj_res lean_sudo_ts_lock(uint32_t fd, uint64_t offset,
     if (lock) {
         rc = ts_wait_lock((int)fd, &region);
     } else {
-        do {
-            rc = fcntl((int)fd, F_SETLK, &region);
-        } while (rc != 0 && errno == EINTR);
+        rc = TEMP_FAILURE_RETRY(fcntl((int)fd, F_SETLK, &region));
     }
     if (rc != 0) {
         int error = errno;
@@ -817,7 +740,7 @@ LEAN_EXPORT lean_obj_res lean_sudo_ts_remove(b_lean_obj_arg directory,
         return ts_errno_error("timestamp directory", errno);
     }
     /* sudo -K unlinks under restored credentials, without interpreting records. */
-    int rc = ts_unlinkat(dir, lean_string_cstr(filename));
+    int rc = TEMP_FAILURE_RETRY(unlinkat(dir, lean_string_cstr(filename), 0));
     int error = errno;
     (void)close(dir);
     if (rc != 0 && error != ENOENT)

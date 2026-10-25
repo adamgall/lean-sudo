@@ -1,21 +1,19 @@
 import LeanSudo.Sudoers.Parser
 import LeanSudo.Policy.Eval
+import LeanSudo.SudoConf
 
 /-! SSSD's wire result is already sorted by descending sudoOrder. Conversion
 reverses that order, just like sssd.c, and partitions negative LDAP members to
 last position (ldap_util.c). Values are data, never reparsed as sudoers lines. -/
 namespace LeanSudo.Sss
 open Sudoers
+open SudoConf (blank trimStart trimEnd)
 
 abbrev Rule := Array (String × Array String)
 
 def values (r : Rule) (name : String) : List String :=
   let key := name.toLower
   ((r.find? fun a => a.1.toLower == key).map (·.2.toList)).getD []
-
-private def blank (c : Char) : Bool := c == ' ' || c == '\t'
-private def trimStart (s : String) : String := String.ofList (s.toList.dropWhile blank)
-private def trimEnd (s : String) : String := String.ofList (s.toList.reverse.dropWhile blank).reverse
 
 /-- Toggle every leading !, ignoring intervening horizontal whitespace. -/
 def negation (text : String) : Bool × String := Id.run do

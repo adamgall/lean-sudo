@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #endif
 #include "intercept.h"
+#include "shim.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -79,11 +80,8 @@ static int gate[2] = {-1, -1};
 static pid_t root_pid = -1;
 static size_t page_size;
 
-static void free_vector(char **v) {
-  if (v) { for (size_t i = 0; v[i]; i++) free(v[i]); free(v); }
-}
 static void clear_expected(struct trace_task *t) {
-  free_vector(t->argv); free_vector(t->env);
+  ls_strv_free(t->argv); ls_strv_free(t->env);
   t->argv = t->env = NULL;
 }
 static struct trace_task *task_find(pid_t pid) {
@@ -153,44 +151,32 @@ static int proc_link(pid_t pid, const char *name, char *out, size_t cap) {
   if ((size_t)n == cap - 1) { errno = ENAMETOOLONG; return -1; }
   out[n] = 0; return 0;
 }
-static int remote_read(pid_t pid, uintptr_t addr, void *out, size_t len) {
+static int remote_rw(pid_t pid, uintptr_t addr, void *data, size_t len, int writing) {
   if (!addr || addr > UINTPTR_MAX - len) { errno = EFAULT; return -1; }
-  struct iovec local = {out, len}, remote = {(void *)addr, len};
-  ssize_t got = process_vm_readv(pid, &local, 1, &remote, 1, 0);
-  if (got == (ssize_t)len) return 0;
-  /* ptrace works even when a credential transition disables process_vm_readv. */
-  for (size_t off = 0; off < len;) {
-    uintptr_t pos = addr + off, aligned = pos & ~(uintptr_t)(sizeof(long) - 1);
-    errno = 0;
-    long word = ptrace(PTRACE_PEEKDATA, pid, (void *)aligned, NULL);
-    if (errno) return -1;
-    size_t skip = (size_t)(pos - aligned), n = sizeof word - skip;
-    if (n > len - off) n = len - off;
-    memcpy((char *)out + off, (char *)&word + skip, n); off += n;
-  }
-  return 0;
-}
-static int remote_write(pid_t pid, uintptr_t addr, const void *data, size_t len) {
-  if (!addr || addr > UINTPTR_MAX - len) { errno = EFAULT; return -1; }
-  struct iovec local = {(void *)data, len}, remote = {(void *)addr, len};
-  ssize_t wrote = process_vm_writev(pid, &local, 1, &remote, 1, 0);
-  if (wrote == (ssize_t)len) return 0;
-  /* Credential transitions may require ptrace, as for remote_read().
-   * Preserve adjacent bytes when the first or last native word is partial. */
-  size_t off = wrote > 0 ? (size_t)wrote : 0;
+  struct iovec local = {data, len}, remote = {(void *)addr, len};
+  ssize_t done = writing ? process_vm_writev(pid, &local, 1, &remote, 1, 0) :
+      process_vm_readv(pid, &local, 1, &remote, 1, 0);
+  if (done == (ssize_t)len) return 0;
+  /* Credential transitions may require ptrace. Reads restart from the beginning;
+   * writes resume after any completed bytes, preserving partial adjacent words. */
+  size_t off = writing && done > 0 ? (size_t)done : 0;
   while (off < len) {
     uintptr_t pos = addr + off, aligned = pos & ~(uintptr_t)(sizeof(long) - 1);
     size_t skip = (size_t)(pos - aligned), n = sizeof(long) - skip;
     if (n > len - off) n = len - off;
     long word;
-    if (skip || n != sizeof word) {
+    if (!writing || skip || n != sizeof word) {
       errno = 0;
       word = ptrace(PTRACE_PEEKDATA, pid, (void *)aligned, NULL);
       if (errno) return -1;
     }
-    memcpy((char *)&word + skip, (const char *)data + off, n);
-    if (ptrace(PTRACE_POKEDATA, pid, (void *)aligned, (void *)(uintptr_t)word) < 0)
-      return -1;
+    if (writing) {
+      memcpy((char *)&word + skip, (const char *)data + off, n);
+      if (ptrace(PTRACE_POKEDATA, pid, (void *)aligned, (void *)(uintptr_t)word) < 0)
+        return -1;
+    } else {
+      memcpy((char *)data + off, (char *)&word + skip, n);
+    }
     off += n;
   }
   return 0;
@@ -202,7 +188,7 @@ static int remote_string_matches(pid_t pid, uintptr_t addr, const char *expected
     char buf[256];
     size_t n = len - off;
     if (n > sizeof buf) n = sizeof buf;
-    if (remote_read(pid, addr + off, buf, n) || memcmp(buf, expected + off, n))
+    if (remote_rw(pid, addr + off, buf, n, 0) || memcmp(buf, expected + off, n))
       return 0;
     off += n;
   }
@@ -215,9 +201,9 @@ static int remote_vector_matches(pid_t pid, uintptr_t addr, size_t width,
     uintptr_t p;
     if (width == sizeof(uint32_t)) {
       uint32_t ptr32;
-      if (remote_read(pid, addr, &ptr32, sizeof ptr32)) return 0;
+      if (remote_rw(pid, addr, &ptr32, sizeof ptr32, 0)) return 0;
       p = ptr32;
-    } else if (remote_read(pid, addr, &p, sizeof p)) return 0;
+    } else if (remote_rw(pid, addr, &p, sizeof p, 0)) return 0;
     if (!expected[i]) return p == 0;
     if (!remote_string_matches(pid, p, expected[i]) || addr > UINTPTR_MAX - width)
       return 0;
@@ -232,7 +218,7 @@ static char *remote_string(pid_t pid, uintptr_t addr, size_t *budget) {
     size_t n = sizeof buf, boundary = page_size - (addr % page_size);
     if (n > boundary) n = boundary;
     if (n > *budget) n = *budget;
-    if (remote_read(pid, addr, buf, n)) break;
+    if (remote_rw(pid, addr, buf, n, 0)) break;
     char *end = memchr(buf, 0, n);
     if (end) n = (size_t)(end - buf) + 1;
     if (used + n > cap) {
@@ -258,9 +244,9 @@ static char **remote_vector(pid_t pid, uintptr_t addr, size_t width, size_t *bud
     uintptr_t p;
     if (width == sizeof(uint32_t)) {
       uint32_t ptr32;
-      if (remote_read(pid, addr, &ptr32, sizeof ptr32)) break;
+      if (remote_rw(pid, addr, &ptr32, sizeof ptr32, 0)) break;
       p = ptr32;
-    } else if (remote_read(pid, addr, &p, sizeof p)) break;
+    } else if (remote_rw(pid, addr, &p, sizeof p, 0)) break;
     *budget -= width;
     if (!p) return v;
     if (count + 1 == cap) {
@@ -275,7 +261,7 @@ static char **remote_vector(pid_t pid, uintptr_t addr, size_t width, size_t *bud
     if (addr > UINTPTR_MAX - width) break;
     addr += width;
   }
-  free_vector(v); errno = EFAULT; return NULL;
+  ls_strv_free(v); errno = EFAULT; return NULL;
 }
 static int get_regs(pid_t pid, trace_regs *r) {
   struct iovec iov = {&r->u, sizeof r->u};
@@ -453,7 +439,7 @@ static int expected_image(const char *command, const char *label,
     int fd = open(current, O_RDONLY | O_CLOEXEC);
     if (fd < 0) break;
     ssize_t n;
-    do { n = read(fd, header, sizeof header); } while (n < 0 && errno == EINTR);
+    n = TEMP_FAILURE_RETRY(read(fd, header, sizeof header));
     int ok = fstat(fd, image); close(fd);
     if (n < 0 || ok || !S_ISREG(image->st_mode)) break;
     if (!depth && (image->st_dev != requested->st_dev || image->st_ino != requested->st_ino))
@@ -536,7 +522,7 @@ static int rewrite_path(pid_t pid, trace_regs *r, const char *command,
   if (sp < 128 || sp - 128 < space) return -1;
   uintptr_t addr = sp - 128 - space;
   if (r->abi == ABI_COMPAT && addr > UINT32_MAX) return -1;
-  if (remote_write(pid, addr, command, len)) return -1;
+  if (remote_rw(pid, addr, (void *)command, len, 1)) return -1;
   set_reg_arg(r, 0, addr);
   if (put_regs(pid, r)) return -1;
 
@@ -602,32 +588,13 @@ static int check_exec(struct trace_task *t) {
       else { t->argv = argv; t->env = env; argv = env = NULL; }
     }
   }
-  free(raw); free(command); free_vector(argv); free_vector(env);
+  free(raw); free(command); ls_strv_free(argv); ls_strv_free(env);
   if (!allow) return deny_exec(t, &r) ? -1 : 1;
   return 0;
 }
 
 int ls_intercept_trace_supported(void) {
-  int fd = open("/proc/sys/kernel/seccomp/actions_avail", O_RDONLY | O_CLOEXEC);
-  if (fd < 0) return 0;
-  char buf[512];
-  size_t used = 0;
-  int complete = 0;
-  while (used < sizeof buf - 1) {
-    ssize_t n = read(fd, buf + used, sizeof buf - 1 - used);
-    if (n < 0 && errno == EINTR) continue;
-    if (n <= 0) { complete = n == 0; break; }
-    used += (size_t)n;
-  }
-  close(fd);
-  if (!complete) return 0;
-  buf[used] = 0;
-  char *save = NULL;
-  for (char *token = strtok_r(buf, " \t\r\n", &save); token;
-      token = strtok_r(NULL, " \t\r\n", &save)) {
-    if (!strcmp(token, "trap")) return 1;
-  }
-  return 0;
+  return ls_trace_supported();
 }
 
 int ls_intercept_trace_prepare(void) {
@@ -643,7 +610,7 @@ int ls_intercept_trace_child(void) {
   if (gate[0] < 0 || gate[1] < 0) { errno = EINVAL; return -1; }
   close(gate[1]); gate[1] = -1;
   char ready = 0; ssize_t n;
-  do { n = read(gate[0], &ready, 1); } while (n < 0 && errno == EINTR);
+  n = TEMP_FAILURE_RETRY(read(gate[0], &ready, 1));
   close(gate[0]); gate[0] = -1;
   if (n != 1 || ready != 1) { errno = EACCES; return -1; }
   struct sock_filter filter[] = {
@@ -685,7 +652,7 @@ int ls_intercept_trace_attach(pid_t pid) {
   }
   close(gate[0]); gate[0] = -1;
   char ready = 1; ssize_t n;
-  do { n = write(gate[1], &ready, 1); } while (n < 0 && errno == EINTR);
+  n = TEMP_FAILURE_RETRY(write(gate[1], &ready, 1));
   close(gate[1]); gate[1] = -1;
   if (n != 1) { kill(pid, SIGKILL); return -1; }
   return 0;

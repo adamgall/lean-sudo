@@ -42,10 +42,6 @@ private def trustedBytes (path : String) : IO (Option ByteArray) := do
     return some (← IO.FS.readBinFile path)
   catch _ => return none
 
-private def word (b : ByteArray) (o : Nat) : Nat :=
-  b[o]!.toNat + b[o+1]!.toNat * 256 + b[o+2]!.toNat * 65536 +
-    b[o+3]!.toNat * 16777216
-
 private def normalized (name : String) : String :=
   let parts := name.splitOn "."
   match parts with
@@ -56,15 +52,16 @@ private def normalized (name : String) : String :=
   | _ => name
 
 private def archiveNames (bytes : ByteArray) : List String := Id.run do
-  if bytes.size < 56 || word bytes 0 != 0xde020109 then return []
-  let offset := word bytes 8
-  let count := word bytes 16
+  let word := fun offset => (I18n.word bytes false offset).getD 0
+  if bytes.size < 56 || word 0 != 0xde020109 then return []
+  let offset := word 8
+  let count := word 16
   if offset > bytes.size || count > (bytes.size - offset) / 12 then return []
   let mut result := []
   for i in List.range count do
     let entry := offset + i * 12
-    let start := word bytes (entry + 4)
-    let record := word bytes (entry + 8)
+    let start := word (entry + 4)
+    let record := word (entry + 8)
     if start < bytes.size && record != 0 && record + 4 + 13 * 8 ≤ bytes.size then
       let nameBytes := (bytes.extract start (min bytes.size (start + 256))).data.toList.takeWhile (· != 0)
       if let some name := String.fromUTF8? ⟨nameBytes.toArray⟩ then
@@ -91,7 +88,7 @@ private def selected (env : List (String × String)) (category : String) : Strin
 locale in place. LANGUAGE is consulted by gettext only after locale activation. -/
 def messageLocale (env : List (String × String)) : IO String := do
   let messages := selected env "LC_MESSAGES"
-  if messages == "C" || messages == "POSIX" || messages.startsWith "C." then return "C"
+  if isCLocale messages then return "C"
   let archive := archiveNames ((← trustedBytes "/usr/lib/locale/locale-archive").getD {})
   for category in ["LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE", "LC_MONETARY",
       "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS", "LC_TELEPHONE",
@@ -118,7 +115,7 @@ def localeVariants (name : String) : List String := Id.run do
 private def loadDomain (languages : List String) (domain : String) : IO Catalog := do
   let mut catalogs : List Catalog := []
   for language in languages do
-    if language == "C" || language == "POSIX" || language.startsWith "C." then break
+    if isCLocale language then break
     -- Ubuntu's local-altlocaledir.diff appends the langpack tree *after all*
     -- specificity variants in the bound /usr/share/locale tree.
     for root in ["/usr/share/locale", "/usr/share/locale-langpack"] do
@@ -133,7 +130,7 @@ private def loadDomain (languages : List String) (domain : String) : IO Catalog 
 
 def loadCatalogs (env : List (String × String)) : IO Catalogs := do
   let locale ← messageLocale env
-  if locale == "C" || locale == "POSIX" || locale.startsWith "C." then return {}
+  if isCLocale locale then return {}
   let languages := ((env.lookup "LANGUAGE").filter (!·.isEmpty)).map (·.splitOn ":") |>.getD [locale]
   let sudo ← loadDomain languages "sudo"
   let sudoers ← loadDomain languages "sudoers"
@@ -159,7 +156,7 @@ private initialize logCatalog : IO.Ref (String × Catalog) ← IO.mkRef ("C", {}
 
 /-- Logs use sudoers_locale, not the invoking user's LANGUAGE or message locale. -/
 def translateLog (locale text : String) : IO String := do
-  if locale == "C" || locale == "POSIX" || locale.startsWith "C." then return text
+  if isCLocale locale then return text
   let (cached, catalog) ← logCatalog.get
   let catalog ← if cached == locale then pure catalog else do
     let loaded ← loadCatalogs [("LC_ALL", locale)]

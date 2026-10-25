@@ -1,7 +1,7 @@
 /* Privileged interception broker. This file transports facts; Lean alone
  * authorizes them. Each request has its own reply socket, so forked tracees
  * cannot consume another process's authorization. */
-#include <lean/lean.h>
+#include "shim.h"
 #include "intercept.h"
 #include "intercept_dso.h"
 #include "logsrv.h"
@@ -61,60 +61,28 @@ static pid_t fork_broker(void) {
   return pid;
 }
 
-static int utf8_valid(const char *str, size_t n) {
-  const unsigned char *s = (const unsigned char *)str;
-  size_t i = 0;
-  while (i < n) {
-    unsigned c = s[i], lo = 0x80, hi = 0xbf;
-    size_t need;
-    if (c < 0x80) { i++; continue; }
-    else if (c >= 0xc2 && c <= 0xdf) need = 1;
-    else if (c == 0xe0) { need = 2; lo = 0xa0; }
-    else if ((c >= 0xe1 && c <= 0xec) || c == 0xee || c == 0xef) need = 2;
-    else if (c == 0xed) { need = 2; hi = 0x9f; }
-    else if (c == 0xf0) { need = 3; lo = 0x90; }
-    else if (c >= 0xf1 && c <= 0xf3) need = 3;
-    else if (c == 0xf4) { need = 3; hi = 0x8f; }
-    else return 0;
-    if (n - i - 1 < need || s[i + 1] < lo || s[i + 1] > hi) return 0;
-    for (size_t k = 2; k <= need; k++) if ((s[i + k] & 0xc0) != 0x80) return 0;
-    i += need + 1;
-  }
-  return 1;
-}
-
-static int transfer(int fd, void *buf, size_t len, int sending) {
-  unsigned char *p = buf;
-  while (len) {
-    ssize_t n = sending ? send(fd, p, len, MSG_NOSIGNAL) : read(fd, p, len);
-    if (n < 0 && errno == EINTR) continue;
-    if (n <= 0) return -1;
-    p += n; len -= (size_t)n;
-  }
-  return 0;
-}
 static int send_string(int fd, const char *s, size_t *total) {
   size_t n = strlen(s);
   if (n > REQUEST_MAX || *total > REQUEST_MAX - n) return -1;
   *total += n;
   uint32_t len = (uint32_t)n;
-  return transfer(fd, &len, sizeof len, 1) || transfer(fd, (void *)s, n, 1) ? -1 : 0;
+  return ls_transfer(fd, &len, sizeof len, 1) || ls_transfer(fd, (void *)s, n, 1) ? -1 : 0;
 }
 static int send_array(int fd, char *const a[], size_t *total) {
   uint32_t n = 0;
   if (a) while (a[n]) { if (++n > REQUEST_MAX / 4) return -1; }
-  if (transfer(fd, &n, sizeof n, 1)) return -1;
+  if (ls_transfer(fd, &n, sizeof n, 1)) return -1;
   for (uint32_t i = 0; i < n; i++) if (send_string(fd, a[i], total)) return -1;
   return 0;
 }
 static lean_object *receive_string(int fd, size_t *total) {
   uint32_t n;
-  if (transfer(fd, &n, sizeof n, 0) || n > REQUEST_MAX || *total > REQUEST_MAX - n)
+  if (ls_transfer(fd, &n, sizeof n, 0) || n > REQUEST_MAX || *total > REQUEST_MAX - n)
     return NULL;
   *total += n;
   char *s = malloc((size_t)n + 1);
   if (!s) return NULL;
-  if (transfer(fd, s, n, 0) || memchr(s, 0, n) || !utf8_valid(s, n)) {
+  if (ls_transfer(fd, s, n, 0) || memchr(s, 0, n) || !ls_utf8_valid(s, n)) {
     free(s); return NULL;
   }
   s[n] = 0;
@@ -124,7 +92,7 @@ static lean_object *receive_string(int fd, size_t *total) {
 }
 static lean_object *receive_array(int fd, size_t *total) {
   uint32_t n;
-  if (transfer(fd, &n, sizeof n, 0) || n > REQUEST_MAX / 4) return NULL;
+  if (ls_transfer(fd, &n, sizeof n, 0) || n > REQUEST_MAX / 4) return NULL;
   lean_object *a = lean_mk_empty_array_with_capacity(lean_box(n));
   for (uint32_t i = 0; i < n; i++) {
     lean_object *s = receive_string(fd, total);
@@ -149,7 +117,7 @@ static int call_policy(lean_object *command, lean_object *cwd, lean_object *argv
 static lean_object *string_array(char *const words[]) {
   lean_object *a = lean_mk_empty_array_with_capacity(lean_box(0));
   if (words) for (size_t i = 0; words[i]; i++) {
-    if (!utf8_valid(words[i], strlen(words[i]))) { lean_dec(a); return NULL; }
+    if (!ls_utf8_valid(words[i], strlen(words[i]))) { lean_dec(a); return NULL; }
     a = lean_array_push(a, lean_mk_string(words[i]));
   }
   return a;
@@ -158,7 +126,7 @@ int ls_intercept_check(const char *command, char *const argv[], char *const envp
     const char *cwd, pid_t pid, int setid) {
   if (!active || !command || !cwd) { errno = EACCES; return -1; }
   if (policy_callback) {
-    if (!utf8_valid(command, strlen(command)) || !utf8_valid(cwd, strlen(cwd))) return -1;
+    if (!ls_utf8_valid(command, strlen(command)) || !ls_utf8_valid(cwd, strlen(cwd))) return -1;
     lean_object *args = string_array(argv), *env = string_array(envp);
     if (!args || !env) {
       if (args) lean_dec(args);
@@ -184,7 +152,7 @@ int ls_intercept_check(const char *command, char *const argv[], char *const envp
   size_t total = 0;
   uint32_t facts[2] = { (uint32_t)pid, setid != 0 };
   uint8_t answer = 0;
-  if (ok && !transfer(pair[0], facts, sizeof facts, 1) &&
+  if (ok && !ls_transfer(pair[0], facts, sizeof facts, 1) &&
       !send_string(pair[0], command, &total) && !send_string(pair[0], cwd, &total) &&
       !send_array(pair[0], argv, &total) && !send_array(pair[0], envp, &total)) {
     shutdown(pair[0], SHUT_WR);
@@ -194,7 +162,7 @@ int ls_intercept_check(const char *command, char *const argv[], char *const envp
       int ready = ls_plugins_poll(p, 2, -1);
       if (ready < 0 && errno == EINTR) continue;
       if (ready < 0 || (p[1].revents && ls_logsrv_dispatch() != 0)) { ok = 0; break; }
-      if (p[0].revents) { ok = !transfer(pair[0], &answer, sizeof answer, 0); break; }
+      if (p[0].revents) { ok = !ls_transfer(pair[0], &answer, sizeof answer, 0); break; }
     }
   } else ok = 0;
   close(pair[0]);
@@ -205,7 +173,7 @@ static void handle_request(int fd) {
   uint32_t facts[2]; size_t total = 0;
   lean_object *values[4] = { NULL, NULL, NULL, NULL };
   uint8_t answer = 0;
-  if (transfer(fd, facts, sizeof facts, 0) || facts[1] > 1) goto done;
+  if (ls_transfer(fd, facts, sizeof facts, 0) || facts[1] > 1) goto done;
   values[0] = receive_string(fd, &total); if (!values[0]) goto done;
   values[1] = receive_string(fd, &total); if (!values[1]) goto done;
   values[2] = receive_array(fd, &total); if (!values[2]) goto done;
@@ -216,7 +184,7 @@ static void handle_request(int fd) {
   memset(values, 0, sizeof values);
 done:
   for (unsigned i = 0; i < 4; i++) if (values[i]) lean_dec(values[i]);
-  (void)transfer(fd, &answer, sizeof answer, 1);
+  (void)ls_transfer(fd, &answer, sizeof answer, 1);
   close(fd);
 }
 static void broker_loop(int fd) {

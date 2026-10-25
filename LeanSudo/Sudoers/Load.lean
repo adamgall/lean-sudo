@@ -24,14 +24,18 @@ def mainSudoersPath : String := "/etc/sudoers"
 /-- Maximum include nesting, as in sudo. -/
 def maxDepth : Nat := 128
 
-/-- sudo's ownership/mode policy for sudoers sources. Pure so it can be tested. -/
-def checkPerms (path : String) (st : FileStat) : Except String Unit :=
-  if !st.isReg then .error s!"{path} is not a regular file"
+private def checkOwnership (kind : Bool) (what path : String) (st : FileStat) :
+    Except String Unit :=
+  if !kind then .error s!"{path} is not {what}"
   else if st.uid != 0 then .error s!"{path} is owned by uid {st.uid}, should be 0"
   else if st.mode &&& 0o002 != 0 then .error s!"{path} is world writable"
   else if st.mode &&& 0o020 != 0 && st.gid != 0 then
     .error s!"{path} is owned by gid {st.gid}, should be 0"
   else .ok ()
+
+/-- sudo's ownership/mode policy for sudoers sources. Pure so it can be tested. -/
+def checkPerms (path : String) (st : FileStat) : Except String Unit :=
+  checkOwnership st.isReg "a regular file" path st
 
 /-- Directory part of a path (`/etc/sudoers` ↦ `/etc`). -/
 def dirName (path : String) : String :=
@@ -54,41 +58,10 @@ def resolveIncludePath (including : String) (host : String) (raw : String) : Str
 def includeDirEntryOk (name : String) : Bool :=
   !name.isEmpty && !name.endsWith "~" && !name.contains '.'
 
-/-- Insertion sort; directory listings are short. Lexical order as sudo uses. -/
-def sortNames (xs : List String) : List String :=
-  xs.foldl (fun acc x => insert x acc) []
-where
-  insert (x : String) : List String → List String
-    | [] => [x]
-    | y :: ys => if decide (x < y) then x :: y :: ys else y :: insert x ys
-
-/-- Outcome of reading one source file. -/
-inductive Source where
-  | parsed (entries : List Located)
-  /-- failed the ownership/mode policy; the message explains why -/
-  | insecure (msg : String)
-
-/-- Read and parse one file (no include resolution). Parse errors and unreadable
-files throw; ownership/mode violations are reported as `insecure`. -/
-def readSource (path : String) : IO Source := do
-  let (st, text) ← try readFileFollow path
-    catch e => throw <| IO.userError s!"unable to open {path}: {e}"
-  match checkPerms path st with
-  | .error msg => return .insecure msg
-  | .ok () =>
-    match parse path text with
-    | .ok entries => return .parsed entries
-    | .error err => throw <| IO.userError err.toString
-
 /-- Directory policy for `@includedir`: a real directory owned by root, not
 world-writable, and group-writable only when owned by gid 0. Violations are fatal. -/
 def checkDirPerms (path : String) (st : FileStat) : Except String Unit :=
-  if !st.isDir then .error s!"{path} is not a directory"
-  else if st.uid != 0 then .error s!"{path} is owned by uid {st.uid}, should be 0"
-  else if st.mode &&& 0o002 != 0 then .error s!"{path} is world writable"
-  else if st.mode &&& 0o020 != 0 && st.gid != 0 then
-    .error s!"{path} is owned by gid {st.gid}, should be 0"
-  else .ok ()
+  checkOwnership st.isDir "a directory" path st
 
 mutual
 /-- Load `path` and splice includes, depth-bounded.
@@ -99,9 +72,10 @@ partial def loadFile (host : String) (depth : Nat) (path : String) :
     IO (List Located) := do
   if depth > maxDepth then
     throw <| IO.userError s!"{path}: too many levels of includes"
-  let entries ← match ← readSource path with
-    | .parsed es => pure es
-    | .insecure msg => throw <| IO.userError msg
+  let (st, text) ← try readFileFollow path
+    catch e => throw <| IO.userError s!"unable to open {path}: {e}"
+  IO.ofExcept (checkPerms path st)
+  let entries ← IO.ofExcept (parse path text)
   let mut out : Array Located := #[]
   for loc in entries do
     for warning in loc.warnings do writeStderr (warning ++ "\n")
@@ -122,7 +96,7 @@ partial def loadDir (host : String) (depth : Nat) (dir : String) :
   | .ok () => pure ()
   let names ← listDir dir
   let mut out : Array Located := #[]
-  for name in sortNames (names.filter includeDirEntryOk) do
+  for name in (names.filter includeDirEntryOk).mergeSort (· < ·) do
     let path := dir ++ "/" ++ name
     let some st ← stat path | continue
     if st.isReg then out := out ++ (← loadFile host depth path)

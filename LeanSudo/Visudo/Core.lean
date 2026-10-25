@@ -247,36 +247,15 @@ def runtimeAliasErrors (es : List Located) : List String :=
     | _ => state) state
   state.errors
 
-/-- Share the runtime's authoritative sudo 1.9.17p2 option table. -/
-def sudoOptionNames : List String := defaultOptionNames
-
-inductive SettingCheck where
-  | ok
-  | warn (msg : String)
-  | err (msg : String)
-
-/-- Check syntax and types without requiring runtime support for the option's action. -/
-def checkSetting (d : DefaultsSetting) : SettingCheck :=
-  match applySetting {} d false with
-  | .error e => .err e
-  | .ok (_, none) => .ok
-  | .ok (_, some w) => .err w
-
-def defaultsChecks (es : List Located) : List (Located × SettingCheck) :=
+def defaultsErrors (es : List Located) : List String :=
   es.flatMap fun l =>
     match l.entry with
-    | .defaults _ ss => ss.map fun d => (l, checkSetting d)
+    | .defaults _ ss => ss.filterMap fun d =>
+      let error := match applySetting {} d false with
+        | .error e => some e
+        | .ok (_, warning) => warning
+      error.map fun m => s!"{locPos l}: {m}"
     | _ => []
-
-def defaultsErrors (es : List Located) : List String :=
-  (defaultsChecks es).filterMap fun
-    | (l, .err m) => some s!"{locPos l}: {m}"
-    | _ => none
-
-def defaultsWarnings (es : List Located) : List String :=
-  (defaultsChecks es).filterMap fun
-    | (l, .warn m) => some s!"Warning: {locPos l}: {m}"
-    | _ => none
 
 /-- No runtime-invalid policy is accepted, regardless of `-s`. Keep source-located
 sudo-style diagnostics, with an authoritative fallback for future validation rules. -/
@@ -297,7 +276,7 @@ def unusedWarnings (es : List Located) : List String :=
 
 /-- Unused aliases remain warnings; runtime-invalid aliases are errors above. -/
 def semanticWarnings (es : List Located) (_strict : Bool := false) : List String :=
-  defaultsWarnings es ++ unusedWarnings es
+  unusedWarnings es
 
 /-! ## Edit mode helpers -/
 

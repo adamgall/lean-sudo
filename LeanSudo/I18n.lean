@@ -20,6 +20,21 @@ inductive PluralExpr where
 
 private def truth (n : Int) : Int := if n == 0 then 0 else 1
 
+private def operators : List (List Char × String × Nat × (Int → Int → Int)) :=
+  [(['|', '|'], "||", 2, fun a b => if a != 0 then 1 else truth b),
+   (['&', '&'], "&&", 3, fun a b => if a == 0 then 0 else truth b),
+   (['=', '='], "==", 4, fun a b => if a == b then 1 else 0),
+   (['!', '='], "!=", 4, fun a b => if a != b then 1 else 0),
+   (['<', '='], "<=", 5, fun a b => if a ≤ b then 1 else 0),
+   (['>', '='], ">=", 5, fun a b => if a ≥ b then 1 else 0),
+   (['<'], "<", 5, fun a b => if a < b then 1 else 0),
+   (['>'], ">", 5, fun a b => if a > b then 1 else 0),
+   (['+'], "+", 6, (· + ·)),
+   (['-'], "-", 6, (· - ·)),
+   (['*'], "*", 7, (· * ·)),
+   (['/'], "/", 7, fun a b => if b == 0 then 0 else a.tdiv b),
+   (['%'], "%", 7, fun a b => if b == 0 then 0 else a.tmod b)]
+
 /-- C/gettext integer arithmetic; division by zero is defined as zero. -/
 def PluralExpr.eval : PluralExpr → Nat → Int
   | .number k, _ => k
@@ -32,38 +47,16 @@ def PluralExpr.eval : PluralExpr → Nat → Int
     let a := x.eval n
     if op == "&&" then if a == 0 then 0 else truth (y.eval n)
     else if op == "||" then if a != 0 then 1 else truth (y.eval n)
-    else
-      let b := y.eval n
-      if op == "+" then a + b else if op == "-" then a - b
-      else if op == "*" then a * b
-      else if op == "/" then if b == 0 then 0 else a.tdiv b
-      else if op == "%" then if b == 0 then 0 else a.tmod b
-      else if op == "==" then if a == b then 1 else 0
-      else if op == "!=" then if a != b then 1 else 0
-      else if op == "<" then if a < b then 1 else 0
-      else if op == "<=" then if a ≤ b then 1 else 0
-      else if op == ">" then if a > b then 1 else 0
-      else if op == ">=" then if a ≥ b then 1 else 0
-      else 0
+    else match operators.find? (fun (_, name, _, _) => name == op) with
+      | some (_, _, _, apply) => apply a (y.eval n)
+      | none => 0
   | .cond p x y, n => if p.eval n != 0 then x.eval n else y.eval n
 
 private def skipSpace (cs : List Char) : List Char := cs.dropWhile Char.isWhitespace
 
-private def binaryOp : List Char → Option (String × Nat × List Char)
-  | '|' :: '|' :: xs => some ("||", 2, xs)
-  | '&' :: '&' :: xs => some ("&&", 3, xs)
-  | '=' :: '=' :: xs => some ("==", 4, xs)
-  | '!' :: '=' :: xs => some ("!=", 4, xs)
-  | '<' :: '=' :: xs => some ("<=", 5, xs)
-  | '>' :: '=' :: xs => some (">=", 5, xs)
-  | '<' :: xs => some ("<", 5, xs)
-  | '>' :: xs => some (">", 5, xs)
-  | '+' :: xs => some ("+", 6, xs)
-  | '-' :: xs => some ("-", 6, xs)
-  | '*' :: xs => some ("*", 7, xs)
-  | '/' :: xs => some ("/", 7, xs)
-  | '%' :: xs => some ("%", 7, xs)
-  | _ => none
+private def binaryOp (cs : List Char) : Option (String × Nat × List Char) :=
+  (operators.find? (fun (token, _, _, _) => token.isPrefixOf cs)).map
+    fun (token, name, prec, _) => (name, prec, cs.drop token.length)
 
 mutual
   private def expression : Nat → Nat → List Char → Option (PluralExpr × List Char)
@@ -126,6 +119,13 @@ structure Catalog where
   pluralRules : List (String × PluralRule) := []
   deriving Repr, BEq, Inhabited
 
+/-- Preserve each raw original's plural rule when catalogs are composed. -/
+def ruleFor (catalog : Catalog) (original : String) : PluralRule :=
+  ((catalog.pluralRules.find? (fun r => r.1 == original)).map Prod.snd).getD {}
+
+def isCLocale (locale : String) : Bool :=
+  locale == "C" || locale == "POSIX" || locale.startsWith "C."
+
 private def singular (s : String) : String := (s.splitOn (String.singleton '\x00')).head!
 
 private def entry (catalog : Catalog) (msgid : String) : Option (String × String) :=
@@ -152,7 +152,7 @@ theorem lookup_absent (catalog : Catalog) (msgid : String)
 def nlookup (catalog : Catalog) (msgid plural : String) (n : Nat) : String := Id.run do
   let fallback := if n == 1 then msgid else plural
   let some (original, translated) := entry catalog msgid | return fallback
-  let rule := ((catalog.pluralRules.find? (fun r => r.1 == original)).map Prod.snd).getD {}
+  let rule := ruleFor catalog original
   let index := rule.expr.eval n
   if index < 0 || index.toNat ≥ rule.count then return fallback
   let some result := (translated.splitOn (String.singleton '\x00'))[index.toNat]?
@@ -162,10 +162,8 @@ def nlookup (catalog : Catalog) (msgid plural : String) (n : Nat) : String := Id
 /-- Left-biased catalog composition, retaining per-entry plural metadata. -/
 def merge (preferred fallback : Catalog) : Catalog :=
   { entries := preferred.entries ++ fallback.entries
-    pluralRules := preferred.entries.map (fun e =>
-      (e.1, ((preferred.pluralRules.find? (fun r => r.1 == e.1)).map Prod.snd).getD {})) ++
-      fallback.entries.map (fun e =>
-      (e.1, ((fallback.pluralRules.find? (fun r => r.1 == e.1)).map Prod.snd).getD {})) }
+    pluralRules := preferred.entries.map (fun e => (e.1, ruleFor preferred e.1)) ++
+      fallback.entries.map (fun e => (e.1, ruleFor fallback e.1)) }
 
 private def trim (s : String) : String := s.trimAscii.toString
 
@@ -181,7 +179,7 @@ private def metadataRule (header : String) : PluralRule := Id.run do
   let some expr := parsePlural (String.intercalate "=" (exprField.drop 1)) | return {}
   return { count, expr }
 
-private def word (bytes : ByteArray) (big : Bool) (offset : Nat) : Option Nat :=
+def word (bytes : ByteArray) (big : Bool) (offset : Nat) : Option Nat :=
   if offset + 4 ≤ bytes.size then
     let a := (bytes[offset]!).toNat
     let b := (bytes[offset + 1]!).toNat

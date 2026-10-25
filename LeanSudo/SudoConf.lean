@@ -1,5 +1,31 @@
 namespace LeanSudo.SudoConf
 
+def blank (c : Char) : Bool := c == ' ' || c == '\t'
+def trimStart (s : String) : String := String.ofList (s.toList.dropWhile blank)
+def trimEnd (s : String) : String := String.ofList (s.toList.reverse.dropWhile blank).reverse
+
+def words (s : String) : List String :=
+  s.splitOn " " |>.flatMap (·.splitOn "\t") |>.filter (!·.isEmpty)
+
+/-- sudo_parseln folding without an intermediate line list. nsswitch trims trailing
+horizontal blanks on completed physical lines; sudo.conf deliberately retains them. -/
+@[specialize] def foldLogicalLinesM {m : Type → Type} [Monad m] {α : Type}
+    (trimTrailing : Bool) (step : α → Nat → String → m α) (initial : α)
+    (text : String) : m α := do
+  let (n, pending, result) ← (text.splitOn "\n").foldlM
+    (fun (n, pending, result) s => do
+      let s := String.ofList ((s.toList.reverse.dropWhile (· == '\r')).reverse)
+      let parts := s.splitOn "#"
+      let s := parts.headD ""
+      let continued := parts.length == 1 && s.endsWith "\\" && !s.endsWith "\\\\"
+      let s := trimStart (if continued then (s.dropEnd 1).toString
+        else if trimTrailing then trimEnd s else s)
+      if continued then pure (n + 1, pending ++ s, result)
+      else return (n + 1, "", ← step result n (pending ++ s)))
+    (1, "", initial)
+  if pending.isEmpty then return result
+  step result (n - 1) pending
+
 structure Plugin where
   symbol : String
   path : String
@@ -77,23 +103,8 @@ private def line (c : Config) (lineno : Nat) (words : List String) : Except Stri
   | _ => return c
 
 /-- Parse physical lines after joining backslash continuations and stripping comments. -/
-def parse (text : String) : Except String Config := do
-  let (n, pending, c) ← (text.splitOn "\n").foldlM
-    (fun (n, pending, c) s => do
-      let s := String.ofList ((s.toList.reverse.dropWhile (· == '\r')).reverse)
-      let s := (s.dropWhile fun c => c == ' ' || c == '\t').toString
-      let parts := s.splitOn "#"
-      let s := parts.headD ""
-      if parts.length == 1 && s.endsWith "\\" && !s.endsWith "\\\\" then
-        pure (n + 1, pending ++ (s.dropEnd 1).toString, c)
-      else
-        let words := (pending ++ s).splitOn " "
-          |>.flatMap (·.splitOn "\t") |>.filter (!·.isEmpty)
-        let c ← line c n words
-        pure (n + 1, "", c))
-    (1, "", ({} : Config))
-  if pending.isEmpty then return c
-  line c (n - 1) (pending.splitOn " " |>.flatMap (·.splitOn "\t") |>.filter (!·.isEmpty))
+def parse (text : String) : Except String Config :=
+  foldLogicalLinesM false (fun c n s => line c n (words s)) {} text
 
 /-- sudo.conf uses sudo_secure_fd with uid 0 and no trusted group: even
 root-group write permission is rejected. Diagnostic precedence matches sudo. -/

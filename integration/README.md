@@ -11,7 +11,7 @@ Current full-suite results:
 
 | Suite | sudo.ws | lean-sudo |
 |---|---:|---:|
-| sudo | 926/926 | 926/926 |
+| sudo | 946/946 | 946/946 |
 | visudo | 154/154 | 154/154 |
 
 These are shared compatibility suites, not a claim that every behavior is

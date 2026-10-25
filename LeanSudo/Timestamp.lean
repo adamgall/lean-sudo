@@ -3,8 +3,7 @@ import LeanSudo.Policy.Types
 /-!
 # Timestamp records (pure)
 
-Pure model of sudo's credential cache ("timestamp") file: record identity (scope),
-validity, update / invalidation, and a canonical codec with a proved roundtrip.
+Credential-cache identity, validity, and fixed-slot encoding.
 Runtime uses the bounded `scanStep` raw-slot decoder, `LocatedEntry.recordFor`,
 and `updateEntry`; their theorems cover the same helpers consumed by IO.
 Raw slot matching preserves malformed first matches, while authorization rejects
@@ -78,26 +77,6 @@ def valid (now : Nat) (timeout : Option Nat) (scope : Scope) (authUid : Nat) (r 
 def lookup (now : Nat) (timeout : Option Nat) (scope : Scope) (authUid : Nat)
     (rs : List Record) : Bool :=
   rs.any (valid now timeout scope authUid)
-
-/-- Bound for pure snapshot updates. Disk transactions update fixed slots instead
-of truncating or reordering the shared sudo timestamp file. -/
-def maxRecords : Nat := 128
-
-/-- Update an in-memory snapshot after successful authentication: the fresh record
-replaces the same key and goes first; older snapshot records beyond `maxRecords`
-are dropped. The IO layer writes only the selected on-disk slot. -/
-def update (now : Nat) (scope : Scope) (authUid : Nat) (rs : List Record) : List Record :=
-  { scope, authUid, time := now, disabled := false } ::
-    (rs.filter (fun r => !(decide (r.scope = scope) && decide (r.authUid = authUid)))).take
-      (maxRecords - 1)
-
-/-- Bulk invalidation disables every record, independently of scope. -/
-def invalidate (rs : List Record) : List Record :=
-  rs.map fun r => { r with disabled := true }
-
-/-- `sudo -k` disables all authentication identities in the selected scope. -/
-def invalidateScope (scope : Scope) (rs : List Record) : List Record :=
-  rs.map fun r => if r.scope = scope then { r with disabled := true } else r
 
 /-! ## Ubuntu64 sudo timestamp v2
 
@@ -198,14 +177,12 @@ theorem DiskEntry.matches_uid {e : DiskEntry} {scope : Scope} {uid : Nat}
 theorem DiskEntry.matches_tty_start {e : DiskEntry} {dev sid start uid : Nat}
     {anyUid : Bool} (h : e.matches (.tty dev sid start) uid anyUid = true) :
     e.kind = 2 ∧ e.key = dev ∧ e.start = start := by
-  simp only [DiskEntry.matches, Bool.and_eq_true, beq_iff_eq] at h
-  exact ⟨h.2.1.1, h.2.1.2, h.2.2⟩
+  simp_all [DiskEntry.matches]
 
 theorem DiskEntry.matches_ppid_start {e : DiskEntry} {pid start uid : Nat}
     {anyUid : Bool} (h : e.matches (.ppid pid start) uid anyUid = true) :
     e.kind = 3 ∧ e.key = pid ∧ e.start = start := by
-  simp only [DiskEntry.matches, Bool.and_eq_true, beq_iff_eq] at h
-  exact ⟨h.2.1.1, h.2.1.2, h.2.2⟩
+  simp_all [DiskEntry.matches]
 
 theorem DiskEntry.matches_ofRecord (sid : Nat) (r : Record) :
     (DiskEntry.ofRecord sid r).matches r.scope r.authUid = true := by
@@ -435,93 +412,6 @@ theorem decodeSlot_validity {bytes : ByteArray} {offset : Nat} {located : Locate
     · contradiction
   · contradiction
 
-/-- A model record is representable iff its canonical disk projection is. -/
-def Record.Representable (r : Record) : Prop := (DiskEntry.ofRecord 0 r).Representable
-
-def encRecord (r : Record) : List UInt8 := encEntry (DiskEntry.ofRecord 0 r)
-
-def decRecord (bs : List UInt8) : Option (Record × List UInt8) := do
-  let (entry, rest) ← decEntry bs
-  let record ← entry.toRecord
-  return (record, rest)
-
-theorem decRecord_encRecord (r : Record) (rest : List UInt8) (h : r.Representable) :
-    decRecord (encRecord r ++ rest) = some (r, rest) := by
-  simp [encRecord, decRecord, decEntry_encEntry _ _ h, DiskEntry.toRecord_ofRecord]
-
-/-- Scope helpers use an ordinary v2 record with zero uid/time/flags. -/
-def encScope (s : Scope) : List UInt8 := encRecord ⟨s, 0, 0, false⟩
-
-def decScope (bs : List UInt8) : Option (Scope × List UInt8) := do
-  let (record, rest) ← decRecord bs
-  return (record.scope, rest)
-
-theorem decScope_encScope (s : Scope) (rest : List UInt8)
-    (h : (Record.mk s 0 0 false).Representable) :
-    decScope (encScope s ++ rest) = some (s, rest) := by
-  simp [encScope, decScope, decRecord_encRecord _ _ h]
-
-def encRecords : List Record → List UInt8
-  | [] => []
-  | r :: rs => encRecord r ++ encRecords rs
-
-def decRecords : Nat → List UInt8 → Option (List Record × List UInt8)
-  | 0, bs => some ([], bs)
-  | k + 1, bs => do
-    let (r, bs) ← decRecord bs
-    let (rs, bs) ← decRecords k bs
-    return (r :: rs, bs)
-
-theorem decRecords_encRecords (rs : List Record) (rest : List UInt8)
-    (h : ∀ r ∈ rs, r.Representable) :
-    decRecords rs.length (encRecords rs ++ rest) = some (rs, rest) := by
-  induction rs with
-  | nil => rfl
-  | cons r rs ih =>
-    have hr := h r (by simp)
-    have hrs : ∀ r ∈ rs, r.Representable := fun r hm => h r (by simp [hm])
-    simp [encRecords, decRecords, List.append_assoc, decRecord_encRecord _ _ hr, ih hrs]
-
-@[simp] theorem length_encRecords (rs : List Record) :
-    (encRecords rs).length = rs.length * recordSize := by
-  induction rs with
-  | nil => rfl
-  | cons r rs ih => simp [encRecords, encRecord, ih, Nat.add_mul, Nat.add_comm]
-
-def encodeList (rs : List Record) : List UInt8 :=
-  encEntry lockEntry ++ encRecords rs
-
-/-- Strict whole-file codec for the pure model. Runtime uses `scan` instead so
-foreign entries remain in place and do not invalidate unrelated tickets. -/
-def decodeList (bs : List UInt8) : Option (List Record) := do
-  let (lock, bs) ← decEntry bs
-  if lock.kind ≠ 4 then none else
-    match decRecords (bs.length / recordSize) bs with
-    | some (rs, []) => some rs
-    | _ => none
-
-theorem decodeList_encodeList (rs : List Record)
-    (h : ∀ r ∈ rs, r.Representable) : decodeList (encodeList rs) = some rs := by
-  have hd := decRecords_encRecords rs [] h
-  simp only [List.append_nil] at hd
-  unfold decodeList encodeList
-  rw [decEntry_encEntry lockEntry (encRecords rs) (by decide)]
-  simp [lockEntry, recordSize, hd]
-
-def encode (rs : List Record) : ByteArray := ⟨(encodeList rs).toArray⟩
-
-def decode (b : ByteArray) : Option (List Record) := decodeList b.data.toList
-
-def load (b : ByteArray) : List Record := (decode b).getD []
-
-theorem decode_encode (rs : List Record) (h : ∀ r ∈ rs, r.Representable) :
-    decode (encode rs) = some rs := by
-  simp [decode, encode, decodeList_encodeList _ h]
-
-theorem load_encode (rs : List Record) (h : ∀ r ∈ rs, r.Representable) :
-    load (encode rs) = rs := by
-  simp [load, decode_encode _ h]
-
 /-- A bounded chunk is relative to `offset`, while `extent` is the absolute file end.
 Foreign records need only their header; a v2/56 slot requires an exact 56-byte window.
 No SID or timespec error terminates the structural scan. -/
@@ -571,103 +461,6 @@ theorem scanStep_decoded {bytes : ByteArray} {offset extent next : Nat}
         · exact (ScanStep.next.inj h).2
       · cases h
 
-/-- Tail accumulation preserves physical order, including malformed matching
-slots. In particular a rejected first match cannot expose a later duplicate. -/
-def scanAcc (bytes : ByteArray) (offset fuel : Nat) (acc : List LocatedEntry) :
-    List LocatedEntry :=
-  match fuel with
-  | 0 => acc.reverse
-  | fuel + 1 =>
-    match scanStep (bytes.extract offset (offset + recordSize)) offset bytes.size with
-    | .stop => acc.reverse
-    | .next next entry =>
-      scanAcc bytes next fuel (match entry with | some e => e :: acc | none => acc)
-
-def scanFrom (bytes : ByteArray) (offset fuel : Nat) : List LocatedEntry :=
-  scanAcc bytes offset fuel []
-
-def scan (bytes : ByteArray) : List LocatedEntry := scanFrom bytes 0 (bytes.size / 4)
-
-theorem scanAcc_append (bytes : ByteArray) (offset fuel : Nat)
-    (front suffix : List LocatedEntry) :
-    scanAcc bytes offset fuel (front ++ suffix) =
-      suffix.reverse ++ scanAcc bytes offset fuel front := by
-  induction fuel generalizing offset front with
-  | zero => simp [scanAcc, List.reverse_append]
-  | succ fuel ih =>
-    cases hs : scanStep (bytes.extract offset (offset + recordSize)) offset bytes.size with
-    | stop => simp [scanAcc, hs, List.reverse_append]
-    | next next found =>
-      cases found with
-      | none => simpa only [scanAcc, hs] using ih next front
-      | some entry =>
-        simpa only [scanAcc, hs, List.cons_append] using ih next (entry :: front)
-
-/-- Recognition prepends the physical first slot, even if it cannot authorize. -/
-theorem scanFrom_next_some {bytes : ByteArray} {offset next fuel : Nat}
-    {entry : LocatedEntry}
-    (h : scanStep (bytes.extract offset (offset + recordSize)) offset bytes.size =
-      .next next (some entry)) :
-    scanFrom bytes offset (fuel + 1) = entry :: scanFrom bytes next fuel := by
-  simpa [scanFrom, scanAcc, h] using scanAcc_append bytes next fuel [] [entry]
-
-theorem scanFrom_next_none {bytes : ByteArray} {offset next fuel : Nat}
-    (h : scanStep (bytes.extract offset (offset + recordSize)) offset bytes.size =
-      .next next none) :
-    scanFrom bytes offset (fuel + 1) = scanFrom bytes next fuel := by
-  simp only [scanFrom, scanAcc, h]
-
-/-- Every accumulated result originates in an actual bounded scanner step. -/
-theorem scanAcc_origin (bytes : ByteArray) (offset fuel : Nat) (acc : List LocatedEntry)
-    (entry : LocatedEntry) (h : entry ∈ scanAcc bytes offset fuel acc) :
-    entry ∈ acc ∨ ∃ pos next,
-      scanStep (bytes.extract pos (pos + recordSize)) pos bytes.size =
-        .next next (some entry) := by
-  induction fuel generalizing offset acc with
-  | zero =>
-    left
-    simpa [scanAcc] using h
-  | succ fuel ih =>
-    cases hs : scanStep (bytes.extract offset (offset + recordSize)) offset bytes.size with
-    | stop =>
-      left
-      simpa [scanAcc, hs] using h
-    | next next found =>
-      cases found with
-      | none =>
-        exact ih next acc (by simpa [scanAcc, hs] using h)
-      | some located =>
-        have hr := ih next (located :: acc) (by simpa [scanAcc, hs] using h)
-        rcases hr with hm | hw
-        · rcases List.mem_cons.mp hm with he | hm
-          · subst entry
-            exact Or.inr ⟨offset, next, hs⟩
-          · exact Or.inl hm
-        · exact Or.inr hw
-
-theorem scan_sound {bytes : ByteArray} {entry : LocatedEntry} (h : entry ∈ scan bytes) :
-    ∃ pos next,
-      scanStep (bytes.extract pos (pos + recordSize)) pos bytes.size =
-        .next next (some entry) ∧ pos + 4 ≤ next ∧ next ≤ bytes.size := by
-  have ho := scanAcc_origin bytes 0 (bytes.size / 4) [] entry h
-  rcases ho with hm | ⟨pos, next, hs⟩
-  · cases hm
-  · exact ⟨pos, next, hs, scanStep_bounds hs⟩
-
-/-- A scanned slot's validity flags describe the raw bytes, not a normalized
-timestamp reconstructed by the encoder. -/
-theorem scan_timespecs {bytes : ByteArray} {entry : LocatedEntry}
-    (h : entry ∈ scan bytes) :
-    ∃ chunk, decodeSlot chunk entry.offset = some entry ∧
-      (entry.startValid = true ↔
-        slotWord chunk 16 8 < 2 ^ 63 ∧ slotWord chunk 24 8 < 1000000000) ∧
-      (entry.timeValid = true ↔
-        slotWord chunk 32 8 < 2 ^ 63 ∧ slotWord chunk 40 8 < 1000000000) := by
-  obtain ⟨pos, next, hs, _⟩ := scan_sound h
-  have hd := scanStep_decoded hs
-  have hv := decodeSlot_validity hd
-  exact ⟨_, by simpa [hv.1] using hd, hv.2⟩
-
 def DiskEntry.forSession (e : DiskEntry) (sid : Nat) : Option Record :=
   if e.kind = 1 ∨ e.sid = sid then e.toRecord else none
 
@@ -685,9 +478,6 @@ def LocatedEntry.forSession (located : LocatedEntry) (sid : Nat) : Option Record
 def LocatedEntry.recordFor (located : LocatedEntry) (scope : Scope) (authUid sid : Nat) :
     Option Record :=
   if located.matches scope authUid then located.forSession sid else none
-
-def loadFor (sid : Nat) (bytes : ByteArray) : List Record :=
-  (scan bytes).filterMap fun located => located.forSession sid
 
 theorem DiskEntry.forSession_sound {e : DiskEntry} {sid : Nat} {r : Record}
     (h : e.forSession sid = some r) : e.kind = 1 ∨ e.sid = sid := by
@@ -709,15 +499,13 @@ theorem LocatedEntry.matches_tty_start {located : LocatedEntry} {dev sid start u
     {anyUid : Bool} (h : located.matches (.tty dev sid start) uid anyUid = true) :
     located.startValid = true ∧ located.entry.kind = 2 ∧
       located.entry.key = dev ∧ located.entry.start = start := by
-  simp only [LocatedEntry.matches, Bool.and_eq_true] at h
-  exact ⟨by simpa using h.1, DiskEntry.matches_tty_start h.2⟩
+  simp_all [LocatedEntry.matches, DiskEntry.matches]
 
 theorem LocatedEntry.matches_ppid_start {located : LocatedEntry} {pid start uid : Nat}
     {anyUid : Bool} (h : located.matches (.ppid pid start) uid anyUid = true) :
     located.startValid = true ∧ located.entry.kind = 3 ∧
       located.entry.key = pid ∧ located.entry.start = start := by
-  simp only [LocatedEntry.matches, Bool.and_eq_true] at h
-  exact ⟨by simpa using h.1, DiskEntry.matches_ppid_start h.2⟩
+  simp_all [LocatedEntry.matches, DiskEntry.matches]
 
 theorem LocatedEntry.forSession_sound {located : LocatedEntry} {sid : Nat} {r : Record}
     (h : located.forSession sid = some r) :
@@ -759,16 +547,6 @@ theorem LocatedEntry.recordFor_wrong_sid (located : LocatedEntry)
     (scope : Scope) (uid sid : Nat) (hg : located.entry.kind ≠ 1)
     (hs : located.entry.sid ≠ sid) : located.recordFor scope uid sid = none := by
   simp [LocatedEntry.recordFor, LocatedEntry.forSession, DiskEntry.forSession, hg, hs]
-
-/-- Every runtime-projected record comes from a real scanned slot and is
-global or belongs to the requesting session. -/
-theorem loadFor_sound {sid : Nat} {bytes : ByteArray} {r : Record}
-    (h : r ∈ loadFor sid bytes) :
-    ∃ located ∈ scan bytes, located.entry.toRecord = some r ∧
-      (located.entry.kind = 1 ∨ located.entry.sid = sid) := by
-  obtain ⟨located, hm, hp⟩ := List.mem_filterMap.mp h
-  have hs := LocatedEntry.forSession_sound hp
-  exact ⟨located, hm, hs.2.2.1, hs.2.2.2⟩
 
 /-! ## Properties -/
 
@@ -840,70 +618,37 @@ theorem lookup_timeout_zero (now : Nat) (scope : Scope) (authUid : Nat) (rs : Li
     lookup now (some 0) scope authUid rs = false := by
   simp [lookup, valid, fresh]
 
-/-- After bulk invalidation no record is accepted. -/
-theorem lookup_invalidate (now : Nat) (timeout : Option Nat) (scope : Scope) (authUid : Nat)
-    (rs : List Record) : lookup now timeout scope authUid (invalidate rs) = false := by
-  simp [lookup, invalidate, valid]
+/-- Disabling the selected runtime slot prevents authorization. -/
+theorem lookup_invalidateScope (located : LocatedEntry) (scope : Scope)
+    (uid sid now : Nat) (timeout : Option Nat) {record : Record}
+    (h : (LocatedEntry.recordFor { located with entry := disabledEntry located.entry }
+      scope uid sid) = some record) : valid now timeout scope uid record = false :=
+  located.disabled_not_valid scope uid sid now timeout h
 
-theorem lookup_invalidateScope (now : Nat) (timeout : Option Nat) (scope : Scope)
-    (authUid : Nat) (rs : List Record) :
-    lookup now timeout scope authUid (invalidateScope scope rs) = false := by
-  simp only [lookup, invalidateScope, List.any_map]
-  apply List.any_eq_false.mpr
-  intro r _
-  by_cases h : r.scope = scope <;> simp [h, valid]
+/-- The runtime invalidation branch leaves every nonmatching slot untouched. -/
+theorem invalidateScope_other (located : LocatedEntry) (scope : Scope)
+    (h : located.matches scope 0 true = false) :
+    (if located.matches scope 0 true then disabledEntry located.entry else located.entry) =
+      located.entry := by simp [h]
 
-theorem invalidateScope_other (scope : Scope) (r : Record) (h : r.scope ≠ scope) :
-    invalidateScope scope [r] = [r] := by
-  simp [invalidateScope, h]
+/-- A slot written for one authenticated key cannot authorize another key. -/
+theorem lookup_update_other {scope lockScope other : Scope} {sid uid otherUid now : Nat}
+    {timeout : Option Nat} {record : Record} {entry : DiskEntry}
+    (hw : updateEntry scope lockScope sid uid record = some entry)
+    (hne : (other, otherUid) ≠ (scope, uid)) :
+    valid now timeout other otherUid record = false := by
+  have hs := updateEntry_sound hw
+  cases hv : valid now timeout other otherUid record with
+  | false => rfl
+  | true =>
+    have hv := valid_sound hv
+    exact False.elim (hne (Prod.ext (hv.1.1.symm.trans hs.1)
+      (hv.1.2.1.symm.trans hs.2.1)))
 
-theorem lookup_update_self (now t : Nat) (scope : Scope) (authUid : Nat) (rs : List Record)
-    (ht : 0 < t) : lookup now (some t) scope authUid (update now scope authUid rs) = true := by
-  simp [lookup, update, valid, fresh]
-  omega
-
-theorem lookup_update_self_none (now : Nat) (scope : Scope) (authUid : Nat) (rs : List Record) :
-    lookup now none scope authUid (update now scope authUid rs) = true := by
-  simp [lookup, update, valid, fresh]
-
-/-- Isolation: updating `(scope, authUid)` never makes a record valid for a different key. -/
-theorem lookup_update_other {now now' : Nat} {timeout : Option Nat} {scope scope' : Scope}
-    {authUid authUid' : Nat} {rs : List Record} (hne : (scope', authUid') ≠ (scope, authUid))
-    (h : lookup now timeout scope' authUid' (update now' scope authUid rs) = true) :
-    lookup now timeout scope' authUid' rs = true := by
-  rw [lookup_iff] at h ⊢
-  obtain ⟨r, hr, hv⟩ := h
-  simp only [update, List.mem_cons] at hr
-  rcases hr with rfl | hr
-  · obtain ⟨⟨h1, h2, -⟩, -⟩ := valid_sound hv
-    simp at h1 h2
-    exact absurd (by rw [h1, h2]) hne
-  · exact ⟨r, (List.mem_filter.mp (List.mem_of_mem_take hr)).1, hv⟩
-
-/-- Isolation: as long as the file is below its record limit, updating one key leaves
-lookups for every other key unchanged. -/
-theorem lookup_update_other_eq {now now' : Nat} {timeout : Option Nat} {scope scope' : Scope}
-    {authUid authUid' : Nat} {rs : List Record} (hne : (scope', authUid') ≠ (scope, authUid))
-    (hlen : rs.length < maxRecords) :
-    lookup now timeout scope' authUid' (update now' scope authUid rs) =
-      lookup now timeout scope' authUid' rs := by
-  apply Bool.eq_iff_iff.mpr
-  refine ⟨lookup_update_other hne, fun h => ?_⟩
-  rw [lookup_iff] at h ⊢
-  obtain ⟨r, hr, hv⟩ := h
-  refine ⟨r, ?_, hv⟩
-  obtain ⟨⟨h1, h2, -⟩, -⟩ := valid_sound hv
-  have hlen' : (rs.filter (fun r => !(decide (r.scope = scope) && decide (r.authUid = authUid)))).length
-      ≤ maxRecords - 1 := by
-    have := List.length_filter_le (fun r => !(decide (r.scope = scope) && decide (r.authUid = authUid))) rs
-    omega
-  simp only [update, List.mem_cons, List.take_of_length_le hlen', List.mem_filter]
-  right
-  refine ⟨hr, ?_⟩
-  simp only [h1, h2, Bool.not_eq_true', Bool.and_eq_false_iff, decide_eq_false_iff_not]
-  by_cases hs : scope' = scope
-  · subst hs; right; intro hu; exact hne (by rw [hu])
-  · left; exact hs
+/-- The fixed-slot runtime encoder round-trips representable disk entries. -/
+theorem decode_encode (entry : DiskEntry) (h : entry.Representable) :
+    decodeEntry (encodeEntry entry) = some entry :=
+  decodeEntry_encodeEntry entry h
 
 /-- A future-dated record (e.g. from before a clock reset) is never accepted. -/
 theorem valid_not_future {now : Nat} {timeout : Option Nat} {scope : Scope} {authUid : Nat}

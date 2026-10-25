@@ -43,7 +43,7 @@ structure ResolvedCmd where
   deriving Repr, BEq, DecidableEq, Inhabited
 
 /-- Everything `decide` may depend on. -/
-structure Context where
+structure Context extends Facts where
   /-- `sudo` or `sudoedit` (basename of argv[0]) -/
   progname : String
   opts : Cli.Options
@@ -69,8 +69,6 @@ structure Context where
   command : Option ResolvedCmd
   /-- Set-user-ID or set-group-ID mode on the host-root resolved command inode. -/
   commandSetid : Bool := false
-  /-- Root-indexed command lookup and filesystem facts captured before policy. -/
-  rootFacts : List (String × RootCommandFacts) := []
   /-- the invoking user's environment (UTF-8 entries only) -/
   userEnv : EnvList
   /-- current working directory -/
@@ -79,10 +77,6 @@ structure Context where
   userUmask : Nat
   /-- `ttyname` of the controlling terminal (for logging and PAM_TTY), if any -/
   ttyName : Option String
-  /-- realpath oracle for literal command paths written in sudoers (identity when a
-  path does not resolve) -/
-  canon : String → String
-  canonPaths : List (String × String) := []
   /-- `CLOCK_BOOTTIME` nanoseconds -/
   now : Nat
   /-- timestamp scope of this invocation (`Timestamp.scopeFor settings.timestampType …`) -/
@@ -99,22 +93,13 @@ structure Context where
   longHost : String := ""
   /-- Actual submitting hostname, independent of the host selected with -h. -/
   submitHost : Option String := none
-  interfaces : List (IpAddr × IpAddr) := []
-  netgroups : List (String × Option String × Option String × Bool) := []
-  pluginGroups : List (String × String × Bool) := []
-  regexMatches : List (String × String × Bool) := []
-  digests : List Digest := []
   wallTime : Nat := 0
-  fileIds : List (String × Nat × Nat) := []
-  globPaths : List (String × List String) := []
   envFile : EnvList := []
   restrictedEnvFile : EnvList := []
   homes : List (String × String) := []
   selinuxEnabled : Bool := false
   mailerAvailable : Bool := false
   locatedSudoers : List Located := []
-  /-- Listing displays all queried NSS backends, even beyond authorization return actions. -/
-  listingSources : List Located := []
   /-- Loaded NSS backends retained for subcommand-specific source selection. -/
   policySources : List (Nsswitch.Source × List Located) := []
   /-- Pre-privilege Defaults snapshot: winning LDAP options cannot re-authorize a different rule. -/
@@ -125,8 +110,6 @@ structure Context where
   root : Principal := { name := "root", uid := 0, gid := 0, groups := [], home := "/root", shell := "/bin/bash" }
   previousUser : Option Principal := none
   listColumns : Nat := 0
-  /-- Zone-less civil seconds mapped to per-bound system-zone epochs by the shell. -/
-  localTimeBounds : List (Nat × Nat) := []
   validShells : List String := []
   invokingRealGid : Option Nat := none
   commandFoundInDot : Bool := false
@@ -145,38 +128,39 @@ inductive AuthReq where
 /-- How to run the command. The environment is `buildEnv { envInput with pamEnv }`
 where `pamEnv` is `pam_getenvlist` after `pam_open_session`; `decide` has already checked
 that `buildEnv envInput` succeeds (its success does not depend on `pamEnv`). -/
-structure ExecPlan where
-  path : String
-  /-- full argv including argv[0] -/
-  argv : List String
+structure RunPlan where
   envInput : EnvInput
-  uid : Nat
-  gid : Nat
-  /-- supplementary groups for `setgroups` -/
-  groups : List Nat
-  /-- `chdir` target after the privilege drop (`none`: stay in the current directory) -/
-  cwd : Option String
   /-- umask for the command, `≤ 0o777` -/
   umask : Nat
-  usePty : Bool
-  background : Bool
-  closeFrom : Nat
   /-- PAM service: `pamLoginService` for `-i`, else `pamService` -/
   pamService : String
   pamSession : Bool
   pamSetcred : Bool
+  cwd : Option String := none
   cwdOptional : Bool := false
+  usePty : Bool := false
+  closeFrom : Nat := 3
   timeout : Nat := 0
   noexecFile : Option String := none
   apparmorProfile : Option String := none
   rlimits : List (String × String) := []
   utmpUser : Option String := none
-  execFd : Option Nat := none
   iolog : Option IoLog.Plan := none
   execBackground : Bool := false
-  staySetuid : Bool := false
-  /-- Root selected by the deciding rule and authorized command-line override. -/
+  /-- Editor children use this root, but original edit files remain on the host. -/
   chroot : Option String := none
+
+structure ExecPlan extends RunPlan where
+  path : String
+  /-- full argv including argv[0] -/
+  argv : List String
+  uid : Nat
+  gid : Nat
+  /-- supplementary groups for `setgroups` -/
+  groups : List Nat
+  background : Bool
+  execFd : Option Nat := none
+  staySetuid : Bool := false
   /-- Recheck intercepted subcommands against the sudoers policy. -/
   intercept : Bool := false
   /-- Log intercepted subcommands even when policy interception is disabled. -/
@@ -185,7 +169,7 @@ structure ExecPlan where
 /-- `sudoedit` (`-e`): files are copied to temporary files owned by the invoking user,
 the editor runs as the invoking user, and changed files are written back as the target
 (`LeanSudo.Sudoedit`). -/
-structure EditPlan where
+structure EditPlan extends RunPlan where
   /-- the files to edit, made absolute against `Context.cwd`, in the order given -/
   files : List String
   /-- candidate editor command lines in order of preference (`SUDO_EDITOR`, `VISUAL`,
@@ -200,12 +184,6 @@ structure EditPlan where
   fileUid : Nat
   fileGid : Nat
   fileGroups : List Nat
-  /-- environment of the editor: `buildEnv { envInput with pamEnv }` -/
-  envInput : EnvInput
-  umask : Nat
-  pamService : String
-  pamSession : Bool
-  pamSetcred : Bool
   follow : Bool := false
   checkdir : Bool := true
   /-- Original file operands, exactly as evaluated by sudoers before making paths absolute. -/
@@ -213,19 +191,6 @@ structure EditPlan where
   editorSources : List String := []
   editorNotFound : String := ""
   editorPath : String := ""
-  /-- Root for the editor child only; sudo.ws still accesses original files on the host. -/
-  chroot : Option String := none
-  usePty : Bool := false
-  iolog : Option IoLog.Plan := none
-  timeout : Nat := 0
-  rlimits : List (String × String) := []
-  utmpUser : Option String := none
-  closeFrom : Nat := 3
-  execBackground : Bool := false
-  noexecFile : Option String := none
-  apparmorProfile : Option String := none
-  cwd : Option String := none
-  cwdOptional : Bool := false
 
 inductive Action where
   | exec (plan : ExecPlan)

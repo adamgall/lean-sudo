@@ -121,13 +121,7 @@ structure RunasSpec where
   groups : Option (List (Member UserAtom))
   deriving Repr, BEq, DecidableEq, Inhabited
 
-/-- Tags; `none` = not specified (the corresponding Defaults flag decides). -/
-structure Tags where
-  /-- `PASSWD:` = `some true`, `NOPASSWD:` = `some false` -/
-  passwd : Option Bool := Option.none
-  /-- `SETENV:` = `some true`, `NOSETENV:` = `some false` -/
-  setenv : Option Bool := Option.none
-  /-- `NOEXEC:` = `some true`, `EXEC:` = `some false` -/
+structure TagEffects where
   noexec : Option Bool := Option.none
   /-- `INTERCEPT:` / `NOINTERCEPT:` -/
   intercept : Option Bool := Option.none
@@ -141,8 +135,14 @@ structure Tags where
   follow : Option Bool := Option.none
   deriving Repr, BEq, DecidableEq, Inhabited
 
+/-- Tags; `none` = not specified (the corresponding Defaults flag decides). -/
+structure Tags extends TagEffects where
+  passwd : Option Bool := Option.none
+  setenv : Option Bool := Option.none
+  deriving Repr, BEq, DecidableEq, Inhabited
+
 /-- Per-command options. -/
-structure CmndOptions where
+structure ExecutionOptions where
   /-- `CWD=path` (`some (some p)`), `CWD=*` (`some none`: user may pick with `-D`);
   `~` / `~user` are kept verbatim and expanded by the decision core -/
   cwd : Option (Option String) := Option.none
@@ -150,14 +150,6 @@ structure CmndOptions where
   chroot : Option String := Option.none
   /-- `TIMEOUT=` in seconds -/
   timeout : Option Nat := Option.none
-  /-- `NOTBEFORE=` / `NOTAFTER=` as Unix time (seconds, UTC) -/
-  notBefore : Option Nat := Option.none
-  notAfter : Option Nat := Option.none
-  /-- Zone-less Generalized Time values need per-bound system-zone
-  `mktime(tm_isdst = -1)` resolution. Stored civil seconds are computed as UTC;
-  negative epochs clamp to zero for contemporary positive wall clocks. -/
-  notBeforeLocal : Bool := false
-  notAfterLocal : Bool := false
   /-- SELinux `ROLE=` / `TYPE=` -/
   role : Option String := Option.none
   type : Option String := Option.none
@@ -166,6 +158,17 @@ structure CmndOptions where
   /-- Solaris `PRIVS=` / `LIMITPRIVS=` (no effect on Linux) -/
   privs : Option String := Option.none
   limitprivs : Option String := Option.none
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+structure CmndOptions extends ExecutionOptions where
+  /-- `NOTBEFORE=` / `NOTAFTER=` as Unix time (seconds, UTC) -/
+  notBefore : Option Nat := Option.none
+  notAfter : Option Nat := Option.none
+  /-- Zone-less Generalized Time values need per-bound system-zone
+  `mktime(tm_isdst = -1)` resolution. Stored civil seconds are computed as UTC;
+  negative epochs clamp to zero for contemporary positive wall clocks. -/
+  notBeforeLocal : Bool := false
+  notAfterLocal : Bool := false
   deriving Repr, BEq, DecidableEq, Inhabited
 
 structure CmndSpec where

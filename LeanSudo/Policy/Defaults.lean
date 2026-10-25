@@ -41,14 +41,8 @@ open LeanSudo.Sudoers
 
 /-- Split on whitespace, dropping empty words. -/
 def splitWords (v : String) : List String :=
-  go v.toList []
-where
-  go : List Char → List Char → List String
-    | [], cur => if cur.isEmpty then [] else [String.ofList cur.reverse]
-    | c :: cs, cur =>
-      if c.isWhitespace then
-        if cur.isEmpty then go cs [] else String.ofList cur.reverse :: go cs []
-      else go cs (c :: cur)
+  ((v.split Char.isWhitespace).filter (fun word => !word.isEmpty)).map
+    (·.toString) |>.toList
 
 def digitVal (c : Char) : Nat := c.toNat - '0'.toNat
 
@@ -100,7 +94,7 @@ def parseTimestampType : String → Option TimestampType
 
 def syslogFacilities : List String :=
   ["authpriv", "auth", "daemon", "user", "local0", "local1", "local2", "local3", "local4",
-   "local5", "local6", "local7", "cron", "kern", "lpr", "mail", "news", "syslog", "uucp", "ftp"]
+   "local5", "local6", "local7"]
 
 /-! ## Typed option table (sudo 1.9.17p2 `def_data.in`) -/
 
@@ -128,7 +122,8 @@ def defaultKind : String → Option DefaultKind
   | "syslog" => some (.facility (fun st v => { st with syslog := v }))
   | "syslog_goodpri" => some (.priority (fun st v => { st with syslogGoodpri := v }))
   | "syslog_badpri" => some (.priority (fun st v => { st with syslogBadpri := v }))
-  | "long_otp_prompt" => some (.flag (fun st v => { st with longOtpPrompt := v }))
+  | "long_otp_prompt" | "use_loginclass" | "ignore_local_sudoers" =>
+    some (.flag (fun st _ => st))
   | "ignore_dot" => some (.flag (fun st v => { st with ignoreDot := v }))
   | "mail_always" => some (.flag (fun st v => { st with mailAlways := v }))
   | "mail_badpass" => some (.flag (fun st v => { st with mailBadpass := v }))
@@ -154,7 +149,6 @@ def defaultKind : String → Option DefaultKind
   | "rootpw" => some (.flag (fun st v => { st with rootpw := v }))
   | "runaspw" => some (.flag (fun st v => { st with runaspw := v }))
   | "targetpw" => some (.flag (fun st v => { st with targetpw := v }))
-  | "use_loginclass" => some (.flag (fun st v => { st with useLoginclass := v }))
   | "set_logname" => some (.flag (fun st v => { st with setLogname := v }))
   | "stay_setuid" => some (.flag (fun st v => { st with staySetuid := v }))
   | "preserve_groups" => some (.flag (fun st v => { st with preserveGroups := v }))
@@ -182,7 +176,6 @@ def defaultKind : String → Option DefaultKind
   | "listpw" => some (.tuple true ["never", "any", "all", "always"] (fun st v => { st with listpw := (parsePwPolicy v).getD .never }))
   | "verifypw" => some (.tuple true ["never", "all", "any", "always"] (fun st v => { st with verifypw := (parsePwPolicy v).getD .never }))
   | "noexec" => some (.flag (fun st v => { st with noexec := v }))
-  | "ignore_local_sudoers" => some (.flag (fun st v => { st with ignoreLocalSudoers := v }))
   | "closefrom" => some (.integer (fun st v => { st with closefrom := v }))
   | "closefrom_override" => some (.flag (fun st v => { st with closefromOverride := v }))
   | "setenv" => some (.flag (fun st v => { st with setenv := v }))
@@ -318,7 +311,19 @@ private def valueOf (name : String) (boolean : Bool) : DefaultsOp → Except Str
   | .flag true => noValue name
   | op => badOp name op
 
-/-- Sudo command timeouts are compound decimal seconds/minutes/hours/days. -/
+/-- Parse a typed value, preserving the option's disabled value and diagnostics. -/
+private def parsedSetting (st : Settings) (d : DefaultsSetting) (boolean : Bool)
+    (off : α) (parse : String → Option α) (set : Settings → α → Settings)
+    : Except String Settings := do
+  match ← valueOf d.name boolean d.op with
+  | none => pure (set st off)
+  | some text =>
+    match parse text with
+    | some value => pure (set st value)
+    | none => invalid d.name text
+
+/-- Defaults command timeouts use lowercase units without whitespace or signs.
+Unlike command-spec timeouts, units need not appear in descending order. -/
 def parseCommandTimeout (v : String) : Option Nat :=
   go v.toList 0 0 false
 where
@@ -341,17 +346,15 @@ private def validRlimit (v : String) : Bool :=
     | _ => false
 
 private def checkPath (name : String) (path : DefaultPath) (v : String) : Except String Unit := do
+  if let .unrestricted := path then return ()
+  if v.utf8ByteSize ≥ 4096 then throw s!"path name for \"{name}\" too long"
   match path with
+  | .absolute =>
+    if !v.startsWith "/" then throw s!"values for \"{name}\" must start with a '/'"
+  | .changeDirectory =>
+    if !v.startsWith "/" && !v.startsWith "~" && v != "*" then
+      throw s!"values for \"{name}\" must start with a '/', '~', or '*'"
   | .unrestricted => pure ()
-  | _ =>
-    if v.utf8ByteSize ≥ 4096 then throw s!"path name for \"{name}\" too long"
-    match path with
-    | .absolute =>
-      if !v.startsWith "/" then throw s!"values for \"{name}\" must start with a '/'"
-    | .changeDirectory =>
-      if !v.startsWith "/" && !v.startsWith "~" && v != "*" then
-        throw s!"values for \"{name}\" must start with a '/', '~', or '*'"
-    | .unrestricted => pure ()
 
 /-- Apply one setting. Type-only checks disable callbacks; verbose policy setup
 additionally emits deprecation diagnostics, as visudo does but runtime sudo does not. -/
@@ -385,45 +388,20 @@ def applySetting (st : Settings) (d : DefaultsSetting) (callbacks : Bool := true
         let bounded := if value < 0 || value > 2176782335 then 2176782335 else value
         pure (set st (some (toString bounded)))
     else pure (set st v)
-  | .rlimit set => do
-    let v ← valueOf n true d.op
-    if let some text := v then
-      if !validRlimit text then invalid n text else pure (set st v)
-    else pure (set st none)
-  | .unsigned boolean set => do
-    let v ← valueOf n boolean d.op
-    match v with
-    | none => pure (set st 0)
-    | some text => match parseDecimal (if text.startsWith "+" then text.drop 1 |>.toString else text) with
-      | some k => if k ≤ 4294967295 then pure (set st k) else invalid n text
-      | none => invalid n text
-  | .integer set => do
-    let v ← valueOf n false d.op
-    let text := v.getD ""
-    match text.toInt? with
-    | some k => if -2147483648 ≤ k && k ≤ 2147483647 then pure (set st k) else invalid n text
-    | none => invalid n text
-  | .mode boolean set => do
-    let v ← valueOf n boolean d.op
-    match v with
-    | none => pure (set st 0o777)
-    | some text => match parseOctal text with
-      | some k => if k ≤ 0o777 then pure (set st k) else invalid n text
-      | none => invalid n text
-  | .minutes set => do
-    let v ← valueOf n true d.op
-    match v with
-    | none => pure (set st (some 0))
-    | some text => match parseTimeout text with
-      | some seconds => pure (set st seconds)
-      | none => invalid n text
-  | .timeout set => do
-    let v ← valueOf n true d.op
-    match v with
-    | none => pure (set st 0)
-    | some text => match parseCommandTimeout text with
-      | some seconds => pure (set st seconds)
-      | none => invalid n text
+  | .rlimit set =>
+    parsedSetting st d true none (fun text =>
+      if validRlimit text then some (some text) else none) set
+  | .unsigned boolean set =>
+    parsedSetting st d boolean 0 (fun text =>
+      (parseDecimal (if text.startsWith "+" then text.drop 1 |>.toString else text)).filter
+        (· ≤ 4294967295)) set
+  | .integer set =>
+    parsedSetting st d false 0 (fun text =>
+      text.toInt?.filter (fun k => -2147483648 ≤ k && k ≤ 2147483647)) set
+  | .mode boolean set =>
+    parsedSetting st d boolean 0o777 (fun text => (parseOctal text).filter (· ≤ 0o777)) set
+  | .minutes set => parsedSetting st d true (some 0) parseTimeout set
+  | .timeout set => parsedSetting st d true 0 parseCommandTimeout set
   | .tuple boolean values set =>
     match d.op with
     | .flag b => if boolean then pure (set st ((values[b.toNat]?).getD "")) else noValue n
@@ -435,15 +413,12 @@ def applySetting (st : Settings) (d : DefaultsSetting) (callbacks : Bool := true
     | .flag false => pure (set st none)
     | .assign text => if syslogFacilities.contains text then pure (set st (some text)) else invalid n text
     | op => badOp n op
-  | .priority set => do
-    let v ← valueOf n true d.op
-    match v with
-    | none => pure (set st none)
-    | some text =>
-      if text == "none" then pure (set st none)
+  | .priority set =>
+    parsedSetting st d true none (fun text =>
+      if text == "none" then some none
       else if ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"].contains text then
-        pure (set st (some text))
-      else invalid n text
+        some (some text)
+      else none) set
   return (result, if callbacks && verbose && n == "runchroot" then
     let location := (d.source.map fun (file, line, column) => s!"{file}:{line}:{column}: ").getD ""
     some (location ++ "\"runchroot\" is deprecated and will be removed in a future sudo release")
@@ -484,15 +459,6 @@ private def scopeMatches (al : Aliases) (st : Settings) (user : Principal) (host
   | .cmnd cs => cmd.any fun cm =>
     cmndListResult al al.fuel canon cm cs
       (facts.map fun r => { r with command := cm, fastGlob := st.fastGlob }) == some true
-
-/-- Applicable settings in phase order, with explicit matching settings and facts. -/
-def applicableDefaults (s : Sudoers) (user : Principal) (host : String) (runas : Option Principal)
-    (cmd : Option Command) (canon : String → String := id) (st : Settings := {})
-    (facts : Option Request := none) : List DefaultsSetting :=
-  let al := aliasesOf s
-  [0, 1, 2].flatMap fun phase =>
-    (defaultsOf s).flatMap fun (sc, ss) =>
-      if scopePhase sc == phase && scopeMatches al st user host runas cmd canon facts sc then ss else []
 
 /-- Resolve all options, rejecting invalid values and retaining unknown-option warnings.
 `initial` supplies front-end defaults (such as `-p` implying passprompt_override);

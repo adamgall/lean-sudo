@@ -1,5 +1,6 @@
 /* Framed TCP/TLS and the Lean I/O relay bridge. No protobuf or logging policy. */
 #include "logsrv.h"
+#include "shim.h"
 #include <arpa/inet.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -55,6 +56,11 @@ struct tls_api {
   unsigned long (*get_error)(void);
   const char *(*reason_error)(unsigned long);
 };
+struct frame {
+  unsigned char header[4];
+  size_t header_used, body_used;
+  lean_object *body;
+};
 static struct {
   int fd, tls_errno;
   uint32_t timeout, relay;
@@ -62,32 +68,23 @@ static struct {
   struct tls_api api;
   SSL_CTX *ctx;
   SSL *ssl;
-  unsigned char header[4];
-  size_t header_used, body_used;
-  lean_object *body;
+  struct frame frame;
 } connection = {.fd = -1};
 
 /* Independent lifetime: reconnecting the parent must not discard broker data. */
 static struct {
   int reader, writer;
   uint32_t timeout;
-  unsigned char header[4];
-  size_t header_used, body_used;
-  lean_object *body;
+  struct frame frame;
 } queue = {.reader = -1, .writer = -1};
 static int detached_broker;
 
-static int64_t now_ms(void) {
-  struct timespec ts;
-  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return -1;
-  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
 static int64_t deadline_new(void) {
-  int64_t now = now_ms();
+  int64_t now = ls_mono_ms();
   return now < 0 ? -1 : now + (int64_t)connection.timeout * 1000;
 }
 static int remaining(int64_t deadline) {
-  int64_t now = now_ms();
+  int64_t now = ls_mono_ms();
   if (now < 0) return -1;
   if (now >= deadline) return 0;
   int64_t n = deadline - now;
@@ -132,7 +129,7 @@ static void reset(void) {
   if (connection.ssl) connection.api.ssl_free(connection.ssl);
   if (connection.ctx) connection.api.ctx_free(connection.ctx);
   if (connection.fd >= 0) close(connection.fd);
-  if (connection.body) lean_dec(connection.body);
+  if (connection.frame.body) lean_dec(connection.frame.body);
   if (connection.ssl_lib) dlclose(connection.ssl_lib);
   if (connection.crypto_lib) dlclose(connection.crypto_lib);
   memset(&connection, 0, sizeof connection);
@@ -162,18 +159,6 @@ struct address_node {
   struct resolved_address value;
   struct address_node *next;
 };
-static int resolver_write(int fd, const struct resolved_address *address) {
-  const unsigned char *p = (const unsigned char *)address;
-  size_t left = sizeof *address;
-  while (left) {
-    ssize_t n = write(fd, p, left);
-    if (n < 0 && errno == EINTR) continue;
-    if (n <= 0) return -1;
-    p += n;
-    left -= (size_t)n;
-  }
-  return 0;
-}
 static void resolver_child(int fd, const char *host, const char *service) {
   struct sigaction action;
   memset(&action, 0, sizeof action);
@@ -197,12 +182,12 @@ static void resolver_child(int fd, const char *host, const char *service) {
     address.protocol = ai->ai_protocol;
     address.length = ai->ai_addrlen;
     memcpy(&address.address, ai->ai_addr, ai->ai_addrlen);
-    if (resolver_write(fd, &address) != 0) { freeaddrinfo(result); _exit(1); }
+    if (ls_write_all(fd, &address, sizeof address) != 0) { freeaddrinfo(result); _exit(1); }
   }
   freeaddrinfo(result);
   struct resolved_address end;
   memset(&end, 0, sizeof end);
-  int status = resolver_write(fd, &end);
+  int status = ls_write_all(fd, &end, sizeof end);
   close(fd);
   _exit(status == 0 ? 0 : 1);
 }
@@ -274,12 +259,6 @@ static int connect_addresses(const struct address_node *addresses, int keepalive
         setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof enabled) != 0) {
       last_error = errno; close(fd); continue;
     }
-#ifdef SO_NOSIGPIPE
-    enabled = 1;
-    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof enabled) != 0) {
-      last_error = errno; close(fd); continue;
-    }
-#endif
     int rc = connect(fd, (const struct sockaddr *)&address->address, address->length);
     if (rc < 0 && (errno == EINPROGRESS || errno == EINTR || errno == EALREADY)) {
       rc = wait_fd(fd, POLLOUT, 1, deadline);
@@ -298,18 +277,9 @@ static int connect_addresses(const struct address_node *addresses, int keepalive
   return -1;
 }
 
-static void *load_library(const char *soname, const char *dylib) {
-  void *handle = dlopen(soname, RTLD_NOW | RTLD_LOCAL);
-#ifdef __APPLE__
-  if (!handle) handle = dlopen(dylib, RTLD_NOW | RTLD_LOCAL);
-#else
-  (void)dylib;
-#endif
-  return handle;
-}
 static int tls_load(void) {
-  connection.crypto_lib = load_library("libcrypto.so.3", "libcrypto.3.dylib");
-  connection.ssl_lib = load_library("libssl.so.3", "libssl.3.dylib");
+  connection.crypto_lib = dlopen("libcrypto.so.3", RTLD_NOW | RTLD_LOCAL);
+  connection.ssl_lib = dlopen("libssl.so.3", RTLD_NOW | RTLD_LOCAL);
   if (!connection.crypto_lib || !connection.ssl_lib) { errno = ENOSYS; return -1; }
   struct tls_api *api = &connection.api;
   const struct { const char *name; void *slot; int crypto; } symbols[] = {
@@ -481,11 +451,7 @@ static ssize_t transfer(void *buf, size_t len, int writing, int wait, int64_t de
       if (rc < 0) return -1;
     } else {
       if (writing) {
-#ifdef MSG_NOSIGNAL
         rc = send(connection.fd, buf, len, MSG_NOSIGNAL);
-#else
-        rc = send(connection.fd, buf, len, 0);
-#endif
       } else rc = recv(connection.fd, buf, len, 0);
       if (rc == 0) { errno = ENODATA; return -1; }
       if (rc < 0) {
@@ -511,7 +477,7 @@ LEAN_EXPORT lean_obj_res leansudo_logsrv_clock(lean_obj_arg world) {
   (void)world;
   struct timespec ts;
   int rc;
-  do { rc = clock_gettime(CLOCK_MONOTONIC, &ts); } while (rc != 0 && errno == EINTR);
+  rc = TEMP_FAILURE_RETRY(clock_gettime(CLOCK_MONOTONIC, &ts));
   if (rc != 0 || ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L ||
       (uint64_t)ts.tv_sec > (UINT64_MAX - (uint64_t)ts.tv_nsec) / UINT64_C(1000000000))
     return lean_io_result_mk_error(lean_mk_io_user_error(
@@ -577,37 +543,45 @@ LEAN_EXPORT lean_obj_res leansudo_logsrv_send(b_lean_obj_arg bytes, lean_obj_arg
   }
   return lean_io_result_mk_ok(lean_box(0));
 }
+/* Network reads may wait/TLS-retry; broker reads must return to the supervisor
+ * on EINTR/EAGAIN. Framing and allocation bounds are otherwise identical. */
+static int frame_read(struct frame *frame, bool broker, int wait, int64_t deadline) {
+  for (unsigned part = 0; part < 2; part++) {
+    if (part && !frame->body) {
+      uint32_t length;
+      memcpy(&length, frame->header, sizeof length);
+      length = ntohl(length);
+      if (length > LOGSRV_MAX_FRAME) { errno = EMSGSIZE; return -1; }
+      frame->body = lean_alloc_sarray(1, length, length);
+    }
+    unsigned char *buf = part ? lean_sarray_cptr(frame->body) : frame->header;
+    size_t len = part ? lean_sarray_size(frame->body) : sizeof frame->header;
+    size_t *used = part ? &frame->body_used : &frame->header_used;
+    while (*used < len) {
+      ssize_t n;
+      if (broker) {
+        n = recv(queue.reader, buf + *used, len - *used, 0);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
+        if (!n) { errno = ECONNRESET; return -1; }
+      } else n = transfer(buf + *used, len - *used, 0, wait, deadline);
+      if (n <= 0) return n < 0 ? -1 : 0;
+      *used += (size_t)n;
+    }
+  }
+  return 1;
+}
 LEAN_EXPORT lean_obj_res leansudo_logsrv_receive(uint8_t wait, lean_obj_arg world) {
   (void)world;
   if (connection.fd < 0) { errno = ENOTCONN; return failure("receive"); }
   int64_t deadline = deadline_new();
   if (deadline < 0) return failure("clock");
-  while (connection.header_used < sizeof connection.header) {
-    ssize_t n = transfer(connection.header + connection.header_used,
-        sizeof connection.header - connection.header_used, 0, wait, deadline);
-    if (n < 0) return failure("receive");
-    if (!n) return lean_io_result_mk_ok(lean_box(0));
-    connection.header_used += (size_t)n;
-  }
-  if (!connection.body) {
-    uint32_t length;
-    memcpy(&length, connection.header, sizeof length);
-    length = ntohl(length);
-    if (length > LOGSRV_MAX_FRAME) { errno = EMSGSIZE; return failure("receive"); }
-    connection.body = lean_alloc_sarray(1, length, length);
-  }
-  size_t length = lean_sarray_size(connection.body);
-  while (connection.body_used < length) {
-    ssize_t n = transfer(lean_sarray_cptr(connection.body) + connection.body_used,
-        length - connection.body_used, 0, wait, deadline);
-    if (n < 0) return failure("receive");
-    if (!n) return lean_io_result_mk_ok(lean_box(0));
-    connection.body_used += (size_t)n;
-  }
+  int rc = frame_read(&connection.frame, false, wait, deadline);
+  if (rc < 0) return failure("receive");
+  if (!rc) return lean_io_result_mk_ok(lean_box(0));
   lean_object *some = lean_alloc_ctor(1, 1, 0);
-  lean_ctor_set(some, 0, connection.body);
-  connection.body = NULL;
-  connection.header_used = connection.body_used = 0;
+  lean_ctor_set(some, 0, connection.frame.body);
+  connection.frame.body = NULL;
+  connection.frame.header_used = connection.frame.body_used = 0;
   return lean_io_result_mk_ok(some);
 }
 LEAN_EXPORT lean_obj_res leansudo_logsrv_close(lean_obj_arg world) {
@@ -665,7 +639,7 @@ static void queue_reset(void) {
   int saved = errno;
   if (queue.reader >= 0) close(queue.reader);
   if (queue.writer >= 0) close(queue.writer);
-  if (queue.body) lean_dec(queue.body);
+  if (queue.frame.body) lean_dec(queue.frame.body);
   memset(&queue, 0, sizeof queue);
   queue.reader = queue.writer = -1;
   errno = saved;
@@ -692,11 +666,6 @@ LEAN_EXPORT lean_obj_res leansudo_logsrv_queue_init(lean_obj_arg world) {
   if (cloexec(pair[0]) != 0 || cloexec(pair[1]) != 0 ||
       nonblocking(pair[0]) != 0 || nonblocking(pair[1]) != 0)
     return queue_failure("initialize");
-#ifdef SO_NOSIGPIPE
-  int enabled = 1;
-  if (setsockopt(queue.writer, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof enabled) != 0)
-    return queue_failure("initialize");
-#endif
   return lean_io_result_mk_ok(lean_box(0));
 }
 LEAN_EXPORT lean_obj_res leansudo_logsrv_queue_send(b_lean_obj_arg bytes, lean_obj_arg world) {
@@ -704,7 +673,7 @@ LEAN_EXPORT lean_obj_res leansudo_logsrv_queue_send(b_lean_obj_arg bytes, lean_o
   if (queue.writer < 0) { errno = ENOTCONN; return queue_failure("send"); }
   size_t len = lean_sarray_size(bytes);
   if (len > LOGSRV_MAX_FRAME) { errno = EMSGSIZE; return queue_failure("send"); }
-  int64_t now = now_ms();
+  int64_t now = ls_mono_ms();
   if (now < 0) return queue_failure("clock");
   int64_t deadline = now + (int64_t)queue.timeout * 1000;
   uint32_t header = htonl((uint32_t)len);
@@ -715,11 +684,7 @@ LEAN_EXPORT lean_obj_res leansudo_logsrv_queue_send(b_lean_obj_arg bytes, lean_o
     while (used < lengths[i]) {
       int ms = remaining(deadline);
       if (ms <= 0) { if (!ms) errno = ETIMEDOUT; return queue_failure("send"); }
-#ifdef MSG_NOSIGNAL
       ssize_t n = send(queue.writer, parts[i] + used, lengths[i] - used, MSG_NOSIGNAL);
-#else
-      ssize_t n = send(queue.writer, parts[i] + used, lengths[i] - used, 0);
-#endif
       if (n < 0 && errno == EINTR) continue;
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         if (wait_fd(queue.writer, POLLOUT, 1, deadline) < 0) return queue_failure("send");
@@ -738,35 +703,15 @@ LEAN_EXPORT lean_obj_res leansudo_logsrv_queue_close(lean_obj_arg world) {
 }
 int ls_logsrv_queue_fd(void) { return queue.reader; }
 
-/* No waiting here: the exec monitor owns readiness and command supervision. */
-static int queue_read(void *buf, size_t len, size_t *used) {
-  while (*used < len) {
-    ssize_t n = recv(queue.reader, (unsigned char *)buf + *used, len - *used, 0);
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
-    if (n <= 0) { if (!n) errno = ECONNRESET; return -1; }
-    *used += (size_t)n;
-  }
-  return 1;
-}
 int ls_logsrv_dispatch(void) {
   if (queue.reader < 0) return 0;
   for (;;) {
-    int rc = queue_read(queue.header, sizeof queue.header, &queue.header_used);
+    int rc = frame_read(&queue.frame, true, 0, 0);
     if (rc == 0) return 0;
     if (rc < 0) { queue_reset(); return -1; }
-    if (!queue.body) {
-      uint32_t length;
-      memcpy(&length, queue.header, sizeof length);
-      length = ntohl(length);
-      if (length > LOGSRV_MAX_FRAME) { errno = EMSGSIZE; queue_reset(); return -1; }
-      queue.body = lean_alloc_sarray(1, length, length);
-    }
-    rc = queue_read(lean_sarray_cptr(queue.body), lean_sarray_size(queue.body), &queue.body_used);
-    if (rc == 0) return 0;
-    if (rc < 0) { queue_reset(); return -1; }
-    lean_object *body = queue.body;
-    queue.body = NULL;
-    queue.header_used = queue.body_used = 0;
+    lean_object *body = queue.frame.body;
+    queue.frame.body = NULL;
+    queue.frame.header_used = queue.frame.body_used = 0;
     lean_object *result = leansudo_logsrv_subcommand_wire(body, lean_box(0));
     if (callback_status(result)) { queue_reset(); return -1; }
     /* Lean may close the queue as part of its failure policy. */

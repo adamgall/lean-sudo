@@ -25,15 +25,9 @@
 #define SUDO_API_MKVERSION(x, y) (((x) << 16) | (y))
 #define SUDO_API_VERSION SUDO_API_MKVERSION(SUDO_API_VERSION_MAJOR, SUDO_API_VERSION_MINOR)
 
-/* Getters and setters for plugin API versions */
+/* Getters for plugin API versions */
 #define SUDO_API_VERSION_GET_MAJOR(v) ((v) >> 16)
 #define SUDO_API_VERSION_GET_MINOR(v) ((v) & 0xffffU)
-#define SUDO_API_VERSION_SET_MAJOR(vp, n) do { \
-    *(vp) = (*(vp) & 0x0000ffffU) | ((n) << 16); \
-} while(0)
-#define SUDO_API_VERSION_SET_MINOR(vp, n) do { \
-    *(vp) = (*(vp) & 0xffff0000U) | (n); \
-} while(0)
 
 /* "plugin type" for the sudo front end, as passed to an audit plugin */
 #define SUDO_FRONT_END		0
@@ -64,11 +58,6 @@ struct sudo_conv_message {
 struct sudo_conv_reply {
     char *reply;
 };
-
-/* Conversation callback API version major/minor */
-#define SUDO_CONV_CALLBACK_VERSION_MAJOR	1
-#define SUDO_CONV_CALLBACK_VERSION_MINOR	0
-#define SUDO_CONV_CALLBACK_VERSION SUDO_API_MKVERSION(SUDO_CONV_CALLBACK_VERSION_MAJOR, SUDO_CONV_CALLBACK_VERSION_MINOR)
 
 /*
  * Callback struct to be passed to the conversation function.
@@ -162,31 +151,8 @@ struct sudo_plugin_event {
 #define SUDO_PLUGIN_EV_PERSIST	0x08	/* persist until deleted */
 #define SUDO_PLUGIN_EV_SIGNAL	0x10	/* fire on signal receipt */
 
-/* Policy plugin type and defines. */
-struct passwd;
-struct policy_plugin {
+/* Policy plugin type, used when reporting policy decisions to audit plugins. */
 #define SUDO_POLICY_PLUGIN     1
-    unsigned int type; /* always SUDO_POLICY_PLUGIN */
-    unsigned int version; /* always SUDO_API_VERSION */
-    int (*open)(unsigned int version, sudo_conv_t conversation,
-	sudo_printf_t sudo_plugin_printf, char * const settings[],
-	char * const user_info[], char * const user_env[],
-	char * const plugin_options[], const char **errstr);
-    void (*close)(int exit_status, int error); /* wait status or error */
-    int (*show_version)(int verbose);
-    int (*check_policy)(int argc, char * const argv[],
-	char *env_add[], char **command_info[],
-	char **argv_out[], char **user_env_out[], const char **errstr);
-    int (*list)(int argc, char * const argv[], int verbose,
-	const char *user, const char **errstr);
-    int (*validate)(const char **errstr);
-    void (*invalidate)(int rmcred);
-    int (*init_session)(struct passwd *pwd, char **user_env_out[],
-	const char **errstr);
-    void (*register_hooks)(int version, int (*register_hook)(struct sudo_hook *hook));
-    void (*deregister_hooks)(int version, int (*deregister_hook)(struct sudo_hook *hook));
-    struct sudo_plugin_event * (*event_alloc)(void);
-};
 
 /* I/O plugin type and defines. */
 struct io_plugin {
@@ -263,17 +229,6 @@ struct approval_plugin {
     int (*show_version)(int verbose);
 };
 
-/* Sudoers group plugin version major/minor */
-#define GROUP_API_VERSION_MAJOR 1
-#define GROUP_API_VERSION_MINOR 0
-#define GROUP_API_VERSION SUDO_API_MKVERSION(GROUP_API_VERSION_MAJOR, GROUP_API_VERSION_MINOR)
-
-/* Getters and setters for group version (for source compat only) */
-#define GROUP_API_VERSION_GET_MAJOR(v) SUDO_API_VERSION_GET_MAJOR(v)
-#define GROUP_API_VERSION_GET_MINOR(v) SUDO_API_VERSION_GET_MINOR(v)
-#define GROUP_API_VERSION_SET_MAJOR(vp, n) SUDO_API_VERSION_SET_MAJOR(vp, n)
-#define GROUP_API_VERSION_SET_MINOR(vp, n) SUDO_API_VERSION_SET_MINOR(vp, n)
-
 /*
  * version: for compatibility checking
  * group_init: return 1 on success, 0 if unconfigured, -1 on error.
@@ -281,6 +236,7 @@ struct approval_plugin {
  * user_in_group: returns 1 if user is in group, 0 if not.
  *                note that pwd may be NULL if the user is not in passwd.
  */
+struct passwd;
 struct sudoers_group_plugin {
     unsigned int version;
     int (*init)(int version, sudo_printf_t sudo_plugin_printf,

@@ -1,8 +1,9 @@
 import LeanSudo.Sudoers.Ast
 
 /-! FIPS 180-4 SHA-2. Words and schedules use machine arithmetic; padding is
-read virtually so hashing does not copy the input. Only the final digest is
-serialized. These length proofs do not claim cryptographic correctness. -/
+read virtually so hashing does not copy the input. A local macro specializes
+the shared algorithm at compile time, without runtime word-operation dispatch.
+Only the final digest is serialized. The length proofs do not claim cryptographic correctness. -/
 namespace LeanSudo.Sha2
 
 private def paddedByte (m : ByteArray) (total lengthBytes i : Nat) : UInt8 :=
@@ -29,59 +30,71 @@ private def k32 : Array UInt32 := #[
   0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
   0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2]
 
-@[inline] private def rotr32 (x n : UInt32) : UInt32 :=
-  (x >>> n) ||| (x <<< (32 - n))
+local macro "sha2Impl " word:ident ofByte:ident ofNat:ident toByte:ident
+    rotr:ident compress:ident hash:ident bytes:ident
+    bits:num wordBytes:num lengthBytes:num blockBytes:num rounds:num constants:ident
+    "(" s00:num "," s01:num "," s02:num ")" "(" s10:num "," s11:num "," s12:num ")"
+    "(" b00:num "," b01:num "," b02:num ")" "(" b10:num "," b11:num "," b12:num ")"
+    : command => `(
+  @[inline] private def $rotr (x n : $word) : $word :=
+    (x >>> n) ||| (x <<< ($bits - n))
 
-private def compress32 (m : ByteArray) (total offset : Nat)
-    (state : Array UInt32) : Array UInt32 := Id.run do
-  let mut w : Array UInt32 := Array.replicate 64 0
-  for i in [:16] do
-    let mut v : UInt32 := 0
-    for j in [:4] do
-      v := (v <<< 8) ||| (paddedByte m total 8 (offset + i * 4 + j)).toUInt32
-    w := w.set! i v
-  for i in [16:64] do
-    let x := w[i - 15]!
-    let y := w[i - 2]!
-    let s0 := rotr32 x 7 ^^^ rotr32 x 18 ^^^ (x >>> 3)
-    let s1 := rotr32 y 17 ^^^ rotr32 y 19 ^^^ (y >>> 10)
-    w := w.set! i (w[i - 16]! + s0 + w[i - 7]! + s1)
-  let mut a := state[0]!
-  let mut b := state[1]!
-  let mut c := state[2]!
-  let mut d := state[3]!
-  let mut e := state[4]!
-  let mut f := state[5]!
-  let mut g := state[6]!
-  let mut h := state[7]!
-  for i in [:64] do
-    let sum1 := rotr32 e 6 ^^^ rotr32 e 11 ^^^ rotr32 e 25
-    let ch := (e &&& f) ^^^ (~~~e &&& g)
-    let temp1 := h + sum1 + ch + k32[i]! + w[i]!
-    let sum0 := rotr32 a 2 ^^^ rotr32 a 13 ^^^ rotr32 a 22
-    let maj := (a &&& b) ^^^ (a &&& c) ^^^ (b &&& c)
-    let temp2 := sum0 + maj
-    h := g
-    g := f
-    f := e
-    e := d + temp1
-    d := c
-    c := b
-    b := a
-    a := temp1 + temp2
-  return #[state[0]! + a, state[1]! + b, state[2]! + c, state[3]! + d,
-    state[4]! + e, state[5]! + f, state[6]! + g, state[7]! + h]
+  private def $compress (m : ByteArray) (total offset : Nat)
+      (state : Array $word) : Array $word := Id.run do
+    let mut w : Array $word := Array.replicate $rounds 0
+    for i in [:16] do
+      let mut v : $word := 0
+      for j in [:$wordBytes] do
+        v := (v <<< 8) ||| $ofByte (paddedByte m total $lengthBytes
+          (offset + i * $wordBytes + j))
+      w := w.set! i v
+    for i in [16:$rounds] do
+      let x := w[i - 15]!
+      let y := w[i - 2]!
+      let s0 := $rotr x $s00 ^^^ $rotr x $s01 ^^^ (x >>> $s02)
+      let s1 := $rotr y $s10 ^^^ $rotr y $s11 ^^^ (y >>> $s12)
+      w := w.set! i (w[i - 16]! + s0 + w[i - 7]! + s1)
+    let mut a := state[0]!
+    let mut b := state[1]!
+    let mut c := state[2]!
+    let mut d := state[3]!
+    let mut e := state[4]!
+    let mut f := state[5]!
+    let mut g := state[6]!
+    let mut h := state[7]!
+    for i in [:$rounds] do
+      let sum1 := $rotr e $b10 ^^^ $rotr e $b11 ^^^ $rotr e $b12
+      let ch := (e &&& f) ^^^ (~~~e &&& g)
+      let temp1 := h + sum1 + ch + $constants[i]! + w[i]!
+      let sum0 := $rotr a $b00 ^^^ $rotr a $b01 ^^^ $rotr a $b02
+      let maj := (a &&& b) ^^^ (a &&& c) ^^^ (b &&& c)
+      let temp2 := sum0 + maj
+      h := g
+      g := f
+      f := e
+      e := d + temp1
+      d := c
+      c := b
+      b := a
+      a := temp1 + temp2
+    return #[state[0]! + a, state[1]! + b, state[2]! + c, state[3]! + d,
+      state[4]! + e, state[5]! + f, state[6]! + g, state[7]! + h]
 
-private def hash32 (m : ByteArray) (initial : Array UInt32) : Array UInt32 := Id.run do
-  let blocks := (m.size + 8 + 64) / 64
-  let mut state := initial
-  for i in [:blocks] do
-    state := compress32 m (blocks * 64) (i * 64) state
-  return state
+  private def $hash (m : ByteArray) (initial : Array $word) : Array $word := Id.run do
+    let blocks := (m.size + $lengthBytes + $blockBytes) / $blockBytes
+    let mut state := initial
+    for i in [:blocks] do
+      state := $compress m (blocks * $blockBytes) (i * $blockBytes) state
+    return state
 
-private def bytes32 (state : Array UInt32) (size : Nat) : ByteArray :=
-  ⟨Array.ofFn (fun (i : Fin size) =>
-    (state[i.val / 4]! >>> UInt32.ofNat (8 * (3 - i.val % 4))).toUInt8)⟩
+  private def $bytes (state : Array $word) (size : Nat) : ByteArray :=
+    ⟨Array.ofFn (fun (i : Fin size) =>
+      $toByte (state[i.val / $wordBytes]! >>>
+        $ofNat (8 * ($wordBytes - 1 - i.val % $wordBytes))))⟩)
+
+sha2Impl UInt32 UInt8.toUInt32 UInt32.ofNat UInt32.toUInt8
+  rotr32 compress32 hash32 bytes32 32 4 8 64 64 k32
+  (7, 18, 3) (17, 19, 10) (2, 13, 22) (6, 11, 25)
 
 private def k64 : Array UInt64 := #[
   0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
@@ -105,59 +118,9 @@ private def k64 : Array UInt64 := #[
   0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c,
   0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817]
 
-@[inline] private def rotr64 (x n : UInt64) : UInt64 :=
-  (x >>> n) ||| (x <<< (64 - n))
-
-private def compress64 (m : ByteArray) (total offset : Nat)
-    (state : Array UInt64) : Array UInt64 := Id.run do
-  let mut w : Array UInt64 := Array.replicate 80 0
-  for i in [:16] do
-    let mut v : UInt64 := 0
-    for j in [:8] do
-      v := (v <<< 8) ||| (paddedByte m total 16 (offset + i * 8 + j)).toUInt64
-    w := w.set! i v
-  for i in [16:80] do
-    let x := w[i - 15]!
-    let y := w[i - 2]!
-    let s0 := rotr64 x 1 ^^^ rotr64 x 8 ^^^ (x >>> 7)
-    let s1 := rotr64 y 19 ^^^ rotr64 y 61 ^^^ (y >>> 6)
-    w := w.set! i (w[i - 16]! + s0 + w[i - 7]! + s1)
-  let mut a := state[0]!
-  let mut b := state[1]!
-  let mut c := state[2]!
-  let mut d := state[3]!
-  let mut e := state[4]!
-  let mut f := state[5]!
-  let mut g := state[6]!
-  let mut h := state[7]!
-  for i in [:80] do
-    let sum1 := rotr64 e 14 ^^^ rotr64 e 18 ^^^ rotr64 e 41
-    let ch := (e &&& f) ^^^ (~~~e &&& g)
-    let temp1 := h + sum1 + ch + k64[i]! + w[i]!
-    let sum0 := rotr64 a 28 ^^^ rotr64 a 34 ^^^ rotr64 a 39
-    let maj := (a &&& b) ^^^ (a &&& c) ^^^ (b &&& c)
-    let temp2 := sum0 + maj
-    h := g
-    g := f
-    f := e
-    e := d + temp1
-    d := c
-    c := b
-    b := a
-    a := temp1 + temp2
-  return #[state[0]! + a, state[1]! + b, state[2]! + c, state[3]! + d,
-    state[4]! + e, state[5]! + f, state[6]! + g, state[7]! + h]
-
-private def hash64 (m : ByteArray) (initial : Array UInt64) : Array UInt64 := Id.run do
-  let blocks := (m.size + 16 + 128) / 128
-  let mut state := initial
-  for i in [:blocks] do
-    state := compress64 m (blocks * 128) (i * 128) state
-  return state
-
-private def bytes64 (state : Array UInt64) (size : Nat) : ByteArray :=
-  ⟨Array.ofFn (fun (i : Fin size) =>
-    (state[i.val / 8]! >>> UInt64.ofNat (8 * (7 - i.val % 8))).toUInt8)⟩
+sha2Impl UInt64 UInt8.toUInt64 UInt64.ofNat UInt64.toUInt8
+  rotr64 compress64 hash64 bytes64 64 8 16 128 80 k64
+  (1, 8, 7) (19, 61, 6) (28, 34, 39) (14, 18, 41)
 
 def sha224 (m : ByteArray) : ByteArray :=
   bytes32 (hash32 m #[ 0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4 ]) 28

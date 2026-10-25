@@ -18,9 +18,8 @@ Scalar fields have proto3 defaults; repeated numbers accept packed/unpacked form
 General roundtrip proofs cover bounded varints, signed scalar normalization,
 arbitrary UTF-8 and binary envelopes, TimeSpec, ClientHello, and the server
 commit/log-id/error/abort families. Additional finite-family proofs cover I/O
-stream routing and capability flags. `Tests.LogSrv` covers every constructor,
-malformed inputs, unknown fields, packed lists and a 64 KiB I/O buffer. There is
-no claimed universal roundtrip theorem for all ClientMessage/ServerMessage values.
+stream routing and capability flags. There is no claimed universal roundtrip
+theorem for all ClientMessage/ServerMessage values.
 -/
 
 namespace LeanSudo.LogSrv
@@ -148,28 +147,6 @@ theorem varint_encNat (n : Nat) (rest : List UInt8)
 theorem varint_uint64 (n : Nat) (rest : List UInt8) (bound : n < 2 ^ 64) :
     varint (encNat n ++ rest) = some (n, rest) :=
   varint_encNat n rest bound (encNat_length_uint64 n bound)
-
-@[simp] theorem varint_uint64_nil (n : Nat) (bound : n < 2 ^ 64) :
-    varint (encNat n) = some (n, []) := by
-  simpa using varint_uint64 n [] bound
-
-@[simp] theorem varint_byte (b : UInt8) (rest : List UInt8) (small : b.toNat < 128) :
-    varint (b :: rest) = some (b.toNat, rest) := by
-  simpa [encNat, small] using varint_uint64 b.toNat rest (by omega)
-
-/-- List-facing length primitive, retained with its public roundtrip theorem.
-The indexed field loop checks lengths against the array size instead. -/
-def blob (bs : List UInt8) : Option (List UInt8 × List UInt8) := do
-  let (size, rest) ← varint bs
-  if size ≤ rest.length then pure (rest.take size, rest.drop size) else none
-
-/-- Arbitrary binary payloads roundtrip through the list-facing length primitive.
-The premises express protobuf's uint64 length/ten-byte varint bounds, not a
-decoder-success hypothesis. -/
-theorem blob_roundtrip (payload rest : List UInt8)
-    (bound : payload.length < 2 ^ 64) (width : (encNat payload.length).length ≤ 10) :
-    blob (encNat payload.length ++ payload ++ rest) = some (payload, rest) := by
-  simp [blob, List.append_assoc, varint_encNat payload.length (payload ++ rest) bound width]
 
 /-- Interpret the low `bits` bits as a signed integer. -/
 def signed (bits : Nat) (n : Nat) : Int :=
@@ -344,6 +321,13 @@ def oneof (known merge : Nat → Bool) (fs : List Field) : Option Field := do
   | .bytes _ => pure (selected.1, .bytes chunks.reverse.flatten)
   | _ => pure selected
 
+/-- Validate every known occurrence before decoding the selected oneof case. -/
+@[inline] def decodeOneof (known merge : Nat → Bool) (dec : Field → Option α)
+    (fs : List Field) : Option α := do
+  for f in fs do
+    if known f.1 then let _ ← dec f; pure ()
+  dec (← oneof known merge fs)
+
 /-- Reading a canonical one-byte key advances the cursor by exactly one. -/
 theorem varintAt_small (bs : ByteArray) (pos n : Nat) (rest : List UInt8)
     (suffix : bs.data.toList.drop pos = UInt8.ofNat n :: rest) (small : n < 128) :
@@ -352,6 +336,18 @@ theorem varintAt_small (bs : ByteArray) (pos n : Nat) (rest : List UInt8)
   have parsed := varintAt_encNat bs pos n rest (by simpa [encoded] using suffix) (by omega)
   simpa [encoded] using parsed
 
+private theorem fieldsAux_key_prefix (bs : ByteArray) (pos key : Nat) (rest : List UInt8)
+    (suffix : bs.data.toList.drop pos = UInt8.ofNat key :: rest)
+    (inBounds : pos ≤ bs.size) (small : key < 128) :
+    pos < bs.size ∧ pos + 1 + rest.length = bs.size ∧
+      varintAt bs pos = some (key, pos + 1) ∧ bs.data.toList.drop (pos + 1) = rest := by
+  have size := congrArg List.length suffix
+  simp only [List.length_drop, Array.length_toList, ByteArray.size_data,
+    List.length_cons] at size
+  refine ⟨by omega, by omega, varintAt_small bs pos key rest suffix small, ?_⟩
+  rw [← List.drop_drop]
+  simp [suffix]
+
 private theorem fieldsAux_bytes_small (bs : ByteArray) (fuel pos tag : Nat)
     (payload : List UInt8) (acc : Array Field)
     (suffix : bs.data.toList.drop pos =
@@ -359,24 +355,16 @@ private theorem fieldsAux_bytes_small (bs : ByteArray) (fuel pos tag : Nat)
     (inBounds : pos ≤ bs.size) (positive : 0 < tag) (small : tag < 16)
     (bound : payload.length < 2 ^ 64) :
     fieldsAux bs (fuel + 2) pos acc = some (acc.push (tag, .bytes payload)).toList := by
-  have size := congrArg List.length suffix
-  simp only [List.length_drop, Array.length_toList, ByteArray.size_data,
-    List.length_cons, List.length_append] at size
-  have endPos : pos + 1 + (encNat payload.length).length + payload.length = bs.size := by
-    omega
-  have notEnd : pos ≠ bs.size := by omega
-  have keyParsed := varintAt_small bs pos (tag * 8 + 2)
-    (encNat payload.length ++ payload) suffix (by omega)
-  have afterKey : bs.data.toList.drop (pos + 1) = encNat payload.length ++ payload := by
-    rw [← List.drop_drop]
-    simp [suffix]
+  obtain ⟨progress, endPos, keyParsed, afterKey⟩ :=
+    fieldsAux_key_prefix bs pos _ _ suffix inBounds (by omega)
   have sizeParsed := varintAt_encNat bs (pos + 1) payload.length payload afterKey bound
+  change pos + 1 + (encNat payload.length ++ payload).length = bs.size at endPos
+  simp only [List.length_append, ← Nat.add_assoc] at endPos
   have afterSize : bs.data.toList.drop (pos + 1 + (encNat payload.length).length) =
       payload := by
     rw [← List.drop_drop, afterKey]
     simp
-  have progress : pos < bs.size := by omega
-  simp [fieldsAux, notEnd, keyParsed, sizeParsed, afterSize, endPos, progress,
+  simp [fieldsAux, Nat.ne_of_lt progress, keyParsed, sizeParsed, afterSize, endPos, progress,
     show (tag * 8 + 2) / 8 = tag by omega,
     show (tag * 8 + 2) % 8 = 2 by omega] <;> omega
 
@@ -388,18 +376,14 @@ theorem fieldsAux_number_step (bs : ByteArray) (fuel pos tag n : Nat)
     (bound : n < 2 ^ 64) :
     fieldsAux bs (fuel + 1) pos acc =
       fieldsAux bs fuel (pos + 1 + (encNat n).length) (acc.push (tag, .number n)) := by
-  have size := congrArg List.length suffix
-  simp only [List.length_drop, Array.length_toList, ByteArray.size_data,
-    List.length_cons, List.length_append] at size
-  have notEnd : pos ≠ bs.size := by omega
-  have keyParsed := varintAt_small bs pos (tag * 8) (encNat n ++ rest) suffix (by omega)
-  have afterKey : bs.data.toList.drop (pos + 1) = encNat n ++ rest := by
-    rw [← List.drop_drop]
-    simp [suffix]
+  obtain ⟨notEnd, size, keyParsed, afterKey⟩ :=
+    fieldsAux_key_prefix bs pos _ _ suffix inBounds (by omega)
   have valueParsed := varintAt_encNat bs (pos + 1) n rest afterKey bound
+  change pos + 1 + (encNat n ++ rest).length = bs.size at size
+  simp only [List.length_append] at size
   have progress : pos < pos + 1 + (encNat n).length ∧
       pos + 1 + (encNat n).length ≤ bs.size := by omega
-  simp [fieldsAux, notEnd, keyParsed, valueParsed, progress,
+  simp [fieldsAux, Nat.ne_of_lt notEnd, keyParsed, valueParsed, progress,
     show (tag * 8) / 8 = tag by omega, show (tag * 8) % 8 = 0 by omega] <;> omega
 
 /-- Every log-server embedded-message tag preserves an arbitrary bounded binary
@@ -530,10 +514,8 @@ private def decInfoValue (f : Wire.Field) : Option InfoValue := do
 
 private def decInfo (fs : List Wire.Field) : Option InfoMessage := do
   let key ← Wire.getString 1 fs
-  let known := fun n => decide (2 ≤ n ∧ n ≤ 5)
-  for f in fs do
-    if known f.1 then let _ ← decInfoValue f; pure ()
-  let value ← decInfoValue (← Wire.oneof known (fun n => decide (n = 4 ∨ n = 5)) fs)
+  let value ← Wire.decodeOneof (fun n => decide (2 ≤ n ∧ n ≤ 5))
+    (fun n => decide (n = 4 ∨ n = 5)) decInfoValue fs
   pure ⟨key, value⟩
 
 private def infoAt (tag : Nat) (fs : List Wire.Field) : Option (List InfoMessage) :=
@@ -615,10 +597,7 @@ theorem encodeClient_io_eq (stream : Nat) (delay : TimeSpec) (data : ByteArray) 
 /-- Unknown fields are skipped. No recognized oneof case is a protocol failure. -/
 def decodeClient (body : ByteArray) : Option ClientMessage := do
   let fs ← Wire.fieldsArray body
-  let known := fun n => decide (1 ≤ n ∧ n ≤ 13)
-  for f in fs do
-    if known f.1 then let _ ← decClientField f; pure ()
-  decClientField (← Wire.oneof known (fun _ => true) fs)
+  Wire.decodeOneof (fun n => decide (1 ≤ n ∧ n ≤ 13)) (fun _ => true) decClientField fs
 
 private def encHello (h : ServerHello) : List UInt8 :=
   Wire.text 1 h.serverId ++ Wire.text 2 h.redirect ++
@@ -649,41 +628,36 @@ def encodeServer (m : ServerMessage) : ByteArray := ⟨(encServer m).toArray⟩
 
 def decodeServer (body : ByteArray) : Option ServerMessage := do
   let fs ← Wire.fieldsArray body
-  let known := fun n => decide (1 ≤ n ∧ n ≤ 5)
-  for f in fs do
-    if known f.1 then let _ ← decServerField f; pure ()
-  decServerField (← Wire.oneof known (fun n => decide (n = 1 ∨ n = 2)) fs)
+  Wire.decodeOneof (fun n => decide (1 ≤ n ∧ n ≤ 5))
+    (fun n => decide (n = 1 ∨ n = 2)) decServerField fs
+
+private theorem serverText_roundtrip (tag : Nat) (ctor : String → ServerMessage)
+    (s : String) (bound : s.toUTF8.size < 2 ^ 64)
+    (kind : tag = 3 ∧ ctor = .logId ∨ tag = 4 ∧ ctor = .error ∨
+      tag = 5 ∧ ctor = .abort) :
+    decodeServer (encodeServer (ctor s)) = some (ctor s) := by
+  have bounds : 0 < tag ∧ tag < 16 := by
+    rcases kind with ⟨rfl, _⟩ | ⟨rfl, _⟩ | ⟨rfl, _⟩ <;> decide
+  have parsed := Wire.fields_bytes_roundtrip tag s.toUTF8.data.toList
+    bounds.1 bounds.2 (by simpa using bound)
+  have utf8 : Wire.asString (.bytes s.toByteArray.data.toList) = some s :=
+    Wire.asString_utf8 s
+  rcases kind with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ <;>
+    simp only [encodeServer, encServer, Wire.text, decodeServer, Wire.fieldsArray_toArray] <;>
+    rw [parsed] <;> simp [Wire.decodeOneof, Wire.oneof, decServerField, utf8]
 
 /-- Arbitrary bounded log IDs survive the complete server message codec. -/
 theorem logId_roundtrip (s : String) (bound : s.toUTF8.size < 2 ^ 64) :
-    decodeServer (encodeServer (.logId s)) = some (.logId s) := by
-  have parsed := Wire.fields_bytes_roundtrip 3 s.toUTF8.data.toList (by decide)
-    (by decide) (by simpa using bound)
-  have utf8 : Wire.asString (.bytes s.toByteArray.data.toList) = some s :=
-    Wire.asString_utf8 s
-  simp only [encodeServer, encServer, Wire.text, decodeServer, Wire.fieldsArray_toArray]
-  rw [parsed]
-  simp [Wire.oneof, decServerField, utf8]
+    decodeServer (encodeServer (.logId s)) = some (.logId s) :=
+  serverText_roundtrip 3 .logId s bound (by simp)
 
 theorem error_roundtrip (s : String) (bound : s.toUTF8.size < 2 ^ 64) :
-    decodeServer (encodeServer (.error s)) = some (.error s) := by
-  have parsed := Wire.fields_bytes_roundtrip 4 s.toUTF8.data.toList (by decide)
-    (by decide) (by simpa using bound)
-  have utf8 : Wire.asString (.bytes s.toByteArray.data.toList) = some s :=
-    Wire.asString_utf8 s
-  simp only [encodeServer, encServer, Wire.text, decodeServer, Wire.fieldsArray_toArray]
-  rw [parsed]
-  simp [Wire.oneof, decServerField, utf8]
+    decodeServer (encodeServer (.error s)) = some (.error s) :=
+  serverText_roundtrip 4 .error s bound (by simp)
 
 theorem abort_roundtrip (s : String) (bound : s.toUTF8.size < 2 ^ 64) :
-    decodeServer (encodeServer (.abort s)) = some (.abort s) := by
-  have parsed := Wire.fields_bytes_roundtrip 5 s.toUTF8.data.toList (by decide)
-    (by decide) (by simpa using bound)
-  have utf8 : Wire.asString (.bytes s.toByteArray.data.toList) = some s :=
-    Wire.asString_utf8 s
-  simp only [encodeServer, encServer, Wire.text, decodeServer, Wire.fieldsArray_toArray]
-  rw [parsed]
-  simp [Wire.oneof, decServerField, utf8]
+    decodeServer (encodeServer (.abort s)) = some (.abort s) :=
+  serverText_roundtrip 5 .abort s bound (by simp)
 
 /-- Arbitrary bounded client descriptions survive both protobuf envelopes. -/
 theorem clientHello_roundtrip (s : String) (bound : s.toUTF8.size + 11 < 2 ^ 64) :
@@ -706,7 +680,7 @@ theorem clientHello_roundtrip (s : String) (bound : s.toUTF8.size + 11 < 2 ^ 64)
       Wire.values, utf8]
   simp only [encodeClient, encClient, decodeClient, Wire.fieldsArray_toArray]
   rw [outerParsed]
-  simp [Wire.oneof, decoded]
+  simp [Wire.decodeOneof, Wire.oneof, decoded]
 
 private theorem decServerField_commit (bs : List UInt8) :
     decServerField (2, .bytes bs) =
@@ -731,7 +705,7 @@ theorem commit_roundtrip (t : TimeSpec)
     rfl
   simp only [encodeServer, encServer, decodeServer, Wire.fieldsArray_toArray]
   rw [parsed]
-  simp [Wire.oneof, decoded]
+  simp [Wire.decodeOneof, Wire.oneof, decoded]
 
 /-- Zero-time acceptance, for either value of the I/O negotiation flag. -/
 theorem accept_zero_roundtrip (expect : Bool) :

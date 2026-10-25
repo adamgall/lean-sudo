@@ -1,5 +1,6 @@
 /* sudo's stable group-provider ABI. Configuration/matching stays in Lean. */
-#include <lean/lean.h>
+#include "shim.h"
+#include "sudo_plugin.h"
 #include <dlfcn.h>
 #include <errno.h>
 #include <limits.h>
@@ -10,12 +11,6 @@
 #include <string.h>
 #include <sys/stat.h>
 
-struct sudoers_group_plugin {
-    unsigned int version;
-    int (*init)(int, int (*)(int, const char *, ...), char *const []);
-    void (*cleanup)(void);
-    int (*query)(const char *, const char *, const struct passwd *);
-};
 struct group_handle {
     void *dso;
     struct sudoers_group_plugin *plugin;
@@ -28,11 +23,8 @@ static void group_close(struct group_handle *h) {
         h->plugin = NULL;
     }
     if (h->dso != NULL) { dlclose(h->dso); h->dso = NULL; }
-    if (h->args != NULL) {
-        for (size_t i = 0; h->args[i] != NULL; ++i) free(h->args[i]);
-        free(h->args);
-        h->args = NULL;
-    }
+    ls_strv_free(h->args);
+    h->args = NULL;
 }
 static void group_finalize(void *data) {
     struct group_handle *h = data;
@@ -83,8 +75,7 @@ LEAN_EXPORT lean_obj_res lean_sudo_group_plugin_load(b_lean_obj_arg path_obj,
         b_lean_obj_arg args, lean_obj_arg world) {
     (void)world;
     struct group_handle *h = calloc(1, sizeof(*h));
-    if (h == NULL) return lean_io_result_mk_error(
-        lean_mk_io_user_error(lean_mk_string("unable to allocate memory")));
+    if (h == NULL) return ls_error("unable to allocate memory");
     const char *name = lean_string_cstr(path_obj);
     char path[PATH_MAX];
     size_t len = strlen(name);

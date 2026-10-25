@@ -12,7 +12,7 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
-#include <lean/lean.h>
+#include "shim.h"
 #include "plugins.h"
 #include <dlfcn.h>
 #include <errno.h>
@@ -83,11 +83,6 @@ static pid_t bridge_owner;
 static bool bridge_child_mode;
 static int bridge_dispatch(void);
 static lean_obj_res bridge_request(unsigned op, char **info, char **argv, char **env);
-static lean_obj_res ok(void) { return lean_io_result_mk_ok(lean_box(0)); }
-static lean_obj_res error(const char *s) {
-    return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(s)));
-}
-static lean_obj_res boolean(bool b) { return lean_io_result_mk_ok(lean_box(b)); }
 static void warnx(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -95,25 +90,6 @@ static void warnx(const char *fmt, ...) {
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     va_end(ap);
-}
-static void free_vector(char **v) {
-    if (v) { for (size_t i = 0; v[i]; i++) free(v[i]); free(v); }
-}
-static char **copy_array(b_lean_obj_arg arr) {
-    size_t n = lean_array_size(arr);
-    char **v = calloc(n + 1, sizeof(*v));
-    if (!v) return NULL;
-    for (size_t i = 0; i < n; i++) {
-        b_lean_obj_arg s = lean_array_get_core(arr, i);
-        if (memchr(lean_string_cstr(s), 0, lean_string_size(s) - 1)) {
-            errno = EINVAL; free_vector(v); return NULL;
-        }
-        if (!(v[i] = strdup(lean_string_cstr(s)))) { free_vector(v); return NULL; }
-    }
-    return v;
-}
-static size_t vector_len(char *const *v) {
-    size_t n = 0; if (v) while (v[n]) n++; return n;
 }
 static int plugin_printf(int type, const char *restrict fmt, ...) {
     int fd = -1, ret;
@@ -167,31 +143,10 @@ bad:
 static int conversation_old(int n, const struct sudo_conv_message *m, struct sudo_conv_reply *r) {
     return conversation(n, m, r, NULL);
 }
-/* This front-end capability probe must not pull the execution/interception
- * broker into visudo merely because libc environment hooks share this object. */
-static bool trace_supported(void) {
-#if defined(__linux__) && (defined(__aarch64__) || defined(__x86_64__))
-    FILE *fp = fopen("/proc/sys/kernel/seccomp/actions_avail", "re");
-    if (!fp) return false;
-    char actions[512];
-    bool supported = false;
-    if (fgets(actions, sizeof actions, fp)) {
-        char *save;
-        for (char *action = strtok_r(actions, " \t\r\n", &save); action;
-                action = strtok_r(NULL, " \t\r\n", &save)) {
-            if (!strcmp(action, "trap")) { supported = true; break; }
-        }
-    }
-    fclose(fp);
-    return supported;
-#else
-    return false;
-#endif
-}
 static bool format_settings(struct plugin *p) {
     if (p->settings) return true;
-    size_t n = vector_len(settings);
-    int intercept = trace_supported();
+    size_t n = ls_strv_len(settings);
+    int intercept = ls_trace_supported();
     p->settings = calloc(n + (intercept ? 4 : 2), sizeof(char *));
     if (!p->settings || asprintf(&p->settings[0], "plugin_path=%s", p->path) < 0) return false;
     for (size_t i = 0; i < n; i++) if (!(p->settings[i + 1] = strdup(settings[i]))) return false;
@@ -226,7 +181,7 @@ LEAN_EXPORT lean_obj_res lean_sudo_plugins_load(b_lean_obj_arg symbol, b_lean_ob
         const char *why = dlerror();
         warnx("error in /etc/sudo.conf, line %u while loading plugin \"%s\"", line, name);
         warnx("unable to load %s: %s", file, why ? why : "unknown error");
-        return error("fatal error, unable to load plugins");
+        return ls_error("fatal error, unable to load plugins");
     }
     struct generic_plugin *abi = dlsym(handle, name);
     if (!abi) {
@@ -254,7 +209,7 @@ LEAN_EXPORT lean_obj_res lean_sudo_plugins_load(b_lean_obj_arg symbol, b_lean_ob
         struct generic_plugin *copy = clone ? clone() : NULL;
         if (!copy) {
             warnx("ignoring duplicate plugin \"%s\" in /etc/sudo.conf, line %u", name, line);
-            dlclose(handle); return ok();
+            dlclose(handle); return ls_unit();
         }
         if (copy->type != abi->type || SUDO_API_VERSION_GET_MAJOR(copy->version) != 1) {
             warnx("incompatible cloned plugin %s", name); goto bad;
@@ -266,9 +221,9 @@ LEAN_EXPORT lean_obj_res lean_sudo_plugins_load(b_lean_obj_arg symbol, b_lean_ob
     p->handle = handle; p->abi = abi;
     p->line = line;
     p->name = strdup(name); p->path = strdup(file);
-    if (lean_array_size(options)) p->options = copy_array(options);
+    if (lean_array_size(options)) p->options = ls_strv(options, true);
     if (!p->name || !p->path || (lean_array_size(options) && !p->options)) {
-        free(p->name); free(p->path); free_vector(p->options); free(p); goto oom;
+        free(p->name); free(p->path); ls_strv_free(p->options); free(p); goto oom;
     }
     if (abi->type == SUDO_IO_PLUGIN && abi->version >= SUDO_API_MKVERSION(1, 15))
         ((struct io_plugin *)abi)->event_alloc = event_alloc;
@@ -276,11 +231,11 @@ LEAN_EXPORT lean_obj_res lean_sudo_plugins_load(b_lean_obj_arg symbol, b_lean_ob
         ((struct audit_plugin *)abi)->event_alloc = event_alloc;
     *plugin_tail = p; plugin_tail = &p->next;
     plugin_hooks(p, true);
-    return ok();
+    return ls_unit();
 oom:
     warnx("unable to allocate memory");
 bad:
-    dlclose(handle); return error("fatal error, unable to load plugins");
+    dlclose(handle); return ls_error("fatal error, unable to load plugins");
 }
 static bool audit_message(struct plugin *source, const char *name, unsigned type,
     const char *msg, char *const *info, bool is_error) {
@@ -322,20 +277,16 @@ static bool audit_accept(const char *name, unsigned type, char *const *info,
 static int open_plugin(struct plugin *p, bool version, const char **why) {
     if (!format_settings(p)) { *why = "unable to allocate memory"; return -1; }
     unsigned type = p->abi->type, v = p->abi->version;
-    int argc = version ? 0 : (int)vector_len(run_argv);
+    int argc = version ? 0 : (int)ls_strv_len(run_argv);
     char **info = version ? NULL : command_info;
     char **argv = version ? submit_argv : run_argv;
     char **env = version ? submit_env : run_env;
-    if (type == SUDO_AUDIT_PLUGIN) {
-        struct audit_plugin *a = (void *)p->abi;
-        if (!a->open) { *why = "missing open method"; return -1; }
-        return a->open(SUDO_API_VERSION, conversation, plugin_printf, p->settings,
-            user_info, submit_optind, submit_argv, submit_env, p->options, why);
-    }
-    if (type == SUDO_APPROVAL_PLUGIN) {
-        struct approval_plugin *a = (void *)p->abi;
-        if (!a->open) { *why = "missing open method"; return -1; }
-        return a->open(SUDO_API_VERSION, conversation, plugin_printf, p->settings,
+    if (type == SUDO_AUDIT_PLUGIN || type == SUDO_APPROVAL_PLUGIN) {
+        __typeof__(((struct audit_plugin *)0)->open) open =
+            type == SUDO_AUDIT_PLUGIN ? ((struct audit_plugin *)p->abi)->open :
+            ((struct approval_plugin *)p->abi)->open;
+        if (!open) { *why = "missing open method"; return -1; }
+        return open(SUDO_API_VERSION, conversation, plugin_printf, p->settings,
             user_info, submit_optind, submit_argv, submit_env, p->options, why);
     }
     struct io_plugin *a = (void *)p->abi;
@@ -358,56 +309,56 @@ static int open_plugin(struct plugin *p, bool version, const char **why) {
     return a->open(SUDO_API_VERSION, conversation, plugin_printf, p->settings,
         user_info, info, argc, argv, env, p->options, why);
 }
+/* The caller's plugin loop skips disabled opens; its block handles other failures. */
+#define OPEN_PLUGIN_OR_FAIL(p) \
+    const char *why = NULL; \
+    int rc = open_plugin(p, false, &why); \
+    if (rc == 0) { disable(p); continue; } \
+    if (rc == -2) return ls_error("plugin requested usage"); \
+    if (rc != 1)
 LEAN_EXPORT lean_obj_res lean_sudo_plugins_open(b_lean_obj_arg s, b_lean_obj_arg u,
     b_lean_obj_arg av, b_lean_obj_arg ev, uint32_t optind) {
-    if (settings) return error("plugins already opened");
-    settings = copy_array(s); user_info = copy_array(u);
-    submit_argv = copy_array(av); submit_env = copy_array(ev);
-    if (!settings || !user_info || !submit_argv || !submit_env) return error("unable to allocate plugin context");
-    if (optind > INT_MAX) return error("invalid submit argument index");
+    if (settings) return ls_error("plugins already opened");
+    settings = ls_strv(s, true); user_info = ls_strv(u, true);
+    submit_argv = ls_strv(av, true); submit_env = ls_strv(ev, true);
+    if (!settings || !user_info || !submit_argv || !submit_env)
+        return ls_error("unable to allocate plugin context");
+    if (optind > INT_MAX) return ls_error("invalid submit argument index");
     submit_optind = (int)optind;
     for (struct plugin *p = plugins; p; p = p->next) {
         if (p->disabled || p->abi->type != SUDO_AUDIT_PLUGIN) continue;
-        const char *why = NULL;
-        int rc = open_plugin(p, false, &why);
-        if (rc == 1) p->opened = true;
-        else if (rc == 0) disable(p);
-        else if (rc == -2) return error("plugin requested usage");
-        else {
+        OPEN_PLUGIN_OR_FAIL(p) {
             char msg[512]; snprintf(msg, sizeof msg, "error initializing audit plugin %s", p->name);
-            return error(msg);
+            return ls_error(msg);
         }
+        p->opened = true;
     }
-    return ok();
+    return ls_unit();
 }
 static bool command_context(b_lean_obj_arg info, b_lean_obj_arg argv, b_lean_obj_arg env) {
-    char **i = copy_array(info), **a = copy_array(argv), **e = copy_array(env);
-    if (!i || !a || !e) { free_vector(i); free_vector(a); free_vector(e); return false; }
-    free_vector(command_info); free_vector(run_argv); free_vector(run_env);
+    char **i = ls_strv(info, true), **a = ls_strv(argv, true), **e = ls_strv(env, true);
+    if (!i || !a || !e) { ls_strv_free(i); ls_strv_free(a); ls_strv_free(e); return false; }
+    ls_strv_free(command_info); ls_strv_free(run_argv); ls_strv_free(run_env);
     command_info = i; run_argv = a; run_env = e;
     return true;
 }
 LEAN_EXPORT lean_obj_res lean_sudo_plugins_accept(b_lean_obj_arg info, b_lean_obj_arg argv, b_lean_obj_arg env) {
-    if (!command_context(info, argv, env)) return error("unable to allocate plugin context");
+    if (!command_context(info, argv, env)) return ls_error("unable to allocate plugin context");
     (void)audit_accept("sudoers_policy", SUDO_POLICY_PLUGIN, command_info, run_argv, run_env);
-    return boolean(true); /* sudo.c ignores audit failure for list/validate. */
+    return ls_ok(lean_box(true)); /* sudo.c ignores audit failure for list/validate. */
 }
 static lean_obj_res check_current(bool initial, bool enforce) {
     if (enforce) {
         bool accepted = audit_accept("sudoers_policy", SUDO_POLICY_PLUGIN,
             command_info, run_argv, run_env);
-        if (initial && !accepted) return boolean(false);
+        if (initial && !accepted) return ls_ok(lean_box(false));
     }
     for (struct plugin *p = enforce ? plugins : NULL; p; p = p->next) {
         if (p->disabled || p->abi->type != SUDO_APPROVAL_PLUGIN) continue;
         struct approval_plugin *a = (void *)p->abi;
         if (!a->check) continue;
-        const char *why = NULL;
-        int rc = open_plugin(p, false, &why);
-        if (rc == 0) { disable(p); continue; }
-        if (rc == -2) return error("plugin requested usage");
-        if (rc != 1) {
-            warnx("error initializing approval plugin %s", p->name); return boolean(false);
+        OPEN_PLUGIN_OR_FAIL(p) {
+            warnx("error initializing approval plugin %s", p->name); return ls_ok(lean_box(false));
         }
         rc = a->check(command_info, run_argv, run_env, &why);
         if (rc == 1) {
@@ -416,30 +367,27 @@ static lean_obj_res check_current(bool initial, bool enforce) {
             why ? why : rc == 0 ? "command rejected by approver" : "approval plugin error",
             command_info, rc != 0);
         if (a->close) a->close();
-        if (rc == -2) return error("plugin requested usage");
-        if (rc != 1) return boolean(false);
+        if (rc == -2) return ls_error("plugin requested usage");
+        if (rc != 1) return ls_ok(lean_box(false));
     }
     for (struct plugin *p = initial ? plugins : NULL; p; p = p->next) {
         if (p->disabled || p->abi->type != SUDO_IO_PLUGIN) continue;
-        const char *why = NULL;
-        int rc = open_plugin(p, false, &why);
-        if (rc == 1) p->opened = true;
-        else if (rc == 0) disable(p);
-        else if (rc == -2) return error("plugin requested usage");
-        else {
+        OPEN_PLUGIN_OR_FAIL(p) {
             warnx("error initializing I/O plugin %s", p->name);
             audit_message(NULL, p->name, SUDO_IO_PLUGIN,
                 why ? why : "error initializing I/O plugin", command_info, true);
-            return boolean(false);
+            return ls_ok(lean_box(false));
         }
+        p->opened = true;
     }
     bool accepted = audit_accept("sudo", SUDO_FRONT_END, command_info, run_argv, run_env);
     /* exec_intercept.c treats policy/front-end audit as notification, unlike
      * initial execution. approval_check still acts on its own audit result. */
-    return boolean(!initial || accepted);
+    return ls_ok(lean_box(!initial || accepted));
 }
+#undef OPEN_PLUGIN_OR_FAIL
 LEAN_EXPORT lean_obj_res lean_sudo_plugins_check(b_lean_obj_arg info, b_lean_obj_arg argv, b_lean_obj_arg env) {
-    if (!command_context(info, argv, env)) return error("unable to allocate plugin context");
+    if (!command_context(info, argv, env)) return ls_error("unable to allocate plugin context");
     return check_current(true, true);
 }
 
@@ -448,42 +396,42 @@ LEAN_EXPORT lean_obj_res lean_sudo_plugins_check(b_lean_obj_arg info, b_lean_obj
  * except for the actual command and working directory. */
 static lean_obj_res check_subcommand(char **info, char **argv, char **env, bool enforce) {
     if (!enforce) {
-        size_t n = vector_len(command_info), extra = vector_len(info), used = 0;
+        size_t n = ls_strv_len(command_info), extra = ls_strv_len(info), used = 0;
         char **merged = calloc(n + extra + 1, sizeof(*merged));
         if (!merged) goto failed;
         for (size_t i = 0; i < n; i++) {
             if (!strncmp(command_info[i], "command=", 8) || !strncmp(command_info[i], "runcwd=", 7)) continue;
-            if (!(merged[used++] = strdup(command_info[i]))) { free_vector(merged); goto failed; }
+            if (!(merged[used++] = strdup(command_info[i]))) { ls_strv_free(merged); goto failed; }
         }
         for (size_t i = 0; i < extra; i++) {
-            if (!(merged[used++] = strdup(info[i]))) { free_vector(merged); goto failed; }
+            if (!(merged[used++] = strdup(info[i]))) { ls_strv_free(merged); goto failed; }
         }
-        free_vector(info); info = merged;
+        ls_strv_free(info); info = merged;
     }
     char **saved_info = command_info, **saved_argv = run_argv, **saved_env = run_env;
     command_info = info; run_argv = argv; run_env = env;
     lean_object *result = check_current(false, enforce);
     command_info = saved_info; run_argv = saved_argv; run_env = saved_env;
-    free_vector(info); free_vector(argv); free_vector(env);
+    ls_strv_free(info); ls_strv_free(argv); ls_strv_free(env);
     return result;
 failed:
-    free_vector(info); free_vector(argv); free_vector(env);
-    return error("unable to allocate plugin context");
+    ls_strv_free(info); ls_strv_free(argv); ls_strv_free(env);
+    return ls_error("unable to allocate plugin context");
 }
 
 LEAN_EXPORT lean_obj_res lean_sudo_plugins_check_subcommand(b_lean_obj_arg info,
     b_lean_obj_arg argv, b_lean_obj_arg env, uint8_t enforce) {
     if (bridge_child_mode && bridge_client < 0)
-        return error("unable to check intercepted command with plugins");
-    if (!plugins) return boolean(true);
-    char **i = copy_array(info), **a = copy_array(argv), **e = copy_array(env);
+        return ls_error("unable to check intercepted command with plugins");
+    if (!plugins) return ls_ok(lean_box(true));
+    char **i = ls_strv(info, true), **a = ls_strv(argv, true), **e = ls_strv(env, true);
     if (!i || !a || !e) {
-        free_vector(i); free_vector(a); free_vector(e);
-        return error("unable to allocate plugin context");
+        ls_strv_free(i); ls_strv_free(a); ls_strv_free(e);
+        return ls_error("unable to allocate plugin context");
     }
     if (bridge_client >= 0) {
         lean_object *result = bridge_request(enforce ? 1 : 2, i, a, e);
-        free_vector(i); free_vector(a); free_vector(e);
+        ls_strv_free(i); ls_strv_free(a); ls_strv_free(e);
         return result;
     }
     return check_subcommand(i, a, e, enforce != 0);
@@ -491,25 +439,25 @@ LEAN_EXPORT lean_obj_res lean_sudo_plugins_check_subcommand(b_lean_obj_arg info,
 LEAN_EXPORT lean_obj_res lean_sudo_plugins_reject(b_lean_obj_arg message, uint8_t is_error,
     b_lean_obj_arg info) {
     if (bridge_child_mode && bridge_client < 0)
-        return error("unable to check intercepted command with plugins");
-    char **v = copy_array(info);
-    if (!v) return error("unable to allocate plugin context");
+        return ls_error("unable to check intercepted command with plugins");
+    char **v = ls_strv(info, true);
+    if (!v) return ls_error("unable to allocate plugin context");
     if (bridge_client >= 0) {
         char *message_vector[] = {(char *)lean_string_cstr(message), NULL};
         char *empty[] = {NULL};
         lean_object *result = bridge_request(is_error ? 4 : 3, v, message_vector, empty);
-        free_vector(v);
+        ls_strv_free(v);
         if (lean_io_result_is_ok(result)) {
             bool accepted = lean_unbox(lean_io_result_get_value(result)) == 1;
             lean_dec(result);
-            return accepted ? ok() : error("unable to log policy event");
+            return accepted ? ls_unit() : ls_error("unable to log policy event");
         }
         return result;
     }
     bool rc = audit_message(NULL, "sudoers_policy", SUDO_POLICY_PLUGIN,
         lean_string_cstr(message), v, is_error);
-    free_vector(v);
-    return rc ? ok() : error("unable to log policy event");
+    ls_strv_free(v);
+    return rc ? ls_unit() : ls_error("unable to log policy event");
 }
 
 /* The Lean interception broker is forked, but plugin state belongs to the
@@ -550,7 +498,7 @@ static int bridge_transfer(int fd, void *data, size_t size, bool writing) {
 }
 #define BRIDGE_MAX_BYTES (16U * 1024U * 1024U)
 static int bridge_send_vector(int fd, char **v, size_t *remaining) {
-    size_t count = vector_len(v);
+    size_t count = ls_strv_len(v);
     if (count > *remaining / sizeof(char *)) { errno = E2BIG; return -1; }
     *remaining -= count * sizeof(char *);
     uint32_t n = (uint32_t)count;
@@ -583,7 +531,7 @@ static char **bridge_receive_vector(int fd, size_t *remaining) {
     }
     return v;
 failed:
-    free_vector(v);
+    ls_strv_free(v);
     return NULL;
 }
 static lean_obj_res bridge_request(unsigned op, char **info, char **argv, char **env) {
@@ -596,9 +544,9 @@ static lean_obj_res bridge_request(unsigned op, char **info, char **argv, char *
         bridge_send_vector(bridge_client, env, &remaining) ||
         bridge_transfer(bridge_client, &answer, sizeof answer, false) || answer > 1) {
         ls_plugins_broker_close();
-        return error("unable to check intercepted command with plugins");
+        return ls_error("unable to check intercepted command with plugins");
     }
-    return boolean(answer == 1);
+    return ls_ok(lean_box(answer == 1));
 }
 static int bridge_dispatch(void) {
     uint32_t op;
@@ -620,18 +568,18 @@ static int bridge_dispatch(void) {
         answer = audit_message(NULL, "sudoers_policy", SUDO_POLICY_PLUGIN,
             argv[0], info, op == 4);
     }
-    free_vector(info); free_vector(argv); free_vector(env);
+    ls_strv_free(info); ls_strv_free(argv); ls_strv_free(env);
     return bridge_transfer(bridge_server, &answer, sizeof answer, true);
 failed:
-    free_vector(info); free_vector(argv); free_vector(env);
+    ls_strv_free(info); ls_strv_free(argv); ls_strv_free(env);
     ls_plugins_broker_close();
     errno = EIO;
     return -1;
 }
 LEAN_EXPORT lean_obj_res lean_sudo_plugins_has_io(void) {
     for (struct plugin *p = plugins; p; p = p->next)
-        if (!p->disabled && p->abi->type == SUDO_IO_PLUGIN) return boolean(true);
-    return boolean(false);
+        if (!p->disabled && p->abi->type == SUDO_IO_PLUGIN) return ls_ok(lean_box(true));
+    return ls_ok(lean_box(false));
 }
 LEAN_EXPORT lean_obj_res lean_sudo_plugins_version(uint8_t verbose,
     uint32_t builtin_io_line, uint32_t builtin_audit_line) {
@@ -655,8 +603,8 @@ LEAN_EXPORT lean_obj_res lean_sudo_plugins_version(uint8_t verbose,
                 struct approval_plugin *a = (void *)p->abi;
                 if (rc == 0) disable(p);
                 else if (rc == 1) { a->show_version(verbose); if (a->close) a->close(); }
-                else if (rc == -2) return error("plugin requested usage");
-                else return error("error initializing approval plugin");
+                else if (rc == -2) return ls_error("plugin requested usage");
+                else return ls_error("error initializing approval plugin");
             }
         }
         if (type == SUDO_IO_PLUGIN && builtin_io_line) {
@@ -677,7 +625,7 @@ LEAN_EXPORT lean_obj_res lean_sudo_plugins_version(uint8_t verbose,
     }
     if (builtin_audit_line)
         plugin_printf(SUDO_CONV_INFO_MSG, "Sudoers audit plugin version 1.9.17p2\n");
-    return ok();
+    return ls_unit();
 }
 void ls_plugins_exec_begin(void) {
     native_type = SUDO_PLUGIN_SUDO_ERROR; native_status = 1; native_valid = true;
@@ -708,18 +656,18 @@ LEAN_EXPORT lean_obj_res lean_sudo_plugins_close(uint32_t type, uint32_t status)
     events_free(); hooks_free();
     while (plugins) {
         struct plugin *p = plugins; plugins = p->next;
-        free_vector(p->settings); free_vector(p->options);
+        ls_strv_free(p->settings); ls_strv_free(p->options);
         free(p->name); free(p->path); dlclose(p->handle); free(p);
     }
     plugin_tail = &plugins;
-    free_vector(settings); settings = NULL; free_vector(user_info); user_info = NULL;
-    free_vector(submit_argv); submit_argv = NULL; free_vector(submit_env); submit_env = NULL;
-    free_vector(command_info); command_info = NULL;
-    free_vector(run_argv); run_argv = NULL; free_vector(run_env); run_env = NULL;
+    ls_strv_free(settings); settings = NULL; ls_strv_free(user_info); user_info = NULL;
+    ls_strv_free(submit_argv); submit_argv = NULL; ls_strv_free(submit_env); submit_env = NULL;
+    ls_strv_free(command_info); command_info = NULL;
+    ls_strv_free(run_argv); run_argv = NULL; ls_strv_free(run_env); run_env = NULL;
     native_valid = false;
     conv_stdin = conv_noninteractive = false;
     ls_plugin_conversation_config(0, NULL);
-    return ok();
+    return ls_unit();
 }
 typedef int (*log_fn)(const char *, unsigned, const char **);
 static log_fn stream_fn(struct plugin *p, int stream) {
@@ -770,55 +718,47 @@ int ls_plugins_io_write(int stream, const void *data, size_t size) {
     }
     return 0;
 }
-int ls_plugins_io_winsize(unsigned rows, unsigned cols) {
+static int io_event(bool suspend, unsigned rows, unsigned cols, int signo) {
+    unsigned mask = suspend ? 64 : 32;
     for (struct plugin *p = plugins; p; p = p->next) {
         if (!p->opened || p->disabled || p->abi->type != SUDO_IO_PLUGIN ||
-            p->abi->version < SUDO_API_MKVERSION(1, 12) || (p->disabled_streams & 32)) continue;
+            p->abi->version < SUDO_API_MKVERSION(1, suspend ? 13 : 12) ||
+            (p->disabled_streams & mask)) continue;
         struct io_plugin *a = (void *)p->abi;
         const char *why = NULL;
         int rc = 1;
-        if (a->change_winsize) {
+        if (suspend && a->log_suspend) {
             if (a->version < SUDO_API_MKVERSION(1, 15)) {
-                int (*winsize_old)(unsigned, unsigned);
-                memcpy(&winsize_old, &a->change_winsize, sizeof winsize_old);
-                rc = winsize_old(rows, cols);
+                int (*old)(int);
+                memcpy(&old, &a->log_suspend, sizeof old);
+                rc = old(signo);
+            } else {
+                rc = a->log_suspend(signo, &why);
+            }
+        } else if (!suspend && a->change_winsize) {
+            if (a->version < SUDO_API_MKVERSION(1, 15)) {
+                int (*old)(unsigned, unsigned);
+                memcpy(&old, &a->change_winsize, sizeof old);
+                rc = old(rows, cols);
             } else {
                 rc = a->change_winsize(rows, cols, &why);
             }
         }
         if (rc <= 0) {
-            p->disabled_streams |= 32;
-            audit_message(NULL, p->name, SUDO_IO_PLUGIN,
-                why ? why : "error changing window size", command_info, true);
+            p->disabled_streams |= mask;
+            audit_message(NULL, p->name, SUDO_IO_PLUGIN, why ? why :
+                suspend ? "error logging suspend" : "error changing window size",
+                command_info, true);
             errno = EIO; return -1;
         }
     }
     return 0;
 }
+int ls_plugins_io_winsize(unsigned rows, unsigned cols) {
+    return io_event(false, rows, cols, 0);
+}
 int ls_plugins_io_suspend(int signo) {
-    for (struct plugin *p = plugins; p; p = p->next) {
-        if (!p->opened || p->disabled || p->abi->type != SUDO_IO_PLUGIN ||
-            p->abi->version < SUDO_API_MKVERSION(1, 13) || (p->disabled_streams & 64)) continue;
-        struct io_plugin *a = (void *)p->abi;
-        const char *why = NULL;
-        int rc = 1;
-        if (a->log_suspend) {
-            if (a->version < SUDO_API_MKVERSION(1, 15)) {
-                int (*suspend_old)(int);
-                memcpy(&suspend_old, &a->log_suspend, sizeof suspend_old);
-                rc = suspend_old(signo);
-            } else {
-                rc = a->log_suspend(signo, &why);
-            }
-        }
-        if (rc <= 0) {
-            p->disabled_streams |= 64;
-            audit_message(NULL, p->name, SUDO_IO_PLUGIN,
-                why ? why : "error logging suspend", command_info, true);
-            errno = EIO; return -1;
-        }
-    }
-    return 0;
+    return io_event(true, 0, 0, signo);
 }
 
 /* Environment hooks are process-local, as in sudo's hooks.c. Reentrant libc
@@ -871,51 +811,44 @@ char *getenv(const char *name) {
         if (!strncmp(*v, name, len) && (*v)[len] == '=') return *v + len + 1;
     return NULL;
 }
+/* Preserve each hook's signature while sharing dispatch and reentrancy handling. */
+#define ENV_HOOK_CHAIN(kind, call) \
+    if (!in_hook) { \
+        in_hook++; \
+        for (struct env_hook *h = env_hooks; h; h = h->next) { \
+            if (h->value.hook_type != kind) continue; \
+            int rc = (call); \
+            if (rc == SUDO_HOOK_RET_NEXT) continue; \
+            in_hook--; \
+            return rc == SUDO_HOOK_RET_STOP ? 0 : -1; \
+        } \
+        in_hook--; \
+    }
 int setenv(const char *name, const char *value, int overwrite) {
     static int (*real_setenv)(const char *, const char *, int);
     if (!real_setenv) real_setenv = (void *)dlsym(RTLD_NEXT, "setenv");
-    if (!in_hook) {
-        in_hook++;
-        for (struct env_hook *h = env_hooks; h; h = h->next) {
-            if (h->value.hook_type != SUDO_HOOK_SETENV) continue;
-            int rc = ((sudo_hook_fn_setenv_t)h->value.hook_fn)(name, value, overwrite, h->value.closure);
-            if (rc != SUDO_HOOK_RET_NEXT) { in_hook--; return rc == SUDO_HOOK_RET_STOP ? 0 : -1; }
-        }
-        in_hook--;
-    }
+    ENV_HOOK_CHAIN(SUDO_HOOK_SETENV,
+        ((sudo_hook_fn_setenv_t)h->value.hook_fn)(name, value, overwrite, h->value.closure))
     if (!real_setenv) { errno = ENOSYS; return -1; }
     return real_setenv(name, value, overwrite);
 }
 int unsetenv(const char *name) {
     static int (*real_unsetenv)(const char *);
     if (!real_unsetenv) real_unsetenv = (void *)dlsym(RTLD_NEXT, "unsetenv");
-    if (!in_hook) {
-        in_hook++;
-        for (struct env_hook *h = env_hooks; h; h = h->next) {
-            if (h->value.hook_type != SUDO_HOOK_UNSETENV) continue;
-            int rc = ((sudo_hook_fn_unsetenv_t)h->value.hook_fn)(name, h->value.closure);
-            if (rc != SUDO_HOOK_RET_NEXT) { in_hook--; return rc == SUDO_HOOK_RET_STOP ? 0 : -1; }
-        }
-        in_hook--;
-    }
+    ENV_HOOK_CHAIN(SUDO_HOOK_UNSETENV,
+        ((sudo_hook_fn_unsetenv_t)h->value.hook_fn)(name, h->value.closure))
     if (!real_unsetenv) { errno = ENOSYS; return -1; }
     return real_unsetenv(name);
 }
 int putenv(char *value) {
     static int (*real_putenv)(char *);
     if (!real_putenv) real_putenv = (void *)dlsym(RTLD_NEXT, "putenv");
-    if (!in_hook) {
-        in_hook++;
-        for (struct env_hook *h = env_hooks; h; h = h->next) {
-            if (h->value.hook_type != SUDO_HOOK_PUTENV) continue;
-            int rc = ((sudo_hook_fn_putenv_t)h->value.hook_fn)(value, h->value.closure);
-            if (rc != SUDO_HOOK_RET_NEXT) { in_hook--; return rc == SUDO_HOOK_RET_STOP ? 0 : -1; }
-        }
-        in_hook--;
-    }
+    ENV_HOOK_CHAIN(SUDO_HOOK_PUTENV,
+        ((sudo_hook_fn_putenv_t)h->value.hook_fn)(value, h->value.closure))
     if (!real_putenv) { errno = ENOSYS; return -1; }
     return real_putenv(value);
 }
+#undef ENV_HOOK_CHAIN
 
 /* Event objects stay allocated until the end of the current dispatch. A
  * callback may delete/free itself or another event without invalidating traversal. */
@@ -1161,9 +1094,9 @@ int ls_plugins_poll(struct pollfd *fds, nfds_t count, int timeout) {
 LEAN_EXPORT lean_obj_res lean_sudo_plugins_conversation(uint8_t use_stdin,
     uint8_t noninteractive, uint8_t bell, b_lean_obj_arg askpass) {
     if (ls_plugin_conversation_config(bell, lean_string_cstr(askpass)) != 0)
-        return error("unable to configure plugin conversation");
+        return ls_error("unable to configure plugin conversation");
     conv_stdin = use_stdin; conv_noninteractive = noninteractive;
-    return ok();
+    return ls_unit();
 }
 
 static bool fact(lean_object **array, const char *fmt, ...) {
@@ -1202,7 +1135,7 @@ static unsigned dimension(const char *name, unsigned fallback) {
 LEAN_EXPORT lean_obj_res lean_sudo_plugins_user_info(b_lean_obj_arg group_source, uint32_t max_groups) {
     lean_object *a = lean_mk_empty_array_with_capacity(lean_box(40));
     struct passwd *pw = getpwuid(getuid());
-    if (!pw) { lean_dec(a); return error("you do not exist in the passwd database"); }
+    if (!pw) { lean_dec(a); return ls_error("you do not exist in the passwd database"); }
     int tty = open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
     pid_t tcpgid = tty < 0 ? 0 : tcgetpgrp(tty), sid = getsid(0);
     if (tcpgid < 0) tcpgid = 0;
@@ -1321,5 +1254,5 @@ oom:
     errno = ENOMEM;
 failed:
     if (tty >= 0) close(tty);
-    lean_dec(a); return error("unable to collect plugin user information");
+    lean_dec(a); return ls_error("unable to collect plugin user information");
 }

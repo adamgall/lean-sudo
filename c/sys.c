@@ -1,5 +1,5 @@
 /* System lookup oracles: no policy decisions live in this translation unit. */
-#include <lean/lean.h>
+#include "shim.h"
 #include "locale_scope.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -25,10 +25,6 @@
 #define AUDIT_USER_CMD 1123
 #endif
 
-static lean_obj_res failure(const char *msg) {
-  return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(msg)));
-}
-
 LEAN_EXPORT lean_obj_res leansudo_sys_domain(lean_obj_arg world) {
   (void)world;
   char name[256] = {0};
@@ -46,7 +42,7 @@ static const char *optional(b_lean_obj_arg x) {
 LEAN_EXPORT lean_obj_res leansudo_sys_interfaces(lean_obj_arg world) {
   (void)world;
   struct ifaddrs *ifs;
-  if (getifaddrs(&ifs)) return failure("unable to read network interfaces");
+  if (getifaddrs(&ifs)) return ls_error("unable to read network interfaces");
   lean_object *out = lean_mk_empty_array();
   for (struct ifaddrs *i = ifs; i; i = i->ifa_next) {
     if (!i->ifa_addr || !i->ifa_netmask || !(i->ifa_flags & IFF_UP) ||
@@ -57,10 +53,7 @@ LEAN_EXPORT lean_obj_res leansudo_sys_interfaces(lean_obj_arg world) {
     const void *a = af == AF_INET ? (void *)&((struct sockaddr_in *)i->ifa_addr)->sin_addr : (void *)&((struct sockaddr_in6 *)i->ifa_addr)->sin6_addr;
     const void *m = af == AF_INET ? (void *)&((struct sockaddr_in *)i->ifa_netmask)->sin_addr : (void *)&((struct sockaddr_in6 *)i->ifa_netmask)->sin6_addr;
     if (!inet_ntop(af, a, addr, sizeof addr) || !inet_ntop(af, m, mask, sizeof mask)) continue;
-    lean_object *pair = lean_alloc_ctor(0, 2, 0);
-    lean_ctor_set(pair, 0, lean_mk_string(addr));
-    lean_ctor_set(pair, 1, lean_mk_string(mask));
-    out = lean_array_push(out, pair);
+    out = lean_array_push(out, ls_pair(lean_mk_string(addr), lean_mk_string(mask)));
   }
   freeifaddrs(ifs);
   return lean_io_result_mk_ok(out);
@@ -183,7 +176,7 @@ LEAN_EXPORT lean_obj_res leansudo_sys_regex(b_lean_obj_arg pattern, b_lean_obj_a
   regex_t re = {0};
   const char *expr = lean_string_cstr(pattern);
   size_t len = strlen(expr);
-  if (len > 1024) return failure("regular expression too large");
+  if (len > 1024) return ls_error("regular expression too large");
   int flags = REG_EXTENDED | REG_NOSUB;
   const char *prefix = expr[0] == '^' ? expr + 1 : expr;
   char adjusted[1025];
@@ -199,19 +192,19 @@ LEAN_EXPORT lean_obj_res leansudo_sys_regex(b_lean_obj_arg pattern, b_lean_obj_a
   }
   locale_t previous;
   locale_t locale = leansudo_locale_enter(lean_string_cstr(locale_name), &previous);
-  if (!locale) return failure("unable to initialize matching locale");
+  if (!locale) return ls_error("unable to initialize matching locale");
   int err = regex_check(expr);
   if (!err) err = regcomp(&re, expr, flags);
   if (err) {
     char msg[256];
     regerror(err, &re, msg, sizeof msg);
     leansudo_locale_leave(locale, previous);
-    return failure(msg);
+    return ls_error(msg);
   }
   err = regexec(&re, lean_string_cstr(text), 0, NULL, 0);
   regfree(&re);
   leansudo_locale_leave(locale, previous);
-  if (err != 0 && err != REG_NOMATCH) return failure("unable to match regular expression");
+  if (err != 0 && err != REG_NOMATCH) return ls_error("unable to match regular expression");
   return lean_io_result_mk_ok(lean_box(err == 0));
 }
 LEAN_EXPORT lean_obj_res leansudo_sys_glob(b_lean_obj_arg pattern,
@@ -219,7 +212,7 @@ LEAN_EXPORT lean_obj_res leansudo_sys_glob(b_lean_obj_arg pattern,
   (void)world;
   locale_t previous;
   locale_t locale = leansudo_locale_enter(lean_string_cstr(locale_name), &previous);
-  if (!locale) return failure("unable to initialize matching locale");
+  if (!locale) return ls_error("unable to initialize matching locale");
   glob_t g = {0};
   int err = glob(lean_string_cstr(pattern), GLOB_NOSORT, NULL, &g);
   lean_object *out = lean_box(0);
@@ -233,7 +226,7 @@ LEAN_EXPORT lean_obj_res leansudo_sys_glob(b_lean_obj_arg pattern,
   }
   globfree(&g);
   leansudo_locale_leave(locale, previous);
-  if (err != 0 && err != GLOB_NOMATCH) return failure("unable to expand command glob");
+  if (err != 0 && err != GLOB_NOMATCH) return ls_error("unable to expand command glob");
   return lean_io_result_mk_ok(out);
 }
 LEAN_EXPORT lean_obj_res leansudo_sys_hostname(b_lean_obj_arg host, lean_obj_arg world) {

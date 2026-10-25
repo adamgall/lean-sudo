@@ -177,22 +177,21 @@ def JsonValue.render (compact : Bool) (depth : Nat) : JsonValue → String
   | .string s => jsonQuote s
   | .number n => toString n
   | .bool b => if b then "true" else "false"
-  | .object fields =>
-    let indent := if compact then "" else "\n" ++ String.ofList (List.replicate (4 * (depth + 1)) ' ')
-    let close := if compact then "" else "\n" ++ String.ofList (List.replicate (4 * depth) ' ')
-    "{" ++ String.intercalate "," (fields.attach.map fun ⟨(k, v), _⟩ =>
-      indent ++ jsonQuote k ++ (if compact then ":" else ": ") ++ v.render compact (depth + 1)) ++ close ++ "}"
-  | .array values =>
-    let indent := if compact then "" else "\n" ++ String.ofList (List.replicate (4 * (depth + 1)) ' ')
-    let close := if compact then "" else "\n" ++ String.ofList (List.replicate (4 * depth) ' ')
-    "[" ++ String.intercalate "," (values.attach.map fun ⟨v, _⟩ =>
-      indent ++ v.render compact (depth + 1)) ++ close ++ "]"
+  | .object fields => wrap "{" "}" fun indent =>
+    fields.attach.map fun ⟨(k, v), _⟩ =>
+      indent ++ jsonQuote k ++ (if compact then ":" else ": ") ++ v.render compact (depth + 1)
+  | .array values => wrap "[" "]" fun indent =>
+    values.attach.map fun ⟨v, _⟩ => indent ++ v.render compact (depth + 1)
 termination_by v => sizeOf v
 decreasing_by
   all_goals
     have h := List.sizeOf_lt_of_mem ‹_ ∈ _›
     simp_all +arith
     omega
+where
+  wrap (left right : String) (items : String → List String) : String :=
+    let indent n := if compact then "" else "\n" ++ String.ofList (List.replicate (4 * n) ' ')
+    left ++ String.intercalate "," (items (indent (depth + 1))) ++ indent depth ++ right
 
 structure Time where
   seconds : Nat := 0

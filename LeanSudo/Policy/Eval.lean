@@ -273,18 +273,11 @@ def runasOk (al : Aliases) (fuel : Nat) (st : Settings) (r : Request) (rs : Opti
 
 /-! ## Commands -/
 
-/-- Directory part of a path, without the trailing slash (`/usr/bin/ls` ↦ `/usr/bin`). -/
-def dirOf (s : String) : String :=
-  let d := String.ofList ((s.toList.reverse.dropWhile (· != '/')).drop 1).reverse
-  if d.isEmpty && s.startsWith "/" then "/" else d
 
 def endsWithSlash (p : String) : Bool := p.toList.getLast? == some '/'
 
 def dropLastChar (p : String) : String := String.ofList p.toList.dropLast
 
-/-- Last path component (`/usr/bin/ls` ↦ `ls`). -/
-def baseOf (s : String) : String :=
-  String.ofList (s.toList.reverse.takeWhile (· != '/')).reverse
 
 /-- Argument constraint. `pathname`: `*`/`?` do not match `/` (sudo uses `FNM_PATHNAME`
 for `sudoedit` arguments, `command_args_match` in match_command.c). -/
@@ -299,24 +292,20 @@ def argsMatch (pathname : Bool) (a : CmndArgs) (args : List String)
   | .pattern q => fnmatch q (" ".intercalate args) pathname
   | .regex q => regexMatch facts q (" ".intercalate args)
 
-/-- Device/inode comparison. Missing facts never authorize an IO-backed request. -/
-def sameFile (facts : Option Request) (p path : String) : Bool :=
+def fileIdMatch (fallback : Bool) (facts : Option Request) (p path : String) : Bool :=
   match facts with
   | none => p == path
   | some r =>
     match r.fileIds.find? (·.1 == p), r.fileIds.find? (·.1 == path) with
     | some (_, d, i), some (_, d', i') => d == d' && i == i'
-    | _, _ => false
+    | _, _ => fallback && p == path
+
+/-- Missing facts never authorize directory matching in an IO-backed request. -/
+def sameFile := fileIdMatch false
 
 /-- Unlike directory matching, sudo's literal matcher falls back to exact raw
 path equality when either stat fails (`command_matches_normal`). -/
-def literalFileMatches (facts : Option Request) (p path : String) : Bool :=
-  match facts with
-  | none => p == path
-  | some r =>
-    match r.fileIds.find? (·.1 == p), r.fileIds.find? (·.1 == path) with
-    | some (_, d, i), some (_, d', i') => d == d' && i == i'
-    | _, _ => p == path
+def literalFileMatches := fileIdMatch true
 
 def pathNamesMatch (canon : String → String) (p path : String) : Bool :=
   baseOf p == baseOf path && canon (dirOf p) == canon (dirOf path)
@@ -432,13 +421,8 @@ def rootCanon (facts : RootCommandFacts) (path : String) : String :=
 
 def withRootFacts (r : Request) (facts : RootCommandFacts) : Request :=
   { r with
-    command := rootedCommand r.command facts
-    canon := rootCanon facts
-    canonPaths := facts.canonPaths
-    fileIds := facts.fileIds
-    globPaths := facts.globPaths
-    regexMatches := facts.regexMatches
-    digests := facts.digests }
+    command := rootedCommand r.command facts, canon := rootCanon facts,
+    toCommandFacts := facts.toCommandFacts }
 
 def specRequest (r : Request) (cs : CmndSpec) : Option Request :=
   match specRoot r cs with
@@ -552,20 +536,8 @@ def allowedOf (st : Settings) (c : Candidate) : Allowed :=
   { needsAuth := specNeedsAuth st c.spec
     -- `ALL` (written directly in the spec) implies SETENV, like sudo's parser does
     setenv := c.spec.tags.setenv.getD (st.setenv || commandImpliesSetenv c.spec.cmnd.atom)
-    cwd := c.spec.options.cwd
-    noexec := c.spec.tags.noexec
-    intercept := c.spec.tags.intercept
-    logInput := c.spec.tags.logInput
-    logOutput := c.spec.tags.logOutput
-    mail := c.spec.tags.mail
-    follow := c.spec.tags.follow
-    chroot := c.spec.options.chroot
-    timeout := c.spec.options.timeout
-    role := c.spec.options.role
-    type := c.spec.options.type
-    apparmorProfile := c.spec.options.apparmorProfile
-    privs := c.spec.options.privs
-    limitprivs := c.spec.options.limitprivs
+    toTagEffects := c.spec.tags.toTagEffects
+    toExecutionOptions := c.spec.options.toExecutionOptions
     usesDigest := c.usesDigest
     selection := c.selection }
 

@@ -2,7 +2,8 @@ import LeanSudo.Core
 import LeanSudo.Policy.Proofs
 
 /-! End-to-end authorization, identity, environment and authentication invariants.
-The IO shell must successfully perform the returned authentication before execution. -/
+Execution and editing share a checked policy-decision origin; the IO shell must
+successfully perform the returned authentication before execution. -/
 namespace LeanSudo.Core
 open Policy
 
@@ -110,6 +111,33 @@ private theorem resolvedFor_lineage (ctx : Context) (a : Allowed) (rc : Resolved
         cases hc
         exact Or.inr ⟨selected, args, hs, hf, hcmd, hargv⟩
 
+private theorem decide_allowed_action (ctx : Context) (p : ExecPlan ⊕ EditPlan)
+    (h : (decide ctx).action = p.elim Action.exec Action.edit) :
+    ∃ a, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
+      earlyAction ctx = none ∧ allowedFailure ctx a = none ∧
+      allowedAction ctx a = p.elim Action.exec Action.edit ∧
+      decide ctx = policyDecision ctx (.allow a) := by
+  cases he : earlyAction ctx with
+  | some act =>
+    have hs := early_safe ctx act he
+    cases p with
+    | inl p => exact False.elim (hs.1 p (by simpa [decide, he] using h))
+    | inr p => exact False.elim (hs.2 p (by simpa [decide, he] using h))
+  | none =>
+    cases hj : policyJudgement ctx with
+    | deny =>
+      have hs := denied_policy_safe ctx
+      cases p with
+      | inl p => exact False.elim (hs.1 p (by simpa [decide, he, hj] using h))
+      | inr p => exact False.elim (hs.2 p (by simpa [decide, he, hj] using h))
+    | allow a =>
+      have hh : allowedAction ctx a = p.elim Action.exec Action.edit := by
+        simpa [decide, he, hj, policyDecision, decisionFailure] using h
+      cases hf : allowedFailure ctx a with
+      | some failure => cases p <;> simp [allowedAction, hf, FailureInfo.action] at hh
+      | none =>
+        exact ⟨a, policyJudgement_allow ctx a hj, rfl, hf, hh, by simp [decide, he, hj]⟩
+
 /-- Every executable plan comes from an allowed resolved run with a checked environment. -/
 theorem exec_origin (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .exec p) :
     ∃ a rc, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
@@ -117,31 +145,17 @@ theorem exec_origin (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .e
       (∃ env, buildEnv (environment ctx a) = .ok env) ∧
       decide ctx = policyDecision ctx (.allow a) ∧
       CommandLineage ctx a rc ∧ p.argv.tail = rc.args := by
-  cases he : earlyAction ctx with
-  | some act =>
-    exact False.elim ((early_safe ctx act he).1 p (by simpa [decide, he] using h))
-  | none =>
-    cases hj : policyJudgement ctx with
-    | deny =>
-      exact False.elim ((denied_policy_safe ctx).1 p (by simpa [decide, he, hj] using h))
-    | allow a =>
-      have hh : allowedAction ctx a = .exec p := by
-        simpa [decide, he, hj, policyDecision, decisionFailure] using h
-      cases hf : allowedFailure ctx a with
-      | some failure => simp [allowedAction, hf, FailureInfo.action] at hh
-      | none =>
-        cases hm : ctx.opts.mode <;> simp only [allowedAction, hf, hm] at hh
-        case run =>
-          cases hc : resolvedFor ctx a with
-          | none => simp [hc, notFound] at hh
-          | some rc =>
-            have hp : execPlan ctx a rc = p := by simpa [hc] using hh
-            refine ⟨a, rc, policyJudgement_allow ctx a hj, rfl, hc, hp.symm,
-              allowedFailure_env ctx a hf (Or.inl hm), ?_,
-              resolvedFor_lineage ctx a rc hm hc, ?_⟩
-            · simp [decide, he, hj]
-            · simp [← hp, execPlan]
-        all_goals repeat first | split at hh | cases hh
+  obtain ⟨a, ha, _, hf, hh, hd⟩ := decide_allowed_action ctx (.inl p) h
+  cases hm : ctx.opts.mode <;> simp only [allowedAction, hf, hm, Sum.elim] at hh
+  case run =>
+    cases hc : resolvedFor ctx a with
+    | none => simp [hc, notFound] at hh
+    | some rc =>
+      have hp : execPlan ctx a rc = p := by simpa [hc] using hh
+      exact ⟨a, rc, ha, rfl, hc, hp.symm,
+        allowedFailure_env ctx a hf (Or.inl hm), hd,
+        resolvedFor_lineage ctx a rc hm hc, by simp [← hp, execPlan]⟩
+  all_goals repeat first | split at hh | cases hh
 
 /-- Editing is authorized for precisely the absolute file list in the returned plan. -/
 theorem edit_origin (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .edit p) :
@@ -149,25 +163,12 @@ theorem edit_origin (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .e
       ctx.opts.mode = .edit ∧ p = editPlan ctx a ∧
       (∃ env, buildEnv (environment ctx a) = .ok env) ∧
       decide ctx = policyDecision ctx (.allow a) := by
-  cases he : earlyAction ctx with
-  | some act =>
-    exact False.elim ((early_safe ctx act he).2 p (by simpa [decide, he] using h))
-  | none =>
-    cases hj : policyJudgement ctx with
-    | deny =>
-      exact False.elim ((denied_policy_safe ctx).2 p (by simpa [decide, he, hj] using h))
-    | allow a =>
-      have hh : allowedAction ctx a = .edit p := by
-        simpa [decide, he, hj, policyDecision, decisionFailure] using h
-      cases hf : allowedFailure ctx a with
-      | some failure => simp [allowedAction, hf, FailureInfo.action] at hh
-      | none =>
-        cases hm : ctx.opts.mode <;> simp only [allowedAction, hf, hm] at hh
-        case edit =>
-          have hp : editPlan ctx a = p := by simpa using hh
-          exact ⟨a, policyJudgement_allow ctx a hj, rfl, hp.symm,
-            allowedFailure_env ctx a hf (Or.inr hm), by simp [decide, he, hj]⟩
-        all_goals repeat first | split at hh | cases hh
+  obtain ⟨a, ha, _, hf, hh, hd⟩ := decide_allowed_action ctx (.inr p) h
+  cases hm : ctx.opts.mode <;> simp only [allowedAction, hf, hm, Sum.elim] at hh
+  case edit =>
+    have hp : editPlan ctx a = p := by simpa using hh
+    exact ⟨a, ha, rfl, hp.symm, allowedFailure_env ctx a hf (Or.inr hm), hd⟩
+  all_goals repeat first | split at hh | cases hh
 
 theorem exec_allowed (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .exec p) :
     ∃ a rc, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
@@ -212,12 +213,7 @@ policy's original operands or lexically folding symlink-sensitive parent compone
 theorem edit_files_normalized (ctx : Context) (p : EditPlan)
     (h : (decide ctx).action = .edit p) :
     ∀ file ∈ p.files, file.startsWith "/" = true ∧ file.contains '\x00' = false := by
-  have he : earlyAction ctx = none := by
-    cases hx : earlyAction ctx with
-    | none => rfl
-    | some act =>
-      have ha : act = .edit p := by simpa [decide, hx] using h
-      exact False.elim ((early_safe ctx act hx).2 p ha)
+  obtain ⟨_, _, he, _⟩ := decide_allowed_action ctx (.inr p) h
   obtain ⟨a, _, hm, rfl, _, _⟩ := edit_origin ctx p h
   have hb : invalidEditFile ctx = none := by
     cases hx : invalidEditFile ctx with
@@ -281,12 +277,7 @@ theorem invalid_runas_shell_no_exec (ctx : Context)
     (hv : ctx.validShells.contains ctx.target.shell = false) :
     ∀ p, (decide ctx).action ≠ .exec p := by
   intro p hp
-  have he : earlyAction ctx = none := by
-    cases hx : earlyAction ctx with
-    | none => rfl
-    | some act =>
-      have ha : act = .exec p := by simpa [decide, hx] using hp
-      exact False.elim ((early_safe ctx act hx).1 p ha)
+  obtain ⟨_, _, he, _⟩ := decide_allowed_action ctx (.inl p) hp
   obtain ⟨a, rc, _, hm, _⟩ := exec_origin ctx p hp
   have hv' : ctx.target.shell ∉ ctx.validShells := by simpa using hv
   simp [earlyAction, earlyFailure, hm, hs, hv'] at he
@@ -312,21 +303,24 @@ private theorem authentication_none (ctx : Context) (a : Allowed)
   unfold AuthExemption
   cases hg : ctx.targetGroup <;> cases ho : ctx.opts.group <;> simp_all <;> grind
 
+private theorem noauth_of_decision (ctx : Context) (a : Allowed)
+    (hm : ctx.opts.mode ≠ .list) (hd : decide ctx = policyDecision ctx (.allow a))
+    (hn : (decide ctx).auth = .none) : AuthExemption ctx a := by
+  rw [hd] at hn
+  exact authentication_none ctx a
+    (by simpa only [policyDecision, authJudgement, hm, ↓reduceIte] using hn)
+
 theorem exec_noauth (ctx : Context) (p : ExecPlan)
     (h : (decide ctx).action = .exec p) (hn : (decide ctx).auth = .none) :
     ∃ a, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧ AuthExemption ctx a := by
   obtain ⟨a, rc, ha, hm, _, _, _, hd, _⟩ := exec_origin ctx p h
-  rw [hd] at hn
-  simp only [policyDecision, authJudgement, hm, reduceCtorEq, ↓reduceIte] at hn
-  exact ⟨a, ha, authentication_none ctx a hn⟩
+  exact ⟨a, ha, noauth_of_decision ctx a (by simp [hm]) hd hn⟩
 
 theorem edit_noauth (ctx : Context) (p : EditPlan)
     (h : (decide ctx).action = .edit p) (hn : (decide ctx).auth = .none) :
     ∃ a, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧ AuthExemption ctx a := by
   obtain ⟨a, ha, hm, _, _, hd⟩ := edit_origin ctx p h
-  rw [hd] at hn
-  simp only [policyDecision, authJudgement, hm, reduceCtorEq, ↓reduceIte] at hn
-  exact ⟨a, ha, authentication_none ctx a hn⟩
+  exact ⟨a, ha, noauth_of_decision ctx a (by simp [hm]) hd hn⟩
 
 theorem exec_environment (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .exec p) :
     ∃ a env, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
@@ -452,15 +446,9 @@ theorem enforcement_error_no_exec (ctx : Context) (a : Allowed)
     (he : (enforcementError ctx a).isSome = true) :
     ∀ p, (decide ctx).action ≠ .exec p := by
   intro p hp
-  obtain ⟨b, rc, hb, hm, hc, _, _, hd, _⟩ := exec_origin ctx p hp
+  obtain ⟨b, hb, _, hf, _⟩ := decide_allowed_action ctx (.inl p) hp
   rw [ha] at hb
   cases hb
-  rw [hd] at hp
-  have hf : allowedFailure ctx a = none := by
-    cases hf : allowedFailure ctx a with
-    | none => rfl
-    | some failure =>
-      simp [policyDecision, decisionFailure, allowedAction, hf, FailureInfo.action] at hp
   have checks := allowedFailure_checks ctx a hf
   simp [enforcementError, checks.1, checks.2] at he
 
@@ -469,15 +457,9 @@ theorem enforcement_error_no_edit (ctx : Context) (a : Allowed)
     (he : (enforcementError ctx a).isSome = true) :
     ∀ p, (decide ctx).action ≠ .edit p := by
   intro p hp
-  obtain ⟨b, hb, hm, _, _, hd⟩ := edit_origin ctx p hp
+  obtain ⟨b, hb, _, hf, _⟩ := decide_allowed_action ctx (.inr p) hp
   rw [ha] at hb
   cases hb
-  rw [hd] at hp
-  have hf : allowedFailure ctx a = none := by
-    cases hf : allowedFailure ctx a with
-    | none => rfl
-    | some failure =>
-      simp [policyDecision, decisionFailure, allowedAction, hf, FailureInfo.action] at hp
   have checks := allowedFailure_checks ctx a hf
   simp [enforcementError, checks.1, checks.2] at he
 
@@ -540,7 +522,7 @@ theorem exec_selected_root (ctx : Context) (p : ExecPlan)
   obtain ⟨b, rc, hb, hm, _, rfl, _⟩ := exec_origin ctx p h
   rw [ha] at hb
   cases hb
-  simp [execPlan, commandChroot, selectedChroot, hm, hs]
+  simp [execPlan, runPlan, commandChroot, selectedChroot, hm, hs]
 
 /-- sudoedit roots its editor according to Defaults, not the command's CHROOT
 option; original-file operands remain unchanged (edit_files_match_policy). -/
@@ -549,7 +531,7 @@ theorem edit_chroot_uses_defaults (ctx : Context) (p : EditPlan)
     p.chroot = ((ctx.opts.chroot.or (authorizationSettings ctx).runchroot).filter (· != "*")).bind
       (expandHome ctx) := by
   obtain ⟨a, _, hm, rfl, _⟩ := edit_origin ctx p h
-  simp [editPlan, commandChroot, selectedChroot, configuredChroot, effectiveChroot, hm]
+  simp [editPlan, runPlan, commandChroot, selectedChroot, configuredChroot, effectiveChroot, hm]
   rfl
 
 theorem edit_user_chroot_requires_wildcard (ctx : Context) (p : EditPlan)
@@ -564,7 +546,6 @@ theorem edit_user_chroot_requires_wildcard (ctx : Context) (p : EditPlan)
     have he : (enforcementError ctx a).isSome = true := by
       simp [enforcementError, preCommandFailure, permissionFailure, hp]
     exact False.elim (enforcement_error_no_edit ctx a ha he p h)
-
 
 /-- Remote destinations affect transport, not command-policy enforcement.
 The shell separately enforces the configured logging failure policy. -/

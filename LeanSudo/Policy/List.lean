@@ -1,5 +1,6 @@
 import LeanSudo.Policy.Defaults
 import LeanSudo.Sss
+import LeanSudo.Cli
 
 /-!
 # `sudo -l` rendering
@@ -27,8 +28,8 @@ User alice may run the following commands on host:
   explicit run-as spec starts a new line even if its value is unchanged. Aliases
   expand with negation composition. Verbose entries retain source filenames.
 * No privileges ⇒ only `User <u> is not allowed to run sudo on <h>.`
-* Output folding follows `sudo_lbuf_print`, using separate Defaults and privilege
-  continuation indents; a zero column count denotes unwrapped pipe output.
+* Output folding shares `Cli.wrapListing` with help text and follows `sudo_lbuf_print`,
+  using separate Defaults and privilege indents; zero columns means unwrapped output.
 
 The result ends with a newline.
 -/
@@ -131,11 +132,8 @@ def renderDefaultsValue (v : String) : String :=
 
 def renderSetting (d : DefaultsSetting) : String :=
   match d.op with
-  | .flag true => d.name
-  | .flag false => "!" ++ d.name
-  | .assign v => d.name ++ "=" ++ renderDefaultsValue v
-  | .add v => d.name ++ "+=" ++ renderDefaultsValue v
-  | .remove v => d.name ++ "-=" ++ renderDefaultsValue v
+  | .flag _ => opText d.op ++ d.name
+  | .assign v | .add v | .remove v => d.name ++ opText d.op ++ renderDefaultsValue v
 
 /-- Expand aliases without losing the polarity inherited from enclosing aliases. -/
 def expandMembers {α : Type} (aliasName : α → Option String)
@@ -270,34 +268,6 @@ private def sources (s : Sudoers) (located : List Located) : List Located :=
     s.map fun e => { file := "/etc/sudoers", line := 1, entry := e }
   else located
 
-/-- sudo_lbuf wrapping is byte-counted and splits only at ASCII spaces. -/
-def wrapListing (text : String) (columns indent : Nat) : String :=
-  if columns ≤ indent + 20 then text else
-    "\n".intercalate ((text.splitOn "\n").map fun line =>
-      wrapLine (line.utf8ByteSize + 1) line columns false)
-where
-  wrapLine : Nat → String → Nat → Bool → String
-    | 0, line, _, continued => (if continued then padding else "") ++ line
-    | fuel + 1, line, available, continued =>
-      let lead := if continued then padding else ""
-      let bytes := line.toUTF8
-      if bytes.size ≤ available then lead ++ line else Id.run do
-        let mut before : Option Nat := none
-        let mut after : Option Nat := none
-        for i in [:bytes.size] do
-          if bytes[i]! == 32 then
-            if i < available then before := some i
-            else if after.isNone then after := some i
-        let some split := before.or after | return lead ++ line
-        let mut next := split
-        for i in [split:bytes.size] do
-          if next == i && (bytes[i]! == 32 || bytes[i]! == 9) then next := i + 1
-        let first := String.fromUTF8! (bytes.extract 0 split)
-        if next == bytes.size then return lead ++ first
-        let rest := String.fromUTF8! (bytes.extract next bytes.size)
-        return lead ++ first ++ "\n" ++ wrapLine fuel rest (columns - indent) true
-  padding := String.ofList (List.replicate indent ' ')
-
 /-- Omit specs whose local bounds lack system-zone facts, rather than rendering
 an unresolved civil timestamp as UTC. Matching and display share the resolver. -/
 private def displaySpec (localTimeBounds : List (Nat × Nat)) (cs : CmndSpec) :
@@ -312,9 +282,8 @@ private def displaySpec (localTimeBounds : List (Nat × Nat)) (cs : CmndSpec) :
 
 /-- Short or verbose privileges. Locations preserve the source filename for `-ll`. -/
 def listPrivileges (s : Sudoers) (st : Settings) (user : Principal) (host : String)
-    (canon : String → String := id) (verbose : Bool := false) (located : List Located := [])
+    (verbose : Bool := false) (located : List Located := [])
     (facts : Option Request := none) (columns : Nat := 0) : String :=
-  let _ := canon
   let al := aliasesOf s
   let f := al.fuel
   let ds := defaultsOf s
@@ -344,15 +313,17 @@ def listPrivileges (s : Sudoers) (st : Settings) (user : Principal) (host : Stri
           else none
       else []
     | _ => []
-  if privs.isEmpty then wrapListing (notAllowedMessage user.name host ++ "\n") columns 8
+  if privs.isEmpty then Cli.wrapListing (notAllowedMessage user.name host ++ "\n") columns 8
   else
     let defsSec := if matching.isEmpty then "" else
       s!"Matching Defaults entries for {user.name} on {host}:\n    " ++
         ", ".intercalate (matching.map renderSetting) ++ "\n\n"
     let boundSec := if bound.isEmpty then "" else
       s!"Runas and Command-specific defaults for {user.name}:\n" ++ bound ++ "\n\n"
-    wrapListing (defsSec ++ boundSec) columns 4 ++
-      wrapListing (s!"User {user.name} may run the following commands on {host}:\n" ++ String.join privs) columns 8
+    Cli.wrapListing (defsSec ++ boundSec) columns 4 ++
+      Cli.wrapListing
+        (s!"User {user.name} may run the following commands on {host}:\n" ++ String.join privs)
+        columns 8
 
 /-- Display the exact last matching command specification for `sudo -ll command`. -/
 def listCommand (s : Sudoers) (st : Settings) (r : Request) (located : List Located := [])
@@ -368,10 +339,7 @@ def listCommand (s : Sudoers) (st : Settings) (r : Request) (located : List Loca
     match displaySpec r.localTimeBounds candidate.spec with
     | none => ""
     | some displayed =>
-      let cmd := match r.command with
-        | .run path _ args => " ".intercalate (path :: args)
-        | .sudoedit files => " ".intercalate ("sudoedit" :: files)
-        | _ => "list"
+      let cmd := if r.command == .validate then "list" else r.command.text
       (if verbose then longHeader al st r.user.name file displayed ++ "\t" ++
         expandedCommands al "\n\t" displayed.cmnd ++ "\n    Matched: " else "") ++ cmd ++ "\n"
   | none => ""

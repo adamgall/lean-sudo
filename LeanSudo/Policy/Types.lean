@@ -5,7 +5,8 @@ import LeanSudo.Sudoers.Ast
 
 Shared between the policy engine (`LeanSudo.Policy.Eval`, `LeanSudo.Policy.Defaults`),
 the environment builder (`LeanSudo.Env`), the decision core (`LeanSudo.Core`) and the
-IO shell (`Main`). Everything here is pure data.
+IO shell (`Main`). Everything here is pure data. `Facts` carries invocation-wide
+evidence; `CommandFacts` is replaced as a unit when selecting a different root.
 -/
 
 namespace LeanSudo
@@ -41,18 +42,38 @@ inductive Command where
   | validate
   deriving Repr, BEq, DecidableEq, Inhabited
 
-/-- Command lookup facts for one root. Paths are logical paths inside that root;
-the shell gathers their stat/digest data through host-prefixed paths. -/
-structure RootCommandFacts where
-  command : Command
-  argv : List String := []
-  found : Bool := true
-  execFd : Option Nat := none
+def Command.text : Command → String
+  | .run p _ args => String.intercalate " " (p :: args)
+  | .sudoedit fs => String.intercalate " " ("sudoedit" :: fs)
+  | .validate => "validate"
+  | .list | .checkList => "list"
+
+namespace Policy
+
+def dirOf (s : String) : String :=
+  let d := String.ofList ((s.toList.reverse.dropWhile (· != '/')).drop 1).reverse
+  if d.isEmpty && s.startsWith "/" then "/" else d
+
+def baseOf (s : String) : String :=
+  String.ofList (s.toList.reverse.takeWhile (· != '/')).reverse
+
+end Policy
+
+structure CommandFacts where
   canonPaths : List (String × String) := []
   fileIds : List (String × Nat × Nat) := []
   globPaths : List (String × List String) := []
   regexMatches : List (String × String × Bool) := []
   digests : List Sudoers.Digest := []
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+/-- Command lookup facts for one root. Paths are logical paths inside that root;
+the shell gathers their stat/digest data through host-prefixed paths. -/
+structure RootCommandFacts extends CommandFacts where
+  command : Command
+  argv : List String := []
+  found : Bool := true
+  execFd : Option Nat := none
   /-- Namespace safety failure, enforced only if this lookup wins authorization. -/
   refusal : Option String := none
   /-- Whether the resolved executable has setuid or setgid mode bits. -/
@@ -73,7 +94,19 @@ structure CommandSelection where
   setid : Bool := false
   deriving Repr, BEq, DecidableEq, Inhabited
 
-structure Request where
+structure Facts extends CommandFacts where
+  /-- Canonical paths and parent directories, precomputed by the shell. -/
+  canon : String → String := id
+  interfaces : List (Sudoers.IpAddr × Sudoers.IpAddr) := []
+  /-- (netgroup, user, host, innetgr result). -/
+  netgroups : List (String × Option String × Option String × Bool) := []
+  /-- (user, plugin group spelling, provider answered exactly 1). -/
+  pluginGroups : List (String × String × Bool) := []
+  /-- Zoneless civil timestamps mapped by mktime; missing bounds fail closed. -/
+  localTimeBounds : List (Nat × Nat) := []
+  rootFacts : List (String × RootCommandFacts) := []
+
+structure Request extends Facts where
   /-- the invoking user -/
   user : Principal
   /-- short host name -/
@@ -85,29 +118,11 @@ structure Request where
   /-- whether `-u` was given explicitly -/
   runasUserExplicit : Bool
   command : Command
-  /-- Canonical paths and parent directories, precomputed by the shell. -/
-  canon : String → String := id
-  canonPaths : List (String × String) := []
   lhost : String := ""
-  interfaces : List (Sudoers.IpAddr × Sudoers.IpAddr) := []
-  /-- (netgroup, user, host, innetgr result). -/
-  netgroups : List (String × Option String × Option String × Bool) := []
-  /-- (user, plugin group spelling, provider answered exactly 1). -/
-  pluginGroups : List (String × String × Bool) := []
-  regexMatches : List (String × String × Bool) := []
-  digests : List Sudoers.Digest := []
   now : Nat := 0
-  /-- Zoneless civil timestamps (encoded as UTC seconds) mapped to system-zone
-  epochs by `mktime` with `tm_isdst = -1`. Missing bounds fail closed. -/
-  localTimeBounds : List (Nat × Nat) := []
-  /-- stat results keyed by absolute path: device and inode. -/
-  fileIds : List (String × Nat × Nat) := []
-  /-- glob(3) expansions keyed by policy pattern. -/
-  globPaths : List (String × List String) := []
   fastGlob : Bool := false
   requestedChroot : Option String := none
   defaultChroot : Option String := none
-  rootFacts : List (String × RootCommandFacts) := []
 
 inductive TimestampType where
   | tty | ppid | global | kernel
@@ -283,12 +298,9 @@ structure Settings where
   ignoreAuditErrors : Bool := true
   ignoreIologErrors : Bool := false
   ignoreLogfileErrors : Bool := true
-  longOtpPrompt : Bool := false
   ignoreDot : Bool := true
   pathInfo : Bool := true
   staySetuid : Bool := false
-  useLoginclass : Bool := false
-  ignoreLocalSudoers : Bool := false
   noninteractiveAuth : Bool := false
   privs : Option String := none
   limitprivs : Option String := none
@@ -314,27 +326,12 @@ def Settings.resourceLimits (st : Settings) : List (String × String) :=
      value.map (name, ·)
 
 /-- What the policy permits for an allowed request. -/
-structure Allowed where
+structure Allowed extends Sudoers.TagEffects, Sudoers.ExecutionOptions where
   /-- the matching rule requires authentication (PASSWD tag / `authenticate`) -/
   needsAuth : Bool
   /-- the user may preserve/set environment variables (`SETENV` tag, `setenv`
   default, or the command was matched by `ALL`) -/
   setenv : Bool
-  /-- `CWD=` option of the matching rule -/
-  cwd : Option (Option String)
-  noexec : Option Bool := none
-  intercept : Option Bool := none
-  logInput : Option Bool := none
-  logOutput : Option Bool := none
-  mail : Option Bool := none
-  follow : Option Bool := none
-  chroot : Option String := none
-  timeout : Option Nat := none
-  role : Option String := none
-  type : Option String := none
-  apparmorProfile : Option String := none
-  privs : Option String := none
-  limitprivs : Option String := none
   /-- The deciding command match verified a digest (including through aliases). -/
   usesDigest : Bool := false
   selection : Option CommandSelection := none

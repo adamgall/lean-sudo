@@ -2,7 +2,7 @@
  * forked workers with permanently dropped and verified credentials. Directory
  * descriptors pin each checked component; no pathname is re-walked at copyback.
  * Selection, writable-directory refusal and copyback decisions live in Lean. */
-#include <lean/lean.h>
+#include "shim.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -18,32 +18,6 @@
 #include <unistd.h>
 #include <time.h>
 
-static lean_obj_res error(int e) {
-    return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(strerror(e))));
-}
-static const char *string_arg(b_lean_obj_arg s) {
-    const char *p = lean_string_cstr(s);
-    return strlen(p) == lean_string_size(s) - 1 ? p : NULL;
-}
-static int drop(uid_t uid, gid_t gid, gid_t *groups, size_t n, gid_t *verify) {
-    uid_t r, e, s;
-    gid_t gr, ge, gs;
-    if (setgroups(n, groups) || setresgid(gid, gid, gid) || setresuid(uid, uid, uid)) return -1;
-    if (getresuid(&r, &e, &s) || getresgid(&gr, &ge, &gs)) return -1;
-    if (r != uid || e != uid || s != uid || gr != gid || ge != gid || gs != gid) goto bad;
-    if (getgroups((int)n, verify) != (int)n) goto bad;
-    /* Linux may sort supplementary groups. Compare membership, not order. */
-    for (size_t i = 0; i < n; ++i) {
-        size_t j;
-        for (j = 0; j < n && verify[i] != groups[j]; ++j) {}
-        if (j == n) goto bad;
-    }
-    if (uid != 0 && setuid(0) != -1) goto bad;
-    return 0;
-bad:
-    errno = EPERM;
-    return -1;
-}
 struct reply { int err; int value; char name[PATH_MAX]; };
 /* op: 0 directory, 1 read regular (ENOENT is optional), 2 write regular,
  * 3 W_OK directory, 4 mkstemps, 5 unlink, 6 executable regular (follows links),
@@ -60,6 +34,7 @@ static int worker(uint32_t op, int dir, const char *path, uid_t uid, gid_t gid,
         groups[i] = lean_unbox_uint32(lean_array_get_core(gs, i));
         if (groups[i] == (gid_t)-1) { free(groups); free(verify); errno = EINVAL; return -1; }
     }
+    qsort(groups, n, sizeof(*groups), ls_compare_gid);
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) { free(groups); free(verify); return -1; }
     pid_t pid = fork();
@@ -69,7 +44,7 @@ static int worker(uint32_t op, int dir, const char *path, uid_t uid, gid_t gid,
         struct reply result;
         memset(&result, 0, sizeof result);
         int fd = -1;
-        if (drop(uid, gid, groups, n, verify)) result.err = errno;
+        if (ls_drop_credentials(uid, gid, groups, n, verify)) result.err = errno;
         else {
             umask(mask);
             switch (op) {
@@ -124,7 +99,7 @@ static int worker(uint32_t op, int dir, const char *path, uid_t uid, gid_t gid,
             memcpy(CMSG_DATA(c), &fd, sizeof fd);
         }
         ssize_t sent;
-        do { sent = sendmsg(sv[1], &msg, MSG_NOSIGNAL); } while (sent < 0 && errno == EINTR);
+        sent = TEMP_FAILURE_RETRY(sendmsg(sv[1], &msg, MSG_NOSIGNAL));
         if (op == 4 && fd >= 0 && sent != (ssize_t)sizeof result) {
             int ignored = unlink(result.name); (void)ignored;
         }
@@ -138,14 +113,14 @@ static int worker(uint32_t op, int dir, const char *path, uid_t uid, gid_t gid,
     msg.msg_iov = &io; msg.msg_iovlen = 1;
     msg.msg_control = control; msg.msg_controllen = sizeof control;
     ssize_t got;
-    do { got = recvmsg(sv[0], &msg, MSG_CMSG_CLOEXEC); } while (got < 0 && errno == EINTR);
+    got = TEMP_FAILURE_RETRY(recvmsg(sv[0], &msg, MSG_CMSG_CLOEXEC));
     int fd = -1;
     struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
     if (c && c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS && c->cmsg_len == CMSG_LEN(sizeof(int)))
         memcpy(&fd, CMSG_DATA(c), sizeof fd);
     close(sv[0]);
     int status = 0; pid_t waited;
-    do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+    waited = TEMP_FAILURE_RETRY(waitpid(pid, &status, 0));
     if (got != (ssize_t)sizeof *out || (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) || waited != pid || !WIFEXITED(status) || WEXITSTATUS(status)) {
         if (fd >= 0) close(fd);
         errno = EIO; return -1;
@@ -156,13 +131,13 @@ static int worker(uint32_t op, int dir, const char *path, uid_t uid, gid_t gid,
 }
 LEAN_EXPORT lean_obj_res leansudo_edit_op(uint32_t op, uint32_t dir, b_lean_obj_arg path,
         uint32_t uid, uint32_t gid, b_lean_obj_arg groups, uint32_t mask, uint32_t suffixlen) {
-    const char *p = string_arg(path);
-    if (!p || (dir != UINT32_MAX && dir > INT_MAX)) return error(EINVAL);
+    const char *p = ls_cstr(path);
+    if (!p || (dir != UINT32_MAX && dir > INT_MAX)) return ls_errno(EINVAL);
     struct reply r;
     memset(&r, 0, sizeof r);
     errno = 0;
     int fd = worker(op, dir == UINT32_MAX ? AT_FDCWD : (int)dir, p, uid, gid, groups, mask, suffixlen, &r);
-    if (fd < 0 && errno) return error(errno);
+    if (fd < 0 && errno) return ls_errno(errno);
     lean_object *result = lean_alloc_ctor(0, 1, 4);
     lean_ctor_set(result, 0, lean_mk_string(r.name));
     lean_ctor_set_uint32(result, sizeof(void *), op == 3 ? (uint32_t)r.value : (fd < 0 ? UINT32_MAX : (uint32_t)fd));
@@ -174,7 +149,7 @@ LEAN_EXPORT lean_obj_res leansudo_edit_close(uint32_t fd) {
 }
 LEAN_EXPORT lean_obj_res leansudo_edit_stat(uint32_t fd) {
     struct stat st;
-    if (fd > INT_MAX || fstat((int)fd, &st)) return error(errno ? errno : EBADF);
+    if (fd > INT_MAX || fstat((int)fd, &st)) return ls_errno(errno ? errno : EBADF);
     uint64_t values[] = { st.st_mode, st.st_uid, st.st_gid, (uint64_t)st.st_size,
         (uint64_t)st.st_mtim.tv_sec, (uint64_t)st.st_mtim.tv_nsec, st.st_nlink, st.st_dev, st.st_ino };
     lean_object *a = lean_mk_empty_array();
@@ -184,34 +159,34 @@ LEAN_EXPORT lean_obj_res leansudo_edit_stat(uint32_t fd) {
 /* Preserve the original timestamp (epoch for a new file). The caller restats
  * the temp afterwards to account for filesystem timestamp resolution. */
 LEAN_EXPORT lean_obj_res leansudo_edit_times(uint32_t fd, uint64_t sec, uint64_t nsec) {
-    if (fd > INT_MAX || nsec >= 1000000000) return error(EINVAL);
+    if (fd > INT_MAX || nsec >= 1000000000) return ls_errno(EINVAL);
     struct timespec times[2] = {
         { (time_t)sec, (long)nsec }, { (time_t)sec, (long)nsec }
     };
-    if (futimens((int)fd, times)) return error(errno);
+    if (futimens((int)fd, times)) return ls_errno(errno);
     return lean_io_result_mk_ok(lean_box(0));
 }
 LEAN_EXPORT lean_obj_res leansudo_edit_clock(void) {
     struct timespec ts;
-    if (clock_gettime(CLOCK_REALTIME, &ts)) return error(errno);
+    if (clock_gettime(CLOCK_REALTIME, &ts)) return ls_errno(errno);
     return lean_io_result_mk_ok(lean_box_uint64((uint64_t)ts.tv_sec * 1000000000 + ts.tv_nsec));
 }
 LEAN_EXPORT lean_obj_res leansudo_edit_read(uint32_t fd) {
     struct stat st;
-    if (fd > INT_MAX || fstat((int)fd, &st)) return error(errno ? errno : EBADF);
-    if (!S_ISREG(st.st_mode) || st.st_size < 0 || (uintmax_t)st.st_size > SIZE_MAX) return error(EINVAL);
+    if (fd > INT_MAX || fstat((int)fd, &st)) return ls_errno(errno ? errno : EBADF);
+    if (!S_ISREG(st.st_mode) || st.st_size < 0 || (uintmax_t)st.st_size > SIZE_MAX) return ls_errno(EINVAL);
     size_t size = (size_t)st.st_size;
     lean_object *a = lean_alloc_sarray(1, size, size);
     size_t pos = 0;
     while (pos < size) {
         ssize_t n = pread((int)fd, lean_sarray_cptr(a) + pos, size - pos, (off_t)pos);
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) { int e = n == 0 ? EIO : errno; lean_dec(a); return error(e); }
+        if (n <= 0) { int e = n == 0 ? EIO : errno; lean_dec(a); return ls_errno(e); }
         pos += (size_t)n;
     }
     struct stat after;
     if (fstat((int)fd, &after) || after.st_size != st.st_size || after.st_mtim.tv_sec != st.st_mtim.tv_sec || after.st_mtim.tv_nsec != st.st_mtim.tv_nsec) {
-        lean_dec(a); return error(EAGAIN);
+        lean_dec(a); return ls_errno(EAGAIN);
     }
     return lean_io_result_mk_ok(a);
 }
@@ -229,12 +204,12 @@ static int replace_bytes(int fd, b_lean_obj_arg bytes) {
 /* Write without truncating first. On failure restore the caller's original
  * snapshot; the editable temporary copy is retained by Lean in either case. */
 LEAN_EXPORT lean_obj_res leansudo_edit_write(uint32_t fd, b_lean_obj_arg bytes, b_lean_obj_arg original) {
-    if (fd > INT_MAX) return error(EBADF);
+    if (fd > INT_MAX) return ls_errno(EBADF);
     if (replace_bytes((int)fd, bytes)) {
         int e = errno;
         if (replace_bytes((int)fd, original))
             return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("write failed and original contents could not be restored")));
-        return error(e);
+        return ls_errno(e);
     }
     return lean_io_result_mk_ok(lean_box(0));
 }

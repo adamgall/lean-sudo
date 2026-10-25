@@ -76,18 +76,13 @@ def authorizationSettings (ctx : Context) : Settings :=
   ctx.policySettings.getD ctx.settings
 
 def request (ctx : Context) : Request :=
-  { user := if ctx.opts.mode == .list then ctx.listUser.getD ctx.invoking else ctx.invoking
+  { toFacts := ctx.toFacts
+    user := if ctx.opts.mode == .list then ctx.listUser.getD ctx.invoking else ctx.invoking
     host := ctx.opts.host.getD ctx.host, runasUser := ctx.policyTarget.getD ctx.target,
-    runasGroup := ctx.targetGroup, runasUserExplicit := ctx.opts.user.isSome, canon := ctx.canon,
-    lhost := ctx.opts.host.getD ctx.longHost, interfaces := ctx.interfaces,
-    netgroups := ctx.netgroups, regexMatches := ctx.regexMatches, digests := ctx.digests,
-    pluginGroups := ctx.pluginGroups,
-    now := ctx.wallTime, localTimeBounds := ctx.localTimeBounds,
-    fileIds := ctx.fileIds, globPaths := ctx.globPaths,
+    runasGroup := ctx.targetGroup, runasUserExplicit := ctx.opts.user.isSome,
+    lhost := ctx.opts.host.getD ctx.longHost, now := ctx.wallTime,
     fastGlob := (authorizationSettings ctx).fastGlob,
-    rootFacts := ctx.rootFacts, requestedChroot := ctx.opts.chroot,
-    defaultChroot := (authorizationSettings ctx).runchroot,
-    canonPaths := ctx.canonPaths,
+    requestedChroot := ctx.opts.chroot, defaultChroot := (authorizationSettings ctx).runchroot,
     command := match ctx.opts.mode with
       | .edit => .sudoedit ctx.opts.command
       | .list => if ctx.opts.command.isEmpty then .list else runCommand ctx
@@ -158,13 +153,7 @@ def commandUmask (ctx : Context) : Nat :=
    else if ctx.settings.umaskOverride then ctx.settings.umask
    else ctx.settings.umask ||| ctx.userUmask) &&& 0o777
 
-def commandText (ctx : Context) : String :=
-  match (request ctx).command with
-  | .run p _ args => String.intercalate " " (p :: args)
-  | .sudoedit fs => String.intercalate " " ("sudoedit" :: fs)
-  | .list => "list"
-  | .validate => "validate"
-  | .checkList => "list"
+def commandText (ctx : Context) : String := (request ctx).command.text
 
 
 /-- env.c limits the argument portion of SUDO_COMMAND to 4096 bytes. -/
@@ -256,63 +245,54 @@ def commandTimeout (ctx : Context) (a : Allowed) : Nat :=
   | none => policy
   | some user => if user == 0 then policy else if policy == 0 then user else min user policy
 
-def execPlan (ctx : Context) (a : Allowed) (rc : ResolvedCmd) : ExecPlan :=
-  { path := selectedExecutionPath ctx a rc, argv := rc.argv0 :: rc.args, envInput := environment ctx a,
-    uid := ctx.target.uid, gid := commandGid ctx, groups := targetGroups ctx,
-    cwd := ((configuredCwd ctx a).bind (expandHome ctx)).or (if ctx.opts.login then some ctx.target.home else none),
-    umask := commandUmask ctx,
-    usePty := ctx.settings.usePty, background := ctx.opts.background,
+def noexecFor (ctx : Context) (enabled : Bool) : Option String :=
+  if enabled then some (ctx.settings.noexecFile.getD "/usr/libexec/sudo/sudo_noexec.so")
+  else none
+
+def runPlan (ctx : Context) (a : Allowed) : RunPlan :=
+  { envInput := environment ctx a, umask := commandUmask ctx, pamService := pamService ctx,
+    pamSession := ctx.settings.pamSession, pamSetcred := ctx.settings.pamSetcred,
+    chroot := commandChroot ctx a, cwd := (configuredCwd ctx a).bind (expandHome ctx),
+    usePty := ctx.settings.usePty, timeout := ctx.settings.commandTimeout,
+    rlimits := ctx.settings.resourceLimits, execBackground := ctx.settings.execBackground,
     closeFrom := ctx.opts.closeFrom.getD ctx.settings.closefrom.toNat,
-    pamService := pamService ctx, pamSession := ctx.settings.pamSession,
-    pamSetcred := ctx.settings.pamSetcred, cwdOptional := ctx.opts.login && (configuredCwd ctx a).isNone,
-    execBackground := ctx.settings.execBackground,
-    staySetuid := ctx.settings.staySetuid,
-    intercept := a.intercept.getD ctx.settings.intercept,
-    logSubcmds := ctx.settings.logSubcmds,
-    chroot := commandChroot ctx a,
-    timeout := commandTimeout ctx a,
-    noexecFile := if a.noexec.getD ctx.settings.noexec then
-      some (ctx.settings.noexecFile.getD "/usr/libexec/sudo/sudo_noexec.so") else none,
-    apparmorProfile := a.apparmorProfile.or ctx.settings.apparmorProfile,
     utmpUser := if ctx.settings.setUtmp then
       some (if ctx.settings.utmpRunas then ctx.target.name else ctx.invoking.name) else none,
-    execFd := if ctx.settings.fdexec != "never" &&
-      (a.usesDigest || ctx.settings.fdexec == "always") then descriptorFor ctx a else none,
-    rlimits := ctx.settings.resourceLimits,
-    iolog := IoLog.plan ctx.settings { logInput := a.logInput, logOutput := a.logOutput } }
+    noexecFile := noexecFor ctx ctx.settings.noexec,
+    apparmorProfile := ctx.settings.apparmorProfile }
 
-def editorWords (s : String) : List String := Sudoedit.editorWords s
+def execPlan (ctx : Context) (a : Allowed) (rc : ResolvedCmd) : ExecPlan :=
+  { toRunPlan := { runPlan ctx a with
+      cwd := ((configuredCwd ctx a).bind (expandHome ctx)).or
+        (if ctx.opts.login then some ctx.target.home else none),
+      cwdOptional := ctx.opts.login && (configuredCwd ctx a).isNone,
+      timeout := commandTimeout ctx a,
+      noexecFile := noexecFor ctx (a.noexec.getD ctx.settings.noexec),
+      apparmorProfile := a.apparmorProfile.or ctx.settings.apparmorProfile,
+      iolog := IoLog.plan ctx.settings { toTagEffects := a.toTagEffects } },
+    path := selectedExecutionPath ctx a rc, argv := rc.argv0 :: rc.args,
+    uid := ctx.target.uid, gid := commandGid ctx, groups := targetGroups ctx,
+    background := ctx.opts.background, staySetuid := ctx.settings.staySetuid,
+    intercept := a.intercept.getD ctx.settings.intercept, logSubcmds := ctx.settings.logSubcmds,
+    execFd := if ctx.settings.fdexec != "never" &&
+      (a.usesDigest || ctx.settings.fdexec == "always") then descriptorFor ctx a else none }
 
 def environmentEditors (ctx : Context) : List String :=
   (["SUDO_EDITOR", "VISUAL", "EDITOR"].filterMap (lookup ctx.userEnv)).filter (!·.isEmpty)
 
 def editorCandidates (ctx : Context) : List (String × List String) :=
   (environmentEditors ctx ++ ctx.settings.editor.splitOn ":").filterMap fun source =>
-    let words := editorWords source
+    let words := Sudoedit.editorWords source
     if words.isEmpty then none else some (source, words)
-
-def editors (ctx : Context) : List (List String) := (editorCandidates ctx).map (·.2)
 
 def editPlan (ctx : Context) (a : Allowed) : EditPlan :=
   let candidates := editorCandidates ctx
-  { files := files ctx, policyFiles := ctx.opts.command, editors := candidates.map (·.2), editUid := (displayUser ctx).uid,
+  { toRunPlan := { runPlan ctx a with iolog := IoLog.plan ctx.settings {} },
+    files := files ctx, policyFiles := ctx.opts.command,
+    editors := candidates.map (·.2), editUid := (displayUser ctx).uid,
     editGid := (displayUser ctx).gid, editGroups := (displayUser ctx).groups.map (·.2),
     fileUid := ctx.target.uid, fileGid := targetGid ctx, fileGroups := targetGroups ctx,
-    envInput := environment ctx a, umask := commandUmask ctx, pamService := pamService ctx,
-    pamSession := ctx.settings.pamSession, pamSetcred := ctx.settings.pamSetcred,
     follow := a.follow.getD ctx.settings.sudoeditFollow, checkdir := ctx.settings.sudoeditCheckdir,
-    chroot := commandChroot ctx a,
-    cwd := (configuredCwd ctx a).bind (expandHome ctx), cwdOptional := false,
-    usePty := ctx.settings.usePty,
-    iolog := IoLog.plan ctx.settings {},
-    timeout := ctx.settings.commandTimeout, rlimits := ctx.settings.resourceLimits,
-    utmpUser := if ctx.settings.setUtmp then
-      some (if ctx.settings.utmpRunas then ctx.target.name else ctx.invoking.name) else none,
-    closeFrom := ctx.opts.closeFrom.getD ctx.settings.closefrom.toNat,
-    execBackground := ctx.settings.execBackground,
-    noexecFile := if ctx.settings.noexec then
-      some (ctx.settings.noexecFile.getD "/usr/libexec/sudo/sudo_noexec.so") else none,
-    apparmorProfile := ctx.settings.apparmorProfile,
     editorSources := candidates.map (·.1),
     editorNotFound := (environmentEditors ctx).getLast?.getD ctx.settings.editor,
     editorPath := (if userIsExempt ctx.settings ctx.invoking then none else ctx.settings.securePath).getD
@@ -437,10 +417,11 @@ def allowedAction (ctx : Context) (a : Allowed)
   | none, .edit => .edit (editPlan ctx a)
   | none, .list =>
     if ctx.opts.command.isEmpty then
-      let located := if ctx.listingSources.isEmpty then ctx.locatedSudoers else ctx.listingSources
-      let policy := if ctx.listingSources.isEmpty then ctx.sudoers else located.map (·.entry)
+      let sources := ctx.policySources.flatMap (·.2)
+      let located := if sources.isEmpty then ctx.locatedSudoers else sources
+      let policy := if sources.isEmpty then ctx.sudoers else located.map (·.entry)
       .print (listPrivileges policy ctx.settings (ctx.listUser.getD ctx.invoking)
-        (displayShortHost ctx) ctx.canon (ctx.opts.listVerbose > 1) located
+        (displayShortHost ctx) (ctx.opts.listVerbose > 1) located
           (some (request ctx)) ctx.listColumns) 0
     else match resolvedFor ctx a with
       | none => notFound ctx

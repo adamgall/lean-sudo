@@ -95,13 +95,14 @@ def timeoutError (o : Options) : Option String :=
 
 /-! ## Usage, help and version text -/
 
-/-- `basename` of `argv[0]` (sudo's `getprogname()`). -/
-def basename (path : String) : String :=
-  String.ofList ((path.toList.reverse.takeWhile (· != '/')).reverse)
-
 /-- Only sudoedit changes the front-end identity, regardless of the executable name. -/
 def programName (argv0 : String) : String :=
-  if basename argv0 == "sudoedit" then "sudoedit" else "sudo"
+  if Policy.baseOf argv0 == "sudoedit" then "sudoedit" else "sudo"
+
+private def editUsage (lead : String) : List String :=
+  [ lead ++ "[-ABkNnS] [-r role] [-t type] [-C num] [-D directory]",
+    "[-g group] [-h host] [-p prompt] [-R directory] [-T timeout]",
+    "[-u user] file ..." ]
 
 private def sudoUsage : List (List String) :=
   [ ["-h | -K | -k | -V"],
@@ -111,19 +112,11 @@ private def sudoUsage : List (List String) :=
     ["[-ABbEHkNnPS] [-r role] [-t type] [-C num] [-D directory]",
      "[-g group] [-h host] [-p prompt] [-R directory] [-T timeout]",
      "[-u user] [VAR=value] [-i | -s] [command [arg ...]]"],
-    ["-e [-ABkNnS] [-r role] [-t type] [-C num] [-D directory]",
-     "[-g group] [-h host] [-p prompt] [-R directory] [-T timeout]",
-     "[-u user] file ..."] ]
-
-private def sudoeditUsage : List (List String) :=
-  [ ["-h | -V"],
-    ["[-ABkNnS] [-r role] [-t type] [-C num] [-D directory]",
-     "[-g group] [-h host] [-p prompt] [-R directory] [-T timeout]",
-     "[-u user] file ..."] ]
+    editUsage "-e " ]
 
 /-- sudo's `display_usage` for the given program name (`sudo` or `sudoedit`). -/
 def usageFor (progname : String) : String :=
-  let vecs := if progname == "sudoedit" then sudoeditUsage else sudoUsage
+  let vecs := if progname == "sudoedit" then [["-h | -V"], editUsage ""] else sudoUsage
   let ind := String.ofList (List.replicate (progname.length + 8) ' ')
   String.join <| vecs.map fun
     | [] => ""
@@ -132,28 +125,35 @@ def usageFor (progname : String) : String :=
 
 def usageText : String := usageFor "sudo"
 
-/-- Word wrapping as done by sudo's `sudo_lbuf_println` (80 columns, continuation
-lines indented by `indent`). sudo counts bytes, not Unicode display columns.
-Breaks are at ASCII spaces, so UTF-8 characters are never split. -/
-private def wrapAux (indent : Nat) : Nat → Nat → List UInt8 → List UInt8
-  | 0, _, _ => []
-  | fuel + 1, avail, cs =>
-    if cs.length ≤ avail then cs ++ [10] else
-      -- last space strictly before position `avail`, else first space after it
-      let firstPart := cs.take avail
-      let brk : Option Nat :=
-        match (firstPart.reverse.findIdx? (· == 32)) with
-        | some j => some (avail - 1 - j)
-        | none => ((cs.drop avail).findIdx? (· == 32)).map (· + avail)
-      match brk with
-      | none => cs ++ [10]
-      | some n =>
-        let rest := (cs.drop n).dropWhile (fun c => c == 32 || c == 9)
-        if rest.isEmpty then cs.take n ++ [10] else
-        cs.take n ++ [10] ++ List.replicate indent 32 ++ wrapAux indent fuel (80 - indent) rest
+/-- Shared help/listing wrapping: byte-counted, splitting only at ASCII spaces. -/
+def wrapListing (text : String) (columns indent : Nat) : String :=
+  if columns ≤ indent + 20 then text else
+    "\n".intercalate ((text.splitOn "\n").map fun line =>
+      wrapLine (line.utf8ByteSize + 1) line columns false)
+where
+  wrapLine : Nat → String → Nat → Bool → String
+    | 0, line, _, continued => (if continued then padding else "") ++ line
+    | fuel + 1, line, available, continued =>
+      let lead := if continued then padding else ""
+      let bytes := line.toUTF8
+      if bytes.size ≤ available then lead ++ line else Id.run do
+        let mut before : Option Nat := none
+        let mut after : Option Nat := none
+        for i in [:bytes.size] do
+          if bytes[i]! == 32 then
+            if i < available then before := some i
+            else if after.isNone then after := some i
+        let some split := before.or after | return lead ++ line
+        let mut next := split
+        for i in [split:bytes.size] do
+          if next == i && (bytes[i]! == 32 || bytes[i]! == 9) then next := i + 1
+        let first := String.fromUTF8! (bytes.extract 0 split)
+        if next == bytes.size then return lead ++ first
+        let rest := String.fromUTF8! (bytes.extract next bytes.size)
+        return lead ++ first ++ "\n" ++ wrapLine fuel rest (columns - indent) true
+  padding := String.ofList (List.replicate indent ' ')
 
-private def wrapLine (s : String) : String :=
-  String.fromUTF8! ⟨(wrapAux 32 (s.utf8ByteSize + 1) 80 s.toUTF8.data.toList).toArray⟩
+private def wrapLine (s : String) : String := wrapListing s 80 32 ++ "\n"
 
 private def helpEntries (sudoedit : Bool) : List String :=
   let both (l : String) := [l]
@@ -404,48 +404,23 @@ def isEnvarL : List Char → Bool
 
 def isEnvar (s : String) : Bool := isEnvarL s.toList
 
-/-- Parser state (the settings sudo's `parse_args` accumulates). -/
-structure Raw where
+/-- Parser state shares option storage; `build` resolves scan-only mode and flag metadata. -/
+structure Raw extends Options where
   progname : String
   sudoedit : Bool
   /-- Caller environment used by `parse_env_list`; an empty value is still set. -/
   env : List (String × String) := []
   warnings : List String := []
-  mode : Option Mode := none
-  lcount : Nat := 0
+  selected : Option Mode := none
   /-- `-k` or `-K` seen (`ARG_IGNORE_TICKET`) -/
   ignoreTicket : Bool := false
-  noUpdate : Bool := false
-  background : Bool := false
   preserveAll : Bool := false
   preserveVars : List String := []
-  resetHome : Bool := false
-  login : Bool := false
-  nonInteractive : Bool := false
-  preserveGroups : Bool := false
-  shell : Bool := false
-  /-- Ordered explicit assignments and named-preservation snapshots. -/
-  envVars : List (String × String) := []
-  user : Option String := none
-  group : Option String := none
-  otherUser : Option String := none
-  prompt : Option String := none
-  chdir : Option String := none
-  closeFrom : Option Nat := none
-  askpass : Bool := false
-  stdin : Bool := false
-  bell : Bool := false
-  host : Option String := none
-  role : Option String := none
-  type : Option String := none
-  chroot : Option String := none
-  timeout : Option Nat := none
-  timeoutText : Option String := none
 
 def Raw.init (argv0 : String) (env : List (String × String) := []) : Raw :=
   let progname := programName argv0
   let se := progname == "sudoedit"
-  { progname, sudoedit := se, env, mode := if se then some .edit else none }
+  { progname, sudoedit := se, env, selected := if se then some .edit else none }
 
 def Raw.failure (r : Raw) (message : String) (getopt : Bool := false) : ParseFailure :=
   { diagnostic := { message, getopt }, warnings := r.warnings }
@@ -507,25 +482,26 @@ def applyOpt (r : Raw) (key : Char) (arg : Option String) : Except ParseFailure 
         let envVars := r.envVars ++ present
         .ok { r with preserveVars, envVars }
   | 'e' =>
-    if r.mode.isSome && r.mode != some .edit then excl else .ok { r with mode := some .edit }
+    if r.selected.isSome && r.selected != some .edit then excl
+    else .ok { r with selected := some .edit }
   | 'g' => nonEmpty fun a => if r.group.isSome then usage else .ok { r with group := some a }
-  | 'H' => .ok { r with resetHome := true }
+  | 'H' => .ok { r with setHome := true }
   | 'h' =>
     match arg with
     | some a => if r.host.isSome then usage else .ok { r with host := some a }
     | none =>
-      if r.mode.isSome && r.mode != some .help && !r.sudoedit then excl
-      else .ok { r with mode := some .help }
+      if r.selected.isSome && r.selected != some .help && !r.sudoedit then excl
+      else .ok { r with selected := some .help }
   | '#' => nonEmpty fun a => if r.host.isSome then usage else .ok { r with host := some a }
   | 'i' => .ok { r with login := true }
   | 'K' =>
-    if r.mode.isSome && r.mode != some .removeTimestamp then excl
+    if r.selected.isSome && r.selected != some .removeTimestamp then excl
     else if r.noUpdate then exclTicket
-    else .ok { r with mode := some .removeTimestamp, ignoreTicket := true }
+    else .ok { r with selected := some .removeTimestamp, ignoreTicket := true }
   | 'k' => if r.noUpdate then exclTicket else .ok { r with ignoreTicket := true }
   | 'l' =>
-    if r.mode.isSome && r.mode != some .list then excl
-    else .ok { r with mode := some .list, lcount := r.lcount + 1 }
+    if r.selected.isSome && r.selected != some .list then excl
+    else .ok { r with selected := some .list, listVerbose := r.listVerbose + 1 }
   | 'N' => if r.ignoreTicket then exclTicket else .ok { r with noUpdate := true }
   | 'n' => .ok { r with nonInteractive := true }
   | 'P' => .ok { r with preserveGroups := true }
@@ -546,10 +522,11 @@ def applyOpt (r : Raw) (key : Char) (arg : Option String) : Except ParseFailure 
   | 'U' => nonEmpty fun a => if r.otherUser.isSome then usage else .ok { r with otherUser := some a }
   | 'u' => nonEmpty fun a => if r.user.isSome then usage else .ok { r with user := some a }
   | 'v' =>
-    if r.mode.isSome && r.mode != some .validate then excl else .ok { r with mode := some .validate }
+    if r.selected.isSome && r.selected != some .validate then excl
+    else .ok { r with selected := some .validate }
   | 'V' =>
-    if r.mode.isSome && r.mode != some .version && !r.sudoedit then excl
-    else .ok { r with mode := some .version }
+    if r.selected.isSome && r.selected != some .version && !r.sudoedit then excl
+    else .ok { r with selected := some .version }
   -- BSD authentication and login classes are not compiled in.
   | _ => usage
 
@@ -638,7 +615,7 @@ decreasing_by all_goals (simp only [List.length_tail, List.length_cons]; omega)
 
 /-- The mode sudo settles on (`-k` alone becomes `resetTimestamp`). -/
 def Raw.effMode (r : Raw) (ops : List String) : Mode :=
-  match r.mode with
+  match r.selected with
   | some m => m
   | none => if r.ignoreTicket && ops.isEmpty && !(r.shell || r.login) then .resetTimestamp else .run
 
@@ -647,12 +624,10 @@ and the second `-l`. -/
 def Raw.flagsValid (r : Raw) (m : Mode) : Bool :=
   match m with
   | .run => true
-  | .edit | .validate => !(r.background || r.preserveAll || r.resetHome || r.login ||
+  | .edit | .validate | .list => !(r.background || r.preserveAll || r.setHome || r.login ||
       r.preserveGroups || r.shell)
-  | .list => !(r.background || r.preserveAll || r.resetHome || r.login ||
-      r.preserveGroups || r.shell)
-  | _ => !(r.background || r.preserveAll || r.resetHome || r.login || r.nonInteractive ||
-      r.preserveGroups || r.shell || r.lcount > 1)
+  | _ => !(r.background || r.preserveAll || r.setHome || r.login || r.nonInteractive ||
+      r.preserveGroups || r.shell || r.listVerbose > 1)
 
 /-- sudo's post-scan checks, in order: (violated?, error text). -/
 def Raw.rules (r : Raw) (ops : List String) : List (Bool × String) :=
@@ -677,31 +652,13 @@ def Raw.check (r : Raw) (ops : List String) : Option String :=
 
 def Raw.build (r : Raw) (ops : List String) : Options :=
   let m := r.effMode ops
-  { mode := m
-    user := r.user
-    group := r.group
-    otherUser := r.otherUser
-    login := r.login
+  { r.toOptions with
+    mode := m
     shell := r.shell || (m == .run && ops.isEmpty && !r.login)
     preserveEnv := if r.preserveAll then .all
       else if r.preserveVars.isEmpty then .none else .vars r.preserveVars
-    setHome := r.resetHome
-    nonInteractive := r.nonInteractive
-    stdin := r.stdin
-    prompt := r.prompt
-    background := r.background
     resetTimestamp := r.ignoreTicket && m != .resetTimestamp && m != .removeTimestamp
-    chdir := r.chdir
-    listVerbose := r.lcount
-    preserveGroups := r.preserveGroups
-    bell := r.bell
-    closeFrom := r.closeFrom
-    askpass := r.askpass
-    noUpdate := r.noUpdate
-    envVars := r.envVars
     command := ops
-    host := r.host, role := r.role, type := r.type, chroot := r.chroot, timeout := r.timeout,
-    timeoutText := r.timeoutText
     impliedShell := m == .run && ops.isEmpty && !(r.shell || r.login) }
 
 def finish (r : Raw) (ops : List String) : Except Diagnostic Options :=
@@ -750,10 +707,10 @@ structure ShellCmd where
 `shell` is the shell path (`-s`: the invoking user's `$SHELL` or passwd shell;
 `-i`: the target user's passwd shell). -/
 def shellCommand (shell : String) (login : Bool) (command : List String) : ShellCmd :=
-  let argv0 := if login then "-" ++ basename shell else shell
+  let argv0 := if login then "-" ++ Policy.baseOf shell else shell
   { path := shell
     argv := if command.isEmpty then [argv0] else
-      [argv0] ++ (if login && basename shell == "bash" then ["--login"] else []) ++
+      [argv0] ++ (if login && Policy.baseOf shell == "bash" then ["--login"] else []) ++
         ["-c", shellEscape command] }
 
 /-- Empty environment and passwd shells fall back exactly as sudo's get_user_info. -/
