@@ -493,16 +493,24 @@ structure Candidate where
   selection : Option CommandSelection := none
   deriving Repr, BEq, Inhabited
 
-def inTimeWindow (now : Nat) (cs : CmndSpec) (utcOffset : Int) : Bool :=
+/-- Resolve a zoneless civil timestamp using its own system-zone conversion,
+not the offset at request time. Explicitly zoned timestamps are already epochs. -/
+def resolveTimeBound (localTimeBounds : List (Nat × Nat)) (localTime : Bool)
+    (n : Nat) : Option Nat :=
+  if localTime then (localTimeBounds.find? (·.1 == n)).map (·.2) else some n
+
+/-- Bounds are inclusive. A missing conversion for either local bound makes the
+spec inapplicable; an absent bound imposes no restriction. -/
+def inTimeWindow (now : Nat) (cs : CmndSpec) (localTimeBounds : List (Nat × Nat)) : Bool :=
   cs.options.notBefore.all (fun n =>
-    (n : Int) ≤ (now : Int) + if cs.options.notBeforeLocal then utcOffset else 0) &&
+    (resolveTimeBound localTimeBounds cs.options.notBeforeLocal n).any (· ≤ now)) &&
   cs.options.notAfter.all (fun n =>
-    (now : Int) + (if cs.options.notAfterLocal then utcOffset else 0) ≤ (n : Int))
+    (resolveTimeBound localTimeBounds cs.options.notAfterLocal n).any (now ≤ ·))
 
 /-- Does a command spec apply to the request? For `-l`/`-v` every spec does (only the
 user and host lists are relevant); otherwise run-as and the command member must match. -/
 def specApplies (al : Aliases) (fuel : Nat) (st : Settings) (r : Request) (cs : CmndSpec) : Bool :=
-  !isRunCmd r.command || (inTimeWindow r.now cs r.utcOffset &&
+  !isRunCmd r.command || (inTimeWindow r.now cs r.localTimeBounds &&
     (runasOk al fuel st r cs.runas && (specCmndResult al fuel r cs).isSome))
 
 /-- Listing/validation are authorized by any applicable user/host entry, even
@@ -613,7 +621,7 @@ def canListOther (s : Sudoers) (st : Settings) (r : Request) (other root : Princ
         if hostListOk al al.fuel r.host hc.hosts st (some r) then hc.cmnds else []
     else []
   let results := specs.filterMap fun cs =>
-    if !inTimeWindow r.now cs r.utcOffset then none else
+    if !inTimeWindow r.now cs r.localTimeBounds then none else
     let base := match listingRunasResult al st r other cs with
       | some true => some (fun a => cmndBase r.canon .checkList a (some r))
       | some false => none

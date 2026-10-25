@@ -222,7 +222,7 @@ unixTime : IO Nat
 noNewPrivs : IO Bool
 terminalColumns : UInt32 → IO Nat
 terminalSize : IO (Nat × Nat)
-utcOffset : IO Int
+localCivilEpoch : Nat → IO (Option Int)
 createAdminFlag : String → Nat → Nat → List Nat → IO Unit
 logTime : Bool → String → IO String
 eventTime : Bool → String → IO EventLog.Time
@@ -231,6 +231,12 @@ appendLog, appendJson : String → String → IO Unit
 signalName : UInt32 → IO String
 sendMail : String → Array String → String → IO Unit
 ```
+
+Zone-less command time bounds are resolved individually with the system timezone
+and `mktime(tm_isdst = -1)`, not the current UTC offset. The shell supplies the
+resulting civil-time-to-epoch table to both matching and listing; a missing local
+bound never authorizes a command. Startup removes the caller's `TZ` before this
+conversion, including daylight-saving gaps and folds.
 
 Sudoers loading follows symlinks and checks the opened regular file; it is not
 an O_NOFOLLOW policy. `openCommand` pins the executable; `openReadOnly` permits

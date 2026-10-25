@@ -169,7 +169,11 @@ previous mask. -/
 @[extern "lean_sudo_unix_time"] opaque unixTime : IO Nat
 @[extern "lean_sudo_no_new_privs"] opaque noNewPrivs : IO Bool
 @[extern "lean_sudo_terminal_columns"] opaque terminalColumns (fd : UInt32) : IO Nat
-@[extern "lean_sudo_utc_offset"] opaque utcOffset : IO Int
+/-- Resolve UTC-encoded civil fields with system-zone `mktime(tm_isdst = -1)`.
+The startup locale boundary has removed the caller's TZ. An unrepresentable
+value or mktime's error sentinel returns none, never an offset approximation. -/
+@[extern "lean_sudo_local_civil_epoch"]
+opaque localCivilEpoch (civil : @& Nat) : IO (Option Int)
 @[extern "lean_sudo_architecture"] opaque architecture : IO String
 
 /-- Pin the executable and inspect that descriptor, not a second pathname lookup. -/

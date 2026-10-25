@@ -738,8 +738,9 @@ def civilDays (year month day : Nat) : Int :=
   let doy := (153 * (m + (if m > 2 then -3 else 9)) + 2) / 5 + day - 1
   era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468
 
-/-- Generalized Time; zone-less seconds are UTC-assumed, with a separate local
-flag on command options. Pre-epoch values clamp to zero for contemporary clocks. -/
+/-- Generalized Time; zone-less civil seconds are encoded as UTC, with a local
+flag requesting per-bound system-zone mktime resolution in the trusted shell.
+Pre-epoch values clamp to zero for contemporary clocks. -/
 def parseGentime (s : String) : Option Nat := do
   let cs := s.toList
   let digits := cs.takeWhile Char.isDigit

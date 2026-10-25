@@ -97,8 +97,9 @@ structure Request where
   regexMatches : List (String × String × Bool) := []
   digests : List Sudoers.Digest := []
   now : Nat := 0
-  /-- Local civil-time offset, seconds east of UTC. -/
-  utcOffset : Int := 0
+  /-- Zoneless civil timestamps (encoded as UTC seconds) mapped to system-zone
+  epochs by `mktime` with `tm_isdst = -1`. Missing bounds fail closed. -/
+  localTimeBounds : List (Nat × Nat) := []
   /-- stat results keyed by absolute path: device and inode. -/
   fileIds : List (String × Nat × Nat) := []
   /-- glob(3) expansions keyed by policy pattern. -/

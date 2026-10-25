@@ -124,7 +124,7 @@ theorem judge_listing {st : Settings} {cmd : Command} {cands : List Candidate}
 theorem specApplies_run {al : Aliases} {f : Nat} {st : Settings} {r : Request} {cs : CmndSpec}
     (h : isRunCmd r.command = true) :
     specApplies al f st r cs =
-      (inTimeWindow r.now cs r.utcOffset &&
+      (inTimeWindow r.now cs r.localTimeBounds &&
         (runasOk al f st r cs.runas && (specCmndResult al f r cs).isSome)) := by
   simp [specApplies, h]
 
@@ -301,7 +301,7 @@ theorem evaluate_append_negated (s : Sudoers) (st : Settings) (r : Request)
     (hu : userListOk (aliasesOf s) (aliasesOf s).fuel r.user users st (some r) = true)
     (hh : hostListOk (aliasesOf s) (aliasesOf s).fuel r.host hosts st (some r) = true)
     (hra : runasOk (aliasesOf s) (aliasesOf s).fuel st r cs.runas = true)
-    (htime : inTimeWindow r.now cs r.utcOffset = true)
+    (htime : inTimeWindow r.now cs r.localTimeBounds = true)
     (hcm : specCmndResult (aliasesOf s) (aliasesOf s).fuel r cs = some false) :
     evaluate (s ++ [.userSpec ⟨users, [⟨hosts, [cs]⟩], none⟩]) st r = .deny := by
   have happ : specApplies (aliasesOf s) (aliasesOf s).fuel st r cs = true := by
@@ -535,7 +535,7 @@ theorem myself_never_other (al : Aliases) (f : Nat) (st : Settings) (r : Request
 Own listing/validation deliberately ignore dates, as sudoers lookup.c does. -/
 theorem expired_spec_no_candidate (al : Aliases) (f : Nat) (st : Settings)
     (r : Request) (cs : CmndSpec) (hrun : isRunCmd r.command = true)
-    (h : inTimeWindow r.now cs r.utcOffset = false) :
+    (h : inTimeWindow r.now cs r.localTimeBounds = false) :
     specApplies al f st r cs = false := by
   simp [specApplies, hrun, h]
 
@@ -545,7 +545,7 @@ theorem before_window_no_candidate (al : Aliases) (f : Nat) (st : Settings)
     (hl : cs.options.notBeforeLocal = false)
     (ht : r.now < n) : specApplies al f st r cs = false := by
   apply expired_spec_no_candidate al f st r cs hrun
-  simp [inTimeWindow, hn, hl, Nat.not_le.mpr ht]
+  simp [inTimeWindow, resolveTimeBound, hn, hl, Nat.not_le.mpr ht]
 
 theorem after_window_no_candidate (al : Aliases) (f : Nat) (st : Settings)
     (r : Request) (cs : CmndSpec) (n : Nat) (hn : cs.options.notAfter = some n)
@@ -553,7 +553,61 @@ theorem after_window_no_candidate (al : Aliases) (f : Nat) (st : Settings)
     (hl : cs.options.notAfterLocal = false)
     (ht : n < r.now) : specApplies al f st r cs = false := by
   apply expired_spec_no_candidate al f st r cs hrun
-  simp [inTimeWindow, hn, hl, Nat.not_le.mpr ht]
+  simp [inTimeWindow, resolveTimeBound, hn, hl, Nat.not_le.mpr ht]
+
+/-- Runtime requests cannot authorize a spec with an unresolved local lower bound. -/
+theorem missing_local_notBefore_no_candidate (al : Aliases) (f : Nat) (st : Settings)
+    (r : Request) (cs : CmndSpec) (n : Nat) (hn : cs.options.notBefore = some n)
+    (hrun : isRunCmd r.command = true) (hl : cs.options.notBeforeLocal = true)
+    (hmissing : r.localTimeBounds.find? (·.1 == n) = none) :
+    specApplies al f st r cs = false := by
+  apply expired_spec_no_candidate al f st r cs hrun
+  simp [inTimeWindow, resolveTimeBound, hn, hl, hmissing]
+
+/-- Runtime requests cannot authorize a spec with an unresolved local upper bound. -/
+theorem missing_local_notAfter_no_candidate (al : Aliases) (f : Nat) (st : Settings)
+    (r : Request) (cs : CmndSpec) (n : Nat) (hn : cs.options.notAfter = some n)
+    (hrun : isRunCmd r.command = true) (hl : cs.options.notAfterLocal = true)
+    (hmissing : r.localTimeBounds.find? (·.1 == n) = none) :
+    specApplies al f st r cs = false := by
+  apply expired_spec_no_candidate al f st r cs hrun
+  simp [inTimeWindow, resolveTimeBound, hn, hl, hmissing]
+
+/-- A resolved local lower bound is enforced against its epoch, including DST gaps. -/
+theorem before_local_window_no_candidate (al : Aliases) (f : Nat) (st : Settings)
+    (r : Request) (cs : CmndSpec) (n epoch : Nat) (hn : cs.options.notBefore = some n)
+    (hrun : isRunCmd r.command = true) (hl : cs.options.notBeforeLocal = true)
+    (hresolved : r.localTimeBounds.find? (·.1 == n) = some (n, epoch))
+    (ht : r.now < epoch) : specApplies al f st r cs = false := by
+  apply expired_spec_no_candidate al f st r cs hrun
+  simp [inTimeWindow, resolveTimeBound, hn, hl, hresolved, Nat.not_le.mpr ht]
+
+/-- A resolved local upper bound is enforced against its epoch, including DST folds. -/
+theorem after_local_window_no_candidate (al : Aliases) (f : Nat) (st : Settings)
+    (r : Request) (cs : CmndSpec) (n epoch : Nat) (hn : cs.options.notAfter = some n)
+    (hrun : isRunCmd r.command = true) (hl : cs.options.notAfterLocal = true)
+    (hresolved : r.localTimeBounds.find? (·.1 == n) = some (n, epoch))
+    (ht : epoch < r.now) : specApplies al f st r cs = false := by
+  apply expired_spec_no_candidate al f st r cs hrun
+  simp [inTimeWindow, resolveTimeBound, hn, hl, hresolved, Nat.not_le.mpr ht]
+
+/-- Actual command applicability implies the resolved local lower bound. -/
+theorem applicable_local_notBefore (al : Aliases) (f : Nat) (st : Settings)
+    (r : Request) (cs : CmndSpec) (n epoch : Nat) (hn : cs.options.notBefore = some n)
+    (hrun : isRunCmd r.command = true) (hl : cs.options.notBeforeLocal = true)
+    (hresolved : r.localTimeBounds.find? (·.1 == n) = some (n, epoch))
+    (happly : specApplies al f st r cs = true) : epoch ≤ r.now := by
+  simp only [specApplies_run hrun, inTimeWindow, Bool.and_eq_true] at happly
+  simpa [hn, resolveTimeBound, hl, hresolved] using happly.1.1
+
+/-- Actual command applicability implies the resolved local upper bound. -/
+theorem applicable_local_notAfter (al : Aliases) (f : Nat) (st : Settings)
+    (r : Request) (cs : CmndSpec) (n epoch : Nat) (hn : cs.options.notAfter = some n)
+    (hrun : isRunCmd r.command = true) (hl : cs.options.notAfterLocal = true)
+    (hresolved : r.localTimeBounds.find? (·.1 == n) = some (n, epoch))
+    (happly : specApplies al f st r cs = true) : r.now ≤ epoch := by
+  simp only [specApplies_run hrun, inTimeWindow, Bool.and_eq_true] at happly
+  simpa [hn, resolveTimeBound, hl, hresolved] using happly.1.2
 
 /-- Negation cannot be bypassed by changing the spelling's case. -/
 theorem negated_case_insensitive_name (al : Aliases) (f : Nat) (p : Principal)

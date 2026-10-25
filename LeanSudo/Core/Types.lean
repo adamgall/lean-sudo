@@ -125,7 +125,8 @@ structure Context where
   root : Principal := { name := "root", uid := 0, gid := 0, groups := [], home := "/root", shell := "/bin/bash" }
   previousUser : Option Principal := none
   listColumns : Nat := 0
-  utcOffset : Int := 0
+  /-- Zone-less civil seconds mapped to per-bound system-zone epochs by the shell. -/
+  localTimeBounds : List (Nat × Nat) := []
   validShells : List String := []
   invokingRealGid : Option Nat := none
   commandFoundInDot : Bool := false

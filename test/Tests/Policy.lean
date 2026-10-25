@@ -578,10 +578,80 @@ def digestAliases : Aliases :=
 #guard !isRunasDefault { runasDefault := "ROOT", caseInsensitiveUser := false } root
 #guard runasGroupOk {} 1 (req bob (run "/usr/bin/id") root (some rootG)) none { preserveGroups := true }
 #guard hostBase "box" {} (some { oracleFacts with netgroups := [("short", none, some "box", true)] }) (.netgroup "short")
-#guard inTimeWindow 100 (spec asRoot (pos .all) {} { notBefore := some 200, notBeforeLocal := true }) 100
-#guard !inTimeWindow 100 (spec asRoot (pos .all) {} { notBefore := some 200, notBeforeLocal := true }) 99
-#guard inTimeWindow 100 (spec asRoot (pos .all) {} { notAfter := some 50, notAfterLocal := true }) (-50)
-#guard !inTimeWindow 100 (spec asRoot (pos .all) {} { notAfter := some 50, notAfterLocal := true }) 0
+#guard inTimeWindow 100 (spec asRoot (pos .all) {} { notBefore := some 200, notBeforeLocal := true }) [(200, 100)]
+#guard !inTimeWindow 100 (spec asRoot (pos .all) {} { notBefore := some 200, notBeforeLocal := true }) [(200, 101)]
+#guard inTimeWindow 100 (spec asRoot (pos .all) {} { notAfter := some 50, notAfterLocal := true }) [(50, 100)]
+#guard !inTimeWindow 100 (spec asRoot (pos .all) {} { notAfter := some 50, notAfterLocal := true }) [(50, 99)]
+
+-- New York's nonexistent 2024-03-10 02:30 is normalized by mktime to 07:30Z.
+-- At 07:15Z, applying the current EDT offset would incorrectly permit the rule.
+def gapLower : CmndSpec :=
+  spec asRoot (pos .all) nopw { notBefore := some 1710037800, notBeforeLocal := true }
+def gapUpper : CmndSpec :=
+  spec asRoot (pos .all) nopw { notAfter := some 1710037800, notAfterLocal := true }
+def gapFacts : Request :=
+  { (req bob (run "/usr/bin/id")) with
+    now := 1710054900, localTimeBounds := [(1710037800, 1710055800)] }
+def timedPolicy (cs : CmndSpec) : Sudoers := [rule [pos (.name "bob")] [pos .all] [cs]]
+#guard !inTimeWindow gapFacts.now gapLower gapFacts.localTimeBounds
+#guard evaluate (timedPolicy gapLower) st gapFacts == .deny
+#guard evaluate (timedPolicy gapLower) st { gapFacts with now := 1710055800 } ==
+  .allow { needsAuth := false, setenv := true, cwd := none }
+#guard evaluate (timedPolicy gapUpper) st gapFacts == .allow { needsAuth := false, setenv := true, cwd := none }
+#guard evaluate (timedPolicy gapUpper) st { gapFacts with now := 1710055800 } ==
+  .allow { needsAuth := false, setenv := true, cwd := none }
+#guard evaluate (timedPolicy gapUpper) st { gapFacts with now := 1710055801 } == .deny
+#guard !specApplies {} 1 st { gapFacts with command := .checkList } gapLower
+#guard specApplies {} 1 st { gapFacts with command := .checkList, now := 1710055800 } gapLower
+#guard !canListOther (timedPolicy gapLower) st { gapFacts with command := .list } alice root
+#guard canListOther (timedPolicy gapLower) st
+  { gapFacts with command := .list, now := 1710055800 } alice root
+#guard parsedEval "bob ALL=NOTBEFORE=20240310023000 NOPASSWD: ALL\n" gapFacts == some .deny
+#guard parsedEval "bob ALL=NOTAFTER=20240310023000 NOPASSWD: ALL\n" gapFacts ==
+  some (.allow { needsAuth := false, setenv := true, cwd := none })
+
+-- Missing and unrelated oracle entries never authorize a bounded command.
+#guard evaluate (timedPolicy gapLower) st { gapFacts with localTimeBounds := [] } == .deny
+#guard evaluate (timedPolicy gapUpper) st { gapFacts with localTimeBounds := [] } == .deny
+#guard !inTimeWindow 1710055800 gapLower [(1710037801, 1710055800)]
+#guard !canListOther (timedPolicy gapUpper) st
+  { gapFacts with command := .list, localTimeBounds := [] } alice root
+#guard inTimeWindow 0 (spec asRoot (pos .all)) []
+
+-- A fold's choice comes from the supplied mktime fact, not the request's offset.
+-- 2024-11-03 01:30 can resolve to 05:30Z or 06:30Z; exercise both choices.
+def foldLower : CmndSpec :=
+  spec asRoot (pos .all) nopw { notBefore := some 1730597400, notBeforeLocal := true }
+def foldUpper : CmndSpec :=
+  spec asRoot (pos .all) nopw { notAfter := some 1730597400, notAfterLocal := true }
+#guard !inTimeWindow 1730614500 foldLower [(1730597400, 1730615400)]
+#guard inTimeWindow 1730614500 foldLower [(1730597400, 1730611800)]
+#guard inTimeWindow 1730614500 foldUpper [(1730597400, 1730615400)]
+#guard !inTimeWindow 1730614500 foldUpper [(1730597400, 1730611800)]
+#guard inTimeWindow 1730615400 foldLower [(1730597400, 1730615400)]
+#guard inTimeWindow 1730615400 foldUpper [(1730597400, 1730615400)]
+#guard !inTimeWindow 1730615401 foldUpper [(1730597400, 1730615400)]
+#guard !inTimeWindow 1730615399 foldLower [(1730597400, 1730615400)]
+
+-- Zoned timestamps ignore even a conflicting table entry, and remain inclusive.
+#guard inTimeWindow 100 (spec asRoot (pos .all) {} { notBefore := some 100, notAfter := some 100 }) []
+#guard inTimeWindow 100 (spec asRoot (pos .all) {} { notBefore := some 100, notAfter := some 100 }) [(100, 999)]
+#guard !inTimeWindow 99 (spec asRoot (pos .all) {} { notBefore := some 100 }) [(100, 0)]
+#guard !inTimeWindow 101 (spec asRoot (pos .all) {} { notAfter := some 100 }) [(100, 999)]
+#guard inTimeWindow 1710055800
+  (spec asRoot (pos .all) {} {
+    notBefore := some 1710037800, notBeforeLocal := true
+    notAfter := some 1710055800 }) [(1710037800, 1710055800), (1710055800, 0)]
+#guard !inTimeWindow 1710055800
+  (spec asRoot (pos .all) {} {
+    notBefore := some 1710037800, notBeforeLocal := true
+    notAfter := some 1730597400, notAfterLocal := true }) [(1710037800, 1710055800)]
+#guard inTimeWindow 1710055800
+  (spec asRoot (pos .all) {} {
+    notBefore := some 1710037800, notBeforeLocal := true
+    notAfter := some 1730597400, notAfterLocal := true })
+  [(1710037800, 1710055800), (1730597400, 1730615400)]
+#guard inTimeWindow 0 (spec asRoot (pos .all) {} { notBefore := some 1, notBeforeLocal := true }) [(1, 0)]
 #guard commandImpliesSetenv (.digest [{ algo := .sha256, bytes := [1] }] .all)
 #guard cmndBase id .checkList (.digest [{ algo := .sha256, bytes := [1] }] .list) none
 #guard cmndBase id (.sudoedit ["/etc/hosts"])

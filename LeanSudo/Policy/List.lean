@@ -298,12 +298,17 @@ where
         return lead ++ first ++ "\n" ++ wrapLine fuel rest (columns - indent) true
   padding := String.ofList (List.replicate indent ' ')
 
-private def displaySpec (utcOffset : Int) (cs : CmndSpec) : CmndSpec :=
-  let utc (localTime : Bool) (t : Nat) :=
-    if localTime then (Int.ofNat t - utcOffset).toNat else t
-  { cs with options := { cs.options with
-      notBefore := cs.options.notBefore.map (utc cs.options.notBeforeLocal)
-      notAfter := cs.options.notAfter.map (utc cs.options.notAfterLocal) } }
+/-- Omit specs whose local bounds lack system-zone facts, rather than rendering
+an unresolved civil timestamp as UTC. Matching and display share the resolver. -/
+private def displaySpec (localTimeBounds : List (Nat × Nat)) (cs : CmndSpec) :
+    Option CmndSpec := do
+  let resolve (localTime : Bool) : Option Nat → Option (Option Nat)
+    | none => some none
+    | some n => (resolveTimeBound localTimeBounds localTime n).map some
+  let notBefore ← resolve cs.options.notBeforeLocal cs.options.notBefore
+  let notAfter ← resolve cs.options.notAfterLocal cs.options.notAfter
+  pure { cs with options := { cs.options with
+    notBefore, notAfter, notBeforeLocal := false, notAfterLocal := false } }
 
 /-- Short or verbose privileges. Locations preserve the source filename for `-ll`. -/
 def listPrivileges (s : Sudoers) (st : Settings) (user : Principal) (host : String)
@@ -332,9 +337,10 @@ def listPrivileges (s : Sudoers) (st : Settings) (user : Principal) (host : Stri
       if userListOk al f user us.users st facts then
         us.entries.filterMap fun hc =>
           if hostListOk al f host hc.hosts st facts then
-            let cmnds := hc.cmnds.map (displaySpec ((facts.map (·.utcOffset)).getD 0))
-            some (if verbose then renderLongSpecs al st user.name l.file cmnds
-              else String.join ((renderCmndSpecs st cmnds al user.name).map (· ++ "\n")))
+            let cmnds := hc.cmnds.filterMap (displaySpec ((facts.map (·.localTimeBounds)).getD []))
+            if cmnds.isEmpty then none else
+              some (if verbose then renderLongSpecs al st user.name l.file cmnds
+                else String.join ((renderCmndSpecs st cmnds al user.name).map (· ++ "\n")))
           else none
       else []
     | _ => []
@@ -359,12 +365,15 @@ def listCommand (s : Sudoers) (st : Settings) (r : Request) (located : List Loca
   match matchingSpecs.getLast? with
   | some (file, candidate) =>
     if !candidate.allow then "" else
-    let cmd := match r.command with
-      | .run path _ args => " ".intercalate (path :: args)
-      | .sudoedit files => " ".intercalate ("sudoedit" :: files)
-      | _ => "list"
-    (if verbose then longHeader al st r.user.name file (displaySpec r.utcOffset candidate.spec) ++ "\t" ++
-      expandedCommands al "\n\t" candidate.spec.cmnd ++ "\n    Matched: " else "") ++ cmd ++ "\n"
+    match displaySpec r.localTimeBounds candidate.spec with
+    | none => ""
+    | some displayed =>
+      let cmd := match r.command with
+        | .run path _ args => " ".intercalate (path :: args)
+        | .sudoedit files => " ".intercalate ("sudoedit" :: files)
+        | _ => "list"
+      (if verbose then longHeader al st r.user.name file displayed ++ "\t" ++
+        expandedCommands al "\n\t" displayed.cmnd ++ "\n    Matched: " else "") ++ cmd ++ "\n"
   | none => ""
 
 end LeanSudo.Policy

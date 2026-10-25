@@ -650,11 +650,20 @@ LEAN_EXPORT lean_obj_res lean_sudo_terminal_columns(uint32_t fd) {
     return io_ok(mk_nat(columns));
 }
 
-LEAN_EXPORT lean_obj_res lean_sudo_utc_offset(void) {
-    time_t now = time(NULL);
+/* Recover civil fields encoded without a zone, then let the system timezone
+ * resolve this date's DST rules, including gaps/folds, just like gentime.c.
+ * The caller's TZ has already been removed by locale initialization. */
+LEAN_EXPORT lean_obj_res lean_sudo_local_civil_epoch(b_lean_obj_arg civil) {
+    if (!lean_is_scalar(civil)) return io_ok(mk_none());
+    uint64_t value = lean_unbox(civil);
+    time_t encoded = (time_t)value;
+    if (encoded < 0 || (uint64_t)encoded != value) return io_ok(mk_none());
     struct tm tm;
-    if (!localtime_r(&now, &tm)) return io_err("unable to determine UTC offset");
-    return io_ok(lean_int64_to_int((int64_t)tm.tm_gmtoff));
+    if (!gmtime_r(&encoded, &tm)) return io_ok(mk_none());
+    tm.tm_isdst = -1;
+    time_t epoch = mktime(&tm);
+    if (epoch == (time_t)-1) return io_ok(mk_none());
+    return io_ok(mk_some(lean_int64_to_int((int64_t)epoch)));
 }
 
 LEAN_EXPORT lean_obj_res lean_sudo_architecture(void) {

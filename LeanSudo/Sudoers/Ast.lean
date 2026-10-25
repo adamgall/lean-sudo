@@ -153,9 +153,9 @@ structure CmndOptions where
   /-- `NOTBEFORE=` / `NOTAFTER=` as Unix time (seconds, UTC) -/
   notBefore : Option Nat := Option.none
   notAfter : Option Nat := Option.none
-  /-- Zone-less Generalized Time values need the machine-local UTC offset.
-  The stored seconds are computed as UTC; negative epoch values are clamped to
-  zero (equivalent for authorization at contemporary positive wall clocks). -/
+  /-- Zone-less Generalized Time values need per-bound system-zone
+  `mktime(tm_isdst = -1)` resolution. Stored civil seconds are computed as UTC;
+  negative epochs clamp to zero for contemporary positive wall clocks. -/
   notBeforeLocal : Bool := false
   notAfterLocal : Bool := false
   /-- SELinux `ROLE=` / `TYPE=` -/

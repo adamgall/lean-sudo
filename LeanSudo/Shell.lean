@@ -405,6 +405,19 @@ private def loadSources (sources : List Nsswitch.Source) (host : String)
       | none => pure rules
     return (source, ← fromExcept (Sss.convert defs rules))
 
+private def localTimeBounds (policy : Sudoers.Sudoers) : IO (List (Nat × Nat)) := do
+  let bounds := policy.flatMap fun
+    | .userSpec spec => spec.entries.flatMap fun entry => entry.cmnds.flatMap fun cs =>
+      (if cs.options.notBeforeLocal then cs.options.notBefore.toList else []) ++
+      (if cs.options.notAfterLocal then cs.options.notAfter.toList else [])
+    | _ => []
+  let mut resolved := []
+  for civil in bounds.eraseDups do
+    if let some epoch ← Sys.localCivilEpoch civil then
+      -- Pre-epoch bounds retain the parser's contemporary-clock zero model.
+      resolved := (civil, epoch.toNat) :: resolved
+  return resolved.reverse
+
 private def selectSources (sources : List (Nsswitch.Source × List Sudoers.Located))
     (st : Settings) (r : Request) : List Sudoers.Located :=
   let selected := Nsswitch.select (fun entries =>
@@ -485,11 +498,11 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
     (Sudoers.Parser.ipAddress a).bind fun ip =>
       (Sudoers.Parser.ipAddress m).map fun mask => (ip, mask)
   let wallTime ← Sys.unixTime
-  let utcOffset ← Sys.utcOffset
+  let localTimeBounds ← localTimeBounds policy
   let base : Request := {
     user := invoking, host, lhost := longHost, interfaces
     runasUser := invoking, runasGroup := none, runasUserExplicit := opts.user.isSome
-    command := .list, now := wallTime, utcOffset }
+    command := .list, now := wallTime, localTimeBounds }
   let preliminary ← gatherFacts policy base
   let initial ← defaults policy invoking host none none preliminary opts.prompt.isSome
   let plugin ← loadGroupPlugin initial.groupPlugin
@@ -664,7 +677,7 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
     tsSessionId := sid, tsLockScope, timestampOwnerUid, timestampOwnerGid
     interfaces, netgroups := facts.netgroups, regexMatches := facts.regexMatches,
     pluginGroups := facts.pluginGroups,
-    digests, wallTime, utcOffset, fileIds, globPaths := facts.globPaths, execFd, homes
+    digests, wallTime, localTimeBounds, fileIds, globPaths := facts.globPaths, execFd, homes
     envFile := ← readEnvFile settings.envFile, restrictedEnvFile := ← readEnvFile settings.restrictedEnvFile
     selinuxEnabled := (← Sys.stat "/sys/fs/selinux/enforce").isSome
     root := ← user "root"
