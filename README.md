@@ -117,8 +117,7 @@ flowchart LR
 | **Parser and config** | Every command path in a parsed rule is absolute; regex commands are anchored; digests always guard a command. Additional `sudo.conf` plugins must be loaded, never silently bypassed; approval plugins can only restrict a policy decision. | `parse_command_absolute`, `parse_regex_anchored`, `parse_digest_command_absolute`, `unknown_plugin_refused`, `approval_only_restricts`, `denied_never_approved` |
 | **Globbing, logging, translations** | `fnmatch` agrees with string equality on literal patterns and `*` never crosses `/` with `FNM_PATHNAME`; I/O logging is on exactly when the policy says so; a missing translation falls back to the original English text. | `fnmatch_literal`, `fnmatch_star_pathname`, `plan_enabled`, `lookup_absent` |
 
-In total there are 384 hand-written theorems, plus 1,846 compile-time regression checks
-(`#guard`) that run on every build. `scripts/AxiomAudit.lean` checks mechanically that
+In total there are 384 hand-written theorems. `scripts/AxiomAudit.lean` checks mechanically that
 every declaration defined in a `LeanSudo` module (definitions, theorems and instances,
 including private and generated ones) rests only on Lean's three standard axioms
 (`propext`, `Quot.sound`, `Classical.choice`). A `sorry`, `admit` or `native_decide` in
@@ -310,7 +309,7 @@ Linux-only; on macOS, build them in a container.
 
 ```sh
 curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
-lake build LeanSudo Tests              # library, all proofs, #guard tests (any OS)
+lake build LeanSudo                    # library and all proofs (any OS)
 lake env lean scripts/AxiomAudit.lean  # axiom audit
 integration/build.sh                   # Linux sudo + visudo via Docker → .lake/linux/
 integration/run.sh --build             # end-to-end suite against lean-sudo (Docker)
@@ -319,6 +318,18 @@ integration/run.sh --visudo .lake/linux/visudo
 ```
 
 Core Lean only: no Mathlib, no Batteries. The toolchain is pinned in `lean-toolchain`.
+
+### Testing rules
+
+* **No unit tests.** The only tests in this repository are the end-to-end suites in
+  `integration/`: the real `sudo`/`visudo` binaries, installed setuid root in a real
+  Ubuntu system (a container), driven as real users over pipes and pseudo-terminals,
+  with every expectation checked against sudo.ws. No `#guard`/`#eval`/`example` checks,
+  no test executables that call internal functions, no test-only code paths or hooks
+  in the implementation. Properties of internal functions are stated as theorems.
+* **No mocks.** Tests use the real components sudo talks to (PAM, syslog, the mailer,
+  `sudo_logsrvd`, SSSD/LDAP, sudo's plugins, the audit subsystem, real editors and
+  shells), never stand-ins whose behaviour is scripted by the test.
 
 ## Repository layout
 
@@ -335,8 +346,7 @@ Core Lean only: no Mathlib, no Batteries. The toolchain is pinned in `lean-toolc
 | `LeanSudo/Sudoedit*`, `LeanSudo/Visudo/` | sudoedit and visudo |
 | `LeanSudo/Sys/`, `c/` | the trusted C shim and its Lean bindings |
 | `Main.lean`, `LeanSudo/Shell.lean`, `Visudo.lean` | entry points and IO shell |
-| `test/` | `#guard` unit tests, IO smoke tests |
-| `integration/` | Docker end-to-end suites and the Linux builder |
+| `integration/` | Docker end-to-end suites (the only tests) and the Linux builder |
 | `scripts/AxiomAudit.lean` | the axiom audit |
 | `DESIGN.md` | architecture, module contracts, verified-property targets |
 

@@ -7,14 +7,18 @@ package «lean-sudo» where
     if System.Platform.isOSX then "-Wl,-export_dynamic" else "-Wl,--export-dynamic"]
 
 /-- C shim translation units (each owned by one Lean `LeanSudo.Sys.*` module). -/
-def shimSources : Array String := #["core", "exec", "ts", "visudo", "edit", "sys", "iolog", "lookup", "groupplugin", "plugins", "sss", "logsrv", "intercept", "intercept_trace", "intercept_dso"]
+def shimSources : Array String := #[
+  "core", "exec", "ts", "visudo", "edit", "sys", "iolog", "lookup", "groupplugin",
+  "plugins", "sss", "logsrv", "intercept", "intercept_trace", "intercept_dso", "shim"]
 
 def shimCFlags : Array String :=
   #["-fPIC", "-O2", "-Wall", "-Wextra", "-Werror", "-D_GNU_SOURCE",
     "-fstack-protector-strong", "-D_FORTIFY_SOURCE=2"]
 
 /-- Headers shared by shim translation units; every object is rebuilt when one changes. -/
-def shimHeaders : Array String := #["locale_scope.h", "logsrv.h", "intercept.h", "intercept_dso.h", "plugins.h", "sudo_plugin.h"]
+def shimHeaders : Array String := #[
+  "locale_scope.h", "logsrv.h", "intercept.h", "intercept_dso.h", "plugins.h",
+  "sudo_plugin.h", "shim.h"]
 
 extern_lib leansudoshim pkg := do
   let leanInc := (← getLeanIncludeDir).toString
@@ -34,25 +38,6 @@ lean_lib LeanSudo where
 @[default_target]
 lean_exe sudo where
   root := `Main
-
-/-- Compile-time unit tests (`#guard`/`example`), one module per area: `lake build Tests`. -/
-lean_lib Tests where
-  srcDir := "test"
-  globs := #[.submodules `Tests]
-
-/-- IO smoke executables for the C shim (run unprivileged; root-only paths are
-exercised by the docker integration suite). -/
-lean_exe «smoke-core» where
-  srcDir := "test"
-  root := `Smoke.Core
-
-lean_exe «smoke-exec» where
-  srcDir := "test"
-  root := `Smoke.Exec
-
-lean_exe «smoke-ts» where
-  srcDir := "test"
-  root := `Smoke.Ts
 
 @[default_target]
 lean_exe visudo where
