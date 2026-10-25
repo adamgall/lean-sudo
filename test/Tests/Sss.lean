@@ -53,6 +53,28 @@ private def permitted (rs : Array Rule) : Bool :=
   #[("sudoOption", #["!authenticate", "env_keep+=FOO"])]]) {} bob "host" id true ==
   "User bob may run the following commands on host:\n\nLDAP Role: test-role\n    RunAsUsers: root\n    Options: !authenticate, env_keep+=FOO\n    Commands:\n\t/usr/bin/id\n"
 
+-- ldap_util.c lowers root/cwd options before matching, not into post-winner Defaults.
+private def rootedPolicy : Sudoers := policy #[rule "rooted" #["/usr/bin/id -u"]
+  #[("sudoOption", #["runchroot=/jail", "runcwd=/work", "!authenticate"])]]
+private def rootedSpecs : List CmndSpec :=
+  (Policy.specsOf rootedPolicy).flatMap fun us => us.entries.flatMap (·.cmnds)
+#guard rootedSpecs.map (·.options.chroot) == [some "/jail"]
+#guard rootedSpecs.map (·.options.cwd) == [some (some "/work")]
+#guard rootedSpecs.map (·.ldapOptions) == [["!authenticate"]]
+#guard Policy.evaluate rootedPolicy {} request == .deny
+private def rootedRequest : Request := { request with
+  rootFacts := [("/jail", {
+    command := .run "/usr/bin/id" "/usr/bin/id" ["-u"]
+    argv := ["/usr/bin/id", "-u"]
+    canonPaths := [("/usr/bin", "/usr/bin")]
+    fileIds := [("/usr/bin/id", 9, 10)] })] }
+#guard (match Policy.evaluate rootedPolicy {} rootedRequest with
+  | .allow a => a.selection.map (·.root)
+  | .deny => none) == some "/jail"
+#guard (match Policy.evaluate rootedPolicy {} { rootedRequest with requestedChroot := some "/other" } with
+  | .allow _ => false
+  | .deny => true)
+
 open LeanSudo.Nsswitch
 #guard (configure "sudoers: files [NOTFOUND=return] sss").toOption ==
   some [{ name := "files", returnIfNotFound := true }, { name := "sss" }]

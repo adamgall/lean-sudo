@@ -12,6 +12,8 @@ def entriesOf (t : String) : Option (List Entry) :=
       | .userSpec s => .userSpec { s with source := none, entries := s.entries.map fun h =>
           { h with cmnds := h.cmnds.map fun c =>
             { c with runasExplicit := false, optionsExplicit := [] } } }
+      | .defaults scope settings =>
+        .defaults scope (settings.map fun d => { d with source := none })
       | e => e)
   | .error _ => none
 
@@ -422,5 +424,30 @@ def digestRule (algo text : String) : String := "a ALL = " ++ algo ++ ":" ++ tex
 #guard fails "a ALL=^/bin/a\\\n$"
 #guard (commandsOf "a ALL=/bin/a ^a\\\n  b$").map (·.cmnd.atom) ==
   [.command "/bin/a" (.regex "^ab$")]
+
+-- CHROOT warnings follow lexer token positions and are never inherited.
+def warningsOf (text : String) : List String :=
+  match parse "t" text with
+  | .ok entries => entries.flatMap (·.warnings)
+  | .error _ => []
+
+#guard warningsOf "root ALL=CHROOT=\"/\" /bin/true, /bin/false, CHROOT = / /bin/echo" ==
+  ["t:1:19: \"CHROOT\" is deprecated", "t:1:53: \"CHROOT\" is deprecated"]
+#guard warningsOf "root ALL=CHROOT=\\\n / /bin/true" ==
+  ["t:2:2: \"CHROOT\" is deprecated"]
+#guard warningsOf "root ALL=CWD=/ /bin/true" == []
+#guard fails "root ALL=CHROOT=relative /bin/true"
+
+def defaultsSources (text : String) : List (Option (String × Nat × Nat)) :=
+  match parse "t" text with
+  | .ok entries => entries.flatMap fun l => match l.entry with
+      | .defaults _ settings => settings.map (·.source)
+      | _ => []
+  | .error _ => []
+
+#guard defaultsSources "Defaults runchroot=/tmp" == [some ("t", 1, 20)]
+#guard defaultsSources "Defaults runchroot=\"/tmp\"" == [some ("t", 1, 25)]
+#guard defaultsSources "Defaults !runchroot" == [some ("t", 1, 11)]
+#guard defaultsSources "Defaults runchroot  # comment" == [some ("t", 1, 21)]
 
 end Tests.Parser

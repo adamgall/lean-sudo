@@ -1,4 +1,5 @@
 import LeanSudo.Sys.Exec
+import LeanSudo.Sys.Extra
 
 /-!
 # Smoke test for `LeanSudo.Sys.Exec` (runs unprivileged)
@@ -44,6 +45,15 @@ def spec (ids : Ids) (path : String) (argv : Array String) : ExecSpec :=
     staySetuid := true }).isOk
 #guard !(Exec.check { spec ⟨4294967295, 1000, #[]⟩ "/bin/true" #["true"] with
     staySetuid := true }).isOk
+#guard (Exec.check { spec ⟨1000, 1000, #[]⟩ "/bin/true" #["true"] with
+    chroot := some "/srv/jail" }).isOk
+#guard !(Exec.check { spec ⟨1000, 1000, #[]⟩ "/bin/true" #["true"] with
+    chroot := some "/srv/jail\x00outside" }).isOk
+#guard withinRoot "/" "/usr/bin/id"
+#guard withinRoot "/srv/jail" "/srv/jail/bin/sh"
+#guard withinRoot "/srv/jail" "/srv/jail"
+#guard !withinRoot "/srv/jail" "/srv/jail-other/bin/sh"
+#guard !withinRoot "/srv/jail" "/usr/bin/sh"
 
 def fmtStatus : ExitStatus → String
   | .exited c => s!"exited {c}"

@@ -125,7 +125,7 @@ theorem specApplies_run {al : Aliases} {f : Nat} {st : Settings} {r : Request} {
     (h : isRunCmd r.command = true) :
     specApplies al f st r cs =
       (inTimeWindow r.now cs r.utcOffset &&
-        (runasOk al f st r cs.runas && (cmndMemberResult al f r.canon r.command cs.cmnd (some r)).isSome)) := by
+        (runasOk al f st r cs.runas && (specCmndResult al f r cs).isSome)) := by
   simp [specApplies, h]
 
 theorem judge_nil (st : Settings) (cmd : Command) : judge st cmd [] = .deny := by
@@ -194,7 +194,7 @@ theorem evaluate_sound {s : Sudoers} {st : Settings} {r : Request} {a : Allowed}
     ∃ us hc cs, Entry.userSpec us ∈ s ∧ hc ∈ us.entries ∧ cs ∈ hc.cmnds ∧
       SpecMatches s st r us hc cs ∧
       (if isRunCmd r.command then
-        cmndMemberResult (aliasesOf s) (aliasesOf s).fuel r.canon r.command cs.cmnd (some r) = some true
+        specCmndResult (aliasesOf s) (aliasesOf s).fuel r cs = some true
        else isRunCmd r.command = false) := by
   obtain ⟨c, hc, hca⟩ := judge_allow_mem h
   obtain ⟨us, hcm, cs, hus, hhc, hcs, hm, rfl⟩ := mem_candidates.mp hc
@@ -203,7 +203,7 @@ theorem evaluate_sound {s : Sudoers} {st : Settings} {r : Request} {a : Allowed}
   · simp
   · simp only [↓reduceIte]
     simp only [candidateOf, specAllow, hr, ↓reduceIte] at hca
-    cases he : cmndMemberResult (aliasesOf s) (aliasesOf s).fuel r.canon r.command cs.cmnd (some r) <;>
+    cases he : specCmndResult (aliasesOf s) (aliasesOf s).fuel r cs <;>
       simp_all
 
 /-- For a run request (command or sudoedit), the allow is decided by the **last**
@@ -216,7 +216,7 @@ theorem evaluate_sound_run {s : Sudoers} {st : Settings} {r : Request} {a : Allo
         userListOk (aliasesOf s) (aliasesOf s).fuel r.user us.users st (some r) = true ∧
         hostListOk (aliasesOf s) (aliasesOf s).fuel r.host hc.hosts st (some r) = true ∧
         runasOk (aliasesOf s) (aliasesOf s).fuel st r c.spec.runas = true ∧
-        cmndMemberResult (aliasesOf s) (aliasesOf s).fuel r.canon r.command c.spec.cmnd (some r) = some true := by
+        specCmndResult (aliasesOf s) (aliasesOf s).fuel r c.spec = some true := by
   unfold evaluate at h
   rw [judge_run hrun] at h
   obtain ⟨c, hc, hca, rfl⟩ := judgeRun_allow h
@@ -227,19 +227,25 @@ theorem evaluate_sound_run {s : Sudoers} {st : Settings} {r : Request} {a : Allo
   have hra := ha.2.1
   refine ⟨us, hcm, hus, hhc, hcs, hu, hh, hra, ?_⟩
   simp only [candidateOf, specAllow, hrun, ↓reduceIte] at hca
-  cases he : cmndMemberResult (aliasesOf s) (aliasesOf s).fuel r.canon r.command cs.cmnd (some r) <;>
+  cases he : specCmndResult (aliasesOf s) (aliasesOf s).fuel r cs <;>
     simp_all [candidateOf]
 
 /-- A last candidate whose command member denies makes a run request denied. -/
 theorem evaluate_last_deny {s : Sudoers} {st : Settings} {r : Request} {c : Candidate}
     (hrun : isRunCmd r.command = true)
     (hlast : (candidates s st r).getLast? = some c)
-    (hdeny : cmndMemberResult (aliasesOf s) (aliasesOf s).fuel r.canon r.command c.spec.cmnd (some r) = some false) :
+    (hdeny : specCmndResult (aliasesOf s) (aliasesOf s).fuel r c.spec = some false) :
     evaluate s st r = .deny := by
   obtain ⟨us, hc, cs, hus, hhc, hcs, hm, rfl⟩ :=
     mem_candidates.mp (List.mem_of_getLast? hlast)
-  change cmndMemberResult (aliasesOf s) (aliasesOf s).fuel r.canon r.command cs.cmnd (some r) = some false at hdeny
+  change specCmndResult (aliasesOf s) (aliasesOf s).fuel r cs = some false at hdeny
   simp [evaluate, judge, hrun, judgeRun, hlast, candidateOf, specAllow, hdeny]
+
+theorem candidate_spec_applies {s : Sudoers} {st : Settings} {r : Request} {c : Candidate}
+    (h : c ∈ candidates s st r) :
+    specApplies (aliasesOf s) (aliasesOf s).fuel st r c.spec = true := by
+  obtain ⟨_, _, _, _, _, _, hm, rfl⟩ := mem_candidates.mp h
+  exact hm.2.2
 
 /-- A non-negated command alias inherits an internal DENY at the last candidate. -/
 theorem evaluate_last_alias_deny {s : Sudoers} {st : Settings} {r : Request}
@@ -249,12 +255,21 @@ theorem evaluate_last_alias_deny {s : Sudoers} {st : Settings} {r : Request}
     (hmember : c.spec.cmnd = ⟨false, .alias name⟩)
     (hf : (aliasesOf s).fuel = f + 1)
     (hlookup : lookupAlias (aliasesOf s).cmnd name = some ms)
-    (hinner : matchList (atomMatches CmndAtom.aliasName (aliasesOf s).cmnd
-      (fun a => cmndBase r.canon r.command a (some r)) f) ms = some false) :
+    (hinner : ∀ selected, specRequest r c.spec = some selected →
+      matchList (atomMatches CmndAtom.aliasName (aliasesOf s).cmnd
+        (fun a => cmndBase selected.canon selected.command a (some selected)) f) ms = some false) :
     evaluate s st r = .deny := by
+  have happ := candidate_spec_applies (List.mem_of_getLast? hlast)
   apply evaluate_last_deny hrun hlast
-  simp [cmndMemberResult, cmndListResult, matchList, hmember, hf,
-    atomMatches, CmndAtom.aliasName, hlookup, hinner]
+  cases hr : specRoot r c.spec with
+  | none => simp [specApplies, hrun, specCmndResult, hr] at happ
+  | some root =>
+    cases hs : specRequest r c.spec with
+    | none => simp [specCmndResult, hr, hs]
+    | some selected =>
+      have hi := hinner selected hs
+      simp [specCmndResult, hr, hs, cmndMemberResult, cmndListResult,
+        matchList, hmember, hf, atomMatches, CmndAtom.aliasName, hlookup, hi]
 
 theorem matchList_negation {α : Type} (m : α → Option Bool) (a : α) :
     matchList m [⟨true, a⟩] = (m a).map (!·) := by
@@ -287,12 +302,12 @@ theorem evaluate_append_negated (s : Sudoers) (st : Settings) (r : Request)
     (hh : hostListOk (aliasesOf s) (aliasesOf s).fuel r.host hosts st (some r) = true)
     (hra : runasOk (aliasesOf s) (aliasesOf s).fuel st r cs.runas = true)
     (htime : inTimeWindow r.now cs r.utcOffset = true)
-    (hcm : cmndMemberResult (aliasesOf s) (aliasesOf s).fuel r.canon r.command cs.cmnd (some r) = some false) :
+    (hcm : specCmndResult (aliasesOf s) (aliasesOf s).fuel r cs = some false) :
     evaluate (s ++ [.userSpec ⟨users, [⟨hosts, [cs]⟩], none⟩]) st r = .deny := by
   have happ : specApplies (aliasesOf s) (aliasesOf s).fuel st r cs = true := by
     simp [specApplies_run hrun, hra, hcm, htime]
   have hlast : (candidates (s ++ [.userSpec ⟨users, [⟨hosts, [cs]⟩], none⟩]) st r).getLast? =
-      some ⟨cs, false, cmndUsesDigest (aliasesOf s) r (aliasesOf s).fuel cs.cmnd.atom⟩ := by
+      some ⟨cs, false, specUsesDigest (aliasesOf s) (aliasesOf s).fuel r cs, specSelection r cs⟩ := by
     rw [candidates_append_userSpec]
     simp [usCandidates, hcCandidates, hu, hh, happ, candidateOf, specAllow, hrun, hcm]
   unfold evaluate
@@ -328,11 +343,51 @@ theorem evaluate_last_alias_negated_path {s : Sudoers} {st : Settings} {r : Requ
     (hf : (aliasesOf s).fuel = f + 1)
     (hlookup : lookupAlias (aliasesOf s).cmnd name =
       some [⟨false, .all⟩, ⟨true, .command path .any⟩])
-    (hpath : cmndBase r.canon r.command (.command path .any) (some r) = true) :
+    (hpath : ∀ selected, specRequest r c.spec = some selected →
+      cmndBase selected.canon selected.command (.command path .any) (some selected) = true) :
     evaluate s st r = .deny := by
   apply evaluate_last_alias_deny hrun hlast hmember hf hlookup
+  intro selected hs
   simp [matchList, atomMatches_nonAlias CmndAtom.aliasName _ _ f
-    (.command path .any) rfl, hpath]
+    (.command path .any) rfl, hpath selected hs]
+
+theorem rootedCommand_isRunCmd (command : Command) (facts : RootCommandFacts) :
+    isRunCmd (rootedCommand command facts) = isRunCmd command := by
+  cases command <;> cases hf : facts.command <;> simp [rootedCommand, hf, isRunCmd]
+
+theorem specRequest_isRunCmd {r selected : Request} {cs : CmndSpec}
+    (h : specRequest r cs = some selected) :
+    isRunCmd selected.command = isRunCmd r.command := by
+  cases hr : specRoot r cs with
+  | none => simp [specRequest, hr] at h
+  | some root =>
+    cases root with
+    | none =>
+      simp only [specRequest, hr, Option.some.injEq] at h
+      cases h
+      rfl
+    | some root =>
+      cases hf : r.rootFacts.find? (·.1 == root) with
+      | none => simp [specRequest, hr, hf] at h
+      | some pair =>
+        simp only [specRequest, hr, hf, Option.map_some, Option.some.injEq] at h
+        cases h
+        exact rootedCommand_isRunCmd r.command pair.2
+
+theorem specCmndResult_negated_all (al : Aliases) (fuel : Nat) (r : Request)
+    (cs : CmndSpec) (hrun : isRunCmd r.command = true)
+    (hc : cs.cmnd = ⟨true, .all⟩) (hroot : (specRoot r cs).isSome = true) :
+    specCmndResult al fuel r cs = some false := by
+  cases hr : specRoot r cs with
+  | none => simp [hr] at hroot
+  | some root =>
+    cases hs : specRequest r cs with
+    | none => simp [specCmndResult, hr, hs]
+    | some selected =>
+      have hselected : isRunCmd selected.command = true := (specRequest_isRunCmd hs).trans hrun
+      simp only [specCmndResult, hr, hs, hc, cmndMemberResult, cmndListResult, matchList]
+      rw [atomMatches_nonAlias _ _ _ _ _ rfl]
+      cases hcmd : selected.command <;> simp_all [isRunCmd, cmndBase]
 
 /-- `<user> ALL = (ALL : ALL) !ALL` -/
 def denyAllRule (user : String) : Entry :=
@@ -354,9 +409,8 @@ theorem evaluate_append_deny_all (s : Sudoers) (st : Settings) (r : Request)
     cases hg : r.runasGroup <;>
       simp [runasGroupOk, hg, runasGroupOk.groupResult, matchList, groupBase]
   · rfl
-  · simp only [cmndMemberResult, cmndListResult, matchList]
-    rw [atomMatches_nonAlias _ _ _ _ _ rfl]
-    cases hc : r.command <;> simp_all [isRunCmd, cmndBase]
+  · apply specCmndResult_negated_all _ _ _ _ hrun rfl
+    cases hcmd : r.command <;> cases hr : r.requestedChroot <;> simp [specRoot, hcmd, hr]
 
 /-! ## (5) Authentication -/
 
@@ -448,7 +502,7 @@ theorem pathMatches_literal_basename {canon : String → String} {p path canonic
     {facts : Option Request}
     (hd : endsWithSlash p = false) (hg : Glob.hasGlob p = false)
     (hb : baseOf p ≠ baseOf path) : pathMatches canon p path canonical facts = false := by
-  simp [pathMatches, literalPathMatches, hd, hg, hb]
+  simp [pathMatches, literalPathMatches, pathNamesMatch, hd, hg, hb]
 
 /-- Atom-level form: `command p args` with a literal `p` does not match running a
 command whose basename differs from `p`'s. -/
@@ -465,7 +519,7 @@ theorem literal_match_identity {canon : String → String} {facts : Option Reque
     (hg : Glob.hasGlob p = false) (h : pathMatches canon p path canonical facts = true) :
     baseOf p = baseOf path ∧ canon (dirOf p) = canon (dirOf path) := by
   simp only [pathMatches, hg, hd, Bool.false_eq_true, ↓reduceIte,
-    literalPathMatches, Bool.and_eq_true, beq_iff_eq] at h
+    literalPathMatches, pathNamesMatch, Bool.and_eq_true, beq_iff_eq] at h
   exact h.1
 
 /-- MYSELF cannot authorize a different target account. -/
@@ -524,4 +578,99 @@ theorem digest_command_requires_hash (canon : String → String) (cmd : Command)
   simp only [cmndBase, hp, Bool.false_or, Bool.and_eq_true] at h
   simpa only [List.any_eq_true, Option.any_some] using h.1
 
+/-- Every selected jail command comes from that jail's precomputed lookup facts. -/
+theorem specSelection_origin {r : Request} {cs : CmndSpec} {selection : CommandSelection}
+    (h : specSelection r cs = some selection) :
+    ∃ root facts, (root, facts) ∈ r.rootFacts ∧ selection.root = root ∧
+      selection.command = rootedCommand r.command facts ∧
+      selection.executionPath = rootExecutionPath r facts ∧
+      selection.argv = facts.argv ∧ selection.found = facts.found ∧
+      selection.execFd = facts.execFd ∧ selection.refusal = facts.refusal ∧
+      selection.setid = facts.setid := by
+  cases hrun : isRunCmd r.command with
+  | false => simp [specSelection, hrun] at h
+  | true =>
+    cases hr : (specRoot r cs).bind id with
+    | none => simp [specSelection, hrun, hr] at h
+    | some root =>
+      cases hf : r.rootFacts.find? (·.1 == root) with
+      | none => simp [specSelection, hrun, hr, hf] at h
+      | some pair =>
+        have hm := List.mem_of_find?_eq_some hf
+        have hp := List.find?_some hf
+        simp only [beq_iff_eq] at hp
+        have heq : pair.1 = root := hp
+        simp [specSelection, hrun, hr, hf] at h
+        cases h
+        exact ⟨root, pair.2, heq ▸ hm, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+theorem evaluate_selection_origin {s : Sudoers} {st : Settings} {r : Request}
+    {a : Allowed} {selection : CommandSelection}
+    (h : evaluate s st r = .allow a) (hs : a.selection = some selection) :
+    ∃ root facts, (root, facts) ∈ r.rootFacts ∧ selection.root = root ∧
+      selection.command = rootedCommand r.command facts ∧
+      selection.executionPath = rootExecutionPath r facts ∧
+      selection.argv = facts.argv ∧ selection.found = facts.found ∧
+      selection.execFd = facts.execFd ∧ selection.refusal = facts.refusal ∧
+      selection.setid = facts.setid := by
+  cases hrun : isRunCmd r.command with
+  | false =>
+    simp only [evaluate, judge, hrun, Bool.false_eq_true, ↓reduceIte] at h
+    unfold judgeListing at h
+    split at h
+    · cases h
+    · cases h
+      cases hs
+  | true =>
+    obtain ⟨c, hc, _, ha, _⟩ := evaluate_sound_run hrun h
+    obtain ⟨_, _, _, _, _, _, _, hcandidate⟩ :=
+      mem_candidates.mp (List.mem_of_getLast? hc)
+    rw [ha, hcandidate] at hs
+    exact specSelection_origin hs
+
+/-- Root-specific lookup may change the executable path, but not policy arguments. -/
+theorem rootedCommand_arguments (path canonical : String) (args : List String)
+    (facts : RootCommandFacts) :
+    ∃ p c, rootedCommand (.run path canonical args) facts = .run p c args := by
+  cases hf : facts.command <;> simp [rootedCommand, hf]
+
+/-- A fixed CHROOT rule cannot authorize a different user-requested root. -/
+theorem requested_root_mismatch (al : Aliases) (f : Nat) (st : Settings)
+    (r : Request) (cs : CmndSpec) (requested configured path canonical : String)
+    (args : List String) (hrun : r.command = .run path canonical args)
+    (hr : r.requestedChroot = some requested) (hc : cs.options.chroot = some configured)
+    (hstar : configured ≠ "*") (hne : configured ≠ requested) :
+    specApplies al f st r cs = false := by
+  simp [specApplies, hrun, isRunCmd, specCmndResult, specRoot, hr, hc, hstar, hne]
+
+/-- Missing root facts cannot make a negated command disappear from the decision. -/
+theorem missing_root_facts_deny (al : Aliases) (f : Nat) (r : Request)
+    (cs : CmndSpec) (root : String) (hr : specRoot r cs = some (some root))
+    (hf : r.rootFacts.find? (·.1 == root) = none) :
+    specCmndResult al f r cs = some false := by
+  simp [specCmndResult, specRequest, hr, hf]
+
+/-- An allowing rooted match is backed by the selected request's actual command
+matcher; neither an incompatible root nor unavailable facts can authorize it. -/
+theorem specCmndResult_allow {al : Aliases} {f : Nat} {r : Request} {cs : CmndSpec}
+    (h : specCmndResult al f r cs = some true) :
+    ∃ selected, specRequest r cs = some selected ∧
+      cmndMemberResult al f selected.canon selected.command cs.cmnd (some selected) = some true := by
+  cases hr : specRoot r cs with
+  | none => simp [specCmndResult, hr] at h
+  | some root =>
+    cases hs : specRequest r cs with
+    | none => simp [specCmndResult, hr, hs] at h
+    | some selected =>
+      exact ⟨selected, rfl, by simpa [specCmndResult, hr, hs] using h⟩
+
+
+/-- A missing stat cannot turn an alternate pathname into a literal match. -/
+theorem literal_missing_stat_requires_same_name (r : Request) (p path : String)
+    (hm : (r.fileIds.find? (·.1 == p)).isNone = true ∨
+      (r.fileIds.find? (·.1 == path)).isNone = true)
+    (h : literalFileMatches (some r) p path = true) : p = path := by
+  cases hp : r.fileIds.find? (·.1 == p) <;>
+    cases hpath : r.fileIds.find? (·.1 == path) <;>
+    simp_all [literalFileMatches]
 end LeanSudo.Policy

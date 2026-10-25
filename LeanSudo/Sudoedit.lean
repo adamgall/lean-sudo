@@ -1,6 +1,8 @@
 import LeanSudo.Core.Types
 import LeanSudo.Sys.Core
 import LeanSudo.Sys.Edit
+import LeanSudo.Sys.Extra
+import LeanSudo.Policy.Eval
 import LeanSudo.Sudoedit.Check
 import LeanSudo.I18n.Load
 
@@ -23,6 +25,15 @@ status with exit 1. Editor environment variables are always considered, independ
 of visudo's env_editor setting; lookup uses the policy-rebuilt PATH, while the editor
 itself receives the invoking environment. Quoting/backslash splitting and rejection
 of an editor-supplied `--` happen before any file session is created.
+
+sudo.ws 1.9.17p2's sudoedit root behavior is deliberately preserved: command-rule
+CHROOT is ignored, while Defaults runchroot (or -R permitted by runchroot=*) changes
+only the editor child's root. Originals, temporary creation and copyback still use
+the host filesystem. Consequently a jailed editor cannot normally access the host
+temporary pathname. Rule CHROOT=* alone does not authorize sudoedit's -R option.
+As with exec, an editor or its parent resolving outside the configured root is
+refused before preparation; this is the explicit fail-closed exception to upstream
+root semantics, including absolute symlinks that upstream would follow in the jail.
 -/
 namespace LeanSudo.Sudoedit
 
@@ -191,6 +202,10 @@ def run (progname : String) (plan : Core.EditPlan) (env : Array String) : IO Sys
       if result.isSome then break
     let some (path, words) := selectEditor resolved
       | throw (IO.userError s!"{plan.editorNotFound}: command not found")
+    if let some root := plan.chroot then
+      for candidate in [path, Policy.dirOf path] do
+        if ← Sys.rootPathEscapes root candidate then
+          throw (IO.userError s!"{path}: command resolves outside the chroot directory")
     let mut failed := false
     try
       for file in plan.files do
@@ -211,13 +226,13 @@ def run (progname : String) (plan : Core.EditPlan) (env : Array String) : IO Sys
           gid := plan.editGid
           groups := plan.editGroups.toArray
           cwd := none
+          chroot := plan.chroot
           umask := plan.umask
           usePty := false
           background := false }
       catch e =>
-        for s in sessions do
-          warn progname s!"contents of edit session left in {s.temp}"
-        throw e
+        warn progname e.toString
+        pure (.exited 1)
     let elapsed := started != (← Sys.Edit.clock)
     for s in sessions do
       unless ← copyBack progname invoker target plan.umask plan.follow plan.checkdir elapsed s do failed := true

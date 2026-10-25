@@ -269,7 +269,8 @@ def defaultKind : String → Option DefaultKind
   | "log_subcmds" => some (.flag (fun st v => { st with logSubcmds := v }))
   | "log_exit_status" => some (.flag (fun st v => { st with logExitStatus := v }))
   | "intercept_authenticate" => some (.flag (fun st v => { st with interceptAuthenticate := v }))
-  | "intercept_allow_setid" => some (.flag (fun st v => { st with interceptAllowSetid := v }))
+  | "intercept_allow_setid" => some (.flag (fun st v =>
+      { st with interceptAllowSetid := v, interceptAllowSetidConfigured := true }))
   | "rlimit_as" => some (.rlimit (fun st v => { st with rlimitAs := v }))
   | "rlimit_core" => some (.rlimit (fun st v => { st with rlimitCore := v }))
   | "rlimit_cpu" => some (.rlimit (fun st v => { st with rlimitCpu := v }))
@@ -284,7 +285,9 @@ def defaultKind : String → Option DefaultKind
   | "noninteractive_auth" => some (.flag (fun st v => { st with noninteractiveAuth := v }))
   | "log_passwords" => some (.flag (fun st v => { st with logPasswords := v }))
   | "passprompt_regex" => some (.list true (·.passpromptRegex) (fun st v => { st with passpromptRegex := v }))
-  | "intercept_type" => some (.tuple false ["dso", "trace"] (fun st v => { st with interceptType := v }))
+  | "intercept_type" => some (.tuple false ["dso", "trace"] (fun st v =>
+      { st with interceptType := v, interceptAllowSetid :=
+        if st.interceptAllowSetidConfigured then st.interceptAllowSetid else v == "trace" }))
   | "intercept_verify" => some (.flag (fun st v => { st with interceptVerify := v }))
   | "apparmor_profile" => some (.string false .unrestricted (fun st v => { st with apparmorProfile := v }))
   | "cmddenial_message" => some (.string false .unrestricted (fun st v => { st with cmddenialMessage := v }))
@@ -350,9 +353,10 @@ private def checkPath (name : String) (path : DefaultPath) (v : String) : Except
         throw s!"values for \"{name}\" must start with a '/', '~', or '*'"
     | .unrestricted => pure ()
 
-/-- Apply one setting. Visudo validates types without running runtime callbacks. -/
+/-- Apply one setting. Type-only checks disable callbacks; verbose policy setup
+additionally emits deprecation diagnostics, as visudo does but runtime sudo does not. -/
 def applySetting (st : Settings) (d : DefaultsSetting) (callbacks : Bool := true)
-    : Except String (Settings × Option String) := do
+    (verbose : Bool := false) : Except String (Settings × Option String) := do
   let n := d.name
   let some kind := defaultKind n |
     return (st, if st.ignoreUnknownDefaults then none else some s!"unknown defaults entry \"{n}\"")
@@ -440,12 +444,16 @@ def applySetting (st : Settings) (d : DefaultsSetting) (callbacks : Bool := true
       else if ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"].contains text then
         pure (set st (some text))
       else invalid n text
-  return (result, none)
+  return (result, if callbacks && verbose && n == "runchroot" then
+    let location := (d.source.map fun (file, line, column) => s!"{file}:{line}:{column}: ").getD ""
+    some (location ++ "\"runchroot\" is deprecated and will be removed in a future sudo release")
+    else none)
 
 /-- Apply settings in order, collecting warnings. -/
-def applySettings (st : Settings) (ds : List DefaultsSetting) : Except String (Settings × List String) :=
+def applySettings (st : Settings) (ds : List DefaultsSetting) (verbose : Bool := false)
+    : Except String (Settings × List String) :=
   ds.foldlM (fun (acc : Settings × List String) d => do
-    let (st', w) ← applySetting acc.1 d
+    let (st', w) ← applySetting acc.1 d true verbose
     pure (st', acc.2 ++ w.toList)) (st, [])
 
 /-! ## Scoping -/
@@ -491,7 +499,7 @@ def applicableDefaults (s : Sudoers) (user : Principal) (host : String) (runas :
 explicit sudoers settings still override that seed. -/
 def resolveDefaults (s : Sudoers) (user : Principal) (host : String) (runas : Option Principal)
     (cmd : Option Command) (canon : String → String := id) (facts : Option Request := none)
-    (initial : Settings := {}) : Except String (Settings × List String) := do
+    (initial : Settings := {}) (verbose : Bool := false) : Except String (Settings × List String) := do
   let al := aliasesOf s
   let ds := defaultsOf s
   [0, 1, 2].foldlM (fun acc phase =>
@@ -499,7 +507,7 @@ def resolveDefaults (s : Sudoers) (user : Principal) (host : String) (runas : Op
       ds.foldlM (fun (acc : Settings × List String) (sc, ss) => do
         if scopePhase sc != phase || !scopeMatches al acc.1 user host runas cmd canon facts sc then
           return acc
-        let (st, warnings) ← applySettings acc.1 (ss.filter fun d => earlyDefaults.contains d.name == early)
+        let (st, warnings) ← applySettings acc.1 (ss.filter fun d => earlyDefaults.contains d.name == early) verbose
         return (st, acc.2 ++ warnings)) acc) acc) (initial, [])
 
 /-- Clearing an unknown option cannot mutate any setting. -/

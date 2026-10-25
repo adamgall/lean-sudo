@@ -46,14 +46,19 @@ def main : IO UInt32 := do
     check (!lookup (later + 901 * 10 ^ 9) (some 900) scope 1000 rs2) "expired after timeout"
     check (!lookup later (some 900) scope 1000 (load (encode (invalidate rs2)))) "-k invalidates"
 
-    -- storage: expected to fail unprivileged
-    let r ← (withTimestampFile 1000 fun b => pure ((none : Option ByteArray), b.size)).toBaseIO
+    -- Use an isolated directory: never remove a user's real sudo timestamp.
+    let config : TimestampConfig := { directory := s!"/run/lean-sudo-smoke-ts-{pid}", uid := 1000 }
+    let key : TimestampKey := { scope, lockScope := scope, sid, authUid := 1000 }
+    let r ← (withTimestampFile config key (fun records =>
+      pure ((none : Option Record), records.length)) IO.eprintln).toBaseIO
     match r with
-    | .ok n => IO.println s!"withTimestampFile succeeded (running as root?), {n} bytes"
-    | .error e => IO.println s!"withTimestampFile error (expected unprivileged): {e}"
-    let r ← (removeTimestampFile 1000).toBaseIO
+    | .ok n => IO.println s!"timestamp callback observed {n} records"
+    | .error e => IO.println s!"timestamp storage error: {e}"
+    let r ← (removeTimestampFile config).toBaseIO
     match r with
-    | .ok _ => IO.println "removeTimestampFile succeeded (running as root?)"
+    | .ok _ =>
+      IO.println "removeTimestampFile succeeded"
+      try IO.FS.removeDir config.directory catch _ => pure ()
     | .error e => IO.println s!"removeTimestampFile error (expected unprivileged): {e}"
     IO.println "smoke-ts: all checks passed"
     return 0

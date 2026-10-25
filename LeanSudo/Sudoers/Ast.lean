@@ -223,6 +223,8 @@ inductive DefaultsOp where
 structure DefaultsSetting where
   name : String
   op : DefaultsOp
+  /-- Defaults callback token location, absent for non-file sources. -/
+  source : Option (String × Nat × Nat) := none
   deriving Repr, BEq, DecidableEq, Inhabited
 
 inductive Entry where
@@ -243,6 +245,8 @@ structure Located where
   file : String
   line : Nat
   entry : Entry
+  /-- Nonfatal parser diagnostics, in source order, with file/line/column. -/
+  warnings : List String := []
   deriving Repr, BEq, Inhabited
 
 /-- A fully include-resolved sudoers policy, in file order. -/

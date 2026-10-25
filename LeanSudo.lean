@@ -41,3 +41,7 @@ import LeanSudo.Sys.Lookup
 import LeanSudo.Sss
 import LeanSudo.Sys.GroupPlugin
 import LeanSudo.Sys.Sss
+import LeanSudo.Intercept
+import LeanSudo.LogSrv
+import LeanSudo.Sys.Intercept
+import LeanSudo.Sys.LogSrv

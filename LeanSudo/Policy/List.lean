@@ -266,7 +266,9 @@ def notAllowedMessage (user host : String) : String :=
   s!"User {user} is not allowed to run sudo on {host}."
 
 private def sources (s : Sudoers) (located : List Located) : List Located :=
-  if located.isEmpty then s.map fun e => ⟨"/etc/sudoers", 1, e⟩ else located
+  if located.isEmpty then
+    s.map fun e => { file := "/etc/sudoers", line := 1, entry := e }
+  else located
 
 /-- sudo_lbuf wrapping is byte-counted and splits only at ASCII spaces. -/
 def wrapListing (text : String) (columns indent : Nat) : String :=

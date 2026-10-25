@@ -41,6 +41,38 @@ inductive Command where
   | validate
   deriving Repr, BEq, DecidableEq, Inhabited
 
+/-- Command lookup facts for one root. Paths are logical paths inside that root;
+the shell gathers their stat/digest data through host-prefixed paths. -/
+structure RootCommandFacts where
+  command : Command
+  argv : List String := []
+  found : Bool := true
+  execFd : Option Nat := none
+  canonPaths : List (String × String) := []
+  fileIds : List (String × Nat × Nat) := []
+  globPaths : List (String × List String) := []
+  regexMatches : List (String × String × Bool) := []
+  digests : List Sudoers.Digest := []
+  /-- Namespace safety failure, enforced only if this lookup wins authorization. -/
+  refusal : Option String := none
+  /-- Whether the resolved executable has setuid or setgid mode bits. -/
+  setid : Bool := false
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+/-- The command selected by the deciding CHROOT rule, not a subsequent lookup. -/
+structure CommandSelection where
+  /-- Root lookup key; `*` denotes a wildcard rule without an explicit user root,
+  not a directory named `*`. -/
+  root : String
+  command : Command
+  executionPath : String
+  argv : List String := []
+  found : Bool := true
+  execFd : Option Nat := none
+  refusal : Option String := none
+  setid : Bool := false
+  deriving Repr, BEq, DecidableEq, Inhabited
+
 structure Request where
   /-- the invoking user -/
   user : Principal
@@ -55,6 +87,7 @@ structure Request where
   command : Command
   /-- Canonical paths and parent directories, precomputed by the shell. -/
   canon : String → String := id
+  canonPaths : List (String × String) := []
   lhost : String := ""
   interfaces : List (Sudoers.IpAddr × Sudoers.IpAddr) := []
   /-- (netgroup, user, host, innetgr result). -/
@@ -71,6 +104,9 @@ structure Request where
   /-- glob(3) expansions keyed by policy pattern. -/
   globPaths : List (String × List String) := []
   fastGlob : Bool := false
+  requestedChroot : Option String := none
+  defaultChroot : Option String := none
+  rootFacts : List (String × RootCommandFacts) := []
 
 inductive TimestampType where
   | tty | ppid | global | kernel
@@ -237,6 +273,7 @@ structure Settings where
   intercept : Bool := false
   interceptAuthenticate : Bool := false
   interceptAllowSetid : Bool := true
+  interceptAllowSetidConfigured : Bool := false
   interceptType : String := "trace"
   interceptVerify : Bool := true
   logSubcmds : Bool := false
@@ -299,6 +336,7 @@ structure Allowed where
   limitprivs : Option String := none
   /-- The deciding command match verified a digest (including through aliases). -/
   usesDigest : Bool := false
+  selection : Option CommandSelection := none
   deriving Repr, BEq, DecidableEq, Inhabited
 
 inductive Judgement where

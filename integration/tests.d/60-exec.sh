@@ -350,3 +350,379 @@ PERL
   rm -f /usr/local/bin/exec-stop-group.pl
   end
 }
+
+# Build a self-contained jail without relying on the host's merged-/usr links.
+exec_chroot_setup() {
+  python3 - <<'PY'
+import os, pathlib, shutil, subprocess
+root = pathlib.Path("/srv/lean-sudo-jail")
+shutil.rmtree(root, ignore_errors=True)
+for directory in ("bin", "usr/bin", "etc", "work"):
+    (root / directory).mkdir(parents=True, exist_ok=True)
+for source, destination in (("/bin/dash", "/bin/sh"), ("/usr/bin/id", "/usr/bin/id")):
+    shutil.copy2(source, str(root) + destination)
+    for word in subprocess.check_output(["ldd", source], text=True).split():
+        if word.startswith("/") and os.path.isfile(word):
+            target = pathlib.Path(str(root) + word)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(word, target)
+(root / "usr/bin/jail-tool").write_text(
+    '#!/bin/sh\nprintf "jail-marker\\ncwd=%s\\n" "$PWD"\n/usr/bin/id -u\n')
+os.chmod(root / "usr/bin/jail-tool", 0o755)
+# Policy and target identity must not come from the jail's NSS configuration.
+(root / "etc/nsswitch.conf").write_text("passwd: unavailable\ngroup: unavailable\n")
+PY
+}
+
+# Isolate filesystem-rule lookup from sudo's cross-NSS cmnd_info-reset bug.
+# The generic jail helper above is also used by SSSD integration tests.
+exec_chroot_files_only() {
+  cp /etc/nsswitch.conf /tmp/exec-nsswitch.saved
+  python3 - <<'PY'
+from pathlib import Path
+path = Path("/etc/nsswitch.conf")
+text = path.read_text()
+path.write_text("\n".join(line for line in text.splitlines()
+                         if not line.lstrip().startswith("sudoers:"))
+                + "\nsudoers: files\n")
+PY
+}
+
+begin exec-chroot-rule-path-lookup && {
+  exec_chroot_setup
+  exec_chroot_files_only
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+root ALL = (ALL) CHROOT=/srv/lean-sudo-jail NOPASSWD: /usr/bin/jail-tool
+EOF
+  run root "sudo -n jail-tool"
+  expect_rc 0
+  expect_out_line jail-marker
+  expect_out_line cwd=/
+  expect_out_line 0
+  expect_err_has '"CHROOT" is deprecated'
+  mv /tmp/exec-nsswitch.saved /etc/nsswitch.conf
+  rm -rf /srv/lean-sudo-jail
+  end
+}
+
+begin exec-chroot-default && {
+  exec_chroot_setup
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+Defaults runchroot=/srv/lean-sudo-jail
+EOF
+  run root "sudo -n jail-tool"
+  expect_rc 0
+  expect_out_line jail-marker
+  expect_out_line cwd=/
+  rm -rf /srv/lean-sudo-jail
+  end
+}
+
+begin exec-chroot-user-root-wildcard && {
+  exec_chroot_setup
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+root ALL = CHROOT=* NOPASSWD: /usr/bin/jail-tool
+EOF
+  run root "sudo -n -R /srv/lean-sudo-jail jail-tool"
+  expect_rc 0
+  expect_out_line jail-marker
+  expect_err_has 'the -R option will be removed in a future version of sudo'
+  rm -rf /srv/lean-sudo-jail
+  end
+}
+
+begin exec-chroot-user-root-fixed-denied && {
+  exec_chroot_setup
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+root ALL = CHROOT=/srv/lean-sudo-jail NOPASSWD: /usr/bin/jail-tool
+EOF
+  run root "sudo -n -R /srv/lean-sudo-jail jail-tool"
+  expect_rc 1
+  expect_err_has 'you are not permitted to use the -R option with /usr/bin/jail-tool'
+  expect_out_empty
+  rm -rf /srv/lean-sudo-jail
+  end
+}
+
+begin exec-chroot-wildcard-without-user-root && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+root ALL = CHROOT=* NOPASSWD: ALL
+EOF
+  run root "sudo -n /bin/true"
+  expect_rc 0
+  end
+}
+
+begin exec-chroot-wildcard-literal-without-user-root && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+ivan ALL = CHROOT=* NOPASSWD: /bin/true
+EOF
+  run ivan "sudo -n /bin/true"
+  expect_rc 0
+  expect_out_empty
+  end
+}
+
+begin exec-chroot-cwd-and-host-identity && {
+  exec_chroot_setup
+  exec_chroot_files_only
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+Defaults runchroot=/srv/lean-sudo-jail
+root ALL = (bob) CWD=/work NOPASSWD: /usr/bin/jail-tool
+EOF
+  run root "sudo -n -u bob /usr/bin/jail-tool"
+  expect_rc 0
+  expect_out_line jail-marker
+  expect_out_line cwd=/work
+  expect_out_line "$(uid_of bob)"
+  mv /tmp/exec-nsswitch.saved /etc/nsswitch.conf
+  rm -rf /srv/lean-sudo-jail
+  end
+}
+
+begin exec-chroot-last-rule-selects-namespace && {
+  exec_chroot_setup
+  exec_chroot_files_only
+  cp -a /srv/lean-sudo-jail /srv/lean-sudo-jail-second
+  printf '#!/bin/sh\nprintf "second-root\\n"\n' >/srv/lean-sudo-jail-second/usr/bin/jail-tool
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+root ALL = CHROOT=/srv/lean-sudo-jail NOPASSWD: /usr/bin/jail-tool, CHROOT=/srv/lean-sudo-jail-second /usr/bin/jail-tool
+EOF
+  run root "sudo -n jail-tool"
+  expect_rc 0
+  expect_out_line second-root
+  mv /tmp/exec-nsswitch.saved /etc/nsswitch.conf
+  rm -rf /srv/lean-sudo-jail /srv/lean-sudo-jail-second
+  end
+}
+
+begin exec-chroot-fdexec-pins-jail-command && {
+  exec_chroot_setup
+  exec_chroot_files_only
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+Defaults fdexec=always
+root ALL = CHROOT=/srv/lean-sudo-jail NOPASSWD: /bin/sh
+EOF
+  run root "sudo -n /bin/sh -c 'printf pinned-jail'"
+  expect_rc 0
+  expect_out_line pinned-jail
+  mv /tmp/exec-nsswitch.saved /etc/nsswitch.conf
+  rm -rf /srv/lean-sudo-jail
+  end
+}
+
+begin exec-chroot-digest-uses-jail-bytes && {
+  exec_chroot_setup
+  exec_chroot_files_only
+  digest=$(sha256sum /srv/lean-sudo-jail/bin/sh | cut -d' ' -f1)
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<EOF
+root ALL = CHROOT=/srv/lean-sudo-jail NOPASSWD: sha256:$digest /bin/sh
+EOF
+  run root "sudo -n /bin/sh -c 'printf digested-jail'"
+  expect_rc 0
+  expect_out_line digested-jail
+  mv /tmp/exec-nsswitch.saved /etc/nsswitch.conf
+  rm -rf /srv/lean-sudo-jail
+  end
+}
+
+begin exec-chroot-noexec-library-inside-jail && {
+  exec_chroot_setup
+  exec_chroot_files_only
+  install -D -m 0755 /usr/libexec/sudo/sudo_noexec.so \
+    /srv/lean-sudo-jail/usr/libexec/sudo/sudo_noexec.so
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+root ALL = CHROOT=/srv/lean-sudo-jail NOPASSWD: NOEXEC: /usr/bin/jail-tool
+EOF
+  run root "sudo -n jail-tool"
+  expect_rc 126
+  expect_out_line jail-marker
+  expect_err_has 'Permission denied'
+  mv /tmp/exec-nsswitch.saved /etc/nsswitch.conf
+  rm -rf /srv/lean-sudo-jail
+  end
+}
+
+begin exec-chroot-relative-symlink-contained && {
+  exec_chroot_setup
+  exec_chroot_files_only
+  ln -s ../../bin/sh /srv/lean-sudo-jail/usr/bin/relative-shell
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+root ALL = CHROOT=/srv/lean-sudo-jail NOPASSWD: /usr/bin/relative-shell
+EOF
+  run root "sudo -n /usr/bin/relative-shell -c 'printf contained'"
+  expect_rc 0
+  expect_out_line contained
+  mv /tmp/exec-nsswitch.saved /etc/nsswitch.conf
+  rm -rf /srv/lean-sudo-jail
+  end
+}
+
+# Documented deviation: sudo's prefixed host lookup follows absolute symlinks
+# outside the jail. lean-sudo refuses that ambiguous namespace before execution.
+begin exec-chroot-absolute-symlink-escape-refused && {
+  exec_chroot_setup
+  exec_chroot_files_only
+  cp /srv/lean-sudo-jail/bin/sh /srv/lean-sudo-jail/bin/dash
+  ln -s /bin/dash /srv/lean-sudo-jail/bin/outside
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+root ALL = CHROOT=/srv/lean-sudo-jail NOPASSWD: /bin/outside
+EOF
+  run root "sudo -n /bin/outside -c 'printf absolute-link'"
+  if [[ $LABEL == reference ]]; then
+    expect_rc 0
+    expect_out_line absolute-link
+  else
+    expect_rc 1
+    expect_out_empty
+    expect_err_has '/bin/outside: command resolves outside the chroot directory'
+  fi
+  mv /tmp/exec-nsswitch.saved /etc/nsswitch.conf
+  rm -rf /srv/lean-sudo-jail
+  end
+}
+
+# Documented deviation: a later empty NSS source must not discard an allowed
+# command's selected root and turn successful lookup into "command not found".
+begin exec-chroot-empty-later-nss-retains-command && {
+  exec_chroot_setup
+  exec_chroot_files_only
+  printf 'sudoers: files sss\n' >>/etc/nsswitch.conf
+  python3 - <<'PY'
+from pathlib import Path
+p = Path("/etc/nsswitch.conf")
+p.write_text(p.read_text().replace("sudoers: files\n", ""))
+PY
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+root ALL = CHROOT=/srv/lean-sudo-jail NOPASSWD: /usr/bin/jail-tool
+EOF
+  run root "sudo -n jail-tool"
+  if [[ $LABEL == reference ]]; then
+    expect_rc 1
+    expect_err_has 'jail-tool: command not found'
+  else
+    expect_rc 0
+    expect_out_line jail-marker
+  fi
+  mv /tmp/exec-nsswitch.saved /etc/nsswitch.conf
+  rm -rf /srv/lean-sudo-jail
+  end
+}
+
+# Documented deviation: sudo's nested PERM_RUNAS lookup can call setgroups
+# after dropping effective root. Dedicated lookup workers retain no such state.
+begin exec-chroot-nonroot-rule-lookup-retains-privileges && {
+  exec_chroot_setup
+  exec_chroot_files_only
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+root ALL = (bob) CHROOT=/srv/lean-sudo-jail CWD=/work NOPASSWD: /usr/bin/jail-tool
+EOF
+  run root "sudo -n -u bob /usr/bin/jail-tool"
+  if [[ $LABEL == reference ]]; then
+    expect_rc 1
+    expect_err_has 'unable to set runas group vector: Operation not permitted'
+  else
+    expect_rc 0
+    expect_out_line jail-marker
+    expect_out_line cwd=/work
+    expect_out_line "$(uid_of bob)"
+  fi
+  mv /tmp/exec-nsswitch.saved /etc/nsswitch.conf
+  rm -rf /srv/lean-sudo-jail
+  end
+}
+
+begin exec-chroot-glob-uses-jail-directory && {
+  exec_chroot_setup
+  exec_chroot_files_only
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+ivan ALL = CHROOT=/srv/lean-sudo-jail NOPASSWD: /usr/bin/jail-*
+EOF
+  run ivan "sudo -n jail-tool"
+  expect_rc 0
+  expect_out_line jail-marker
+  mv /tmp/exec-nsswitch.saved /etc/nsswitch.conf
+  rm -rf /srv/lean-sudo-jail
+  end
+}
+
+begin exec-chroot-tilde-root-expands-on-host && {
+  exec_chroot_setup
+  exec_chroot_files_only
+  ln -s /srv/lean-sudo-jail /root/exec-chroot-home
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+root ALL = CHROOT=~root/exec-chroot-home NOPASSWD: /usr/bin/jail-tool
+EOF
+  run root "sudo -n /usr/bin/jail-tool"
+  if [[ $LABEL == reference ]]; then
+    # Upstream expands the home only after command lookup, too late to find a
+    # command present solely in the jail. lean-sudo expands captured host facts.
+    expect_rc 1
+    expect_err_has '/usr/bin/jail-tool: command not found'
+  else
+    expect_rc 0
+    expect_out_line jail-marker
+  fi
+  mv /tmp/exec-nsswitch.saved /etc/nsswitch.conf
+  rm -rf /srv/lean-sudo-jail /root/exec-chroot-home
+  end
+}
+
+begin exec-chroot-parent-symlink-escape-refused && {
+  exec_chroot_setup
+  exec_chroot_files_only
+  cp /srv/lean-sudo-jail/bin/sh /srv/lean-sudo-jail/bin/dash
+  ln -s /bin /srv/lean-sudo-jail/escape
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+root ALL = CHROOT=/srv/lean-sudo-jail NOPASSWD: /escape/dash
+EOF
+  run root "sudo -n /escape/dash -c 'printf parent-link'"
+  if [[ $LABEL == reference ]]; then
+    expect_rc 0
+    expect_out_line parent-link
+  else
+    expect_rc 1
+    expect_out_empty
+    expect_err_has '/escape/dash: command resolves outside the chroot directory'
+  fi
+  mv /tmp/exec-nsswitch.saved /etc/nsswitch.conf
+  rm -rf /srv/lean-sudo-jail
+  end
+}
+
+begin exec-chroot-missing-noexec-fails-closed && {
+  exec_chroot_setup
+  exec_chroot_files_only
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+root ALL = CHROOT=/srv/lean-sudo-jail NOPASSWD: NOEXEC: /usr/bin/jail-tool
+EOF
+  run root "sudo -n jail-tool"
+  if [[ $LABEL == reference ]]; then
+    # The dynamic loader warns but executes without protection. The explicit
+    # lean-sudo NOEXEC contract instead refuses a missing in-jail library.
+    expect_rc 0
+    expect_out_line jail-marker
+  else
+    expect_rc 1
+    expect_out_empty
+    expect_err_has 'unable to load noexec library'
+  fi
+  mv /tmp/exec-nsswitch.saved /etc/nsswitch.conf
+  rm -rf /srv/lean-sudo-jail
+  end
+}
+
+begin exec-chroot-tilde-root-host-command && {
+  exec_chroot_setup
+  exec_chroot_files_only
+  ln -s /srv/lean-sudo-jail /root/exec-chroot-home
+  install -m 0440 /dev/stdin /etc/sudoers.d/exec-chroot <<'EOF'
+root ALL = CHROOT=~root/exec-chroot-home NOPASSWD: /bin/sh
+EOF
+  run root "sudo -n /bin/sh -c 'printf tilde-root'"
+  expect_rc 0
+  expect_out_line tilde-root
+  mv /tmp/exec-nsswitch.saved /etc/nsswitch.conf
+  rm -rf /srv/lean-sudo-jail /root/exec-chroot-home
+  end
+}

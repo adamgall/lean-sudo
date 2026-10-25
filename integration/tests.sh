@@ -63,7 +63,7 @@ gid_of() { id -g "$1"; }
 reset_state() {
   # Timestamp/lecture state of every implementation we know about.
   rm -rf /run/sudo /var/run/sudo /var/lib/sudo/ts /var/lib/sudo/lectured/* \
-         /var/run/sudo-rs /run/sudo-rs /run/lean-sudo /var/db/sudo
+         /var/run/sudo-rs /run/sudo-rs /var/db/sudo
   rm -rf /etc/sudoers.d
   cp -a "$WORK/sudoers.d.orig" /etc/sudoers.d
   cp -a "$WORK/sudoers.orig" /etc/sudoers

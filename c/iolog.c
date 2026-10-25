@@ -1,6 +1,7 @@
 /* sudo-compatible on-disk I/O logs. Policy and metadata rendering live in Lean. */
 #include <lean/lean.h>
 #include "locale_scope.h"
+#include "logsrv.h"
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -104,12 +105,16 @@ static void reset(void) {
 }
 /* Called in the forked command; do not flush the parent's copied gzip buffers. */
 void ls_iolog_child_close(void) {
+  ls_logsrv_child_close();
   if (!logstate.active) return;
   for (int i = 0; i < 6; i++) if (logstate.fd[i] >= 0) close(logstate.fd[i]);
   logstate.active = 0;
 }
-int ls_iolog_active(void) { return logstate.active; }
-int ls_iolog_stream(int stream) { return logstate.active && stream >= 0 && stream < 5 && logstate.fd[stream] >= 0; }
+int ls_iolog_active(void) { return logstate.active || ls_logsrv_active(); }
+int ls_iolog_stream(int stream) {
+  return ls_logsrv_stream(stream) ||
+    (logstate.active && stream >= 0 && stream < 5 && logstate.fd[stream] >= 0);
+}
 static int failed(void) {
   int err = errno ? errno : EIO;
   int ignore = logstate.ignore;
@@ -139,7 +144,7 @@ static int timing(int event, const char *detail) {
   return 0;
 }
 int ls_iolog_write(int stream, const void *buf, size_t len) {
-  if (!logstate.active || stream < 0 || stream > 4) return 0;
+  if (!ls_iolog_active() || stream < 0 || stream > 4) return 0;
   char *copy = NULL;
   if (!logstate.passwords && stream == 4) {
     copy = malloc(len + 1);
@@ -150,7 +155,7 @@ int ls_iolog_write(int stream, const void *buf, size_t len) {
       if (!regexec(&logstate.patterns[i], copy, 0, NULL, 0)) { logstate.filtered = 1; break; }
     free(copy); copy = NULL;
   }
-  if (logstate.fd[stream] < 0 || !len) return 0;
+  if (!ls_iolog_stream(stream) || !len) return 0;
   if (!logstate.passwords && stream == 3 && logstate.filtered) {
     copy = malloc(len);
     if (!copy) return failed();
@@ -161,21 +166,25 @@ int ls_iolog_write(int stream, const void *buf, size_t len) {
     }
     buf = copy;
   }
-  int rc = put(stream, buf, len);
+  int remote = ls_logsrv_stream(stream);
+  int rc = remote ? ls_logsrv_event(stream, buf, len, 0, 0) : put(stream, buf, len);
   free(copy);
+  if (remote) return rc;
   char detail[32]; snprintf(detail, sizeof detail, "%zu", len);
   if (rc || timing(stream, detail)) return failed();
   return 0;
 }
 int ls_iolog_winsize(unsigned rows, unsigned cols) {
+  if (ls_logsrv_active()) return ls_logsrv_event(5, NULL, 0, rows, cols);
   if (!logstate.active) return 0;
   char detail[64]; snprintf(detail, sizeof detail, "%u %u", rows, cols);
   return timing(5, detail) ? failed() : 0;
 }
 int ls_iolog_suspend(int sig) {
-  if (!logstate.active) return 0;
+  if (!ls_iolog_active()) return 0;
   const char *name = sig == SIGCONT ? "CONT" : sig == SIGTSTP ? "TSTP" :
     sig == SIGTTIN ? "TTIN" : sig == SIGTTOU ? "TTOU" : "STOP";
+  if (ls_logsrv_active()) return ls_logsrv_event(7, name, strlen(name), 0, 0);
   return timing(7, name) ? failed() : 0;
 }
 int ls_iolog_close(int exit_code, int signal_number) {
@@ -270,6 +279,26 @@ LEAN_EXPORT lean_obj_res leansudo_iolog_prepare(b_lean_obj_arg dir, b_lean_obj_a
 bad:
   err = errno ? errno : EINVAL; close(fd); errno = err;
   return failure("I/O log sequence");
+}
+/* Remote sessions reuse the same password filter, but never create local files. */
+LEAN_EXPORT lean_obj_res leansudo_iolog_remote(uint32_t flags,
+    b_lean_obj_arg patterns, lean_obj_arg world) {
+  (void)world;
+  reset();
+  logstate.ignore = (flags & 128) != 0;
+  logstate.passwords = (flags & 256) != 0;
+  if (!logstate.passwords) {
+    size_t count = lean_array_size(patterns);
+    logstate.patterns = calloc(count ? count : 1, sizeof(regex_t));
+    if (!logstate.patterns) return failure("I/O log password filters");
+    for (size_t i = 0; i < count; i++) {
+      if (regcomp(&logstate.patterns[i], lean_string_cstr(lean_array_get_core(patterns, i)), REG_EXTENDED | REG_NOSUB)) {
+        reset(); errno = EINVAL; return failure("I/O log password filter");
+      }
+      logstate.npatterns++;
+    }
+  }
+  return lean_io_result_mk_ok(lean_box(0));
 }
 LEAN_EXPORT lean_obj_res leansudo_iolog_start(b_lean_obj_arg path, b_lean_obj_arg legacy,
     b_lean_obj_arg json, uint32_t flags, b_lean_obj_arg patterns, lean_obj_arg world) {

@@ -9,11 +9,11 @@ coverage_compare() {
   local root_hash
   root_hash=$(getent shadow root | cut -d: -f2)
   printf 'root:rootpw\n' | chpasswd
-  rm -rf /run/sudo /run/lean-sudo
+  rm -rf /run/sudo
   run "$user" "S=/usr/bin/sudo.ws; $snippet"
   ref_rc=$RC ref_out=${OUT//sudo.ws/sudo} ref_err=${ERR//sudo.ws/sudo}
   [[ -z $expected || $RC == "$expected" ]] || fail "reference exit: expected $expected, got $RC"
-  rm -rf /run/sudo /run/lean-sudo
+  rm -rf /run/sudo
   run "$user" "S=/usr/bin/sudo; $snippet"
   [[ $RC == "$ref_rc" ]] || fail "reference exit $ref_rc, actual $RC"
   [[ ${OUT//sudo.ws/sudo} == "$ref_out" ]] || fail "reference stdout: [$ref_out]; actual: [$OUT]"

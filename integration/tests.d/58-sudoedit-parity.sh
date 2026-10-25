@@ -307,3 +307,147 @@ begin sudoedit-parity-sudo-e-editor-error-prefix && {
   [[ $ERR == $'sudo: ignoring editor: /usr/bin/true -- /etc/hostname\nsudo: editor arguments may not contain "--"' ]] || fail 'sudo -e editor error lost frontend prefix'
   end
 }
+
+sudoedit_chroot_setup() {
+  sudoedit_parity_setup
+  rm -rf /srv/sudoedit-jail
+  mkdir -p /srv/sudoedit-jail/etc
+  printf 'sudoers: files\npasswd: files\ngroup: files\n' >/srv/sudoedit-jail/etc/nsswitch.conf
+  cp /etc/passwd /etc/group /srv/sudoedit-jail/etc/
+  printf 'inside\n' >/srv/sudoedit-jail/etc/henryfile
+  printf 'outside\n' >/etc/henryfile
+}
+
+begin sudoedit-chroot-rule && {
+  sudoedit_chroot_setup
+  printf 'henry ALL=(ALL:ALL) CHROOT=/srv/sudoedit-jail NOPASSWD: sudoedit\n' >/etc/sudoers.d/58-sudoedit
+  run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /etc/henryfile'
+  expect_rc 0
+  [[ $(cat /srv/sudoedit-jail/etc/henryfile) == inside ]] || fail 'rule root unexpectedly changed edit filesystem'
+  [[ $(cat /etc/henryfile) == $'outside\nedited' ]] || fail 'rule CHROOT was not ignored'
+  end
+}
+
+begin sudoedit-chroot-default-missing-editor && {
+  sudoedit_chroot_setup
+  printf 'Defaults:henry runchroot=/srv/sudoedit-jail\n' >>/etc/sudoers.d/58-sudoedit
+  run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /etc/henryfile'
+  expect_rc 1
+  expect_err_has 'sudoedit: unable to execute /usr/local/bin/henry-editor: No such file or directory'
+  expect_err_has 'sudoedit: /etc/henryfile unchanged'
+  [[ $(cat /srv/sudoedit-jail/etc/henryfile) == inside ]] || fail 'jailed original edited'
+  [[ $(cat /etc/henryfile) == outside ]] || fail 'host original edited'
+  end
+}
+
+begin sudoedit-chroot-rule-wildcard-does-not-allow-user-root && {
+  sudoedit_chroot_setup
+  printf 'henry ALL=(ALL:ALL) CHROOT=* NOPASSWD: sudoedit\n' >/etc/sudoers.d/58-sudoedit
+  run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n -R /srv/sudoedit-jail /etc/henryfile'
+  expect_rc 1
+  expect_err_has 'you are not permitted to use the -R option with sudoedit'
+  [[ $(cat /srv/sudoedit-jail/etc/henryfile) == inside ]] || fail 'jailed original edited'
+  [[ $(cat /etc/henryfile) == outside ]] || fail 'host original edited'
+  end
+}
+
+# Supply a distinct jailed editor. It can observe the jail, but the host temp
+# pathname passed by sudoedit is deliberately absent from that filesystem.
+sudoedit_chroot_editor() {
+  python3 - <<'PY'
+import pathlib, re, shutil, subprocess
+root = pathlib.Path('/srv/sudoedit-jail')
+paths = ['/bin/sh']
+paths += re.findall(r'(/[^\s()]+)', subprocess.check_output(['ldd', '/bin/sh'], text=True))
+for source in dict.fromkeys(paths):
+    target = root / source.lstrip('/')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+editor = root / 'usr/local/bin/henry-editor'
+editor.parent.mkdir(parents=True, exist_ok=True)
+editor.write_text('#!/bin/sh\nprintf "jailed-editor\\n"\n'
+                  'test -f /etc/henryfile || exit 91\n'
+                  'test ! -e "$1" || exit 92\n'
+                  'printf "host-temp-unavailable\\n"\n')
+editor.chmod(0o755)
+PY
+}
+
+begin sudoedit-chroot-default-editor-only && {
+  sudoedit_chroot_setup
+  sudoedit_chroot_editor
+  printf 'Defaults:henry runchroot=/srv/sudoedit-jail\n' >>/etc/sudoers.d/58-sudoedit
+  run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /etc/henryfile'
+  expect_rc 0
+  expect_out_line jailed-editor
+  expect_out_line host-temp-unavailable
+  expect_err_has 'sudoedit: /etc/henryfile unchanged'
+  [[ $(cat /etc/henryfile) == outside ]] || fail 'host original changed'
+  [[ $(cat /srv/sudoedit-jail/etc/henryfile) == inside ]] || fail 'jailed original changed'
+  end
+}
+
+begin sudoedit-chroot-default-wildcard-user-root && {
+  sudoedit_chroot_setup
+  sudoedit_chroot_editor
+  printf 'Defaults:henry runchroot=*\n' >>/etc/sudoers.d/58-sudoedit
+  run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n -R /srv/sudoedit-jail /etc/henryfile'
+  expect_rc 0
+  expect_out_line jailed-editor
+  expect_out_line host-temp-unavailable
+  expect_err_has 'sudoedit: /etc/henryfile unchanged'
+  [[ $(cat /etc/henryfile) == outside ]] || fail 'host original changed'
+  [[ $(cat /srv/sudoedit-jail/etc/henryfile) == inside ]] || fail 'jailed original changed'
+  end
+}
+
+begin sudoedit-chroot-rule-cannot-override-default && {
+  sudoedit_chroot_setup
+  sudoedit_chroot_editor
+  printf 'Defaults:henry runchroot=/srv/sudoedit-jail\nhenry ALL=(ALL:ALL) CHROOT=/ NOPASSWD: sudoedit\n' >/etc/sudoers.d/58-sudoedit
+  run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /etc/henryfile'
+  expect_rc 0
+  expect_out_line jailed-editor
+  expect_err_has 'sudoedit: /etc/henryfile unchanged'
+  end
+}
+
+begin sudoedit-chroot-fixed-default-denies-identical-user-root && {
+  sudoedit_chroot_setup
+  printf 'Defaults:henry runchroot=/srv/sudoedit-jail\n' >>/etc/sudoers.d/58-sudoedit
+  run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n -R /srv/sudoedit-jail /etc/henryfile'
+  expect_rc 1
+  expect_err_has 'you are not permitted to use the -R option with sudoedit'
+  [[ $(cat /etc/henryfile) == outside ]] || fail 'denied request changed host original'
+  end
+}
+
+# Match the exec jail boundary: absolute symlinks whose host realpath leaves the
+# configured root are intentionally refused, even where sudo.ws follows them.
+for escape_kind in editor parent; do
+  begin "sudoedit-chroot-refuses-$escape_kind-escape" && {
+    sudoedit_chroot_setup
+    sudoedit_chroot_editor
+    printf 'Defaults:henry runchroot=/srv/sudoedit-jail\n' >>/etc/sudoers.d/58-sudoedit
+    if [[ $escape_kind == editor ]]; then
+      mkdir -p /srv/sudoedit-jail/usr/bin
+      cp /usr/bin/true /srv/sudoedit-jail/usr/bin/true
+      rm -f /srv/sudoedit-jail/usr/local/bin/henry-editor
+      ln -s /usr/bin/true /srv/sudoedit-jail/usr/local/bin/henry-editor
+    else
+      cp /srv/sudoedit-jail/usr/local/bin/henry-editor /srv/sudoedit-jail/bin/henry-editor
+      rm -rf /srv/sudoedit-jail/usr/local/bin
+      ln -s /bin /srv/sudoedit-jail/usr/local/bin
+    fi
+    run henry 'SUDO_EDITOR=/usr/local/bin/henry-editor sudoedit -n /etc/henryfile'
+    if [[ $LABEL == reference ]]; then
+      expect_rc 0
+      expect_err_has 'sudoedit: /etc/henryfile unchanged'
+    else
+      expect_rc 1
+      expect_err_has 'sudoedit: /usr/local/bin/henry-editor: command resolves outside the chroot directory'
+    fi
+    [[ $(cat /etc/henryfile) == outside ]] || fail 'root escape attempt changed host original'
+    end
+  }
+done

@@ -3,6 +3,7 @@ import LeanSudo.Cli
 import LeanSudo.Env
 import LeanSudo.Timestamp
 import LeanSudo.IoLog
+import LeanSudo.Nsswitch
 
 /-!
 # Decision-core contract (frozen)
@@ -65,6 +66,10 @@ structure Context where
   (`opts.command.head?` is what the user typed). For `-s`/`-i` it is the shell
   command built with `Cli.shellCommand`. Unused for `-e`, `-v`, `-k`, `-K`, `-l`. -/
   command : Option ResolvedCmd
+  /-- Set-user-ID or set-group-ID mode on the host-root resolved command inode. -/
+  commandSetid : Bool := false
+  /-- Root-indexed command lookup and filesystem facts captured before policy. -/
+  rootFacts : List (String × RootCommandFacts) := []
   /-- the invoking user's environment (UTF-8 entries only) -/
   userEnv : EnvList
   /-- current working directory -/
@@ -76,12 +81,19 @@ structure Context where
   /-- realpath oracle for literal command paths written in sudoers (identity when a
   path does not resolve) -/
   canon : String → String
+  canonPaths : List (String × String) := []
   /-- `CLOCK_BOOTTIME` nanoseconds -/
   now : Nat
   /-- timestamp scope of this invocation (`Timestamp.scopeFor settings.timestampType …`) -/
   tsScope : Timestamp.Scope
   /-- records of the invoking uid's timestamp file (`Timestamp.load`; `[]` on any error) -/
   tsRecords : List Timestamp.Record
+  /-- Current session ID for sudo timestamp interoperability. -/
+  tsSessionId : Nat := 0
+  /-- Per-terminal/process lock scope, independent of global authentication tickets. -/
+  tsLockScope : Timestamp.Scope := .global
+  timestampOwnerUid : Nat := 0
+  timestampOwnerGid : Nat := 0
   longHost : String := ""
   interfaces : List (IpAddr × IpAddr) := []
   netgroups : List (String × Option String × Option String × Bool) := []
@@ -99,6 +111,8 @@ structure Context where
   locatedSudoers : List Located := []
   /-- Listing displays all queried NSS backends, even beyond authorization return actions. -/
   listingSources : List Located := []
+  /-- Loaded NSS backends retained for subcommand-specific source selection. -/
+  policySources : List (Nsswitch.Source × List Located) := []
   /-- Pre-privilege Defaults snapshot: winning LDAP options cannot re-authorize a different rule. -/
   policySettings : Option Settings := none
   /-- The target matched before a winning LDAP runas_default callback changes it. -/
@@ -156,6 +170,12 @@ structure ExecPlan where
   iolog : Option IoLog.Plan := none
   execBackground : Bool := false
   staySetuid : Bool := false
+  /-- Root selected by the deciding rule and authorized command-line override. -/
+  chroot : Option String := none
+  /-- Recheck intercepted subcommands against the sudoers policy. -/
+  intercept : Bool := false
+  /-- Log intercepted subcommands even when policy interception is disabled. -/
+  logSubcmds : Bool := false
 
 /-- `sudoedit` (`-e`): files are copied to temporary files owned by the invoking user,
 the editor runs as the invoking user, and changed files are written back as the target
@@ -188,6 +208,8 @@ structure EditPlan where
   editorSources : List String := []
   editorNotFound : String := ""
   editorPath : String := ""
+  /-- Root for the editor child only; sudo.ws still accesses original files on the host. -/
+  chroot : Option String := none
 
 inductive Action where
   | exec (plan : ExecPlan)

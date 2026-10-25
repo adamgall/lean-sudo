@@ -91,10 +91,10 @@ including additional blanks, quotes and sudoers punctuation, stay literal. -/
 def command (text : String) : Except String (Member CmndAtom) := do
   let (neg, text) := negation text
   let (digests, rest) ← match (Parser.readDigests (Parser.context "SSSD" text)).run
-      (Parser.annotate text.toList 1 1 []) with
+      { input := Parser.annotate text.toList 1 1 [] } with
     | .ok result => pure result
     | .error e => throw e.toString
-  let text := String.ofList (rest.map (·.c))
+  let text := String.ofList (rest.input.map (·.c))
   let pathChars := text.toList.takeWhile (!blank ·)
   let path := String.ofList pathChars
   let argsText := String.ofList (text.toList.drop (pathChars.length + 1))

@@ -169,9 +169,13 @@ def editPath (file : String) : Context :=
   | _ => false
 
 -- New execution restrictions are enforced after authentication, never dropped.
-#guard failure { ctx with settings := { ctx.settings with intercept := true } } ==
-  some "sudo: intercept mode is not supported on this system\n"
-#guard execution { ctx with settings := { ctx.settings with logSubcmds := true } } == none
+#guard match (decide { ctx with settings := { ctx.settings with intercept := true } }).action with
+  | .exec p => p.intercept && !p.logSubcmds
+  | _ => false
+#guard match (decide { ctx with settings := { ctx.settings with logSubcmds := true } }).action with
+  | .exec p => !p.intercept && p.logSubcmds
+  | _ => false
+#guard execution { ctx with settings := { ctx.settings with logServers := ["127.0.0.1:30343"] } } |>.isSome
 #guard execution { ctx with opts := { ctx.opts with host := some "remote" } } == none
 #guard execution { ctx with opts := { ctx.opts with closeFrom := some 3 } } |>.isSome
 #guard execution { ctx with opts := { ctx.opts with closeFrom := some 4 } } == none
@@ -239,6 +243,69 @@ def deniedOther : Context :=
 #guard (decide deniedOther).log.isSome
 #guard (editPlan { editCtx with settings := { editCtx.settings with envEditor := false } } selfAuth).editors.head? ==
   some ["vim", "-f"]
+
+def rootedSelection : CommandSelection :=
+  { root := "/jail", command := .run "/usr/bin/id" "/usr/bin/id" ["-u"],
+    executionPath := "/usr/bin/id", argv := ["id", "-u"], execFd := some 17 }
+
+def rootedAllowed : Allowed :=
+  { needsAuth := false, setenv := false, cwd := none, chroot := some "/jail",
+    selection := some rootedSelection }
+
+def rootedFacts : RootCommandFacts :=
+  { command := .run "/usr/bin/id" "/rooted/bin/id" ["-u"], argv := ["id", "-u"],
+    execFd := some 17, canonPaths := [("/usr/bin", "/rooted/bin")],
+    fileIds := [("/usr/bin/id", 7, 11)] }
+
+def rootOnlyCtx : Context :=
+  { ctx with command := none, execFd := some 99, settings := { fdexec := "always" }, sudoers := parsePolicy "alice ALL=(root) CHROOT=/jail NOPASSWD: /usr/bin/id -u\n", rootFacts := [("/jail", rootedFacts)] }
+
+#guard match (decide rootOnlyCtx).action with
+  | .exec p => p.path == "/rooted/bin/id" && p.chroot == some "/jail" &&
+      p.execFd == some 17 && p.argv == ["id", "-u"] && p.envInput.command == "/usr/bin/id -u"
+  | _ => false
+#guard execution { rootOnlyCtx with rootFacts := [("/jail", { rootedFacts with found := false })] } == none
+#guard failure { rootOnlyCtx with opts := { command := ["id", "-u"], chroot := some "/jail" } } ==
+  some "sudo: you are not permitted to use the -R option with /usr/bin/id\n"
+
+#guard resolvedFor { ctx with command := none } rootedAllowed == some idCmd
+#guard descriptorFor { ctx with execFd := some 99 } rootedAllowed == some 17
+#guard descriptorFor { ctx with execFd := some 99 }
+  { rootedAllowed with selection := some { rootedSelection with execFd := none } } == none
+#guard resolvedFor ctx
+  { rootedAllowed with selection := some { rootedSelection with found := false } } == none
+#guard resolvedFor ctx
+  { rootedAllowed with selection := some { rootedSelection with argv := [] } } == none
+#guard selectedExecutionPath { ctx with canon := fun _ => "/host" } rootedAllowed idCmd == "/usr/bin/id"
+#guard commandChroot ctx rootedAllowed == some "/jail"
+#guard !chrootPermitted { ctx with opts := { chroot := some "/jail" } } rootedAllowed
+#guard chrootPermitted { ctx with opts := { chroot := some "/jail" } }
+  { rootedAllowed with chroot := some "*" }
+#guard commandChroot ctx
+  { rootedAllowed with selection := some { rootedSelection with root := "*" } } == none
+#guard commandChroot ctx
+  { rootedAllowed with selection := some { rootedSelection with root := "~missing" } } == none
+#guard enforcementError ctx
+  { rootedAllowed with selection := some { rootedSelection with root := "~missing" } } ==
+  some "invalid chroot directory: ~missing"
+#guard match allowedAction { ctx with command := none }
+    { rootedAllowed with selection := some { rootedSelection with found := false, refusal := some "id: command resolves outside the chroot directory" } } with
+  | .fail message _ => message == "sudo: id: command resolves outside the chroot directory\n"
+  | _ => false
+#guard commandChroot { ctx with opts := { mode := .edit } } rootedAllowed == none
+#guard !chrootPermitted { ctx with opts := { mode := .edit, chroot := some "/jail" } }
+  { rootedAllowed with chroot := some "*" }
+#guard commandChroot { ctx with opts := { mode := .edit }, settings := { runchroot := some "/editor-root" } }
+  rootedAllowed == some "/editor-root"
+#guard failure { ctx with commandSetid := true, settings := { intercept := true, interceptAllowSetid := false } } ==
+  some "sudo: setid commands are not permitted in intercept mode\n"
+#guard !commandSetidFor { ctx with commandSetid := true } rootedAllowed
+#guard commandSetidFor ctx
+  { rootedAllowed with selection := some { rootedSelection with setid := true } }
+#guard commandChroot { ctx with target := carol, policyTarget := some bob }
+  { rootedAllowed with selection := some { rootedSelection with root := "~" } } == some "/home/bob"
+#guard commandChroot { ctx with target := carol, policyTarget := some bob, opts := { mode := .edit }, settings := { runchroot := some "~" } }
+  rootedAllowed == some "/home/carol"
 
 example (c : Context) (p : ExecPlan) (h : (decide c).action = .exec p) :
     p.uid = c.target.uid := (exec_identity c p h).1

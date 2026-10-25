@@ -47,6 +47,9 @@
  *     before runCommand returns.
  */
 #include <lean/lean.h>
+#include "intercept.h"
+#include "intercept_dso.h"
+#include "logsrv.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -450,6 +453,8 @@ enum stage {
   ST_DUP,
   ST_FORK,
   ST_APPARMOR,
+  ST_CHROOT,
+  ST_NOEXEC,
 };
 
 struct child_err {
@@ -472,6 +477,8 @@ struct exec_req {
   gid_t *scratch; /* getgroups buffer, scratch_cap entries */
   int scratch_cap;
   const char *cwd; /* NULL = don't chdir */
+  const char *chroot_dir; /* policy-authorized root; applied only in exec child */
+  const char *noexec_file;
   mode_t umask;
   unsigned closefrom;
   int errfd; /* write end of the CLOEXEC error pipe */
@@ -602,6 +609,8 @@ static void cloexec_from(unsigned from) {
 
 /* Final part of every command child. Signals must still be blocked on entry. */
 __attribute__((noreturn)) static void child_exec(const struct exec_req *r) {
+  if (ls_intercept_trace_child() != 0)
+    child_fail(r->errfd, ST_EXEC, errno, 0, 0);
   ls_iolog_child_close();
   if (restore_startup_signals() != 0)
     child_fail(r->errfd, ST_SIGNALS, errno, 0, 0);
@@ -646,7 +655,24 @@ __attribute__((noreturn)) static void child_exec(const struct exec_req *r) {
     if (n != (ssize_t)len)
       child_fail(r->errfd, ST_APPARMOR, n < 0 ? e : EIO, 0, 0);
   }
+  /* All identity/NSS and policy work is complete before entering the root.
+   * Resolve privileged fd closing outside it, as sudo's exec_setup does. */
+  cloexec_from(r->closefrom);
+  if (r->chroot_dir != NULL &&
+      (chroot(r->chroot_dir) != 0 || chdir("/") != 0))
+    child_fail(r->errfd, ST_CHROOT, errno, 0, 0);
   drop_privileges(r);
+  if (r->noexec_file != NULL) {
+    struct stat st;
+    int fd = open(r->noexec_file, O_RDONLY | O_CLOEXEC);
+    if (fd == -1)
+      child_fail(r->errfd, ST_NOEXEC, errno, 0, 0);
+    int rc = fstat(fd, &st);
+    int saved = errno;
+    close(fd);
+    if (rc != 0 || !S_ISREG(st.st_mode))
+      child_fail(r->errfd, ST_NOEXEC, rc != 0 ? saved : EACCES, 0, 0);
+  }
   if (r->cwd != NULL && chdir(r->cwd) != 0) {
     if (!r->cwd_optional)
       child_fail(r->errfd, ST_CHDIR, errno, 0, 0);
@@ -659,9 +685,14 @@ __attribute__((noreturn)) static void child_exec(const struct exec_req *r) {
     };
     ssize_t ignored = writev(2, parts, 5);
     (void)ignored;
+    if (r->chroot_dir != NULL) {
+      ignored = write(2, "sudo: starting from /\n", sizeof("sudo: starting from /\n") - 1);
+      (void)ignored;
+    }
   }
   umask(r->umask);
-  cloexec_from(r->closefrom);
+  if (ls_intercept_dso_child() != 0)
+    child_fail(r->errfd, ST_EXEC, errno, 0, 0);
   if (r->execfd >= 0) {
     /* Keep binary descriptors close-on-exec. Linux script interpreters need
      * /dev/fd/N after exec; ENOENT is the kernel's CLOEXEC-script indication. */
@@ -732,6 +763,12 @@ static void describe_child_err(const struct exec_req *r, const struct child_err 
     break;
   case ST_VERIFY_REGAIN_GID:
     snprintf(buf, len, "unable to drop privileges: gid 0 could be regained");
+    break;
+  case ST_CHROOT:
+    snprintf(buf, len, "unable to change root to %s: %s", r->chroot_dir, es);
+    break;
+  case ST_NOEXEC:
+    snprintf(buf, len, "unable to load noexec library %s: %s", r->noexec_file, es);
     break;
   case ST_CHDIR:
     snprintf(buf, len, "unable to change directory to %s: %s", r->cwd ? r->cwd : "", es);
@@ -905,11 +942,18 @@ static void nopty_child_stopped(pid_t child, int sig) {
 static int nopty_reap(pid_t child, int *status) {
   for (;;) {
     int st;
-    int r = waitpid_retry(child, &st, WNOHANG | WUNTRACED | WCONTINUED);
+    int tracing = ls_intercept_trace();
+    int r = waitpid_retry(tracing ? -1 : child, &st,
+        WNOHANG | WUNTRACED | WCONTINUED | (tracing ? __WALL : 0));
     if (r < 0)
       return -1;
     if (r == 0)
       return 0;
+    if (tracing) {
+      int consumed = ls_intercept_trace_wait((pid_t)r, st);
+      if (consumed < 0) return -1;
+      if (consumed || r != child) continue;
+    }
     if (WIFEXITED(st) || WIFSIGNALED(st)) {
       *status = st;
       return 1;
@@ -957,12 +1001,15 @@ static lean_obj_res nopty_wait(struct sigstate *ss, pid_t child, unsigned timeou
       return io_errno("waitpid", errno);
     if (r == 1)
       break;
-    struct pollfd pfds[4];
+    struct pollfd pfds[6];
     pfds[0] = (struct pollfd){.fd = ss->pipe_rd, .events = POLLIN};
     io_channel_poll(pfds + 1);
-    if (poll(pfds, 4, timeout_poll(&timer, child, 0)) < 0 && errno != EINTR)
+    pfds[4] = (struct pollfd){.fd = ls_logsrv_queue_fd(), .events = POLLIN};
+    pfds[5] = (struct pollfd){.fd = ls_logsrv_network_fd(), .events = POLLIN};
+    if (poll(pfds, 6, timeout_poll(&timer, child, 0)) < 0 && errno != EINTR)
       return io_errno("poll", errno);
-    if (io_channel_pump(pfds + 1)) {
+    if ((pfds[4].revents && ls_logsrv_dispatch()) ||
+        (pfds[5].revents && ls_logsrv_poll()) || io_channel_pump(pfds + 1)) {
       int e = errno;
       kill(child, SIGKILL);
       waitpid_retry(child, &status, 0);
@@ -976,6 +1023,7 @@ static lean_obj_res nopty_wait(struct sigstate *ss, pid_t child, unsigned timeou
         kill(child, rec.signo);
     }
   }
+  if (ls_logsrv_dispatch()) return io_errno("unable to write remote event log", errno);
   if (io_channels_drain()) return io_errno("unable to write I/O log", errno);
   return lean_io_result_mk_ok(lean_box_uint32(encode_status(status)));
 }
@@ -1229,6 +1277,14 @@ __attribute__((noreturn)) static void monitor_main(struct pty_ctx *p, int sock, 
     close(p->slave);
     child_exec(r);
   }
+  if (ls_intercept_trace_attach(cmd) != 0) {
+    int e = errno;
+    kill(cmd, SIGKILL);
+    ls_intercept_trace_close();
+    int status;
+    (void)waitpid_retry(cmd, &status, 0);
+    child_fail(r->errfd, ST_EXEC, e, 0, 0);
+  }
   ls_iolog_child_close();
   for (int fd = 0; fd < 3; fd++)
     if (io_channels[fd].enabled) close(fd);
@@ -1250,7 +1306,18 @@ __attribute__((noreturn)) static void monitor_main(struct pty_ctx *p, int sock, 
     /* Reap first: SIGCHLD may predate the handler being unblocked. */
     int st;
     pid_t w;
-    while ((w = waitpid_retry(cmd, &st, WNOHANG | WUNTRACED | WCONTINUED)) > 0) {
+    int tracing = ls_intercept_trace();
+    while ((w = waitpid_retry(tracing ? -1 : cmd, &st,
+        WNOHANG | WUNTRACED | WCONTINUED | (tracing ? __WALL : 0))) > 0) {
+      if (tracing) {
+        int consumed = ls_intercept_trace_wait(w, st);
+        if (consumed < 0) {
+          killpg(cmd, SIGKILL);
+          ls_intercept_trace_close();
+          _exit(1);
+        }
+        if (consumed || w != cmd) continue;
+      }
       if (WIFSTOPPED(st)) {
         saved_fg = tcgetpgrp(p->slave);
         if (sock_open)
@@ -1258,6 +1325,7 @@ __attribute__((noreturn)) static void monitor_main(struct pty_ctx *p, int sock, 
         else
           killpg(cmd, SIGCONT); /* nobody to resume us later */
       } else if (WIFEXITED(st) || WIFSIGNALED(st)) {
+        ls_intercept_trace_close();
         close(p->slave);
         if (sock_open)
           bc_send(sock, MSG_EXITED, st);
@@ -1390,7 +1458,7 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
   int sock_open = 1;
   tty_set_raw(p);
   while (!have_status && sock_open) {
-    struct pollfd pfds[7];
+    struct pollfd pfds[9];
     pfds[0] = (struct pollfd){.fd = ss->pipe_rd, .events = POLLIN, .revents = 0};
     pfds[1] = (struct pollfd){.fd = L->sock, .events = POLLIN, .revents = 0};
     short mev = 0;
@@ -1403,11 +1471,15 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
     int want_tty = L->tty_in_ok && p->fg && L->in_len == 0;
     pfds[3] = (struct pollfd){.fd = want_tty ? p->ttyfd : -1, .events = POLLIN, .revents = 0};
     io_channel_poll(pfds + 4);
-    if (poll(pfds, 7, -1) < 0) {
+    pfds[7] = (struct pollfd){.fd = ls_logsrv_queue_fd(), .events = POLLIN};
+    pfds[8] = (struct pollfd){.fd = ls_logsrv_network_fd(), .events = POLLIN};
+    if (poll(pfds, 9, -1) < 0) {
       if (errno == EINTR)
         continue;
       return -1;
     }
+    if (pfds[7].revents && ls_logsrv_dispatch()) return -1;
+    if (pfds[8].revents && ls_logsrv_poll()) return -1;
     if (io_channel_pump(pfds + 4)) return -1;
     if (pfds[2].revents & (POLLIN | POLLHUP | POLLERR))
       pty_pump_master(L);
@@ -1495,6 +1567,7 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
     if (L->log_error) return -1;
   }
   if (io_channels_drain()) return -1;
+  if (ls_logsrv_dispatch()) return -1;
   tty_restore(p);
   return have_status;
 }
@@ -1595,9 +1668,12 @@ static int prepare_options(struct exec_req *r, b_lean_obj_arg noexec,
   }
   if (!lean_is_scalar(noexec)) {
     const char *file = lean_string_cstr(lean_ctor_get(noexec, 0));
-    struct stat st;
-    if (stat(file, &st) != 0) return 0;
-    if (!S_ISREG(st.st_mode) || access(file, R_OK) != 0) { errno = EACCES; return 0; }
+    r->noexec_file = file;
+    if (r->chroot_dir == NULL) {
+      struct stat st;
+      if (stat(file, &st) != 0) return 0;
+      if (!S_ISREG(st.st_mode) || access(file, R_OK) != 0) { errno = EACCES; return 0; }
+    }
     size_t n = 0, slot = 0;
     const char *old = NULL;
     for (size_t i = 0; r->envp[i]; i++) {
@@ -1670,6 +1746,7 @@ LEAN_EXPORT lean_obj_res leansudo_exec_run(b_lean_obj_arg path, b_lean_obj_arg a
                                            b_lean_obj_arg noexec, b_lean_obj_arg apparmor,
                                            b_lean_obj_arg limits, b_lean_obj_arg utmp_user,
                                            uint32_t execfd, uint8_t exec_background, uint8_t stay_setuid,
+                                           b_lean_obj_arg chroot_dir,
                                            lean_obj_arg world) {
   (void)world;
   last_dumped_core = false;
@@ -1684,6 +1761,7 @@ LEAN_EXPORT lean_obj_res leansudo_exec_run(b_lean_obj_arg path, b_lean_obj_arg a
   r.umask = (mode_t)(umask_ & 0777);
   r.closefrom = closefrom < 3 ? 3 : closefrom;
   r.cwd = lean_is_scalar(cwd) ? NULL : lean_string_cstr(lean_ctor_get(cwd, 0));
+  r.chroot_dir = lean_is_scalar(chroot_dir) ? NULL : lean_string_cstr(lean_ctor_get(chroot_dir, 0));
   r.errfd = -1;
   r.cwd_optional = cwd_optional;
   r.timeout = timeout;
@@ -1722,10 +1800,32 @@ LEAN_EXPORT lean_obj_res leansudo_exec_run(b_lean_obj_arg path, b_lean_obj_arg a
     return io_errno("unable to configure command execution", e);
   }
 
+  /* DSO interception modifies only the initial environment. The vector borrows
+   * existing values and has its own two transport variables. */
+  char **plain_env = r.envp;
+  char **intercept_env = NULL;
+  if (ls_intercept_active() && !ls_intercept_trace()) {
+    intercept_env = ls_intercept_dso_environment(plain_env);
+    if (!intercept_env) {
+      int e = errno;
+      free_req(&r);
+      return io_errno("unable to configure command interception", e);
+    }
+    r.envp = intercept_env;
+  }
   lean_obj_res res = run_with_req(&r, use_pty, background);
+  if (intercept_env) {
+    ls_intercept_dso_free_environment(intercept_env);
+    r.envp = plain_env;
+  }
   if (ls_iolog_close(0, 0)) {
     lean_dec(res);
     res = io_errno("unable to close I/O log", errno);
+  }
+  lean_obj_res remote_error = ls_logsrv_take_error();
+  if (remote_error) {
+    lean_dec(res);
+    res = remote_error;
   }
   free_req(&r);
   return res;
@@ -1800,7 +1900,7 @@ static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background
   struct utmpx utmp;
   int utmp_active = pty && utmp_begin(pc.ttyfd, pc.slave, r->utmp_user, &utmp);
 
-  pid_t child = fork();
+  pid_t child = ls_intercept_trace_prepare() == 0 ? fork() : -1;
   if (child == 0) {
     close(errp[0]);
     for (int fd = 0; fd < 3; fd++) {
@@ -1834,7 +1934,34 @@ static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background
   lean_obj_res res;
   if (child < 0) {
     close(errp[0]);
-    res = io_errno("unable to fork", fork_err);
+    res = io_errno("unable to prepare or fork command", fork_err);
+    goto out;
+  }
+  if (pty) {
+    /* Only the monitor owns the tracees; discard our handshake descriptors. */
+    ls_intercept_trace_close();
+  } else if (ls_intercept_trace()) {
+    if (ls_intercept_trace_attach(child) != 0) {
+      int e = errno;
+      kill(child, SIGKILL);
+      ls_intercept_trace_close();
+      int status;
+      (void)waitpid_retry(child, &status, 0);
+      close(errp[0]);
+      res = io_errno("unable to attach command tracer", e);
+      goto out;
+    }
+    /* The exec-error pipe cannot be read synchronously before servicing the
+     * first seccomp stop. Reap/relay normally, then inspect the error report. */
+    res = nopty_wait(&ss, child, r->timeout);
+    ls_intercept_trace_close();
+    struct child_err trace_error;
+    int trace_failed = read_child_err(errp[0], &trace_error);
+    close(errp[0]);
+    if (trace_failed) {
+      lean_dec(res);
+      res = child_error_result(r, &trace_error);
+    }
     goto out;
   }
 
@@ -1877,6 +2004,7 @@ static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background
   }
 
 out:
+  ls_intercept_trace_close();
   if (utmp_active) {
     uint32_t code = lean_io_result_is_ok(res) ? lean_unbox_uint32(lean_io_result_get_value(res)) : 1;
     int status = code >= 0x10000 ? (int)(code - 0x10000) : (int)(code << 8);

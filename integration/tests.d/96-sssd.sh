@@ -120,6 +120,10 @@ EOF
     role-runas-default)
       runas=
       options=$'sudoOption: !authenticate\nsudoOption: runas_default=ivan';;
+    role-runchroot|role-runchroot-cwd)
+      commands='sudoCommand: /usr/bin/jail-tool'
+      options=$'sudoOption: !authenticate\nsudoOption: runchroot=/srv/lean-sudo-jail'
+      [[ $scenario != role-runchroot-cwd ]] || options+=$'\nsudoOption: runcwd=/work';;
     wildcard-command-args)
       commands=$'sudoCommand: /usr/bin/* -[ug]\nsudoCommand: !/usr/bin/print* *';;
     order-deny|nss-files-sss|nss-sss-files|nss-files-success-return|nss-sss-success-return)
@@ -258,13 +262,13 @@ EOF
 
 sssd_compare() {
   local args=$1 expected=$2 ref_rc
-  rm -rf /run/sudo /run/lean-sudo
+  rm -rf /run/sudo
   run ivan "/usr/bin/sudo.ws $args"
   ref_rc=$RC
   expect_rc "$expected"
   cp "$WORK/out" "$SSSD_DIR/reference.out"
   sed 's/sudo\.ws/sudo/g' "$WORK/err" >"$SSSD_DIR/reference.err"
-  rm -rf /run/sudo /run/lean-sudo
+  rm -rf /run/sudo
   run ivan "/usr/bin/sudo $args"
   expect_rc "$ref_rc"
   diff -u "$SSSD_DIR/reference.out" "$WORK/out" >>"$LOG" || fail 'SSSD stdout differs from sudo.ws (see diff in log)'
@@ -274,7 +278,7 @@ sssd_compare() {
 
 for sssd_case in allow deny command-negation user-negation host-negation runas-negation \
     runas-user runas-group runas-group-negation order-allow order-deny order-negative \
-    role-noauth role-auth-scope role-runas-default global-noauth auth-required \
+    role-noauth role-auth-scope role-runas-default role-runchroot role-runchroot-cwd global-noauth auth-required \
     wildcard-command-args list-short list-long list-short-success-return list-long-success-return \
     nss-files-sss nss-sss-files nss-notfound-return nss-notfound-continue \
     nss-files-success-return nss-sss-success-return; do
@@ -288,6 +292,9 @@ for sssd_case in allow deny command-negation user-negation host-negation runas-n
         runas-user) sssd_args='-n -u bob /usr/bin/id -u';;
         runas-group) sssd_args='-n -u bob -g root /usr/bin/id -g';;
         runas-group-negation) sssd_args='-n -u bob -g root /usr/bin/id -g'; sssd_expected=1;;
+        role-runchroot|role-runchroot-cwd)
+          exec_chroot_setup
+          sssd_args='-n /usr/bin/jail-tool';;
         list-short) sssd_args='-n -l';;
         list-long) sssd_args='-n -ll';;
         list-short-success-return|list-long-success-return)
@@ -317,6 +324,12 @@ for sssd_case in allow deny command-negation user-negation host-negation runas-n
           # Measured reference behavior: the rule matches with the initial
           # root default, then its option changes the execution target to ivan.
           expect_out_line "$(uid_of ivan)";;
+        role-runchroot|role-runchroot-cwd)
+          expect_out_line jail-marker
+          expect_out_line 0
+          if [[ $sssd_case == role-runchroot-cwd ]]; then expect_out_line cwd=/work
+          else expect_out_line cwd=/; fi
+          rm -rf /srv/lean-sudo-jail;;
         wildcard-command-args)
           expect_out_line 0
           sssd_compare '-n /usr/bin/id -un' 1

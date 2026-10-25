@@ -1,4 +1,5 @@
 import LeanSudo.Core
+import LeanSudo.Policy.Proofs
 
 /-! End-to-end authorization, identity, environment and authentication invariants.
 The IO shell must successfully perform the returned authentication before execution. -/
@@ -54,13 +55,39 @@ private theorem authJudgement_policyJudgement (ctx : Context) :
   by_cases hm : ctx.opts.mode = .list <;>
     simp [authJudgement, policyJudgement, listOtherDenied, hm]
 
+/-- The executable uses either the ordinary matched command or the complete
+command/argv pair retained by the deciding rooted authorization. -/
+def CommandLineage (ctx : Context) (a : Allowed) (rc : ResolvedCmd) : Prop :=
+  (a.selection = none ∧
+    (request ctx).command = .run rc.path rc.canonical (policyArgs ctx rc)) ∨
+  ∃ selected args, a.selection = some selected ∧ selected.found = true ∧
+    selected.command = .run rc.path rc.canonical args ∧
+    selected.argv = rc.argv0 :: rc.args
+
+private theorem resolvedFor_lineage (ctx : Context) (a : Allowed) (rc : ResolvedCmd)
+    (hm : ctx.opts.mode = .run) (hc : resolvedFor ctx a = some rc) :
+    CommandLineage ctx a rc := by
+  cases hs : a.selection with
+  | none =>
+    have hc' : ctx.command = some rc := by simpa [resolvedFor, hs] using hc
+    exact Or.inl ⟨hs, by simp [request, hm, runCommand, hc']⟩
+  | some selected =>
+    cases hf : selected.found with
+    | false => simp [resolvedFor, hs, hf] at hc
+    | true =>
+      cases hcmd : selected.command <;> cases hargv : selected.argv <;>
+        simp [resolvedFor, hs, hf, hcmd, hargv] at hc
+      case run.cons path canonical args argv0 actual =>
+        cases hc
+        exact Or.inr ⟨selected, args, hs, hf, hcmd, hargv⟩
+
 /-- Every executable plan comes from an allowed resolved run with a checked environment. -/
 theorem exec_origin (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .exec p) :
     ∃ a rc, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
-      ctx.opts.mode = .run ∧ ctx.command = some rc ∧ p = execPlan ctx a rc ∧
+      ctx.opts.mode = .run ∧ resolvedFor ctx a = some rc ∧ p = execPlan ctx a rc ∧
       (∃ env, buildEnv (environment ctx a) = .ok env) ∧
       decide ctx = policyDecision ctx (.allow a) ∧
-      (request ctx).command = .run rc.path rc.canonical (policyArgs ctx rc) ∧ p.argv.tail = rc.args := by
+      CommandLineage ctx a rc ∧ p.argv.tail = rc.args := by
   unfold decide at h ⊢
   cases he : earlyAction ctx with
   | some act => simp only [he] at h; exact False.elim ((early_safe ctx act he).1 p h)
@@ -73,8 +100,10 @@ theorem exec_origin (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .e
       unfold allowedAction at h
       split at h
       · rename_i hm
-        cases hc : ctx.command with
-        | none => simp only [hc, notFound, reduceCtorEq] at h
+        cases hc : resolvedFor ctx a with
+        | none =>
+          cases hf : a.selection.bind (·.refusal) <;>
+            simp only [hc, hf, notFound, reduceCtorEq] at h
         | some rc =>
           simp only [hc] at h
           split at h
@@ -85,8 +114,8 @@ theorem exec_origin (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .e
             | error e => simp [hb] at h
             | ok env =>
               simp only [hb, Action.exec.injEq] at h
-              refine ⟨a, rc, policyJudgement_allow ctx a hj, hm, rfl, h.symm, ⟨env, hb⟩, rfl, ?_, ?_⟩
-              · simp [← h, request, hm, runCommand, hc, execPlan]
+              refine ⟨a, rc, policyJudgement_allow ctx a hj, hm, hc, h.symm, ⟨env, hb⟩, rfl, ?_, ?_⟩
+              · exact resolvedFor_lineage ctx a rc hm hc
               · simp [← h, execPlan]
       all_goals repeat' first | split at h | cases h
 
@@ -122,20 +151,35 @@ theorem edit_origin (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .e
 
 theorem exec_allowed (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .exec p) :
     ∃ a rc, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
-      ctx.command = some rc ∧
-      (request ctx).command = .run rc.path rc.canonical (policyArgs ctx rc) ∧
-      p.path = executionPath ctx rc ∧ p.argv = rc.argv0 :: rc.args := by
+      resolvedFor ctx a = some rc ∧ CommandLineage ctx a rc ∧
+      p.path = selectedExecutionPath ctx a rc ∧ p.argv = rc.argv0 :: rc.args := by
   obtain ⟨a, rc, ha, _, hc, hp, _, _, hr, _⟩ := exec_origin ctx p h
   exact ⟨a, rc, ha, hc, hr, by simp [hp, execPlan], by simp [hp, execPlan]⟩
 
-/-- Execution combines exactly the matched canonical parent and requested basename. -/
+/-- Execution uses precisely the matched canonical parent and requested basename,
+with canonical facts from the deciding root rather than the host's lookup. -/
 theorem exec_path_is_canonical (ctx : Context) (p : ExecPlan)
     (h : (decide ctx).action = .exec p) :
-    ∃ rc, ctx.command = some rc ∧
-      p.path = ctx.canon (dirOf rc.path) ++
-        (if (ctx.canon (dirOf rc.path)).endsWith "/" then "" else "/") ++ baseOf rc.path := by
-  obtain ⟨a, rc, _, _, hc, rfl, _⟩ := exec_origin ctx p h
-  exact ⟨rc, hc, rfl⟩
+    ∃ a rc, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
+      resolvedFor ctx a = some rc ∧
+      ((a.selection = none ∧
+        p.path = ctx.canon (dirOf rc.path) ++
+          (if (ctx.canon (dirOf rc.path)).endsWith "/" then "" else "/") ++ baseOf rc.path) ∨
+       ∃ root facts, (root, facts) ∈ ctx.rootFacts ∧
+         a.selection.map (·.root) = some root ∧
+         p.path = rootCanon facts (dirOf rc.path) ++
+           (if (rootCanon facts (dirOf rc.path)).endsWith "/" then "" else "/") ++ baseOf rc.path) := by
+  obtain ⟨a, rc, ha, _, hc, rfl, _, _, hl, _⟩ := exec_origin ctx p h
+  refine ⟨a, rc, ha, hc, ?_⟩
+  rcases hl with ⟨hs, _⟩ | ⟨selected, args, hs, _, hcommand, _⟩
+  · exact Or.inl ⟨hs, by simp [execPlan, selectedExecutionPath, hs, executionPath]⟩
+  · obtain ⟨root, facts, hm, hroot, hcmd, hpath, _⟩ := evaluate_selection_origin ha hs
+    refine Or.inr ⟨root, facts, hm, by simp [hs, hroot], ?_⟩
+    change selectedExecutionPath ctx a rc = _
+    simp only [selectedExecutionPath, hs, Option.map_some, Option.getD_some]
+    rw [hpath]
+    unfold rootExecutionPath
+    rw [← hcmd, hcommand]
 
 theorem edit_allowed (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .edit p) :
     ∃ a, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
@@ -287,11 +331,13 @@ theorem deny_no_execution (ctx : Context)
   · intro p hp; obtain ⟨a, _, ha, _⟩ := exec_allowed ctx p hp; rw [h] at ha; cases ha
   · intro p hp; obtain ⟨a, ha, _⟩ := edit_allowed ctx p hp; rw [h] at ha; cases ha
 
-theorem command_not_found_no_exec (ctx : Context) (h : ctx.command = none) :
+theorem command_not_found_no_exec (ctx : Context)
+    (h : ∀ a, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a →
+      resolvedFor ctx a = none) :
     ∀ p, (decide ctx).action ≠ .exec p := by
   intro p hp
-  obtain ⟨_, rc, _, _, hc, _⟩ := exec_origin ctx p hp
-  rw [h] at hc
+  obtain ⟨a, rc, ha, _, hc, _⟩ := exec_origin ctx p hp
+  rw [h a ha] at hc
   cases hc
 
 private theorem buildEnv_success_iff (i : EnvInput) :
@@ -360,15 +406,25 @@ theorem administrative_modes_no_auth_or_update (ctx : Context)
     (decide ctx).auth = .none ∧ (decide ctx).updateTimestamp = false := by
   rcases hm with h | h | h | h <;> simp [decide, earlyAction, h]
 
-/-- The descriptor pinned before policy/authentication is passed unchanged to exec. -/
+/-- Execution uses the descriptor pinned for the selected root, or the host
+descriptor only when there is no rooted command selection. -/
 theorem exec_fd_is_pinned (ctx : Context) (p : ExecPlan)
     (h : (decide ctx).action = .exec p) {fd : Nat} (hf : p.execFd = some fd) :
-    ctx.execFd = some fd := by
-  obtain ⟨a, rc, _, _, _, rfl, _⟩ := exec_origin ctx p h
-  simp only [execPlan] at hf
-  split at hf
-  · exact hf
-  · cases hf
+    ctx.execFd = some fd ∨
+      ∃ root facts, (root, facts) ∈ ctx.rootFacts ∧ facts.execFd = some fd := by
+  obtain ⟨a, rc, ha, _, _, rfl, _⟩ := exec_origin ctx p h
+  have hd : descriptorFor ctx a = some fd := by
+    simp only [execPlan] at hf
+    split at hf
+    · exact hf
+    · cases hf
+  cases hs : a.selection with
+  | none => exact Or.inl (by simpa [descriptorFor, hs] using hd)
+  | some selected =>
+    obtain ⟨root, facts, hm, _, _, _, _, _, hfd, _⟩ := evaluate_selection_origin ha hs
+    refine Or.inr ⟨root, facts, hm, ?_⟩
+    rw [← hfd]
+    simpa [descriptorFor, hs] using hd
 
 /-- An unsupported deciding restriction cannot authorize execution. -/
 theorem enforcement_error_no_exec (ctx : Context) (a : Allowed)
@@ -382,11 +438,122 @@ theorem enforcement_error_no_exec (ctx : Context) (a : Allowed)
   rw [hd] at hp
   simp [policyDecision, allowedAction, hm, hc, he] at hp
 
-theorem intercept_no_exec (ctx : Context) (a : Allowed)
+theorem enforcement_error_no_edit (ctx : Context) (a : Allowed)
     (ha : evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a)
-    (hi : a.intercept.getD ctx.settings.intercept = true) :
-    ∀ p, (decide ctx).action ≠ .exec p :=
-  enforcement_error_no_exec ctx a ha (by simp [enforcementError, hi])
+    (he : (enforcementError ctx a).isSome = true) :
+    ∀ p, (decide ctx).action ≠ .edit p := by
+  intro p hp
+  obtain ⟨b, hb, hm, _, _, hd⟩ := edit_origin ctx p hp
+  rw [ha] at hb
+  cases hb
+  rw [hd] at hp
+  simp [policyDecision, allowedAction, hm, he] at hp
+
+/-- Namespace escape facts of the winning lookup cannot be ignored or replaced
+by a host-root fallback, in either execution mode. -/
+theorem selected_refusal_no_execution (ctx : Context) (a : Allowed)
+    (ha : evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a)
+    (href : (a.selection.bind (·.refusal)).isSome = true) :
+    (∀ p, (decide ctx).action ≠ .exec p) ∧
+    (∀ p, (decide ctx).action ≠ .edit p) := by
+  have he : (enforcementError ctx a).isSome = true := by
+    simp [enforcementError, href]
+  exact ⟨enforcement_error_no_exec ctx a ha he, enforcement_error_no_edit ctx a ha he⟩
+
+/-- Interception may execute ordinary programs, but not forbidden set-id inodes
+from either the host lookup or the deciding rooted lookup. -/
+theorem intercept_setid_no_exec (ctx : Context) (a : Allowed)
+    (ha : evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a)
+    (hm : ctx.opts.mode = .run)
+    (hi : a.intercept.getD ctx.settings.intercept = true)
+    (hs : ctx.settings.interceptAllowSetid = false)
+    (hmode : commandSetidFor ctx a = true) :
+    ∀ p, (decide ctx).action ≠ .exec p := by
+  apply enforcement_error_no_exec ctx a ha
+  cases href : (a.selection.bind (·.refusal)).isSome <;>
+    simp [enforcementError, href, hm, hi, hs, hmode]
+
+/-- The selected process root is exactly the authorized root, after home
+expansion; a command-line override requires the deciding wildcard permission. -/
+theorem exec_chroot_selection (ctx : Context) (p : ExecPlan)
+    (h : (decide ctx).action = .exec p) :
+    ∃ a, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
+      chrootPermitted ctx a = true ∧ p.chroot = commandChroot ctx a := by
+  obtain ⟨a, rc, ha, _, _, rfl, _⟩ := exec_origin ctx p h
+  refine ⟨a, ha, ?_, rfl⟩
+  cases hp : chrootPermitted ctx a with
+  | true => rfl
+  | false =>
+    have he : (enforcementError ctx a).isSome = true := by
+      unfold enforcementError
+      repeat first | split | assumption | simp_all
+    exact False.elim (enforcement_error_no_exec ctx a ha he _ h)
+
+theorem exec_user_chroot_requires_wildcard (ctx : Context) (p : ExecPlan)
+    (h : (decide ctx).action = .exec p) {root : String}
+    (hr : ctx.opts.chroot = some root) :
+    ∃ a, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
+      effectiveChroot ctx a = some "*" := by
+  obtain ⟨a, ha, hp, _⟩ := exec_chroot_selection ctx p h
+  exact ⟨a, ha, by simpa [chrootPermitted, hr] using hp⟩
+
+/-- Runtime Defaults cannot move a selected command into a different tilde-root
+after lookup: root expansion uses the same run-as principal as policy matching. -/
+theorem exec_selected_root (ctx : Context) (p : ExecPlan)
+    (h : (decide ctx).action = .exec p) (a : Allowed) (selected : CommandSelection)
+    (ha : evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a)
+    (hs : a.selection = some selected) :
+    p.chroot = ((some selected.root).filter (· != "*")).bind
+      (expandHomePath (ctx.policyTarget.getD ctx.target).home ctx.homes) := by
+  obtain ⟨b, rc, hb, hm, _, rfl, _⟩ := exec_origin ctx p h
+  rw [ha] at hb
+  cases hb
+  simp [execPlan, commandChroot, selectedChroot, hm, hs]
+
+/-- sudoedit roots its editor according to Defaults, not the command's CHROOT
+option; original-file operands remain unchanged (edit_files_match_policy). -/
+theorem edit_chroot_uses_defaults (ctx : Context) (p : EditPlan)
+    (h : (decide ctx).action = .edit p) :
+    p.chroot = ((ctx.opts.chroot.or (authorizationSettings ctx).runchroot).filter (· != "*")).bind
+      (expandHome ctx) := by
+  obtain ⟨a, _, hm, rfl, _⟩ := edit_origin ctx p h
+  simp [editPlan, commandChroot, selectedChroot, configuredChroot, effectiveChroot, hm]
+  rfl
+
+theorem edit_user_chroot_requires_wildcard (ctx : Context) (p : EditPlan)
+    (h : (decide ctx).action = .edit p) {root : String}
+    (hr : ctx.opts.chroot = some root) :
+    (authorizationSettings ctx).runchroot = some "*" := by
+  obtain ⟨a, ha, hm, _, _⟩ := edit_origin ctx p h
+  by_cases hn : (authorizationSettings ctx).runchroot = some "*"
+  · exact hn
+  · have hp : chrootPermitted ctx a = false := by
+      simp [chrootPermitted, effectiveChroot, hm, hr, hn]
+    have he : (enforcementError ctx a).isSome = true := by
+      unfold enforcementError
+      repeat first | split | assumption | simp_all
+    exact False.elim (enforcement_error_no_edit ctx a ha he p h)
+
+
+/-- Remote destinations affect transport, not command-policy enforcement.
+The shell separately enforces the configured logging failure policy. -/
+theorem enforcementError_logServers (ctx : Context) (a : Allowed) (servers : List String) :
+    enforcementError { ctx with settings := { ctx.settings with logServers := servers } } a =
+      enforcementError ctx a := by
+  have he : effectiveChroot { ctx with settings := { ctx.settings with logServers := servers } } a =
+      effectiveChroot ctx a := by
+    cases hp : ctx.policySettings <;> simp [effectiveChroot, authorizationSettings, hp]
+  simp only [enforcementError, chrootPermitted, commandChroot, selectedChroot, configuredChroot, he]
+  rfl
+
+/-- Every execution carries the interception flags of its deciding authorization. -/
+theorem exec_intercept_matches_policy (ctx : Context) (p : ExecPlan)
+    (h : (decide ctx).action = .exec p) :
+    ∃ a, evaluate ctx.sudoers (authorizationSettings ctx) (request ctx) = .allow a ∧
+      p.intercept = a.intercept.getD ctx.settings.intercept ∧
+      p.logSubcmds = ctx.settings.logSubcmds := by
+  obtain ⟨a, rc, ha, _, _, rfl, _⟩ := exec_origin ctx p h
+  exact ⟨a, ha, rfl, rfl⟩
 
 /-- A `%:` atom matches only an affirmative provider answer for this exact
 principal and group. Neither Unix membership nor a missing provider grants it. -/

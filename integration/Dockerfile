@@ -10,7 +10,7 @@ ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       sudo sudo-rs python3 procps util-linux passwd login libpam-modules libpam-runtime \
-      locales language-pack-de-base language-pack-fr-base strace \
+      locales language-pack-de-base language-pack-fr-base strace openssl \
       slapd ldap-utils sssd sssd-ldap libsss-sudo libnss-sss \
  && rm -rf /var/lib/apt/lists/*
 RUN localedef -i de_DE -f UTF-8 de_DE.UTF-8 \

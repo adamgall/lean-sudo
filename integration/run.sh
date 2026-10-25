@@ -79,7 +79,7 @@ fi
 
 # Only the log directory is mounted (writable); everything else is copied in.
 cid=$(docker create \
-  --hostname sudo-it --network none --cap-add SYS_PTRACE \
+  --hostname sudo-it --network none --cap-add SYS_PTRACE --cap-add SYS_ADMIN \
   -v "$here/out:/out" \
   -e IMPL_LABEL="$label" -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
   "${visudo_env[@]}" "${entry[@]}" "$image" "$bin" "$filter")

@@ -69,9 +69,9 @@ def vres (s : Sudoers) : String :=
 /-! ## Ubuntu default policy -/
 
 def ubuntu : Sudoers := [
-  .defaults .global [⟨"env_reset", .flag true⟩, ⟨"mail_badpass", .flag true⟩,
-    ⟨"secure_path", .assign "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"⟩,
-    ⟨"use_pty", .flag true⟩],
+  .defaults .global [{ name := "env_reset", op := .flag true }, { name := "mail_badpass", op := .flag true },
+    { name := "secure_path", op := .assign "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin" },
+    { name := "use_pty", op := .flag true }],
   rule [pos (.name "root")] [pos .all] [spec allAll (pos .all)],
   rule [pos (.group "admin")] [pos .all] [spec (some ⟨some [pos .all], none⟩) (pos .all)],
   rule [pos (.group "sudo")] [pos .all] [spec allAll (pos .all)],
@@ -328,15 +328,15 @@ def isErr (s : Sudoers) : Bool :=
   | .error _ => true
   | .ok _ => false
 
-def g1 (n : String) (op : DefaultsOp) : Entry := .defaults .global [⟨n, op⟩]
+def g1 (n : String) (op : DefaultsOp) : Entry := .defaults .global [{ name := n, op }]
 
 def scopePol : Sudoers := [
-  .defaults (.cmnd [pos (cmd "/usr/bin/ls")]) [⟨"passwd_tries", .assign "9"⟩],
-  .defaults (.runas [pos (.name "bob")]) [⟨"passwd_tries", .assign "8"⟩],
-  .defaults (.user [pos (.name "alice")]) [⟨"passwd_tries", .assign "2"⟩],
-  .defaults (.host [pos (.name "box")]) [⟨"passwd_tries", .assign "4"⟩],
+  .defaults (.cmnd [pos (cmd "/usr/bin/ls")]) [{ name := "passwd_tries", op := .assign "9" }],
+  .defaults (.runas [pos (.name "bob")]) [{ name := "passwd_tries", op := .assign "8" }],
+  .defaults (.user [pos (.name "alice")]) [{ name := "passwd_tries", op := .assign "2" }],
+  .defaults (.host [pos (.name "box")]) [{ name := "passwd_tries", op := .assign "4" }],
   g1 "passwd_tries" (.assign "5"),
-  .defaults (.user [pos (.group "wheel")]) [⟨"rootpw", .flag true⟩]]
+  .defaults (.user [pos (.group "wheel")]) [{ name := "rootpw", op := .flag true }]]
 
 #guard (resolveS scopePol carol (host := "other")).map (·.passwdTries) == some 5
 #guard (resolveS scopePol carol).map (·.passwdTries) == some 5
@@ -405,10 +405,10 @@ def listPol : Sudoers := [
 #guard listPrivileges ubuntu st bob "box" == "User bob is not allowed to run sudo on box.\n"
 
 def listPol2 : Sudoers := [
-  .defaults (.user [pos (.name "bob")]) [⟨"env_keep", .add "LANG LC_ALL"⟩],
-  .defaults (.user [pos (.name "alice")]) [⟨"rootpw", .flag true⟩],
-  .defaults (.runas [pos (.name "root")]) [⟨"set_logname", .flag false⟩],
-  .defaults (.cmnd [pos (cmd "/usr/bin/vi")]) [⟨"env_reset", .flag false⟩, ⟨"umask", .assign "077"⟩],
+  .defaults (.user [pos (.name "bob")]) [{ name := "env_keep", op := .add "LANG LC_ALL" }],
+  .defaults (.user [pos (.name "alice")]) [{ name := "rootpw", op := .flag true }],
+  .defaults (.runas [pos (.name "root")]) [{ name := "set_logname", op := .flag false }],
+  .defaults (.cmnd [pos (cmd "/usr/bin/vi")]) [{ name := "env_reset", op := .flag false }, { name := "umask", op := .assign "077" }],
   rule [pos (.name "bob")] [pos .all] [
     spec asRoot (pos (cmd "/usr/bin/ls")) nopw,
     spec asRoot (pos (cmd "/usr/bin/cat" (.pattern "/var/log/*"))) nopw,
@@ -587,5 +587,88 @@ def digestAliases : Aliases :=
 #guard cmndBase id (.sudoedit ["/etc/hosts"])
   (.digest [{ algo := .sha256, bytes := [1] }] (.sudoedit (.pattern "/etc/hosts"))) none
 #guard !cmndUsesDigest {} oracleFacts 1 (.digest [{ algo := .sha256, bytes := [1] }] .list)
+
+/-! Per-rule CHROOT selects its own command facts, never the host's inode/digest. -/
+def jailFacts : RootCommandFacts :=
+  { command := .run "/bin/id" "/usr/bin/id" ["ignored-policy-args"]
+    argv := ["/bin/id", "-u"]
+    execFd := some 12
+    canonPaths := [("/bin", "/usr/bin"), ("/usr/bin", "/usr/bin")]
+    fileIds := [("/bin/id", 9, 10), ("/usr/bin/id", 9, 10)]
+    globPaths := [("/usr/bin/i*", ["/usr/bin/id"])]
+    regexMatches := [("^/usr/bin/id$", "/usr/bin/id", true)]
+    digests := [{ algo := .sha256, bytes := [4, 5, 6] }] }
+
+def jailRequest : Request :=
+  { (req bob (.run "/host/id" "/host/id" ["-u"])) with
+    rootFacts := [("/jail", jailFacts)]
+    digests := [{ algo := .sha256, bytes := [1, 2, 3] }] }
+
+def jailSpec : CmndSpec :=
+  spec asRoot (pos (cmd "/usr/bin/id" (.pattern "-u"))) nopw { chroot := some "/jail" }
+def jailPolicy : Sudoers := [rule [pos (.name "bob")] [pos .all] [jailSpec]]
+def chosen : Judgement → Option CommandSelection
+  | .allow a => a.selection
+  | .deny => none
+#guard isAllow (evaluate jailPolicy {} jailRequest)
+#guard (chosen (evaluate jailPolicy {} jailRequest)).map (·.root) == some "/jail"
+#guard (chosen (evaluate jailPolicy {} jailRequest)).map (·.command) ==
+  some (.run "/bin/id" "/usr/bin/id" ["-u"])
+#guard (chosen (evaluate jailPolicy {} jailRequest)).map (·.executionPath) == some "/usr/bin/id"
+#guard (chosen (evaluate jailPolicy {} jailRequest)).map (·.argv) == some ["/bin/id", "-u"]
+#guard (chosen (evaluate jailPolicy {} jailRequest)).map (·.execFd) == some (some 12)
+#guard evaluate jailPolicy {} { jailRequest with rootFacts := [] } == .deny
+#guard evaluate jailPolicy {} { jailRequest with requestedChroot := some "/other" } == .deny
+#guard isAllow (evaluate jailPolicy {} { jailRequest with requestedChroot := some "/jail" })
+#guard specRoot { jailRequest with defaultChroot := some "*" } { jailSpec with options := {} } == some none
+#guard specRoot { jailRequest with defaultChroot := some "/jail" } { jailSpec with options := {} } == some (some "/jail")
+#guard specRoot { jailRequest with requestedChroot := some "/jail" }
+  { jailSpec with options := { chroot := some "*" } } == some (some "/jail")
+#guard (specCmndResult {} 1 jailRequest { jailSpec with cmnd := neg (cmd "/usr/bin/i*") }) == some false
+#guard (specCmndResult {} 1 jailRequest
+  { jailSpec with cmnd := pos (.commandRegex "^/usr/bin/id$" .any) }) == some true
+#guard (specCmndResult {} 1 jailRequest
+  { jailSpec with cmnd := pos (.digest [{ algo := .sha256, bytes := [4, 5, 6] }] (cmd "/usr/bin/id")) }) == some true
+#guard (specCmndResult {} 1 jailRequest
+  { jailSpec with cmnd := pos (.digest [{ algo := .sha256, bytes := [1, 2, 3] }] (cmd "/usr/bin/id")) }) == none
+#guard isAllow (evaluate jailPolicy {} { jailRequest with command := .list, rootFacts := [] })
+#guard chosen (evaluate jailPolicy {} { jailRequest with command := .list }) == none
+#guard (specCmndResult {} 1 { jailRequest with rootFacts := [("/jail", { jailFacts with found := false, fileIds := [] })] }
+  { jailSpec with cmnd := pos .all }) == some true
+#guard (specSelection { jailRequest with rootFacts := [("/jail", { jailFacts with found := false })] }
+  jailSpec).map (·.found) == some false
+#guard (chosen (evaluate jailPolicy {} { jailRequest with rootFacts :=
+  [("/jail", { jailFacts with refusal := some "command resolves outside the chroot directory" })] })).bind
+  (·.refusal) == some "command resolves outside the chroot directory"
+
+private def twoJailRequest : Request := { jailRequest with rootFacts :=
+  [("/jail", jailFacts), ("/other-jail", { jailFacts with execFd := some 24 })] }
+private def twoJailPolicy : Sudoers :=
+  [rule [pos (.name "bob")] [pos .all]
+    [jailSpec, { jailSpec with options.chroot := some "/other-jail" }]]
+#guard (chosen (evaluate twoJailPolicy {} twoJailRequest)).map (·.root) == some "/other-jail"
+#guard (chosen (evaluate twoJailPolicy {} twoJailRequest)).bind (·.execFd) == some 24
+#guard (specCmndResult {} 1
+  { jailRequest with rootFacts := [("*", jailFacts)], defaultChroot := some "/other-jail" }
+  { jailSpec with options.chroot := some "*" }) == some true
+#guard (specSelection { jailRequest with rootFacts := [("*", jailFacts)] }
+  { jailSpec with options.chroot := some "*" }).map (·.root) == some "*"
+#guard literalPathMatches id (some { jailRequest with fileIds := [] }) "/bin/id" "/bin/id"
+#guard !literalPathMatches (rootCanon jailFacts) (some { jailRequest with fileIds := [] })
+  "/usr/bin/id" "/bin/id"
+#guard !directoryMatches id (some { jailRequest with fileIds := [] }) "/bin/" "/bin/id"
+#guard (specCmndResult {} 1 { jailRequest with rootFacts :=
+  [("*", { jailFacts with command := .run "/usr/bin/id" "/usr/bin/id" [], fileIds := [] })] }
+  { jailSpec with options.chroot := some "*" }) == some true
+#guard !pathMatches id "/bin/i*" "/bin/id" "/bin/id"
+  (some { jailRequest with fileIds := [], globPaths := [("/bin/i*", ["/bin/id"])] })
+#guard (specCmndResult {} 1 { jailRequest with command := .sudoedit ["/etc/config"], rootFacts := [] }
+  { jailSpec with cmnd := pos (.sudoedit .any) }) == some true
+#guard specSelection { jailRequest with command := .sudoedit ["/etc/config"] }
+  { jailSpec with cmnd := pos (.sudoedit .any) } == none
+#guard specRoot { jailRequest with command := .sudoedit [], requestedChroot := some "/other" }
+  jailSpec == some none
+#guard (chosen (evaluate jailPolicy {} { jailRequest with rootFacts :=
+  [("/jail", { jailFacts with setid := true })] })).any (·.setid)
 
 end Tests.Policy

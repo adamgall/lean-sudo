@@ -85,6 +85,7 @@ partial def loadText (host : String) (depth : Nat) (path text : String) : LoadM 
   | .error e => addError (renderSyntaxError e text)
   | .ok es =>
     for l in es do
+      for warning in l.warnings do addWarning warning
       if (← get).strict then checkRegexes l text
       match l.entry with
       | .include raw =>
@@ -143,6 +144,9 @@ structure Analysis where
   /-- syntax, include and semantic errors (any ⇒ the policy is rejected) -/
   errors : List String
   warnings : List String
+  /-- Parser and applied Defaults warnings, also emitted before the first editor. -/
+  initialWarnings : List String
+  settings : Settings
   editable : Array String
 
 def sourceLine (sources : List (String × String)) (loc : Located) : String :=
@@ -185,6 +189,19 @@ def semanticDiagnostic (sources : List (String × String)) (entries : List Locat
       String.ofList (List.replicate (column - 1) ' ') ++ "^"
   return rendered
 
+def invokingPrincipal : IO (Option Principal) := do
+  let uid ← getuid
+  let name ← if (← geteuid) == 0 then IO.getEnv "SUDO_USER" else pure none
+  let named ← match name.filter (!·.isEmpty) with
+    | some name => getpwnam name
+    | none => pure none
+  let some pw ← if named.isSome then pure named else getpwuid uid | return none
+  let gids ← getgrouplist pw.name pw.gid
+  let groups ← gids.filterMapM fun g => do
+    return (← getgrgid g).map fun gi => (gi.name, gi.gid)
+  return some { name := pw.name, uid := pw.uid, gid := pw.gid, groups,
+                home := pw.home, shell := pw.shell }
+
 def analyze (host path text : String) (strict : Bool)
     (overrides : List (String × String) := []) (createMode : Option UInt32 := none) :
     IO Analysis := do
@@ -192,9 +209,16 @@ def analyze (host path text : String) (strict : Bool)
   let entries := s.entries.toList
   let sem := if s.errors.isEmpty then semanticErrors entries strict else []
   let warnings := if s.errors.isEmpty then semanticWarnings entries strict else []
+  let user ← if s.errors.isEmpty then invokingPrincipal else pure none
+  let applied : Settings × List String := (user.bind fun user =>
+    (resolveDefaults (entries.map (·.entry)) user host none none (verbose := true)).toOption).getD ({}, [])
+  -- Unknown Defaults warnings are already fatal, source-located type errors.
+  -- Keep callback warnings here without duplicating those semantic diagnostics.
+  let callbacks := applied.2.filter fun warning => !sem.any (·.endsWith warning)
   pure { files := s.files, entries,
          errors := s.errors.toList ++ sem.map (semanticDiagnostic s.sources entries),
-         warnings := s.warnings.toList ++ warnings.map (semanticDiagnostic s.sources entries),
+         warnings := warnings.map (semanticDiagnostic s.sources entries),
+         initialWarnings := s.warnings.toList ++ callbacks, settings := applied.1,
          editable := s.editable }
 
 def shortHost : IO String := do
@@ -231,6 +255,7 @@ def checkMode (o : Options) (path : String) : IO UInt32 := do
     | .ok t => pure (path, t)
     | .error e => say s!"visudo: {e}"; return 1
   let a ← analyze (← shortHost) name text o.strict
+  a.initialWarnings.forM say
   for error in a.errors do
     if error.startsWith "visudo: " then eprint error else say error
   a.warnings.forM say
@@ -299,22 +324,6 @@ def chooseEditor (st : Settings) (env : List (String × String)) :
     | [] => pure ()
   return .error s!"no editor found (editor path = {st.editor})"
 
-def invokingPrincipal : IO (Option Principal) := do
-  let uid ← getuid
-  let some pw ← getpwuid uid | return none
-  let gids ← getgrouplist pw.name pw.gid
-  let groups ← gids.filterMapM fun g => do
-    return (← getgrgid g).map fun gi => (gi.name, gi.gid)
-  return some { name := pw.name, uid, gid := pw.gid, groups, home := pw.home, shell := pw.shell }
-
-/-- Settings for the editor choice: the current policy's global/host/user `Defaults`,
-or the compiled-in defaults if it does not load. -/
-def editorSettings (host : String) (a : Analysis) : IO Settings := do
-  unless a.errors.isEmpty do return {}
-  let some user ← invokingPrincipal | return {}
-  match resolveDefaults (a.entries.map (·.entry)) user host none none with
-  | .ok (st, _) => pure st
-  | .error _ => pure {}
 
 partial def whatNow : IO Char := do
   let out ← IO.getStdout
@@ -411,6 +420,7 @@ partial def checkEdits (o : Options) (host : String) (session : IO.Ref (Array Ed
   let overrides := files.toList.map fun f => (f.path, f.tmp)
   let a ← analyze host mainFile.path text o.strict overrides (some mode)
   unless o.quiet do
+    a.initialWarnings.forM eprint
     a.errors.forM eprint
     a.warnings.forM eprint
   let mut files := files
@@ -459,8 +469,10 @@ def editMode (o : Options) (path : String) : IO UInt32 := do
     let (_, text) ← readFileFollow path
     let host ← shortHost
     let current ← analyze host path text o.strict [] (some mode)
-    unless o.quiet do current.errors.forM eprint
-    let editor ← match ← chooseEditor (← editorSettings host current) (← environ) with
+    unless o.quiet do
+      current.initialWarnings.forM eprint
+      current.errors.forM eprint
+    let editor ← match ← chooseEditor current.settings (← environ) with
       | .ok ed => pure ed
       | .error e => throw (IO.userError e)
     let first ← openEditFile path mode

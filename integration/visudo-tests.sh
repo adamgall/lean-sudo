@@ -1073,6 +1073,44 @@ EOF
   end
 }
 
+# Callback warnings belong to the applied global/host/user Defaults phase.
+# Merely type-checking a nonmatching, runas, or command scope must not emit them.
+for scope in global unset user other-user host other-host runas command sudo-user parser-order; do
+  for mode in check quiet-check edit quiet-edit; do
+    begin "defaults-callback-$scope-$mode" && {
+      case $scope in
+        global) line='Defaults runchroot="/"';;
+        unset) line='Defaults !runchroot';;
+        user) line='Defaults:root runchroot="/"';;
+        other-user) line='Defaults:nobody runchroot="/"';;
+        host) line='Defaults@sudo-it runchroot="/"';;
+        other-host) line='Defaults@other-host runchroot="/"';;
+        runas) line='Defaults>root runchroot="/"';;
+        command) line='Defaults!/usr/bin/true runchroot="/"';;
+        sudo-user) line='Defaults:bob runchroot="/"';;
+        parser-order) line='Defaults runchroot="/"';;
+      esac
+      printf '%s\nroot ALL=ALL\n' "$line" >"$WORK/scratch/s"
+      if [[ $scope == parser-order ]]; then
+        printf 'root ALL=CHROOT=/ /usr/bin/true\n' >>"$WORK/scratch/s"
+      fi
+      XENV=(EDITOR="$ED/noop")
+      [[ $scope != sudo-user ]] || XENV+=(SUDO_USER=bob)
+      options=(-f "$WORK/scratch/s")
+      case $mode in
+        check) options+=(-c);;
+        quiet-check) options+=(-cq);;
+        quiet-edit) options+=(-q);;
+      esac
+      vrun "${options[@]}"
+      expect_rc 0
+      compare_reference "${options[@]}"
+      expect_no_tmp "$WORK/scratch/s.tmp"
+      end
+    }
+  done
+done
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------

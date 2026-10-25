@@ -1,3 +1,5 @@
+import LeanSudo.Sys.Core
+
 /-! System-provided matching oracles. The shell records these facts in the pure
 policy request; a failed lookup never grants a policy match. -/
 namespace LeanSudo.Sys
@@ -30,5 +32,21 @@ opaque canonicalHostname (host : @& String) : IO (Except String String)
 audit is a successful no-op, as in sudo's Linux audit backend. -/
 @[extern "leansudo_sys_audit"]
 opaque auditCommand (command tty : @& String) (success : Bool) : IO Bool
+
+/-- Directory containment uses a component boundary, never a bare string prefix. -/
+def withinRoot (root path : String) : Bool :=
+  root == "/" || path == root || path.startsWith (root ++ "/")
+
+theorem withinRoot_boundary (root path : String) (hr : root ≠ "/")
+    (hp : path ≠ root) (h : withinRoot root path = true) :
+    path.startsWith (root ++ "/") = true := by
+  simpa [withinRoot, hr, hp] using h
+
+/-- Prefix lookup must not follow a symlink or parent component outside the jail.
+Missing paths are handled by command lookup/exec, not confused with an escape. -/
+def rootPathEscapes (root path : String) : IO Bool := do
+  let canonical := (← realpath root).getD root
+  let some resolved ← realpath (root ++ path) | return false
+  return !withinRoot canonical resolved
 
 end LeanSudo.Sys

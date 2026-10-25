@@ -159,3 +159,15 @@ begin parser-regex-invalid-ere-refuses-runtime && {
   done
   end
 }
+
+begin parser-chroot-deprecation-token-positions && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/parser <<'EOF'
+nick ALL = CHROOT="/" /usr/bin/true, /usr/bin/false, CHROOT = / /usr/bin/echo
+nick ALL = CHROOT=\
+ "/" /usr/bin/id
+EOF
+  /usr/sbin/visudo.ws -cf /etc/sudoers.d/parser >"$WORK/check" 2>&1 || fail "reference visudo rejected CHROOT warning fixture"
+  run root "sudo -l -U nick >'$WORK/chroot-list-actual' 2>'$WORK/chroot-warnings-actual' && /usr/bin/sudo.ws -l -U nick >'$WORK/chroot-list-reference' 2>'$WORK/chroot-warnings-reference' && diff -u '$WORK/chroot-warnings-reference' '$WORK/chroot-warnings-actual' && test \"\$(wc -l <'$WORK/chroot-warnings-actual')\" -eq 3"
+  expect_rc 0
+  end
+}

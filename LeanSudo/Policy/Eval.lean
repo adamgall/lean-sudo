@@ -30,6 +30,12 @@ member all match (for `-l`/`-v` only user and host lists are checked). For runni
 command the last candidate decides (`judge`); no candidate ⇒ `.deny`.
 For own `-l`/`-v`, every spec of a matching user/host entry is allowing:
 listing ignores validity windows and command negation because it executes no command.
+
+CHROOT matching selects a root-indexed command lookup for each rule. User/host/run-as
+facts and policy arguments remain unchanged; path, stat, glob, regex and digest facts
+come from that root. Missing root facts deny rather than dropping a negated rule.
+The winning `Allowed.selection` carries the selected path, argv and descriptor;
+execution must not substitute the host lookup after authorization.
 -/
 
 namespace LeanSudo.Policy
@@ -302,10 +308,23 @@ def sameFile (facts : Option Request) (p path : String) : Bool :=
     | some (_, d, i), some (_, d', i') => d == d' && i == i'
     | _, _ => false
 
-/-- Literal matching compares the basename, canonical PARENT directory and inode.
-The realpath of the file itself is deliberately not used. -/
+/-- Unlike directory matching, sudo's literal matcher falls back to exact raw
+path equality when either stat fails (`command_matches_normal`). -/
+def literalFileMatches (facts : Option Request) (p path : String) : Bool :=
+  match facts with
+  | none => p == path
+  | some r =>
+    match r.fileIds.find? (·.1 == p), r.fileIds.find? (·.1 == path) with
+    | some (_, d, i), some (_, d', i') => d == d' && i == i'
+    | _, _ => p == path
+
+def pathNamesMatch (canon : String → String) (p path : String) : Bool :=
+  baseOf p == baseOf path && canon (dirOf p) == canon (dirOf path)
+
+/-- Literal matching compares the basename, canonical PARENT directory and inode,
+falling back to the exact path if stat fails. File realpath is deliberately unused. -/
 def literalPathMatches (canon : String → String) (facts : Option Request) (p path : String) : Bool :=
-  baseOf p == baseOf path && canon (dirOf p) == canon (dirOf path) && sameFile facts p path
+  pathNamesMatch canon p path && literalFileMatches facts p path
 
 def directoryMatches (canon : String → String) (facts : Option Request) (p path : String) : Bool :=
   canon (if p == "/" then "/" else dropLastChar p) == canon (dirOf path) &&
@@ -321,7 +340,7 @@ def pathMatches (canon : String → String) (p path _canonical : String)
       facts.any fun r =>
         ((r.globPaths.find? (·.1 == p)).map (·.2)).getD [] |>.any fun q =>
           if endsWithSlash q then directoryMatches canon facts q path
-          else literalPathMatches canon facts q path
+          else pathNamesMatch canon q path && sameFile facts q path
   else if endsWithSlash p then directoryMatches canon facts p path
   else literalPathMatches canon facts p path
 
@@ -383,11 +402,95 @@ def isRunCmd : Command → Bool
   | .run _ _ _ | .sudoedit _ | .checkList => true
   | .list | .validate => false
 
+/-- `none` is an incompatible user-requested root; `some none` uses the host.
+A literal rule root overrides the global default. A global `*` means no root
+unless the user supplied `-R`; a rule `*` is kept for its own lookup.
+sudoedit ignores per-command CHROOT and needs no executable lookup; its editor's
+global root is handled separately by the core. -/
+def specRoot (r : Request) (cs : CmndSpec) : Option (Option String) :=
+  match r.command with
+  | .sudoedit _ => some none
+  | _ =>
+    match r.requestedChroot with
+    | some root =>
+      if cs.options.chroot.any (fun p => p != "*" && p != root) then none
+      else some (some root)
+    | none =>
+      match cs.options.chroot with
+      | some root => some (some root)
+      | none => some (r.defaultChroot.filter (· != "*"))
+
+/-- Root lookup changes only command path resolution, never policy arguments
+or the kind of pseudo-command the caller requested. -/
+def rootedCommand (command : Command) (facts : RootCommandFacts) : Command :=
+  match command, facts.command with
+  | .run _ _ args, .run path canonical _ => .run path canonical args
+  | command, _ => command
+
+def rootCanon (facts : RootCommandFacts) (path : String) : String :=
+  ((facts.canonPaths.find? (·.1 == path)).map (·.2)).getD path
+
+def withRootFacts (r : Request) (facts : RootCommandFacts) : Request :=
+  { r with
+    command := rootedCommand r.command facts
+    canon := rootCanon facts
+    canonPaths := facts.canonPaths
+    fileIds := facts.fileIds
+    globPaths := facts.globPaths
+    regexMatches := facts.regexMatches
+    digests := facts.digests }
+
+def specRequest (r : Request) (cs : CmndSpec) : Option Request :=
+  match specRoot r cs with
+  | none => none
+  | some none => some r
+  | some (some root) =>
+    (r.rootFacts.find? (·.1 == root)).map (fun (_, facts) => withRootFacts r facts)
+
+/-- The rule's logical execution path uses the same canonical parent and basename
+that the matcher compares, not an independently supplied path. -/
+def rootExecutionPath (r : Request) (facts : RootCommandFacts) : String :=
+  match rootedCommand r.command facts with
+  | .run path _ _ =>
+    let parent := rootCanon facts (dirOf path)
+    parent ++ (if parent.endsWith "/" then "" else "/") ++ baseOf path
+  | _ => ""
+
+def specSelection (r : Request) (cs : CmndSpec) : Option CommandSelection := do
+  if !isRunCmd r.command then none else
+  let root ← (specRoot r cs).bind id
+  let (_, facts) ← r.rootFacts.find? (·.1 == root)
+  pure
+    { root := root
+      command := rootedCommand r.command facts
+      executionPath := rootExecutionPath r facts
+      argv := facts.argv
+      found := facts.found
+      execFd := facts.execFd
+      refusal := facts.refusal
+      setid := facts.setid }
+
+/-- Missing oracle data is a hard denial, not a skipped negation. Explicit
+not-found facts still participate, allowing ALL to reach command-not-found handling. -/
+def specCmndResult (al : Aliases) (fuel : Nat) (r : Request) (cs : CmndSpec) : Option Bool :=
+  match specRoot r cs with
+  | none => none
+  | some _ =>
+    match specRequest r cs with
+    | none => some false
+    | some selected =>
+      cmndMemberResult al fuel selected.canon selected.command cs.cmnd (some selected)
+
+def specUsesDigest (al : Aliases) (fuel : Nat) (r : Request) (cs : CmndSpec) : Bool :=
+  isRunCmd r.command && (specRequest r cs).any (fun selected =>
+    cmndUsesDigest al selected fuel cs.cmnd.atom)
+
 /-- A matching command spec, retaining its command member's ALLOW or DENY result. -/
 structure Candidate where
   spec : CmndSpec
   allow : Bool
   usesDigest : Bool := false
+  selection : Option CommandSelection := none
   deriving Repr, BEq, Inhabited
 
 def inTimeWindow (now : Nat) (cs : CmndSpec) (utcOffset : Int) : Bool :=
@@ -400,16 +503,16 @@ def inTimeWindow (now : Nat) (cs : CmndSpec) (utcOffset : Int) : Bool :=
 user and host lists are relevant); otherwise run-as and the command member must match. -/
 def specApplies (al : Aliases) (fuel : Nat) (st : Settings) (r : Request) (cs : CmndSpec) : Bool :=
   !isRunCmd r.command || (inTimeWindow r.now cs r.utcOffset &&
-    (runasOk al fuel st r cs.runas && (cmndMemberResult al fuel r.canon r.command cs.cmnd (some r)).isSome))
+    (runasOk al fuel st r cs.runas && (specCmndResult al fuel r cs).isSome))
 
 /-- Listing/validation are authorized by any applicable user/host entry, even
 one containing only negated commands; execution retains the tri-state result. -/
 def specAllow (al : Aliases) (fuel : Nat) (r : Request) (cs : CmndSpec) : Bool :=
-  if isRunCmd r.command then (cmndMemberResult al fuel r.canon r.command cs.cmnd (some r)).getD false
+  if isRunCmd r.command then (specCmndResult al fuel r cs).getD false
   else true
 
 def candidateOf (al : Aliases) (fuel : Nat) (r : Request) (cs : CmndSpec) : Candidate :=
-  ⟨cs, specAllow al fuel r cs, isRunCmd r.command && cmndUsesDigest al r fuel cs.cmnd.atom⟩
+  ⟨cs, specAllow al fuel r cs, specUsesDigest al fuel r cs, specSelection r cs⟩
 
 def hcCandidates (al : Aliases) (fuel : Nat) (st : Settings) (r : Request) (hc : HostCmnds) :
     List Candidate :=
@@ -455,7 +558,8 @@ def allowedOf (st : Settings) (c : Candidate) : Allowed :=
     apparmorProfile := c.spec.options.apparmorProfile
     privs := c.spec.options.privs
     limitprivs := c.spec.options.limitprivs
-    usesDigest := c.usesDigest }
+    usesDigest := c.usesDigest
+    selection := c.selection }
 
 /-- `listpw`/`verifypw` over the allowing specs. -/
 def pwNeedsAuth (pol : PwPolicy) (st : Settings) (ok : List Candidate) : Bool :=

@@ -54,12 +54,15 @@ Absent catalogs preserve the original English bytes.
 | `LeanSudo/Timestamp.lean` | pure timestamp records, (de)serialisation, validity + proofs |
 | `LeanSudo/IoLog.lean` | pure I/O stream plans (`plan_enabled`), sudo path escapes, base-36 sequence paths, legacy/JSON metadata and timing records |
 | `LeanSudo/EventLog.lean` | pure sudo text wrapping and ordered JSON accept/reject/alert/exit formatting; `@cee:` syslog records, pretty logfile members and compact JSON lines |
+| `LeanSudo/LogSrv.lean` | pure sudo log-server protobuf encoder/decoder, bounded signed/unsigned wire and timestamp round-trip proofs, malformed-message rejection |
 | `LeanSudo/Sys/Core.lean` + `c/core.c` | users/groups/host/tty/stat/realpath/secure read/environ/syslog |
 | `LeanSudo/Sys/Pam.lean` (+ `c/core.c`) | PAM handle + conversation (tty / `-S` stdin / `-n`) |
 | `LeanSudo/Sys/Exec.lean` + `c/exec.c` | privilege drop, fork/execve/wait, signal relay, pty |
+| `LeanSudo/Intercept.lean`, `LeanSudo/Sys/Intercept.lean` + `c/intercept*.c` | pure subcommand authorization, privileged policy broker, Linux seccomp/ptrace monitor and the system sudo-intercept DSO protocol |
 | `LeanSudo/Sys/Timestamp.lean` + `c/ts.c` | timestamp file storage, boot clock, session/process identity |
 | `LeanSudo/Sys/GroupPlugin.lean` + `c/groupplugin.c` | sudo group-provider ABI loading (`dlopen`), version validation, init/query/cleanup; the shell supplies exact `(user, group, answer)` facts to pure policy matching |
 | `LeanSudo/Sys/IoLog.lean` + `c/iolog.c` | fail-closed session creation, locked sequence allocation, owner/mode enforcement, plain/gzip streams, password-prompt filtering; pty and pipe relay hooks in `c/exec.c` |
+| `LeanSudo/Sys/LogSrv.lean` + `c/logsrv.c` | remote event and I/O sessions, initial server failover, durable commits, timed TCP framing and dynamically loaded OpenSSL 3 TLS |
 | `LeanSudo/Core/Types.lean` | decision-core contract: `Context`, `Decision`, `ExecPlan`, `EditPlan`, `Action` |
 | `LeanSudo/Core.lean`, `LeanSudo/CoreProofs.lean` | pure decision core (`decide`) + end-to-end theorems |
 | `LeanSudo/Sudoers/Load.lean` | include resolution + file ownership/mode checks |
@@ -69,6 +72,27 @@ Absent catalogs preserve the original English bytes.
 | `test/` | `Tests` library (`#guard` unit tests, checked by `lake build Tests`) and IO smoke executables |
 | `scripts/AxiomAudit.lean` | checks every `LeanSudo` declaration uses only the standard axioms |
 | `integration/` | Docker-based end-to-end suite (runs as real root in a container) |
+
+Remote logging replaces local I/O files when `log_servers` is configured. The
+Lean client chooses initial destinations in configured order and validates server
+messages and acknowledged commit points. Like sudoers 1.9.17p2, it does not
+reconnect an established session: a lost connection stops the command unless
+I/O errors are ignored, in which case the command continues without logging.
+The pure codec also supports RestartMessage, used by sudo_sendlog rather than
+sudoers' live client. An I/O session sends an exit record and waits for the final
+commit; sudo's audit-only client closes without an exit record. Event setup uses
+`ignore_logfile_errors` (enabled by default), while I/O setup and streaming use
+`ignore_iolog_errors` (disabled by default). A server abort is an error, never a
+reason to reconnect. Interception brokers enqueue encoded events over a private
+socketpair; only the original privileged relay touches the TCP/TLS session.
+
+The C transport applies `log_server_timeout` to DNS resolution, connection,
+TLS negotiation and message transfer; DNS runs in a reaped, deadline-bounded
+resolver child. Sockets are close-on-exec and honor `log_server_keepalive`.
+TLS loads `libssl.so.3` and `libcrypto.so.3`, requires TLS 1.2 or later, and checks
+the certificate chain and hostname or connected peer IP unless verification is
+explicitly disabled. A configured CA bundle and optional client certificate/key
+are passed without substituting a different trust store or credential.
 
 ## Sys API contract (Lean signatures)
 
@@ -168,6 +192,30 @@ runCommand : ExecSpec → IO ExitStatus
 /-- exit(code) or re-raise the signal on ourselves with default disposition. -/
 exitWith : ExitStatus → IO α
 ```
+
+Interception brackets `runCommand` with `Sys.Intercept.withMonitor`. A privileged
+broker captures the original caller/target context; the shell refreshes command
+identity, regex, digest, group-provider and NSS-source facts for every exec and
+calls `Intercept.decide`. C cannot select a different principal or authorize an
+exec by itself. Trace requests transfer a private reply socket using `SCM_RIGHTS`;
+only a well-formed affirmative Lean response permits execution. Missing replies
+and malformed requests fail closed. `intercept_authenticate` holds the timestamp
+record lock across the fresh cache check, PAM authentication and renewal.
+
+The trace backend installs a seccomp filter before dropping credentials, traces
+fork/clone descendants, and skips the initial already-authorized execve.
+`intercept_verify` compares the new executable, arguments and environment while
+stopped before its first instruction. The DSO backend uses Ubuntu's
+`/usr/libexec/sudo/sudo_intercept.so`: an inherited bootstrap socket, a random
+128-bit token, and authenticated loopback connections carrying sudo's protobuf
+messages with the implementation's native-endian 32-bit length prefix. Only the
+bootstrap descriptor survives close-on-exec for the initial handshake.
+Subcommand environments are preserved rather than rebuilt. `log_subcmds` alone
+logs without applying a second sudoers authorization check. Remote subcommand
+records are queued to the parent, never written through a forked TLS state.
+The compatibility boundary is sudo.ws 1.9.17p2's: its trace backend does not
+authorize `execveat`, and DSO interception cannot cover statically linked
+programs or dynamic-loader bypasses. These modes are not a general sandbox.
 
 ### `LeanSudo.Sys.Timestamp`
 ```lean

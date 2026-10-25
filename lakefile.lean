@@ -6,14 +6,14 @@ package «lean-sudo» where
   moreLinkArgs := #["-ldl", "-lutil"]
 
 /-- C shim translation units (each owned by one Lean `LeanSudo.Sys.*` module). -/
-def shimSources : Array String := #["core", "exec", "ts", "visudo", "edit", "sys", "iolog", "lookup", "groupplugin", "sss"]
+def shimSources : Array String := #["core", "exec", "ts", "visudo", "edit", "sys", "iolog", "lookup", "groupplugin", "sss", "logsrv", "intercept", "intercept_trace", "intercept_dso"]
 
 def shimCFlags : Array String :=
   #["-fPIC", "-O2", "-Wall", "-Wextra", "-Werror", "-D_GNU_SOURCE",
     "-fstack-protector-strong", "-D_FORTIFY_SOURCE=2"]
 
 /-- Headers shared by shim translation units; every object is rebuilt when one changes. -/
-def shimHeaders : Array String := #["locale_scope.h"]
+def shimHeaders : Array String := #["locale_scope.h", "logsrv.h", "intercept.h", "intercept_dso.h"]
 
 extern_lib leansudoshim pkg := do
   let leanInc := (← getLeanIncludeDir).toString

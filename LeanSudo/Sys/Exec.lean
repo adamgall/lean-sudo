@@ -1,11 +1,11 @@
 /-!
 # Command execution (`c/exec.c`)
 
-`runCommand` forks, drops privileges in the child in the order
-setgroups → setresgid → setresuid, verifies the drop (`getres[ug]id`, `getgroups`,
+`runCommand` forks, marks fds ≥ `closeFrom` close-on-exec, optionally changes
+the child's root, then drops privileges in the order
+setgroups → setresgid → setresuid. It verifies the drop (`getres[ug]id`, `getgroups`,
 and — unless the target or retained real UID is root — that `setuid(0)` fails),
-then `chdir`, `umask`, marks
-fds ≥ `closeFrom` close-on-exec and `execve`s. Any failure before a successful
+then applies `chdir`, `umask`, and `execve`. Any failure before a successful
 `execve` is reported through a close-on-exec pipe and raised here as an
 `IO.userError` (sudo-style text, e.g. `unable to execute /x: No such file or directory`);
 the child never runs the command in that case.
@@ -29,7 +29,8 @@ treats as "unchanged"), strings must not contain NUL (C would truncate them),
 The shell calls `initializeProcess` before privileged file access. Child execution
 restores the saved dump settings and applies policy resource limits (core defaults
 to 0,0); login cwd failures warn, while required cwd failures abort. NOEXEC loads
-the configured sudo noexec DSO and refuses an absent library. AppArmor profiles
+the configured sudo noexec DSO and refuses an absent or unreadable library,
+including a library absent from the selected chroot. AppArmor profiles
 are ignored when the kernel module is disabled; enabled transitions fail closed.
 Both execution modes enforce command deadlines with
 HUP/TERM followed by KILL after two seconds. Backgrounding forks the supervisor,
@@ -41,9 +42,14 @@ All six real/effective/saved IDs are checked after the transition. PAM and the
 command environment still describe the target; shells may voluntarily drop the
 effective IDs when they differ from the real IDs, just as with sudo.
 
-CHROOT is deliberately not an execution option: the deprecated interface remains
-refused by the deciding core, avoiding NSS and command-resolution exposure inside
-an attacker-controlled root (CVE-2025-32463).
+CHROOT is applied only in the final command child, after policy/PAM and all NSS
+lookups, before dropping UIDs. Pre-policy command facts use root-prefixed paths,
+matching sudo 1.9.17p2 rather than changing the privileged policy process's root
+(CVE-2025-32463). The child starts at `/` and then applies any requested cwd.
+Root-prefixed canonical command and parent paths must remain inside the selected
+root; an escaping absolute symlink is refused before the command is authorized.
+The shell expands tilde roots using host passwd facts and retains each deciding
+root's command identity, descriptor, digest, arguments, and set-id mode separately.
 -/
 
 namespace LeanSudo.Sys
@@ -77,6 +83,8 @@ structure ExecSpec where
   execBackground : Bool := false
   /-- Retain invoking real UID and all GIDs; effective/saved UID still use uid. -/
   staySetuid : Bool := false
+  /-- Authorized chroot directory, entered only in the final command child. -/
+  chroot : Option String := none
   deriving Repr, Inhabited
 
 inductive ExitStatus where
@@ -176,7 +184,8 @@ def check (s : ExecSpec) : Except String Checked := do
   unless s.path.startsWith "/" do
     throw s!"unable to execute {s.path}: path is not absolute"
   unless cSafe s.path && s.argv.all cSafe && s.env.all cSafe &&
-      (s.cwd.map cSafe).getD true && (s.noexecFile.map cSafe).getD true &&
+      (s.cwd.map cSafe).getD true && (s.chroot.map cSafe).getD true &&
+      (s.noexecFile.map cSafe).getD true &&
       (s.apparmorProfile.map cSafe).getD true && (s.utmpUser.map cSafe).getD true &&
       s.rlimits.all (fun (k, v) => cSafe k && cSafe v) do
     throw s!"unable to execute {s.path}: argument contains a NUL byte"
@@ -209,7 +218,8 @@ opaque runRaw (path : @& String) (argv : @& Array String) (env : @& Array String
     (uid gid : UInt32) (groups : @& Array UInt32) (cwd : @& Option String) (umask : UInt32)
     (usePty background : Bool) (closeFrom : UInt32) (cwdOptional : Bool) (timeout : UInt32)
     (noexecFile apparmorProfile : @& Option String) (rlimits : @& Array (String × String))
-    (utmpUser : @& Option String) (execFd : UInt32) (execBackground staySetuid : Bool) : IO UInt32
+    (utmpUser : @& Option String) (execFd : UInt32) (execBackground staySetuid : Bool)
+    (chroot : @& Option String) : IO UInt32
 
 @[extern "leansudo_exec_exit"]
 opaque exitRaw (isSignal : Bool) (n : UInt32) : IO Unit
@@ -243,7 +253,7 @@ def runCommand (s : ExecSpec) : IO ExitStatus := do
   let r ← Exec.runRaw s.path s.argv s.env c.uid c.gid c.groups s.cwd c.umask
     s.usePty s.background c.closeFrom s.cwdOptional s.timeout.toUInt32
     s.noexecFile s.apparmorProfile s.rlimits s.utmpUser
-    (s.execFd.map Nat.toUInt32 |>.getD 0xFFFFFFFF) s.execBackground s.staySetuid
+    (s.execFd.map Nat.toUInt32 |>.getD 0xFFFFFFFF) s.execBackground s.staySetuid s.chroot
   pure (Exec.decodeStatus r)
 
 /-- exit(code) or re-raise the signal on ourselves with default disposition

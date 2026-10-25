@@ -104,6 +104,7 @@ partial def loadFile (host : String) (depth : Nat) (path : String) :
     | .insecure msg => throw <| IO.userError msg
   let mut out : Array Located := #[]
   for loc in entries do
+    for warning in loc.warnings do writeStderr (warning ++ "\n")
     match loc.entry with
     | .include raw =>
       out := out ++ (← loadFile host (depth + 1) (resolveIncludePath path host raw))

@@ -6,6 +6,8 @@ import LeanSudo.Sudoers.Ast
 A scannerless recursive-descent parser for sudoers(5) 1.9.17. Lexical rules follow
 sudo's `toke.l`; unsupported execution features are represented in the AST and
 refused by the decision core, not by the grammar. Syntax errors remain fatal.
+Nonfatal syntax deprecations are retained on each located entry for the runtime
+and visudo loaders to render without changing policy semantics.
 
 Termination: every loop runs over a bounded range of `input length + 1` iterations and
 each iteration consumes at least one character (or exits); running out of iterations
@@ -60,7 +62,24 @@ structure Ctx where
   iteration consumes at least one character or exits, so this is never exhausted. -/
   fuel : Nat
 
-abbrev P := ReaderT Ctx (StateT (List PChar) (Except ParseError))
+structure ParseState where
+  input : List PChar
+  /-- Diagnostics for the current entry, accumulated in reverse order. -/
+  warnings : List String := []
+
+abbrev P := ReaderT Ctx (StateT ParseState (Except ParseError))
+
+def get : P (List PChar) := do return (← getThe ParseState).input
+
+def set (input : List PChar) : P Unit :=
+  modifyThe ParseState fun s => { s with input }
+
+def modify (f : List PChar → List PChar) : P Unit :=
+  modifyThe ParseState fun s => { s with input := f s.input }
+
+def warnAt (pos : Nat × Nat) (message : String) : P Unit := do
+  let warning := s!"{(← read).file}:{pos.1}:{pos.2}: {message}"
+  modifyThe ParseState fun s => { s with warnings := warning :: s.warnings }
 
 /-! ## Character classes -/
 
@@ -785,7 +804,15 @@ def cmndSpec (inh : Inherit) : P (CmndSpec × Inherit) := do
       | "CWD" =>
         let v ← directoryValue w
         options := { options with cwd := some (if v == "*" then none else some v) }
-      | "CHROOT" => options := { options with chroot := some (← directoryValue w) }
+      | "CHROOT" =>
+        ws
+        let start ← curPos
+        let quoted := (← peek) == some '"'
+        let value ← directoryValue w
+        let finish ← curPos
+        let pos := if quoted then (finish.1, finish.2 - 1) else start
+        warnAt pos "\"CHROOT\" is deprecated"
+        options := { options with chroot := some value }
       | "TIMEOUT" =>
         let some n := parseTimeout (← optionValue) | err "invalid timeout"
         options := { options with timeout := some n }
@@ -962,7 +989,13 @@ def defaultsSetting : P DefaultsSetting := do
   ws
   let withValue (mk : String → DefaultsOp) : P DefaultsSetting := do
     if n != 0 then errAt pos s!"negated Defaults setting \"{name}\" cannot take a value"
-    return { name, op := mk (← defaultsValue) }
+    ws
+    let start ← curPos
+    let quoted := (← peek) == some '"'
+    let value ← defaultsValue
+    let finish ← curPos
+    let pos := if quoted then (finish.1, finish.2 - 1) else start
+    return { name, op := mk value, source := some ((← read).file, pos.1, pos.2) }
   match (← peek), (← peek2) with
   | some '+', some '=' =>
     advance; advance
@@ -973,7 +1006,10 @@ def defaultsSetting : P DefaultsSetting := do
   | some '=', _ =>
     advance
     withValue .assign
-  | _, _ => return { name, op := .flag (n % 2 == 0) }
+  | _, _ =>
+    let next ← curPos
+    let pos := if n != 0 then pos else next
+    return { name, op := .flag (n % 2 == 0), source := some ((← read).file, pos.1, pos.2) }
 
 /-- After the `Defaults` keyword. -/
 def defaultsEntry : P Entry := do
@@ -1104,7 +1140,9 @@ def entries : P (List Located) := do
         continue
       let es ← entry
       endOfEntry
-      acc := (es.reverse.map fun e => { file, line := c.line, entry := e }) ++ acc
+      let warnings := (← getThe ParseState).warnings.reverse
+      modifyThe ParseState fun s => { s with warnings := [] }
+      acc := (es.reverse.map fun e => { file, line := c.line, entry := e, warnings }) ++ acc
   err "input too long"
 
 /-! ## Post-conditions -/
@@ -1153,7 +1191,7 @@ end Parser
 open Parser in
 /-- Parse the text of one sudoers file. `file` is used for `Located.file` and errors. -/
 def parse (file : String) (text : String) : Except ParseError (List Located) :=
-  match (entries (context file text)).run (annotate text.toList 1 1 []) with
+  match (entries (context file text)).run { input := annotate text.toList 1 1 [] } with
   | .error e => .error e
   | .ok (es, _) => check file es
 

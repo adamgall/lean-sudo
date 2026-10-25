@@ -11,8 +11,8 @@ Current full-suite results:
 
 | Suite | sudo.ws | lean-sudo |
 |---|---:|---:|
-| sudo | 602/602 | 602/602 |
-| visudo | 114/114 | 114/114 |
+| sudo | 728/728 | 728/728 |
+| visudo | 154/154 | 154/154 |
 
 These are shared compatibility suites, not a claim that every behavior is
 identical: intentional safety differences are encoded in the expectations.
@@ -76,11 +76,13 @@ stock policy and validates them with `visudo.ws -c`. It copies `tests.sh`,
 `ptyrun.py`, all `tests.d/` modules and the vendored `sudo-schema.ldif`.
 
 `run.sh` builds the image and creates a container with
-`--hostname sudo-it --network none --cap-add SYS_PTRACE`. Only
+`--hostname sudo-it --network none --cap-add SYS_PTRACE --cap-add SYS_ADMIN`. Only
 `integration/out/` is mounted, writable; host binaries and the visudo harness are
 copied in. The container is removed on runner exit. `SYS_PTRACE` allows the audit
 cases to use `strace` across credential transitions and inspect actual Linux
-`USER_CMD` netlink records. No host audit daemon or `AUDIT_CONTROL` capability is
+`USER_CMD` netlink records. `SYS_ADMIN` lets both sudo implementations install
+their exec-interception seccomp filter without `no_new_privs`, which would change
+set-ID command semantics. No host audit daemon or `AUDIT_CONTROL` capability is
 required. Tests also capture syslog datagrams locally rather than requiring a
 running syslog service.
 
@@ -149,12 +151,37 @@ explicitly. The numbered prefixes control source order, not ownership.
 | `58-sudoedit-parity.sh` | `sudoedit-parity-*`: temporary names/mtime, size/mtime copyback decisions, multi-file failures, editor selection/PATH/quoting/injection and diagnostic prefixes. |
 | `59-shell-policy.sh` | `shell-policy-*`: unknown-identity error/event ordering, shell versus sudoedit authorization, non-generic PAM challenges and relative-command spelling/logging. |
 | `60-exec.sh` | `exec-*`: resource limits, closed stdin, cwd failures, NOEXEC, timeouts/escalation, background/pty lifecycle, AppArmor, utmp, stay_setuid, signal relay and job control. |
+| `61-timestamp-interop.sh` | `timestamp-interop-*`: bidirectional sudo.ws credential sharing, exact v2 layout, tty/ppid isolation, timeout and `-k`/`-K`, configured directory/owner, malformed and foreign records. |
 | `70-iolog.sh` | `iolog-*`: unmodified `sudoreplay.ws` interoperability, input/output streams, compression, permissions, error policy, path expansion, sequence wrap and password masking. |
 | `80-i18n.sh` | `i18n-*`: byte-for-byte German/French/C diagnostics, help/listing/prompts, LANGUAGE precedence, missing-locale fallback and literal configured messages. |
 | `85-jsonlog.sh` | `jsonlog-*`: json/json_compact/json_pretty file and syslog records for acceptance, denial, authentication rejection, exit/signal, runas group, repeated events and I/O-log linkage. |
 | `95-coverage.sh` | `coverage-*`: differential CLI, authentication/listpw/verifypw, timestamps, umask, shell/cwd/environment, listing, sudoedit, signal and job-control matrices. |
 | `96-sssd.sh` | `sssd-*`: real LDAP/SSSD roles, allow/deny/negation, runas, signed sudoOrder, global/role options, argument wildcards, short/long listings and NSS source/action ordering. |
 | `97-group-plugin.sh` | `group-plugin-*`: shipped group_file/system_group providers, named/numeric membership, negation, aliases/runas/Defaults/listing, always_query_group_plugin and loader/init/ABI failures. |
+| `98-logsrv.sh` | `logsrv-*`: real sudo_logsrvd TCP/TLS events and I/O, generated CA/client credentials, trust/identity failures, unreachable-server policies, failover, final commits, live disconnect/restart failure policy and serialized intercepted subcommands. |
+
+### Real remote logging fixtures
+
+`98-logsrv.sh` starts the packaged `/usr/sbin/sudo_logsrvd` on loopback and writes
+isolated event logs and I/O directories. TLS cases generate their own CA and
+server/client keys with OpenSSL; no external network or trust-store modification
+is required. Each daemon is stopped after its case. The same assertions run
+against sudo.ws and lean-sudo, including the difference between audit-only and
+I/O error policies and the audit-only client's lack of an exit record.
+
+The fixture also saves `integration/out/<implementation>-logsrv-<case>.json`
+snapshots. These preserve event metadata and exact stream bytes while removing
+generated IDs, timestamps, peer addresses, and timing delays. Adjacent reads of
+the same stream are coalesced, retaining their total byte counts: kernel read
+chunk boundaries are nondeterministic. Reference and implementation daemon
+output can then be compared directly.
+
+The disconnect cases wait for the daemon to persist the command's first output,
+terminate and restart the daemon while the command is still running, and verify
+that neither implementation reconnects. The default policy stops the command;
+`ignore_iolog_errors` lets it finish without further logging. Both retain the
+same incomplete log. Additional `-result.json` snapshots record exact command
+status, stdout and stderr.
 
 ### Real SSSD fixtures
 
@@ -194,8 +221,6 @@ under **Fail-closed by design** and **Other differences from sudo.ws**:
   falling back to the default could widen access.
 * Non-UTF-8 command-line arguments are refused; non-UTF-8 environment entries are
   dropped.
-* Timestamps live in `/run/lean-sudo/ts/<uid>` in lean-sudo's own format, so `sudo -k`
-  in one implementation does not affect the other while you switch.
 * A fractional `timestamp_timeout` is rounded down to whole seconds.
 
 The integrity cases assert that insecure grants never take effect and check the
@@ -234,6 +259,11 @@ Coverage includes:
 * Check mode, stdin, quiet/strict checking, explicit files, owner/mode flags,
   missing includes, syntax columns, invalid/unknown Defaults, duplicate and
   undefined/cyclic/unused aliases, and exact CLI help/version/error comparisons.
+* Source-located Defaults callback warnings only for applied global/host/user
+  settings, including `runchroot` deprecation, `SUDO_USER` selection, quiet mode,
+  and parser-before-callback diagnostic ordering. Edit mode emits those warnings
+  before the editor and again when checking the edited policy; unused-alias
+  warnings remain in the final semantic-check phase.
 * Valid edits, discard on `x`/EOF, re-editing, the explicit dangerous `Q` override,
   unchanged/empty files, editor precedence/arguments/status, new files and
   ownership/mode preservation or correction.

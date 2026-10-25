@@ -51,6 +51,27 @@ def runCommand (ctx : Context) : Command :=
   | some rc => .run rc.path rc.canonical (policyArgs ctx rc)
   | none => let typed := ctx.opts.command.headD ""; .run typed typed ctx.opts.command.tail
 
+/-- A rooted authorization uses only its own lookup result and actual execution
+arguments. A missing/malformed rooted result never falls back to the host root. -/
+def resolvedFor (ctx : Context) (a : Allowed) : Option ResolvedCmd :=
+  match a.selection with
+  | none => ctx.command
+  | some selected =>
+    if selected.found then
+      match selected.command, selected.argv with
+      | .run path canonical _, argv0 :: args => some { path, canonical, argv0, args }
+      | _, _ => none
+    else none
+
+/-- A selected root's missing descriptor must not reuse a host-root descriptor. -/
+def descriptorFor (ctx : Context) (a : Allowed) : Option Nat :=
+  match a.selection with
+  | none => ctx.execFd
+  | some selected => selected.execFd
+
+def commandSetidFor (ctx : Context) (a : Allowed) : Bool :=
+  (a.selection.map (·.setid)).getD ctx.commandSetid
+
 def authorizationSettings (ctx : Context) : Settings :=
   ctx.policySettings.getD ctx.settings
 
@@ -63,6 +84,9 @@ def request (ctx : Context) : Request :=
     pluginGroups := ctx.pluginGroups,
     now := ctx.wallTime, utcOffset := ctx.utcOffset, fileIds := ctx.fileIds, globPaths := ctx.globPaths,
     fastGlob := (authorizationSettings ctx).fastGlob,
+    rootFacts := ctx.rootFacts, requestedChroot := ctx.opts.chroot,
+    defaultChroot := (authorizationSettings ctx).runchroot,
+    canonPaths := ctx.canonPaths,
     command := match ctx.opts.mode with
       | .edit => .sudoedit ctx.opts.command
       | .list => if ctx.opts.command.isEmpty then .list else runCommand ctx
@@ -153,20 +177,51 @@ def sudoCommand (ctx : Context) : String :=
   else String.fromUTF8! (text.toUTF8.extract 0 (path.utf8ByteSize + 1 + 4096))
 
 /-- Expand home paths from passwd facts gathered before privilege transition. -/
-def expandHome (ctx : Context) (p : String) : Option String :=
-  if p == "~" then some ctx.target.home
-  else if p.startsWith "~/" then some (ctx.target.home ++ String.ofList (p.toList.drop 1))
+def expandHomePath (targetHome : String) (homes : List (String × String))
+    (p : String) : Option String :=
+  if p == "~" then some targetHome
+  else if p.startsWith "~/" then some (targetHome ++ String.ofList (p.toList.drop 1))
   else if p.startsWith "~" then
     let name := String.ofList ((p.toList.drop 1).takeWhile (· != '/'))
-    (ctx.homes.find? (·.1 == name)).map fun kv =>
+    (homes.find? (·.1 == name)).map fun kv =>
       kv.2 ++ String.ofList (p.toList.drop (name.length + 1))
   else some p
 
+def expandHome (ctx : Context) (p : String) : Option String :=
+  expandHomePath ctx.target.home ctx.homes p
+
 def configuredCwd (ctx : Context) (a : Allowed) : Option String :=
   ctx.opts.chdir.or (a.cwd.join.or ctx.settings.runcwd) |>.filter (· != "*")
+
+/-- Run commands use their deciding CHROOT option; sudoedit ignores that option
+and applies only Defaults runchroot to its editor child, as sudo.ws does. -/
+def effectiveChroot (ctx : Context) (a : Allowed) : Option String :=
+  (if ctx.opts.mode == .edit then none else a.chroot).or (authorizationSettings ctx).runchroot
+
+/-- Even an identical fixed root does not authorize the command-line -R option. -/
+def chrootPermitted (ctx : Context) (a : Allowed) : Bool :=
+  ctx.opts.chroot.isNone || effectiveChroot ctx a == some "*"
+
+/-- The wildcard permits -R; by itself it does not select a new process root. -/
+def configuredChroot (ctx : Context) (a : Allowed) : Option String :=
+  (ctx.opts.chroot.or (effectiveChroot ctx a)).filter (· != "*")
+
+/-- Preserve the winning lookup's root across post-authorization runtime options. -/
+def selectedChroot (ctx : Context) (a : Allowed) : Option String :=
+  if ctx.opts.mode == .edit then configuredChroot ctx a
+  else match a.selection with
+    | some selected => (some selected.root).filter (· != "*")
+    | none => configuredChroot ctx a
+
+def commandChroot (ctx : Context) (a : Allowed) : Option String :=
+  let home := if ctx.opts.mode == .edit then ctx.target.home
+    else (ctx.policyTarget.getD ctx.target).home
+  (selectedChroot ctx a).bind (expandHomePath home ctx.homes)
+
 def environment (ctx : Context) (a : Allowed) : EnvInput :=
   { userEnv := ctx.userEnv, settings := ctx.settings, invoking := ctx.invoking,
-    target := ctx.target, command := sudoCommand ctx, preserve := ctx.opts.preserveEnv,
+    target := ctx.target, command := sudoCommand { ctx with command := resolvedFor ctx a },
+    preserve := ctx.opts.preserveEnv,
     setenvAllowed := a.setenv, cmdlineVars := ctx.opts.envVars, loginShell := ctx.opts.login,
     setHome := ctx.opts.setHome, pamEnv := [], shellMode := ctx.opts.shell,
     invokingRealGid := ctx.invokingRealGid,
@@ -181,6 +236,9 @@ def executionPath (ctx : Context) (rc : ResolvedCmd) : String :=
   let parent := ctx.canon (dirOf rc.path)
   parent ++ (if parent.endsWith "/" then "" else "/") ++ baseOf rc.path
 
+def selectedExecutionPath (ctx : Context) (a : Allowed) (rc : ResolvedCmd) : String :=
+  (a.selection.map (·.executionPath)).getD (executionPath ctx rc)
+
 /-- A user timeout can shorten, but never extend, the deciding rule's limit. -/
 def commandTimeout (ctx : Context) (a : Allowed) : Nat :=
   let policy := a.timeout.getD ctx.settings.commandTimeout
@@ -189,7 +247,7 @@ def commandTimeout (ctx : Context) (a : Allowed) : Nat :=
   | some user => if user == 0 then policy else if policy == 0 then user else min user policy
 
 def execPlan (ctx : Context) (a : Allowed) (rc : ResolvedCmd) : ExecPlan :=
-  { path := executionPath ctx rc, argv := rc.argv0 :: rc.args, envInput := environment ctx a,
+  { path := selectedExecutionPath ctx a rc, argv := rc.argv0 :: rc.args, envInput := environment ctx a,
     uid := ctx.target.uid, gid := commandGid ctx, groups := targetGroups ctx,
     cwd := ((configuredCwd ctx a).bind (expandHome ctx)).or (if ctx.opts.login then some ctx.target.home else none),
     umask := commandUmask ctx,
@@ -199,6 +257,9 @@ def execPlan (ctx : Context) (a : Allowed) (rc : ResolvedCmd) : ExecPlan :=
     pamSetcred := ctx.settings.pamSetcred, cwdOptional := ctx.opts.login && (configuredCwd ctx a).isNone,
     execBackground := ctx.settings.execBackground,
     staySetuid := ctx.settings.staySetuid,
+    intercept := a.intercept.getD ctx.settings.intercept,
+    logSubcmds := ctx.settings.logSubcmds,
+    chroot := commandChroot ctx a,
     timeout := commandTimeout ctx a,
     noexecFile := if a.noexec.getD ctx.settings.noexec then
       some (ctx.settings.noexecFile.getD "/usr/libexec/sudo/sudo_noexec.so") else none,
@@ -206,7 +267,7 @@ def execPlan (ctx : Context) (a : Allowed) (rc : ResolvedCmd) : ExecPlan :=
     utmpUser := if ctx.settings.setUtmp then
       some (if ctx.settings.utmpRunas then ctx.target.name else ctx.invoking.name) else none,
     execFd := if ctx.settings.fdexec != "never" &&
-      (a.usesDigest || ctx.settings.fdexec == "always") then ctx.execFd else none,
+      (a.usesDigest || ctx.settings.fdexec == "always") then descriptorFor ctx a else none,
     rlimits := ctx.settings.resourceLimits,
     iolog := IoLog.plan ctx.settings { logInput := a.logInput, logOutput := a.logOutput } }
 
@@ -230,6 +291,7 @@ def editPlan (ctx : Context) (a : Allowed) : EditPlan :=
     envInput := environment ctx a, umask := commandUmask ctx, pamService := pamService ctx,
     pamSession := ctx.settings.pamSession, pamSetcred := ctx.settings.pamSetcred,
     follow := a.follow.getD ctx.settings.sudoeditFollow, checkdir := ctx.settings.sudoeditCheckdir,
+    chroot := commandChroot ctx a,
     editorSources := candidates.map (·.1),
     editorNotFound := (environmentEditors ctx).getLast?.getD ctx.settings.editor,
     editorPath := (if userIsExempt ctx.settings ctx.invoking then none else ctx.settings.securePath).getD
@@ -248,17 +310,18 @@ def notFound (ctx : Context) : Action :=
 
 /-- Unsupported enforcement never silently drops a deciding rule's restriction. -/
 def enforcementError (ctx : Context) (a : Allowed) : Option String :=
-  if a.intercept.getD ctx.settings.intercept || ctx.settings.logSubcmds then
-    some "intercept mode is not supported on this system"
+  if (a.selection.bind (·.refusal)).isSome then a.selection.bind (·.refusal)
+  else if ctx.opts.mode == .run && a.intercept.getD ctx.settings.intercept &&
+      !ctx.settings.interceptAllowSetid && commandSetidFor ctx a then
+    some "setid commands are not permitted in intercept mode"
   else if ctx.opts.timeout.getD 0 > 0 && !ctx.settings.userCommandTimeouts then
     some "sorry, you are not allowed set a command timeout"
   else if ctx.settings.fdexec != "never" && (a.usesDigest || ctx.settings.fdexec == "always") &&
-      ctx.execFd.isNone then some "unable to execute command: missing command descriptor"
-  else if !ctx.settings.logServers.isEmpty then some "unable to connect to log server"
-  else if (ctx.opts.chroot.or (a.chroot.or ctx.settings.runchroot)).isSome then
-    some (if ctx.opts.chroot.isSome then
-      s!"you are not permitted to use the -R option with {(ctx.command.map (·.path)).getD "sudoedit"}"
-      else "command chroot is not supported on this system")
+      (descriptorFor ctx a).isNone then some "unable to execute command: missing command descriptor"
+  else if !chrootPermitted ctx a then
+    some s!"you are not permitted to use the -R option with {((resolvedFor ctx a).map (·.path)).getD "sudoedit"}"
+  else if (selectedChroot ctx a).isSome && (commandChroot ctx a).isNone then
+    some s!"invalid chroot directory: {(selectedChroot ctx a).getD ""}"
   else if ctx.selinuxEnabled && ((ctx.opts.role.or (a.role.or ctx.settings.role)).isSome ||
       (ctx.opts.type.or (a.type.or ctx.settings.type)).isSome) then
     some "unable to set SELinux security context"
@@ -268,8 +331,10 @@ def enforcementError (ctx : Context) (a : Allowed) : Option String :=
 
 def allowedAction (ctx : Context) (a : Allowed) : Action :=
   match ctx.opts.mode with
-  | .run => match ctx.command with
-    | none => notFound ctx
+  | .run => match resolvedFor ctx a with
+    | none => match a.selection.bind (·.refusal) with
+      | some message => .fail ("sudo: " ++ message ++ "\n") 1
+      | none => notFound ctx
     | some rc =>
       if (enforcementError ctx a).isSome then
         .fail ("sudo: " ++ (enforcementError ctx a).getD "" ++ "\n") 1
@@ -292,7 +357,7 @@ def allowedAction (ctx : Context) (a : Allowed) : Action :=
       .print (listPrivileges policy ctx.settings (ctx.listUser.getD ctx.invoking)
         (displayShortHost ctx) ctx.canon (ctx.opts.listVerbose > 1) located
           (some (request ctx)) ctx.listColumns) 0
-    else match ctx.command with
+    else match resolvedFor ctx a with
       | none => notFound ctx
       | some _ => .print (listCommand ctx.sudoers (authorizationSettings ctx) (request ctx)
           ctx.locatedSudoers (ctx.opts.listVerbose > 1)) 0
@@ -370,7 +435,10 @@ def logLine (ctx : Context) (reason : Option String) (allowed : Option Allowed :
   let cwd := (ctx.opts.chdir.or (allowed.bind (·.cwd.join))).or ctx.settings.runcwd
     |>.filter (· != "*")
   let cwd := (cwd.bind (expandHome ctx)).getD (if ctx.opts.login then ctx.target.home else ctx.cwd)
-  let chroot := ctx.opts.chroot.or ((allowed.bind (·.chroot)).or ctx.settings.runchroot)
+  let chroot := match allowed with
+    | some a => commandChroot ctx a
+    | none => ((ctx.opts.chroot.or ctx.settings.runchroot).filter (· != "*")).bind (expandHome ctx)
+  let commandCtx := (allowed.map (fun a => { ctx with command := resolvedFor ctx a })).getD ctx
   { format := ctx.settings.logFormat, reason,
     priority := (if reason.isSome then ctx.settings.syslogBadpri else ctx.settings.syslogGoodpri).getD "none",
     msg := logEscape (displayUser ctx).name ++ " : " ++ (reason.map (fun s => logEscape s ++ " ; ")).getD "" ++
@@ -380,7 +448,7 @@ def logLine (ctx : Context) (reason : Option String) (allowed : Option Allowed :
       (ctx.targetGroup.map (fun g => s!"GROUP={logEscape g.name} ; ")).getD "" ++
       (if ctx.opts.envVars.isEmpty then "" else
         "ENV=" ++ logEscape (String.intercalate " " (ctx.opts.envVars.map fun (k,v) => k ++ "=" ++ v)) ++ " ; ") ++
-      "COMMAND=" ++ logCommand ctx }
+      "COMMAND=" ++ logCommand commandCtx }
 
 /-- Event output follows the resolved sudoers format, including JSON. -/
 theorem logLine_format (ctx : Context) (reason : Option String) (allowed : Option Allowed) :
