@@ -12,6 +12,7 @@
  */
 #include <lean/lean.h>
 #include "locale_scope.h"
+#include "plugins.h"
 
 #include <dirent.h>
 #include <dlfcn.h>
@@ -125,6 +126,10 @@ static bool utf8_valid(const char *str, size_t n) {
         i += need + 1;
     }
     return true;
+}
+
+int ls_plugin_utf8_valid(const char *text, size_t size) {
+    return utf8_valid(text, size);
 }
 
 /* Make a Lean string from n bytes; NULL if not valid UTF-8. */
@@ -1086,6 +1091,9 @@ typedef struct {
 static volatile sig_atomic_t tty_active;
 static volatile sig_atomic_t tty_interrupted;
 static int tty_fd = -1;
+static struct sudo_conv_callback *plugin_conv_callback;
+static volatile sig_atomic_t plugin_conv_stop;
+static volatile sig_atomic_t plugin_conv_active, plugin_conv_has_callback;
 static struct termios tty_saved, tty_noecho;
 
 static const int tty_sigs[] = {SIGINT, SIGQUIT, SIGTERM, SIGHUP, SIGTSTP, SIGTTIN, SIGTTOU};
@@ -1125,6 +1133,13 @@ static void tty_install_one(size_t i) {
 static void tty_sig_handler(int sig) {
     int saved_errno = errno;
     if (tty_active) tcsetattr(tty_fd, TCSANOW, &tty_saved);
+    if (plugin_conv_has_callback && (sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU)) {
+        plugin_conv_stop = sig;
+        const char byte = 0;
+        while (write(tty_wakeup[1], &byte, 1) < 0 && errno == EINTR) {}
+        errno = saved_errno;
+        return;
+    }
     if (sig == SIGINT || sig == SIGQUIT) {
         tty_interrupted = sig;
         const char byte = 0;
@@ -1229,6 +1244,22 @@ static int read_askpass(sudo_pam_t *st, const char *prompt, char *buf, size_t si
     return result;
 }
 
+static int plugin_prompt_suspend(void) {
+    int signo = plugin_conv_stop, ret = 0;
+    plugin_conv_stop = 0;
+    struct sudo_conv_callback *cb = plugin_conv_callback;
+    if (cb->on_suspend && cb->on_suspend(signo, cb->closure) == -1) ret = -1;
+    /* Never execute plugin callbacks from a signal handler. */
+    struct sigaction dfl = {0}, old;
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    if (sigaction(signo, &dfl, &old) != 0) return -1;
+    raise(signo);
+    sigaction(signo, &old, NULL);
+    if (cb->on_resume && cb->on_resume(signo, cb->closure) == -1) ret = -1;
+    return ret;
+}
+
 /* Read one line into buf (NUL-terminated, newline stripped). Returns CONV_OK or an error. */
 static int read_password(sudo_pam_t *st, const char *prompt, bool echo, char *buf, size_t size) {
     int in, out, own_fd = -1;
@@ -1278,14 +1309,32 @@ static int read_password(sudo_pam_t *st, const char *prompt, bool echo, char *bu
         tty_saved = saved;
         tty_noecho = t;
         int rc;
-        do {
+        for (;;) {
             rc = tcsetattr(in, TCSADRAIN, &t);
-        } while (rc != 0 && errno == EINTR && !tty_interrupted);
+            if (plugin_conv_stop) {
+                if (plugin_prompt_suspend() != 0) {
+                    (void)sigprocmask(SIG_SETMASK, &oldmask, NULL);
+                    tty_restore_handlers();
+                    tty_fd = -1;
+                    if (own_fd >= 0) close(own_fd);
+                    return CONV_ERR_READ;
+                }
+                continue;
+            }
+            if (rc == 0 || errno != EINTR || tty_interrupted) break;
+        }
         if (rc == 0) {
             tty_active = 1;
             noecho = true;
             feedback = st->pwfeedback && own_fd >= 0;
         }
+    }
+    if (plugin_conv_active && !echo && !noecho && !st->use_stdin && !st->visiblepw) {
+        (void)sigprocmask(SIG_SETMASK, &oldmask, NULL);
+        tty_restore_handlers();
+        tty_fd = -1;
+        if (own_fd >= 0) close(own_fd);
+        return CONV_ERR_READ;
     }
 
     if (st->bell && own_fd >= 0) (void)write_str(out, "\a");
@@ -1296,6 +1345,13 @@ static int read_password(sudo_pam_t *st, const char *prompt, bool echo, char *bu
     bool got_any = false;
     int result = CONV_OK;
     for (;;) {
+        if (plugin_conv_stop) {
+            if (plugin_prompt_suspend() != 0) { result = CONV_ERR_READ; break; }
+            if (noecho && tcsetattr(in, TCSANOW, &tty_noecho) != 0) {
+                result = CONV_ERR_READ; break;
+            }
+            if (tty_prepare_wakeup() != 0) { result = CONV_ERR_READ; break; }
+        }
         if (tty_interrupted) { result = CONV_ERR_NO_PASSWORD; break; }
         struct pollfd pfds[2] = {
             {.fd = in, .events = POLLIN},
@@ -1315,6 +1371,7 @@ static int read_password(sudo_pam_t *st, const char *prompt, bool echo, char *bu
         }
         if (pr == 0) { result = CONV_ERR_TIMEOUT; break; }
         if (tty_interrupted) { result = CONV_ERR_NO_PASSWORD; break; }
+        if (plugin_conv_stop) continue;
         char c;
         ssize_t k = read(in, &c, 1);
         if (k < 0) {
@@ -1372,6 +1429,58 @@ static int read_password(sudo_pam_t *st, const char *prompt, bool echo, char *bu
     if (own_fd >= 0) close(own_fd);
     if (result != CONV_OK) explicit_bzero(buf, size);
     return result;
+}
+
+static sudo_pam_t plugin_prompt;
+static int pam_askpass_identity(sudo_pam_t *st);
+
+int ls_plugin_conversation_config(int bell, const char *askpass) {
+    char *copy = askpass && *askpass ? strdup(askpass) : NULL;
+    if (askpass && *askpass && !copy) return -1;
+    if (copy) {
+        int err = pam_askpass_identity(&plugin_prompt);
+        if (err) { free(copy); errno = err; return -1; }
+    } else {
+        free(plugin_prompt.askpass_groups);
+        plugin_prompt.askpass_groups = NULL;
+        plugin_prompt.askpass_ngroups = 0;
+    }
+    free(plugin_prompt.askpass);
+    plugin_prompt.askpass = copy;
+    plugin_prompt.bell = bell;
+    return 0;
+}
+
+/* Share PAM's bounded, signal-safe terminal reader with plugin conversations. */
+int ls_plugin_read_reply(const char *prompt, int type, unsigned timeout,
+    int use_stdin, char *buf, size_t size, struct sudo_conv_callback *callback) {
+    if (plugin_conv_active) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (callback && SUDO_API_VERSION_GET_MAJOR(callback->version) != 1) callback = NULL;
+    sudo_pam_t st = plugin_prompt;
+    st.use_stdin = use_stdin;
+    st.timeout = timeout;
+    st.pwfeedback = (type & 0xff) == SUDO_CONV_PROMPT_MASK;
+    st.visiblepw = (type & SUDO_CONV_PROMPT_ECHO_OK) != 0;
+    plugin_conv_callback = callback;
+    plugin_conv_stop = 0;
+    plugin_conv_active = 1;
+    plugin_conv_has_callback = callback != NULL;
+    int ret = read_password(&st, prompt,
+        (type & 0xff) == SUDO_CONV_PROMPT_ECHO_ON, buf, size);
+    plugin_conv_has_callback = 0;
+    plugin_conv_active = 0;
+    plugin_conv_callback = NULL;
+    plugin_conv_stop = 0;
+    if (ret != CONV_OK) {
+        const char *message = conv_error_message(ret);
+        if (message) fprintf(stderr, "sudo: %s\n", message);
+        errno = ret == CONV_ERR_TIMEOUT ? ETIMEDOUT : EIO;
+        return -1;
+    }
+    return 0;
 }
 
 static bool is_generic_password_prompt(const char *p) {

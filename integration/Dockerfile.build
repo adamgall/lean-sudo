@@ -26,5 +26,10 @@ RUN --mount=type=cache,id=lean-sudo-lake,sharing=locked,target=/src/.lake \
     lake build sudo visudo \
  && mkdir -p /out && cp .lake/build/bin/sudo .lake/build/bin/visudo /out/
 
+# Export the independent ABI fixture alongside the implementation binaries.
+RUN curl -fsSL https://raw.githubusercontent.com/sudo-project/sudo/v1.9.17p2/include/sudo_plugin.h \
+      -o /tmp/sudo_plugin.h \
+ && cc -std=c11 -O2 -fPIC -shared -I/tmp integration/plugin-host.c -o /out/plugin-host.so
+
 FROM scratch AS artifact
 COPY --from=build /out/ /

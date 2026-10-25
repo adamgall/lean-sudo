@@ -11,7 +11,7 @@ Current full-suite results:
 
 | Suite | sudo.ws | lean-sudo |
 |---|---:|---:|
-| sudo | 852/852 | 852/852 |
+| sudo | 894/894 | 894/894 |
 | visudo | 154/154 | 154/154 |
 
 These are shared compatibility suites, not a claim that every behavior is
@@ -145,7 +145,7 @@ explicitly. The numbered prefixes control source order, not ownership.
 | `40-cli-env-core.sh` | `cli-core-*`: help/version and option ordering, prompts, shell/login/edit modes, environment construction and PAM merging, preserve/assignment precedence, runas checks, listing/validation denial and cwd selection. |
 | `50-shell-pam.sh` | `shell_*`: askpass/configuration, terminal discovery, logging/mail, lectures/insults/timeouts, PAM account/session behavior and expired-account cache protection. |
 | `55-locale-time.sh` | `locale-time-*`: caller TZ isolation for validity windows, preserved command TZ, translated PAM/libc diagnostics, policy-locale regex matching and log timestamps/paths. |
-| `56-nsswitch.sh` | `nsswitch-*`: sudoers source parsing/defaults/order, unavailable SSSD, no implicit local-policy fallback, empty/unknown-source safety expectations. |
+| `56-nsswitch.sh` | `nsswitch-*`: source/action parsing and ordering, silent omission of unsupported backends, files fallback for empty selections, and no local-policy fallback when supported SSSD is unavailable. |
 | `57-shell-residual.sh` | `shell-residual-*`: noninteractive authentication, visible passwords, EOF/interrupt accounting, file/syslog/audit events, real GID, dot/PATH lookup and timestamp scope/invalidation. |
 | `58-command-lookup.sh` | `command-lookup-*`: runas-first lookup, invoker fallback, private directories, execute-bit/nonregular checks, list resolution and terminal dot-search results. |
 | `58-sudoedit-parity.sh` | `sudoedit-parity-*`: temporary names/mtime, size/mtime copyback decisions, multi-file failures, editor selection/PATH/quoting/injection and diagnostic prefixes. |
@@ -160,6 +160,7 @@ explicitly. The numbered prefixes control source order, not ownership.
 | `96-sssd.sh` | `sssd-*`: real LDAP/SSSD roles, allow/deny/negation, runas, signed sudoOrder, global/role options, argument wildcards, short/long listings and NSS source/action ordering. |
 | `97-group-plugin.sh` | `group-plugin-*`: shipped group_file/system_group providers, named/numeric membership, negation, aliases/runas/Defaults/listing, always_query_group_plugin and loader/init/ABI failures. |
 | `98-logsrv.sh` | `logsrv-*`: real sudo_logsrvd TCP/TLS events and I/O, generated CA/client credentials, trust/identity failures, unreachable-server policies, failover, final commits, live disconnect/restart failure policy, malformed frames and serialized intercepted subcommands. |
+| `99b-plugins.sh` | `plugin host`: shipped audit_json event structure/status, approval restrictions/options, extra I/O streams/terminal/binary data, callback lifecycle, loader failures, plugin version output, trace/DSO intercepted approval and log-only audit, and comment/CRLF/escaped-continuation parsing. The fixture DSO is compiled in a separate Docker build stage. |
 
 ### Real remote logging fixtures
 
@@ -228,8 +229,8 @@ under **Fail-closed by design** and **Other differences from sudo.ws**:
 The integrity cases assert that insecure grants never take effect and check the
 diagnostic; syntax-error cases allow either reference recovery or fail-closed
 refusal. The group-writable include case specifically uses a non-root group.
-The NSS module explicitly branches its empty/unknown-source expectations by
-implementation, and visudo's alias cases encode its stricter validation rather
+NSS empty/unknown-source cases require the same silent files fallback from both
+implementations. Visudo's alias cases encode its stricter validation rather
 than skipping tests.
 
 Unknown Defaults are not the same as invalid values: runtime

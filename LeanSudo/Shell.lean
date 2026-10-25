@@ -21,6 +21,7 @@ import LeanSudo.Sys.LogSrv
 import LeanSudo.I18n.Load
 import LeanSudo.Intercept
 import LeanSudo.Sys.Intercept
+import LeanSudo.Sys.Plugins
 
 /-! Linux IO boundary: collect facts, execute the verified decision, and bracket PAM
 resources. Policy decisions belong to `Core.decide`, not this module. -/
@@ -1053,14 +1054,17 @@ private def interceptedContext (original : Core.Context) (root : Option String) 
     regexMatches := facts.regexMatches, netgroups := facts.netgroups,
     pluginGroups := facts.pluginGroups, digests, wallTime := facts.now }
 
-private def interceptedAuthorize (ctx : Core.Context) (enforce : Bool)
+private def interceptedAuthorize (ctx : Core.Context) (enforce plugins : Bool)
     (req : Sys.Intercept.Request) : IO Bool := do
   let decision := Intercept.decide ctx enforce req.setid
   let logCtx := { ctx with settings := { ctx.settings with runcwd := none } }
   let commandEnv := some (Intercept.environment req.env).toList
   if !decision.allowed then
     audit ctx false
-    Sys.LogSrv.subcommand (← jsonDetails ctx false commandEnv) decision.reason
+    let details ← jsonDetails ctx false commandEnv
+    if plugins && enforce then
+      Sys.Plugins.reject "command rejected by policy" false (Sys.Plugins.rejectionInfo ctx details.source)
+    Sys.LogSrv.subcommand details decision.reason
     if ctx.settings.logDenied then
       let _ ← logLine logCtx (Core.logLine logCtx decision.reason)
         (remote := false) (commandEnv := commandEnv)
@@ -1088,7 +1092,20 @@ private def interceptedAuthorize (ctx : Core.Context) (enforce : Bool)
           account ctx h
           pure true
       finally cleanup (Sys.pamEnd h 0)
-    if !authenticated then return false
+    if !authenticated then
+      if plugins then Sys.Plugins.reject "authentication failure" true #[]
+      return false
+  if plugins then
+    let mut info := #[]
+    if enforce then
+      let .allow allowed := Core.policyJudgement ctx | return false
+      let some command := ctx.command | return false
+      let plan := Core.execPlan ctx allowed command
+      info := Sys.Plugins.commandInfo ctx plan (← jsonDetails ctx true commandEnv).source
+      info := info.filter fun entry => !entry.startsWith "command=" && !entry.startsWith "runcwd="
+    info := info ++ #["command=" ++ req.command, "runcwd=" ++ req.cwd]
+    if !(← Sys.Plugins.checkSubcommand info req.argv req.env enforce) then
+      return false
   audit ctx true
   Sys.LogSrv.subcommand (← jsonDetails ctx true commandEnv) none
   if ctx.settings.logAllowed then
@@ -1097,24 +1114,26 @@ private def interceptedAuthorize (ctx : Core.Context) (enforce : Bool)
     pure ()
   return true
 
-private def interceptedCheck (original : Core.Context) (root : Option String) (enforce : Bool)
+private def interceptedCheck (original : Core.Context) (root : Option String) (enforce plugins : Bool)
     (req : Sys.Intercept.Request) : IO Bool := do
   try
     let ctx ← interceptedContext original root enforce req
     if enforce && ctx.settings.interceptAuthenticate then
-      withInterceptedAuthentication ctx (fun fresh => interceptedAuthorize fresh enforce req)
-    else interceptedAuthorize ctx enforce req
+      withInterceptedAuthentication ctx (fun fresh => interceptedAuthorize fresh enforce plugins req)
+    else interceptedAuthorize ctx enforce plugins req
   catch e =>
     warn e.toString
     return false
 
 private def executeAction (ctx : Core.Context) (decision : Core.Decision)
-    (h : Option Sys.PamHandle) : IO Sys.ExitStatus := do
+    (h : Option Sys.PamHandle) (plugins : Bool) : IO Sys.ExitStatus := do
   let editor ← match decision.action with
     | .edit plan => Sudoedit.select ctx.progname plan
     | _ => pure none
   if let .edit _ := decision.action then
-    if editor.isNone then return .exited 1
+    if editor.isNone then
+      if plugins then Sys.Plugins.reject "policy plugin error" true #[]
+      return .exited 1
   let editorLine := match decision.action, editor with
     | .edit plan, some editor =>
       if decision.log.isNone && !decision.mail then none else
@@ -1164,6 +1183,32 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
         tty := ctx.ttyName.getD "unknown",
         argv := (editor.words ++ ["--"] ++ plan.policyFiles).toArray } ctx.settings.sudoersLocale
     | _ => pure none
+  if plugins then
+    let source := (← jsonDetails ctx true).source
+    let approved ← match decision.action with
+      | .exec plan =>
+        Sys.Plugins.check (Sys.Plugins.commandInfo ctx plan source iologPath)
+          plan.argv.toArray (envToArray (← fromExcept (buildEnv plan.envInput)))
+      | .edit plan => do
+        let some editor := editor | throw (IO.userError "missing selected editor")
+        Sys.Plugins.check (Sys.Plugins.editCommandInfo ctx plan editor.path source iologPath)
+          (editor.words ++ ["--"] ++ plan.policyFiles).toArray
+          (envToArray ctx.userEnv)
+      | .fail _ _ => do
+        Sys.Plugins.reject "command rejected by policy" false (Sys.Plugins.rejectionInfo ctx source)
+        pure true
+      | .print _ code =>
+        if code == 0 then
+          Sys.Plugins.accept #["command=list"] ctx.opts.command.toArray (envToArray ctx.userEnv)
+        else do
+          Sys.Plugins.reject "command rejected by policy" false #["command=list"]
+          pure true
+      | .validate =>
+        Sys.Plugins.accept #["command=validate"] #[] (envToArray ctx.userEnv)
+      | _ => pure true
+    if executes then
+      if !Sys.Plugins.approvalPermits decision approved then return .exited 1
+    else if !approved then return .exited 1
   if let some (.reject _) := decision.audit then audit ctx false
   let event ← match decision.log with
     | some line => logLine ctx (editorLine.getD line) iologPath (detailsOverride := editorDetails)
@@ -1199,7 +1244,7 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
             throw (IO.userError "setid commands are not permitted in intercept mode")
         Sys.Intercept.withMonitor (ctx.settings.interceptType == "trace")
           (plan.intercept && ctx.settings.interceptVerify) (!plan.intercept)
-          (interceptedCheck ctx plan.chroot plan.intercept) run
+          (interceptedCheck ctx plan.chroot plan.intercept plugins) run
       else run
     logExit ctx event started status
     return status
@@ -1251,7 +1296,7 @@ private def execute (ctx : Core.Context) (decision : Core.Decision)
       Core.policyNeedsAuth ctx (Core.authJudgement ctx
         (Core.policyJudgement ctx))
   if !needsSession && !needsAuth && !decision.updateTimestamp then
-    return ← executeAction ctx decision none
+    return ← executeAction ctx decision none (!conf.plugins.isEmpty)
   let askpass := ((ctx.userEnv.lookup "SUDO_ASKPASS").filter (!·.isEmpty)).or conf.askpass
   let useAskpass := ctx.opts.askpass || (!ctx.opts.stdin && ctx.ttyName.isNone &&
     !ctx.settings.visiblepw && (ctx.userEnv.lookup "DISPLAY").isSome && askpass.isSome)
@@ -1306,8 +1351,10 @@ private def execute (ctx : Core.Context) (decision : Core.Decision)
         return (out, (true, 0))) warn
     let (approved, signal) ← authorized
     if !approved then
+      if !conf.plugins.isEmpty then
+        Sys.Plugins.reject "authentication failure" true #[]
       return if signal == 0 then .exited 1 else .signaled signal
-    executeAction ctx decision (some h)
+    executeAction ctx decision (some h) (!conf.plugins.isEmpty)
   finally
     cleanup (Sys.pamEnd h 0)
 
@@ -1331,10 +1378,13 @@ private def configuration : IO SudoConf.Config := do
 /-- `/proc/self/cmdline` preserves argv[0] (unlike the executable's realpath) and
 lets us reject invalid UTF-8 before decoded Lean arguments reach policy. -/
 def run (args : List String) : IO UInt32 := do
+  let mut diagnosticProgname := "sudo"
   try
     Sys.initializeProcess false
     I18n.initializeLocale
     let conf ← configuration
+    let pluginUserInfo ← if conf.plugins.isEmpty then pure #[]
+      else Sys.Plugins.userInfo conf.groupSource conf.maxGroups.toUInt32
     Sys.initializeProcess conf.disableCoredump
     if (← Sys.geteuid) != 0 then
       if ← Sys.noNewPrivs then
@@ -1357,6 +1407,7 @@ def run (args : List String) : IO UInt32 := do
     let first := ByteArray.mk ((raw.data.toList.takeWhile (· != 0)).toArray)
     let argv0 := (String.fromUTF8? first).getD "sudo"
     let progname := Cli.programName argv0
+    diagnosticProgname := progname
     let parsed := Cli.parseArgs argv0 args (← Sys.environ)
     for warning in parsed.warnings do
       Sys.writeStderr (← I18n.translate (Cli.formatError argv0 { message := warning }) false)
@@ -1368,23 +1419,54 @@ def run (args : List String) : IO UInt32 := do
     if opts.mode == .help then
       (← IO.getStdout).putStr (Cli.helpFor progname (← I18n.catalogs).sudo)
       return 0
+    let versionHeader ← if opts.mode == .version then do
+        let configure ← if (← Sys.getuid) == 0 then do
+            pure ("Configure options: " ++ Cli.configureOptions (← Sys.architecture) ++ "\n")
+          else pure ""
+        let header := "Sudo version 1.9.17p2\n" ++ configure
+        (← IO.getStdout).putStr header
+        (← IO.getStdout).flush
+        pure header
+      else pure ""
+    if !conf.plugins.isEmpty then
+      Sys.Plugins.load conf
+      let submitEnv ← Sys.environ
+      let interfaces ← if conf.probeInterfaces then
+          pure ((← Sys.interfaceAddresses).toList.map (fun (a, m) => a ++ "/" ++ m))
+        else pure []
+      Sys.Plugins.configureConversation opts.stdin opts.nonInteractive opts.bell
+        (if opts.askpass then ((submitEnv.lookup "SUDO_ASKPASS").or conf.askpass).getD "" else "")
+      Sys.Plugins.openAudit (Sys.Plugins.settings progname opts conf interfaces)
+        pluginUserInfo (argv0 :: args).toArray (envToArray submitEnv)
+        (args.length + 1 - opts.command.length).toUInt32
     if opts.mode == .version then
       if let some message := Cli.timeoutError opts then
-        let stdout ← IO.getStdout
-        stdout.putStr "Sudo version 1.9.17p2\n"
-        if (← Sys.getuid) == 0 then
-          stdout.putStr ("Configure options: " ++ Cli.configureOptions (← Sys.architecture) ++ "\n")
+        -- The front-end version was printed before loading plugins.
         warn message
         throw (IO.userError "error initializing audit plugin sudoers_audit")
-      if (← Sys.getuid) == 0 then
-        let ctx ← context progname opts conf
-        let interfaces := (← Sys.interfaceAddresses).toList.map (fun (a, m) => a ++ "/" ++ m)
-        (← IO.getStdout).putStr (← I18n.translate (Cli.versionFor true ctx.settings interfaces (← Sys.architecture)))
-      else
-        (← IO.getStdout).putStr (← I18n.translate Cli.versionText)
+      let text ← if (← Sys.getuid) == 0 then do
+          let ctx ← context progname opts conf
+          let interfaces := (← Sys.interfaceAddresses).toList.map (fun (a, m) => a ++ "/" ++ m)
+          pure (Cli.versionFor true ctx.settings interfaces (← Sys.architecture))
+        else pure Cli.versionText
+      let text := (text.drop versionHeader.length).toString
+      let text := if conf.plugins.isEmpty then text else
+        (text.replace "Sudoers I/O plugin version 1.9.17p2\n" "").replace
+          "Sudoers audit plugin version 1.9.17p2\n" ""
+      (← IO.getStdout).putStr (← I18n.translate text)
+      if !conf.plugins.isEmpty then
+        (← IO.getStdout).flush
+        let builtin := fun name => (conf.plugins.find? fun p =>
+          p.symbol == name && Sys.Plugins.isBuiltin conf p).map (·.line.toUInt32)
+        let ioLine := (builtin "sudoers_io").getD
+          (if (builtin "sudoers_policy").isSome || (← Sys.Plugins.hasIo) then 0 else 0xffffffff)
+        Sys.Plugins.showVersion ((← Sys.getuid) == 0) ioLine
+          ((builtin "sudoers_audit").getD 0xffffffff)
+        Sys.Plugins.close 0 0
       return 0
     if !valid || args.any (fun a => a.contains '\ufffd') then
       warn "non-UTF-8 command-line arguments are not supported"
+      if !conf.plugins.isEmpty then Sys.Plugins.close 3 1
       return 1
     let opts ← if opts.mode == .run && !opts.shell && !opts.login &&
         (opts.command.head?.map Policy.baseOf) == some "sudoedit" then do
@@ -1392,14 +1474,22 @@ def run (args : List String) : IO UInt32 := do
         pure { opts with mode := .edit, command := opts.command.drop 1 }
       else pure opts
     let ctx ← context progname opts conf
-    let status ← try execute ctx (Core.decide ctx) conf
+    let status ← try
+      let status ← execute ctx (Core.decide ctx) conf
+      if !conf.plugins.isEmpty then Sys.Plugins.close 0 0
+      pure status
       finally
         cleanup Sys.LogSrv.close
         for fd in (ctx.execFd.toList ++ ctx.rootFacts.filterMap (·.2.execFd)).eraseDups do
           cleanup (Sys.closeDescriptor fd.toUInt32)
     Sys.exitWith status
   catch e =>
-    warn e.toString
+    if e.toString == "plugin requested usage" then
+      cleanup (Sys.Plugins.close 0 0)
+      Sys.writeStderr (Cli.usageFor diagnosticProgname)
+    else
+      cleanup (Sys.Plugins.close 3 1)
+      warn e.toString
     return 1
 
 end LeanSudo.Shell

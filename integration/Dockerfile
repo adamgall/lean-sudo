@@ -1,6 +1,15 @@
 # End-to-end test image for sudo implementations (see integration/README.md).
 # Build context: the integration/ directory.
 ARG BASE=ubuntu:26.04
+FROM ${BASE} AS plugin-build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://raw.githubusercontent.com/sudo-project/sudo/v1.9.17p2/include/sudo_plugin.h \
+      -o /tmp/sudo_plugin.h
+COPY plugin-host.c /tmp/plugin-host.c
+RUN cc -std=c11 -O2 -fPIC -shared -I/tmp /tmp/plugin-host.c -o /tmp/plugin-host.so
+
 FROM ${BASE}
 
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
@@ -34,6 +43,7 @@ RUN set -eu; \
 
 COPY ptyrun.py tests.sh /opt/sudo-it/
 COPY tests.d/ /opt/sudo-it/tests.d/
+COPY --from=plugin-build /tmp/plugin-host.so /opt/sudo-it/plugin-host.so
 COPY sudo-schema.ldif /opt/sudo-it/sudo-schema.ldif
 RUN chmod 0755 /opt/sudo-it/ptyrun.py /opt/sudo-it/tests.sh && mkdir -p /opt/impl
 

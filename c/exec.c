@@ -50,6 +50,7 @@
 #include "intercept.h"
 #include "intercept_dso.h"
 #include "logsrv.h"
+#include "plugins.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -84,6 +85,19 @@ extern int ls_iolog_close(int, int);
 extern void ls_iolog_child_close(void);
 extern int lean_sudo_initialize_locale(void);
 
+static int exec_io_write(int stream, const void *data, size_t size) {
+  if (ls_plugins_io_write(stream, data, size)) return -1;
+  return ls_iolog_write(stream, data, size);
+}
+static int exec_io_suspend(int signo) {
+  if (ls_plugins_io_suspend(signo)) return -1;
+  return ls_iolog_suspend(signo);
+}
+static int exec_io_winsize(unsigned rows, unsigned cols) {
+  if (ls_plugins_io_winsize(rows, cols)) return -1;
+  return ls_iolog_winsize(rows, cols);
+}
+
 struct io_channel {
   int parent, child, enabled;
   char pending[8192];
@@ -105,7 +119,7 @@ static int io_channels_open(int ttymask) {
     io_channels[i].parent = io_channels[i].child = -1;
   }
   for (int i = 0; i < 3; i++) {
-    if ((ttymask & (1 << i)) || !ls_iolog_stream(i)) continue;
+    if ((ttymask & (1 << i)) || !(ls_iolog_stream(i) || ls_plugins_io_stream(i))) continue;
     int fds[2];
     if (pipe2(fds, O_CLOEXEC)) { io_channels_close(); return -1; }
     io_channels[i].parent = fds[i == 0 ? 1 : 0];
@@ -147,7 +161,7 @@ static int io_channel_pump(struct pollfd *p) {
     }
     ssize_t n = read(i == 0 ? STDIN_FILENO : c->parent, c->pending, sizeof c->pending);
     if (n > 0) {
-      if (ls_iolog_write(i, c->pending, (size_t)n)) return -1;
+      if (exec_io_write(i, c->pending, (size_t)n)) return -1;
       if (i == 0) { c->len = (size_t)n; c->off = 0; }
       else {
         size_t off = 0;
@@ -172,9 +186,10 @@ static int io_channels_drain(void) {
   while (io_channels[1].parent >= 0 || io_channels[2].parent >= 0) {
     struct pollfd p[3];
     io_channel_poll(p);
-    int n = poll(p, 3, 100);
+    int n = ls_plugins_poll(p, 3, 100);
     if (n < 0 && errno == EINTR) continue;
-    if (n <= 0) break;
+    if (n < 0) return -1;
+    if (n == 0) break;
     if (io_channel_pump(p)) return -1;
   }
   return 0;
@@ -723,6 +738,7 @@ static lean_obj_res io_error(const char *msg) {
 }
 
 static lean_obj_res io_errno(const char *what, int err) {
+  ls_plugins_exec_status(SUDO_PLUGIN_SUDO_ERROR, err);
   char buf[512];
   snprintf(buf, sizeof buf, "%s: %s", what, strerror(err));
   return io_error(buf);
@@ -842,6 +858,7 @@ LEAN_EXPORT lean_obj_res leansudo_exec_dumped_core(lean_obj_arg world) {
 }
 
 static uint32_t encode_status(int status) {
+  ls_plugins_exec_status(SUDO_PLUGIN_WAIT_STATUS, status);
 #ifdef WCOREDUMP
   last_dumped_core = WIFSIGNALED(status) && WCOREDUMP(status);
 #else
@@ -925,13 +942,13 @@ static void nopty_child_stopped(pid_t child, int sig) {
       return;
     }
   }
-  if (ls_iolog_suspend(sig)) {
+  if (exec_io_suspend(sig)) {
     if (ttyfd >= 0) close(ttyfd);
     kill(child, SIGKILL);
     return;
   }
   stop_self(sig, 0);
-  if (ls_iolog_suspend(SIGCONT)) kill(child, SIGKILL);
+  if (exec_io_suspend(SIGCONT)) kill(child, SIGKILL);
   if (ttyfd >= 0) {
     if (saved != getpgrp()) (void)tcsetpgrp_nobg(ttyfd, saved);
     close(ttyfd);
@@ -956,6 +973,7 @@ static int nopty_reap(pid_t child, int *status) {
     }
     if (WIFEXITED(st) || WIFSIGNALED(st)) {
       *status = st;
+      ls_plugins_exec_status(SUDO_PLUGIN_WAIT_STATUS, st);
       return 1;
     }
     if (WIFSTOPPED(st))
@@ -1006,17 +1024,24 @@ static lean_obj_res nopty_wait(struct sigstate *ss, pid_t child, unsigned timeou
     io_channel_poll(pfds + 1);
     pfds[4] = (struct pollfd){.fd = ls_logsrv_queue_fd(), .events = POLLIN};
     pfds[5] = (struct pollfd){.fd = ls_logsrv_network_fd(), .events = POLLIN};
-    if (poll(pfds, 6, timeout_poll(&timer, child, 0)) < 0 && errno != EINTR)
-      return io_errno("poll", errno);
+    if (ls_plugins_poll(pfds, 6, timeout_poll(&timer, child, 0)) < 0 && errno != EINTR) {
+      int e = errno;
+      kill(child, SIGKILL);
+      if (waitpid_retry(child, &status, 0) > 0)
+        ls_plugins_exec_status(SUDO_PLUGIN_WAIT_STATUS, status);
+      return io_errno("poll", e);
+    }
     if ((pfds[4].revents && ls_logsrv_dispatch()) ||
         (pfds[5].revents && ls_logsrv_poll()) || io_channel_pump(pfds + 1)) {
       int e = errno;
       kill(child, SIGKILL);
-      waitpid_retry(child, &status, 0);
+      if (waitpid_retry(child, &status, 0) > 0)
+        ls_plugins_exec_status(SUDO_PLUGIN_WAIT_STATUS, status);
       return io_errno("unable to write I/O log", e);
     }
     struct sigrec rec;
     while (sigpipe_next(ss->pipe_rd, &rec)) {
+      ls_plugins_signal(rec.signo);
       if (rec.signo == SIGCHLD)
         continue; /* reaped at the top of the loop */
       if (should_forward(&rec, child, 0))
@@ -1403,9 +1428,9 @@ static void pty_cmd_stopped(struct pty_loop *L, int sig) {
     }
   }
   tty_restore(p);
-  if (ls_iolog_suspend(sig)) { L->log_error = 1; return; }
+  if (exec_io_suspend(sig)) { L->log_error = 1; return; }
   stop_self(sig, 1);
-  if (ls_iolog_suspend(SIGCONT)) { L->log_error = 1; return; }
+  if (exec_io_suspend(SIGCONT)) { L->log_error = 1; return; }
   /* Resumed: the command follows us into the foreground or background. */
   check_fg(p);
   if (p->fg) {
@@ -1421,7 +1446,7 @@ static void pty_pump_master(struct pty_loop *L) {
   for (;;) {
     ssize_t n = read(L->p->master, buf, sizeof buf);
     if (n > 0) {
-      if (ls_iolog_write(4, buf, (size_t)n)) { L->log_error = 1; return; }
+      if (exec_io_write(4, buf, (size_t)n)) { L->log_error = 1; return; }
       write_all(L->p->ttyfd, buf, (size_t)n);
       continue;
     }
@@ -1473,7 +1498,7 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
     io_channel_poll(pfds + 4);
     pfds[7] = (struct pollfd){.fd = ls_logsrv_queue_fd(), .events = POLLIN};
     pfds[8] = (struct pollfd){.fd = ls_logsrv_network_fd(), .events = POLLIN};
-    if (poll(pfds, 9, -1) < 0) {
+    if (ls_plugins_poll(pfds, 9, -1) < 0) {
       if (errno == EINTR)
         continue;
       return -1;
@@ -1489,7 +1514,7 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
     if (pfds[3].revents & (POLLIN | POLLHUP | POLLERR)) {
       ssize_t n = read(p->ttyfd, L->in, sizeof L->in);
       if (n > 0) {
-        if (ls_iolog_write(3, L->in, (size_t)n)) return -1;
+        if (exec_io_write(3, L->in, (size_t)n)) return -1;
         L->in_len = (size_t)n;
         L->in_off = 0;
         pty_flush_input(L);
@@ -1502,6 +1527,7 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
     }
     struct sigrec rec;
     while (sigpipe_next(ss->pipe_rd, &rec)) {
+      ls_plugins_signal(rec.signo);
       switch (rec.signo) {
       case SIGCHLD:
         break; /* the monitor reports through the backchannel */
@@ -1509,7 +1535,7 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
         struct winsize ws;
         if (ioctl(p->ttyfd, TIOCGWINSZ, &ws) == 0 &&
             (ws.ws_row != p->rows || ws.ws_col != p->cols)) {
-          if (ls_iolog_winsize(ws.ws_row, ws.ws_col)) return -1;
+          if (exec_io_winsize(ws.ws_row, ws.ws_col)) return -1;
           (void)ioctl(p->master, TIOCSWINSZ, &ws);
           /* TIOCSWINSZ alone may not signal (e.g. an initially zero-sized
            * terminal). sudo explicitly signals the command pgrp as well. */
@@ -1546,6 +1572,7 @@ static int pty_relay(struct sigstate *ss, struct pty_loop *L, int *status) {
           if (L->log_error) return -1;
         } else if (m.type == MSG_EXITED) {
           *status = m.val;
+          ls_plugins_exec_status(SUDO_PLUGIN_WAIT_STATUS, m.val);
           have_status = 1;
         }
       }
@@ -1750,6 +1777,7 @@ LEAN_EXPORT lean_obj_res leansudo_exec_run(b_lean_obj_arg path, b_lean_obj_arg a
                                            lean_obj_arg world) {
   (void)world;
   last_dumped_core = false;
+  ls_plugins_exec_begin();
   struct exec_req r;
   memset(&r, 0, sizeof r);
   r.path = lean_string_cstr(path);
@@ -1832,6 +1860,7 @@ LEAN_EXPORT lean_obj_res leansudo_exec_run(b_lean_obj_arg path, b_lean_obj_arg a
 }
 
 static lean_obj_res child_error_result(const struct exec_req *r, const struct child_err *ce) {
+  ls_plugins_exec_status(SUDO_PLUGIN_EXEC_ERROR, ce->err);
   char buf[1024];
   describe_child_err(r, ce, buf, sizeof buf);
   return io_error(buf);
@@ -1859,7 +1888,7 @@ static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background
   memset(&pc, 0, sizeof pc);
   pc.ttyfd = pc.master = pc.slave = -1;
   int sv[2] = {-1, -1};
-  int pty = ((use_pty && !background) || ls_iolog_active()) && any_tty;
+  int pty = ((use_pty && !background) || ls_iolog_active() || ls_plugins_io_active()) && any_tty;
   if (pty) {
     int perr = 0;
     if (pty_setup(&pc) != 0) {
@@ -1995,6 +2024,12 @@ static lean_obj_res run_with_req(struct exec_req *r, int use_pty, int background
     if (got < 0) bc_send(sv[0], MSG_SIGNAL, SIGKILL);
     int mst;
     waitpid_retry(child, &mst, 0);
+    if (got < 0) {
+      struct bcmsg m;
+      while (bc_recv(sv[0], &m) == 1)
+        if (m.type == MSG_EXITED)
+          ls_plugins_exec_status(SUDO_PLUGIN_WAIT_STATUS, m.val);
+    }
     if (got == 1)
       res = lean_io_result_mk_ok(lean_box_uint32(encode_status(status)));
     else if (got == 0)

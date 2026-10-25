@@ -1,5 +1,12 @@
 namespace LeanSudo.SudoConf
 
+structure Plugin where
+  symbol : String
+  path : String
+  options : List String := []
+  line : Nat
+  deriving BEq, Repr, Inhabited
+
 /-- Front-end configuration is separate from the sudoers policy. Unknown plugins
 must never silently fall back to sudoers: an approval plugin may restrict access. -/
 structure Config where
@@ -10,6 +17,8 @@ structure Config where
   groupSource : String := "adaptive"
   maxGroups : Nat := 65536
   probeInterfaces : Bool := true
+  pluginDir : String := "/usr/libexec/sudo/"
+  plugins : List Plugin := []
   deriving BEq, Repr, Inhabited
 
 def supportedPlugin (symbol path : String) (args : List String) : Bool :=
@@ -22,7 +31,7 @@ private def boolean (s : String) : Except String Bool :=
   else if ["false", "no", "off", "0"].contains s.toLower then .ok false
   else .error ("invalid boolean value: " ++ s)
 
-private def line (c : Config) (words : List String) : Except String Config := do
+private def line (c : Config) (lineno : Nat) (words : List String) : Except String Config := do
   let words := match words with
     | name :: rest =>
       let directive := if name.toLower == "plugin" then "Plugin"
@@ -35,14 +44,20 @@ private def line (c : Config) (words : List String) : Except String Config := do
   match words with
   | [] => return c
   | "Plugin" :: symbol :: path :: args =>
-    if supportedPlugin symbol path args then return c
-    else throw ("unable to load plugin " ++ symbol ++ ": unsupported sudo.conf plugin configuration")
+    if supportedPlugin symbol path args then
+      return { c with plugins := c.plugins ++ [{ symbol, path, options := args, line := lineno }] }
+    else if symbol == "sudoers_policy" && path == "sudoers.so" then
+      throw ("unable to load plugin " ++ symbol ++ ": unsupported sudo.conf plugin configuration")
+    else return { c with plugins := c.plugins ++ [{ symbol, path, options := args, line := lineno }] }
   | ["Path", "askpass", value] => return { c with askpass := some value }
   | ["Path", "noexec", value] => return { c with noexec := some value }
   | ["Path", "devsearch", value] => return { c with devsearch := value }
   | ["Path", "askpass"] => return { c with askpass := none }
   | ["Path", "noexec"] => return { c with noexec := none }
   | ["Path", "devsearch"] => return { c with devsearch := "" }
+  | ["Path", "plugin_dir", value] =>
+    return { c with pluginDir := value }
+  | ["Path", "plugin_dir"] => return { c with pluginDir := "" }
   | "Path" :: _ :: _ => return c
   | ["Set", "disable_coredump", value] =>
     return { c with disableCoredump := ← boolean value }
@@ -63,10 +78,21 @@ private def line (c : Config) (words : List String) : Except String Config := do
 
 /-- Parse physical lines after joining backslash continuations and stripping comments. -/
 def parse (text : String) : Except String Config := do
-  let lines := (text.replace "\\\n" "").splitOn "\n"
-  lines.foldlM (fun c s =>
-    line c (((s.splitOn "#").headD "").splitOn " " |>.flatMap (·.splitOn "\t")
-      |>.map (·.trimAscii.toString) |>.filter (!·.isEmpty))) {}
+  let (n, pending, c) ← (text.splitOn "\n").foldlM
+    (fun (n, pending, c) s => do
+      let s := String.ofList ((s.toList.reverse.dropWhile (· == '\r')).reverse)
+      let parts := s.splitOn "#"
+      let s := parts.headD ""
+      if parts.length == 1 && s.endsWith "\\" && !s.endsWith "\\\\" then
+        pure (n + 1, pending ++ (s.dropEnd 1).toString, c)
+      else
+        let words := (pending ++ s).splitOn " "
+          |>.flatMap (·.splitOn "\t") |>.filter (!·.isEmpty)
+        let c ← line c n words
+        pure (n + 1, "", c))
+    (1, "", ({} : Config))
+  if pending.isEmpty then return c
+  line c (n - 1) (pending.splitOn " " |>.flatMap (·.splitOn "\t") |>.filter (!·.isEmpty))
 
 /-- sudo.conf uses sudo_secure_fd with uid 0 and no trusted group: even
 root-group write permission is rejected. Diagnostic precedence matches sudo. -/
@@ -89,7 +115,8 @@ theorem insecure_file_uses_defaults (uid mode : Nat) (text problem : String)
     parseFile uid mode text = .ok {} := by
   simp [parseFile, h]
 
-/-- Extra arguments can change plugin semantics and cannot be silently discarded. -/
+/-- Built-in emulation must not silently discard arguments; such lines require
+the host's explicit handling rather than bypassing plugin initialization. -/
 theorem plugin_arguments_refused (symbol path : String) (arg : String) (args : List String) :
     supportedPlugin symbol path (arg :: args) = false := by
   simp [supportedPlugin]

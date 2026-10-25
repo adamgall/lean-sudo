@@ -2,75 +2,75 @@ import LeanSudo.Nsswitch
 
 open LeanSudo.Nsswitch
 
-private def diagnostic : Except String Unit → String
-  | .error message => message
-  | .ok () => ""
+private def names (text : String) : Option (List String) :=
+  (configure text).toOption.map (List.map (·.name))
 
--- Missing configuration / missing entry defaults to the local backend.
-#guard (parse "").toOption == some ["files"]
-#guard (approve "").isOk
-#guard (approve "passwd: files sss\ngroup: files ldap\n# sudoers: sss\n").isOk
-#guard (approve "sudoers: files\n").isOk
-#guard (parse " \tSuDoErS:\tFiLeS  # local policy\r\n").toOption == some ["files"]
-#guard (approve "sudoers: files files FILES").isOk
+-- Missing, empty, and unsupported-only configurations all default to files.
+#guard names "" == some ["files"]
+#guard names "passwd: files sss\ngroup: files ldap\n# sudoers: sss\n" == some ["files"]
+#guard names " \tSuDoErS:\tFiLeS  # local policy\r\n" == some ["files"]
+#guard names "sudoers: files files FILES" == some ["files"]
+#guard names "sudoers:" == some ["files"]
+#guard names "sudoers: # no sources" == some ["files"]
+#guard names "sudoers: ldap" == some ["files"]
+#guard names "sudoers: custom_backend ldap" == some ["files"]
+#guard names "sudoers: files ldap" == some ["files"]
+#guard names "sudoers: ldap files custom_backend" == some ["files"]
 
--- Explicit empty/unsupported sources never fall back to files.
-#guard !(approve "sudoers:").isOk
-#guard !(approve "sudoers: # no sources").isOk
-#guard (approve "sudoers: sss").isOk
-#guard !(approve "sudoers: ldap").isOk
-#guard !(approve "sudoers: custom_backend").isOk
-#guard (approve "sudoers: files sss").isOk
-#guard (approve "sudoers: sss files").isOk
-#guard !(approve "sudoers: files ldap").isOk
-#guard !(approve "sudoers: files custom_backend").isOk
-#guard (approve "sudoers: SSS").isOk
-#guard diagnostic (approve "sudoers:") ==
-  "/etc/nsswitch.conf: sudoers entry has no files source"
+-- A supported but unavailable source never causes a local-policy fallback.
+#guard names "sudoers: sss" == some ["sss"]
+#guard names "sudoers: LDAP SSS custom_backend" == some ["sss"]
+#guard names "sudoers: files sss" == some ["files", "sss"]
+#guard names "sudoers: sss files" == some ["sss", "files"]
 
--- Upstream only considers the first exact, case-insensitive sudoers: entry.
-#guard (approve "sudoers: files\nsudoers: sss\n").isOk
-#guard (approve "sudoers: sss\nsudoers: files\n").isOk
-#guard (approve "sudoers : sss\nsudoers: files").isOk
-#guard (approve "sudoers_extra: sss\n").isOk
+-- Only the first exact, case-insensitive sudoers: entry is considered.
+#guard names "sudoers: files\nsudoers: sss\n" == some ["files"]
+#guard names "sudoers: sss\nsudoers: files\n" == some ["sss"]
+#guard names "sudoers: ldap\nsudoers: sss\n" == some ["files"]
+#guard names "sudoers : sss\nsudoers: files" == some ["files"]
+#guard names "sudoers_extra: sss\n" == some ["files"]
 
--- Return clauses are not sources; no return clause hides an unsupported source.
-#guard (parse "sudoers: files [SUCCESS=return]").toOption == some ["files"]
-#guard (approve "sudoers: files [NOTFOUND=return]").isOk
-#guard (approve "sudoers: files [success=RETURN]").isOk
-#guard (approve "sudoers: files [SUCCESS=return] [NOTFOUND=return]").isOk
-#guard (approve "sudoers: [SUCCESS=return] files").isOk
-#guard !(approve "sudoers: [SUCCESS=return]").isOk
-#guard (approve "sudoers: files [SUCCESS=return] sss").isOk
-#guard !(approve "sudoers: files [NOTFOUND=return] ldap").isOk
-#guard (approve "sudoers: sss [SUCCESS=return] files").isOk
-#guard !(approve "sudoers: files [SUCCESS=return sss]").isOk
-#guard !(approve "sudoers: files [SUCCESS=return").isOk
-#guard !(approve "sudoers: files [SUCCESS=continue]").isOk
-#guard !(approve "sudoers: files [UNAVAIL=return]").isOk
-#guard diagnostic (approve "sudoers: files [SUCCESS=continue]") ==
-  "/etc/nsswitch.conf: unsupported sudoers action: [success=continue]"
+-- Only the next recognized return action attaches to a newly added source.
+#guard (configure "sudoers: files [success=RETURN]").toOption ==
+  some [{ name := "files", returnIfFound := true }]
+#guard (configure "sudoers: files [NOTFOUND=return]").toOption ==
+  some [{ name := "files", returnIfNotFound := true }]
+#guard (configure "sudoers: files [SUCCESS=return] [NOTFOUND=return]").toOption ==
+  some [{ name := "files", returnIfFound := true }]
+#guard names "sudoers: [SUCCESS=return]" == some ["files"]
+#guard (configure "sudoers: files ldap [NOTFOUND=return] sss").toOption ==
+  some [{ name := "files" }, { name := "sss" }]
+#guard (configure "sudoers: files files [SUCCESS=return] sss").toOption ==
+  some [{ name := "files" }, { name := "sss" }]
+#guard (configure "sudoers: sss [SUCCESS=return] ldap files").toOption ==
+  some [{ name := "sss", returnIfFound := true }, { name := "files" }]
+#guard names "sudoers: files [SUCCESS=return sss]" == some ["files"]
+#guard names "sudoers: files [SUCCESS=return" == some ["files"]
+#guard (configure "sudoers: files [SUCCESS=continue] [NOTFOUND=return]").toOption ==
+  some [{ name := "files" }]
+#guard names "sudoers: files [UNAVAIL=return]" == some ["files"]
 
--- sudo_parseln strips leading space/tab on every continued physical line,
--- preserves whitespace before the backslash, and does not continue comments.
-#guard (parse "sudoers: fi\\\n  les\n").toOption == some ["files"]
-#guard (approve "sudoers: files \\\n \tsss\n").isOk
-#guard !(approve "sudoers: files \\\r\n ldap\r\n").isOk
-#guard (approve "sudoers: files # ignored \\\nsudoers: sss\n").isOk
-#guard (approve "sudoers: files # sss").isOk
-#guard !(approve "sudoers: files \\\\\n").isOk
-#guard (approve "sudoers: files\\\n").isOk
-#guard !(approve "sudoers: files\x00 sss").isOk
-#guard !(approve "sudoers:\x0bfiles").isOk
+-- sudo_parseln strips indentation on continued lines, not token boundaries.
+#guard names "sudoers: fi\\\n  les\n" == some ["files"]
+#guard names "sudoers: files \\\n \tsss\n" == some ["files", "sss"]
+#guard names "sudoers: files \\\r\n ldap\r\n" == some ["files"]
+#guard names "sudoers: files # ignored \\\nsudoers: sss\n" == some ["files"]
+#guard names "sudoers: files # sss" == some ["files"]
+#guard names "sudoers: files \\\\\n" == some ["files"]
+#guard names "sudoers: files\\\n" == some ["files"]
+#guard !(configure "sudoers: files\x00 sss").isOk
+#guard names "sudoers:\x0bfiles" == some ["files"]
 
-example (text : String) (sources : List String)
-    (parsed : parse text = .ok sources) (approved : approve text = .ok ()) :
-    ∀ source ∈ sources, source = "files" ∨ source = "sss" :=
-  (approve_supported_only text sources parsed approved).2
+example (text : String) (sources : List Source)
+    (configured : configure text = .ok sources) :
+    sources ≠ [] ∧ ∀ source ∈ sources, source.name = "files" ∨ source.name = "sss" :=
+  approve_supported_only text sources configured
 
-example (text : String) (sources : List String)
-    (parsed : parse text = .ok sources) (remote : "ldap" ∈ sources) :
-    approve text ≠ .ok () := by
-  intro approved
-  have h := (approve_supported_only text sources parsed approved).2 "ldap" remote
-  rcases h with h | h <;> contradiction
+example (text : String) (sources : List Source)
+    (configured : configure text = .ok sources) :
+    ∀ source ∈ sources, source.name ≠ "ldap" := by
+  intro source hs ldap
+  have supported := (approve_supported_only text sources configured).2 source hs
+  rcases supported with h | h <;> simp_all
+
+#guard approveSources ["ldap", "sss", "unknown"] == [{ name := "sss" }]

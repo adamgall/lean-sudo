@@ -5,6 +5,7 @@
 #include "intercept.h"
 #include "intercept_dso.h"
 #include "logsrv.h"
+#include "plugins.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -190,7 +191,7 @@ int ls_intercept_check(const char *command, char *const argv[], char *const envp
     for (;;) {
       struct pollfd p[2] = {{ .fd = pair[0], .events = POLLIN },
         { .fd = ls_logsrv_queue_fd(), .events = POLLIN }};
-      int ready = poll(p, 2, -1);
+      int ready = ls_plugins_poll(p, 2, -1);
       if (ready < 0 && errno == EINTR) continue;
       if (ready < 0 || (p[1].revents && ls_logsrv_dispatch() != 0)) { ok = 0; break; }
       if (p[0].revents) { ok = !transfer(pair[0], &answer, sizeof answer, 0); break; }
@@ -255,20 +256,26 @@ lean_obj_res lean_sudo_intercept_start(uint8_t trace, uint8_t verify, uint8_t lo
     ls_intercept_dso_set_log_only(log_only);
     if (ls_intercept_dso_prepare()) { close(pair[0]); close(pair[1]); goto failed; }
   }
+  if (ls_plugins_broker_init()) {
+    close(pair[0]); close(pair[1]); ls_intercept_dso_close(); goto failed;
+  }
   broker_pid = fork_broker();
   if (broker_pid == 0) {
     close(pair[0]); policy_callback = callback;
+    ls_plugins_broker_child();
     ls_logsrv_detach_child();
     if (!tracing) ls_intercept_dso_parent();
     broker_loop(pair[1]);
   }
   close(pair[1]);
+  ls_plugins_broker_parent();
   if (broker_pid < 0) { close(pair[0]); ls_intercept_dso_close(); goto failed; }
   broker_fd = pair[0];
   if (!tracing) ls_intercept_dso_detach_service();
   lean_dec(callback);
   return lean_io_result_mk_ok(lean_box(0));
 failed:
+  ls_plugins_broker_close();
   active = 0; lean_dec(callback);
   return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("unable to initialize command interception")));
 }
@@ -278,6 +285,7 @@ lean_obj_res lean_sudo_intercept_stop(void) {
     (void)send(broker_fd, &quit, 1, MSG_NOSIGNAL);
     close(broker_fd); broker_fd = -1;
   }
+  ls_plugins_broker_close();
   ls_intercept_dso_close();
   if (broker_pid > 0) {
     int status;

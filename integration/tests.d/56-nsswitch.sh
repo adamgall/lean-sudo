@@ -1,6 +1,6 @@
-# sudo_nss.c compatibility: local files are consulted only when configured.
-# Run reference-first. SSSD without its responder contributes no rules; it never
-# causes an implicit fallback to files. Unknown sources still fail closed.
+# sudo_nss.c compatibility: silently ignore backends absent from Ubuntu's build,
+# and default to files only when no supported source remains. Unavailable SSSD
+# is still a supported source and must never cause an implicit local fallback.
 
 nsswitch_setup() {
   cp -a /etc/nsswitch.conf "$WORK/nsswitch.orig"
@@ -15,11 +15,6 @@ nsswitch_restore() {
   cp -a "$WORK/nsswitch.orig" /etc/nsswitch.conf
 }
 
-nsswitch_expect_unsupported() {
-  expect_rc 1
-  expect_out_empty
-  expect_err_has '/etc/nsswitch.conf: unsupported sudoers source:'
-}
 
 begin nsswitch-files && {
   nsswitch_setup
@@ -116,16 +111,9 @@ begin nsswitch-empty-entry && {
   nsswitch_setup
   printf '\nsudoers: # explicitly no sources\n' >>/etc/nsswitch.conf
   run ivan 'sudo -n /usr/bin/id -u'
-  if [[ $LABEL == reference ]]; then
-    # Upstream falls back to files if no recognized backend remains. The
-    # replacement deliberately refuses an explicit entry without files.
-    expect_rc 0
-    expect_out_line 0
-  else
-    expect_rc 1
-    expect_out_empty
-    expect_err_has '/etc/nsswitch.conf: sudoers entry has no files source'
-  fi
+  expect_rc 0
+  expect_out_line 0
+  [[ ! -s "$WORK/err" ]] || fail 'empty NSS source list emitted a warning'
   nsswitch_restore
   end
 }
@@ -134,12 +122,9 @@ begin nsswitch-unknown-source && {
   nsswitch_setup
   printf '\nsudoers: files unavailable_policy_backend\n' >>/etc/nsswitch.conf
   run ivan 'sudo -n /usr/bin/id -u'
-  if [[ $LABEL == reference ]]; then
-    expect_rc 0
-    expect_out_line 0
-  else
-    nsswitch_expect_unsupported
-  fi
+  expect_rc 0
+  expect_out_line 0
+  [[ ! -s "$WORK/err" ]] || fail 'ignored NSS source emitted a warning'
   nsswitch_restore
   end
 }
@@ -154,6 +139,41 @@ begin nsswitch-sss-never-loads-local-policy && {
   expect_rc 1
   expect_out_empty
   expect_err_lacks 'syntax error'
+  expect_err_lacks 'NSS_LOCAL_POLICY_MUST_NOT_BE_READ'
+  nsswitch_restore
+  end
+}
+
+for nsswitch_case in ldap mixed-ldap unknown-only ignored-only orphan-action unsupported-action malformed-action first-unsupported; do
+  begin "nsswitch-$nsswitch_case" && {
+    nsswitch_setup
+    case $nsswitch_case in
+      ldap) printf '\nsudoers: ldap\n' >>/etc/nsswitch.conf ;;
+      mixed-ldap) printf '\nsudoers: ldap files LDAP\n' >>/etc/nsswitch.conf ;;
+      unknown-only) printf '\nsudoers: unavailable_policy_backend\n' >>/etc/nsswitch.conf ;;
+      ignored-only) printf '\nsudoers: ldap unavailable_policy_backend\n' >>/etc/nsswitch.conf ;;
+      orphan-action) printf '\nsudoers: [SUCCESS=return]\n' >>/etc/nsswitch.conf ;;
+      unsupported-action) printf '\nsudoers: files [UNAVAIL=return] [SUCCESS=continue]\n' >>/etc/nsswitch.conf ;;
+      malformed-action) printf '\nsudoers: files [SUCCESS=return sss]\n' >>/etc/nsswitch.conf ;;
+      first-unsupported) printf '\nsudoers: ldap\nsudoers: sss\n' >>/etc/nsswitch.conf ;;
+    esac
+    run ivan 'sudo -n /usr/bin/id -u'
+    expect_rc 0
+    expect_out_line 0
+    [[ ! -s "$WORK/err" ]] || fail 'ignored NSS configuration emitted a warning'
+    nsswitch_restore
+    end
+  }
+done
+
+begin nsswitch-ignored-sources-do-not-replace-sss && {
+  nsswitch_setup
+  printf '\nsudoers: ldap SSS unavailable_policy_backend\n' >>/etc/nsswitch.conf
+  printf '\nNSS_LOCAL_POLICY_MUST_NOT_BE_READ !!!\n' >>/etc/sudoers
+  run ivan 'sudo -n /usr/bin/id -u'
+  expect_rc 1
+  expect_out_empty
+  expect_err_lacks 'unsupported'
   expect_err_lacks 'NSS_LOCAL_POLICY_MUST_NOT_BE_READ'
   nsswitch_restore
   end

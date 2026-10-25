@@ -45,3 +45,4 @@ import LeanSudo.Intercept
 import LeanSudo.LogSrv
 import LeanSudo.Sys.Intercept
 import LeanSudo.Sys.LogSrv
+import LeanSudo.Sys.Plugins

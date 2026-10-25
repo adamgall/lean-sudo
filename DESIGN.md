@@ -38,6 +38,21 @@ ordinary groups also consult the provider under `always_query_group_plugin`.
 Provider load/init failure cannot invent membership, but need not deny an
 independent rule.
 
+Front-end audit, approval and additional I/O plugins use sudo's public 1.22 ABI.
+`SudoConf` retains located plugin declarations and options; `Sys.Plugins` builds
+settings and command metadata from the verified decision. The native host loads
+objects, validates their ABI, dispatches callbacks and relays stream data. It does
+not evaluate policy. Approval checks run only after successful policy/authentication;
+`approval_only_restricts` and `denied_never_approved` make the conjunction explicit.
+Audit plugins observe policy/approval/front-end outcomes; I/O plugins open only
+after approval. Close receives the actual command wait status or execution error.
+External policy plugins remain refused: lean-sudo itself supplies the policy.
+Enforced intercepted commands repeat policy audit, approval and front-end audit;
+log-only interception emits only the front-end audit. A private bounded socket
+dispatches these callbacks from the forked Lean broker back to the original host,
+preserving audit/approval state and the original I/O plugin vectors and session.
+An absent or malformed affirmative reply cannot authorize a subcommand.
+
 The interception broker retains the original principals and selected root and
 refreshes command facts for each exec. Private reply sockets require affirmative
 Lean authorization; malformed or absent replies cannot allow execution.
@@ -104,7 +119,7 @@ one source module; the C table also lists shared headers.
 | `Prompt.lean` | Sudo password-prompt percent expansion. |
 | `Shell.lean` | Trusted sudo orchestration: facts, PAM, locks, logging, broker callbacks and execution. |
 | `Sss.lean` | SSSD attribute conversion, filtering and sudoOrder/negation handling. |
-| `SudoConf.lean` | sudo.conf paths/settings and supported-plugin validation. |
+| `SudoConf.lean` | sudo.conf paths/settings, located plugin declarations and built-in bypass validation. |
 | `Sudoedit.lean` | Descriptor-based file preparation, editor execution and checked copy-back. |
 | `Sudoedit/Check.lean` | Pure editor selection, separator, temporary-file and write-back checks. |
 | `Sudoers/Ast.lean` | Located sudoers syntax, aliases, Defaults, tags and command options. |
@@ -120,6 +135,7 @@ one source module; the C table also lists shared headers.
 | `Sys/LogSrv.lean` | Remote session protocol, failover, relay callbacks and commit validation. |
 | `Sys/Lookup.lean` | Credential-scoped batched path inspection and executable-bit criterion. |
 | `Sys/Pam.lean` | PAM transaction/conversation configuration, lifecycle and diagnostics. |
+| `Sys/Plugins.lean` | Front-end plugin metadata, lifecycle bindings and restriction-only approval theorem. |
 | `Sys/Sss.lean` | SSSD defaults/user-rule attribute-query binding. |
 | `Sys/Timestamp.lean` | Sudo-compatible record locking, storage, process identity and clock IO. |
 | `Timestamp.lean` | Timestamp scopes, sudo v2 codec, bounded scanner, validity and update proofs. |
@@ -139,6 +155,7 @@ one source module; the C table also lists shared headers.
 | `c/edit.c` | Privilege-dropped sudoedit workers and descriptor reads/writes/restoration. |
 | `c/exec.c` | Credential transitions, exec, pty/pipe relay, signals, deadlines and child setup. |
 | `c/groupplugin.c` | Sudo group-provider ABI validation, initialization, query and cleanup. |
+| `c/plugins.c`, `c/plugins.h`, `c/sudo_plugin.h` | Public sudo plugin ABI, dynamic loader, callbacks, lifecycle and execution-relay bridge. |
 | `c/intercept.c` | Privileged broker, private request/reply transport and monitor lifecycle. |
 | `c/intercept_trace.c` | Linux seccomp/ptrace exec monitor and optional post-exec verification. |
 | `c/intercept_dso.c` | System sudo-intercept DSO bootstrap/authenticated protobuf transport. |

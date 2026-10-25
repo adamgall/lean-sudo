@@ -25,7 +25,7 @@ $ sudo id -u
 It reads your existing `/etc/sudoers`, `/etc/sudoers.d` and `/etc/sudo.conf`, uses the
 system's PAM stack (`/etc/pam.d/sudo`, `sudo-i`), prints the same prompts and messages
 (translated, like the original), writes the same syslog lines and I/O logs, and passes
-the same 852-test end-to-end suite as the original sudo, byte for byte where it matters.
+the same 894-test end-to-end suite as the original sudo, byte for byte where it matters.
 
 > **"sudo.ws"** in this document means the original sudo: the C implementation
 > written around 1980 and maintained by Todd C. Miller since the 1990s, whose home is
@@ -114,10 +114,10 @@ flowchart LR
 | **Command line** | The command run is exactly the words you typed after the options, never reordered or rewritten; `--` ends option parsing; conflicting modes are rejected. The `-s`/`-i` shell escaping round-trips. | `parseArgs_command`, `parseArgs_command_suffix`, `parseArgs_dashdash`, `parseArgs_login_shell`, `lex_escapeJoin` |
 | **Credential cache** | A cached authentication is honoured only for the same uid, the same scope (terminal device, session id and the session leader's start time; or parent process and its start time), within the timeout and not from the future; `sudo -k` invalidates the records of the current scope, as in sudo; records for one scope never authorise another. | `lookup_sound`, `lookup_invalidateScope`, `invalidateScope_other`, `lookup_update_other`, `kernel_scope_terminal_separation`, `valid_not_future`, `decode_encode` |
 | **sudoedit** | The chosen editor is the first resolvable candidate; a file is written back only if it changed and passed the safety checks. | `selectEditor_first`, `writeBack_sound`, `tempSafe_sound` |
-| **Parser and config** | Every command path in a parsed rule is absolute; regex commands are anchored; digests always guard a command; non-default plugins in `sudo.conf` are refused. | `parse_command_absolute`, `parse_regex_anchored`, `parse_digest_command_absolute`, `unknown_plugin_refused` |
+| **Parser and config** | Every command path in a parsed rule is absolute; regex commands are anchored; digests always guard a command. Additional `sudo.conf` plugins must be loaded, never silently bypassed; approval plugins can only restrict a policy decision. | `parse_command_absolute`, `parse_regex_anchored`, `parse_digest_command_absolute`, `unknown_plugin_refused`, `approval_only_restricts`, `denied_never_approved` |
 | **Globbing, logging, translations** | `fnmatch` agrees with string equality on literal patterns and `*` never crosses `/` with `FNM_PATHNAME`; I/O logging is on exactly when the policy says so; a missing translation falls back to the original English text. | `fnmatch_literal`, `fnmatch_star_pathname`, `plan_enabled`, `lookup_absent` |
 
-In total there are 375 hand-written theorems, plus 1,784 compile-time regression checks
+In total there are 378 hand-written theorems, plus 1,794 compile-time regression checks
 (`#guard`) that run on every build. `scripts/AxiomAudit.lean` checks mechanically that
 every declaration defined in a `LeanSudo` module (definitions, theorems and instances,
 including private and generated ones) rests only on Lean's three standard axioms
@@ -127,7 +127,7 @@ the library would make it fail; it is backed by a source grep for those words an
 
 ```console
 $ lake env lean scripts/AxiomAudit.lean
-8438 declarations (2572 theorems) checked; axioms used ⊆ propext, Quot.sound, Classical.choice
+8491 declarations (2574 theorems) checked; axioms used ⊆ propext, Quot.sound, Classical.choice
 ```
 
 A proof is only as good as its statement, so the statements are written to be read:
@@ -145,7 +145,7 @@ byte for byte where it matters:
 
 | Suite | sudo.ws 1.9.17p2 | lean-sudo |
 |---|---|---|
-| `sudo` end-to-end: authentication and PAM, run-as users/groups, `!` rules and aliases, globs/regex/digests/netgroups/networks/FQDN hosts, group plugins, SSSD rules (real slapd + sssd), `Defaults` scoping, environment, `-l`/`-ll`/`-U` output, timestamps (interoperating with sudo.ws), `-i`/`-s`/`-b`, exit status, signals and job control, `NOEXEC`, `TIMEOUT`, `CHROOT`, rlimits, `stay_setuid`, utmp, command interception and `log_subcmds`, sudoedit, `sudo.conf`, `nsswitch.conf`, askpass, mail, audit records, accept/reject/alert events compared in syslog, logfile and JSON, remote log servers (`sudo_logsrvd`, TLS), I/O logs replayed with the system's `sudoreplay`, translations (German, French), command-line errors, security regressions | 852/852 | 852/852 |
+| `sudo` end-to-end: authentication and PAM, run-as users/groups, `!` rules and aliases, globs/regex/digests/netgroups/networks/FQDN hosts, group plugins, SSSD rules (real slapd + sssd), `Defaults` scoping, environment, `-l`/`-ll`/`-U` output, timestamps (interoperating with sudo.ws), `-i`/`-s`/`-b`, exit status, signals and job control, `NOEXEC`, `TIMEOUT`, `CHROOT`, rlimits, `stay_setuid`, utmp, command interception and `log_subcmds`, sudoedit, `sudo.conf` with audit/approval/I/O plugins, `nsswitch.conf`, askpass, mail, audit records, accept/reject/alert events compared in syslog, logfile and JSON, remote log servers (`sudo_logsrvd`, TLS), I/O logs replayed with the system's `sudoreplay`, translations (German, French), command-line errors, security regressions | 894/894 | 894/894 |
 | `visudo` (check mode, edit mode with includes, locking, permissions, export) | 154/154 | 154/154 |
 
 ## Features
@@ -168,6 +168,15 @@ including:
   `always_query_group_plugin`. Provider load/init failures emit their diagnostics
   and leave plugin membership unavailable, as in sudo.ws; independent local rules
   may still authorize the request.
+* **Front-end plugins**: sudo's audit, approval and I/O plugin ABI, configured by
+  `Plugin` lines in `sudo.conf`, with plugin options, conversation callbacks,
+  version reporting and command lifecycle notifications. Relative library paths
+  use `Path plugin_dir` (default `/usr/libexec/sudo/`). Approval is an additional
+  restriction after the verified sudoers decision, never another source of authority.
+  Enforced intercepted execs run the same approval chain; `log_subcmds` only audits
+  them. The original host retains plugin state and the initial I/O session across
+  subcommands. Configuration parsing preserves sudo's comment, CRLF and escaped
+  backslash continuation rules.
 * **SSSD-backed rules**: `sudoers: files sss` (any order, with `[NOTFOUND=return]`-style
   actions) in `/etc/nsswitch.conf`, rules fetched through the system's `libsss_sudo`
   with sudo's `sudoOrder`, `sudoOption` and LDAP-style `sudo -l` output, tested against
@@ -197,10 +206,14 @@ including:
 * **sudoedit** with sudo's per-component, descriptor-pinned path checks, and **visudo**
   (`-c`, `-q`, `-f`, `-s`, `-O`, `-P`, `-I`, `-x`, edit mode with includes and locking).
 
-Not implemented, and refused when a rule or setting asks for them (never silently
-ignored): SELinux `ROLE`/`TYPE` on a system without SELinux (Ubuntu uses AppArmor),
-plugins other than the default sudoers plugin in `sudo.conf`, and the `ldap` sudoers
-source (Ubuntu's `sudo` package is not built with LDAP support either).
+Like Ubuntu's sudo build, lean-sudo recognizes `files` and `sss` as NSS sudoers
+backends; other source names, including `ldap`, are silently ignored, and if no
+supported source remains it uses `files`. SELinux `ROLE`/`TYPE` are ignored when
+SELinux is disabled, as on stock Ubuntu (which uses AppArmor), exactly like sudo.ws.
+
+Not implemented, and refused: a policy plugin other than the built-in sudoers policy
+in `sudo.conf` (lean-sudo *is* the sudoers policy; audit, approval and I/O plugins are
+loaded), and SELinux role/type transitions on a system where SELinux is enabled.
 
 ## Fail-closed by design
 
@@ -240,7 +253,7 @@ undefined aliases), so it cannot install a policy that lean-sudo would then refu
 
 Formal verification moves trust; it does not remove it. lean-sudo trusts:
 
-* **The C shim** (`c/*.c`, about 9,000 lines): PAM, `libsss_sudo`, group plugins, OpenSSL and gzip via `dlopen`, seccomp/ptrace interception, `setgroups` →
+* **The C shim** (`c/*.c`, about 10,800 lines): PAM, `libsss_sudo`, sudo plugins (audit, approval, I/O, group), OpenSSL and gzip via `dlopen`, seccomp/ptrace interception, `setgroups` →
   `setresgid` → `setresuid` (each drop re-checked with `getres[ug]id`, and for a
   non-root target `setuid(0)` must fail before `execve`), fork/exec, signal relay, the
   pty monitor, timestamp file locking, sudoedit's file workers, the I/O log writer

@@ -2,8 +2,8 @@ namespace LeanSudo.Nsswitch
 
 /-!
 Ordered sudoers sources, matching sudo 1.9.17p2's sudo_nss.c. The first
-case-insensitive sudoers line wins. Files and SSSD are supported; LDAP and
-unknown sources remain explicit errors rather than falling back to local policy.
+case-insensitive sudoers line wins. Ubuntu supports files and SSSD, silently
+ignores other tokens, and defaults to files when no supported source remains.
 Return actions attach only to the immediately preceding newly added source.
 The source selector retains global Defaults from every source, but never
 consults authorization entries beyond a terminal action.
@@ -32,83 +32,6 @@ private def joinLines : List String → String → List String
     if continued then joinLines rest (pending ++ body)
     else (pending ++ body) :: joinLines rest ""
 
-/-- Normalized source tokens. Recognized actions are not sources. Unknown action
-clauses are diagnosed separately; in particular they never swallow later sources. -/
-private def sourceTokens : List String → Except String (List String)
-  | [] => .ok []
-  | token :: rest => do
-    let token := token.toLower
-    if token == "[success=return]" || token == "[notfound=return]" then
-      sourceTokens rest
-    else if token.startsWith "[" || token.endsWith "]" then
-      throw ("/etc/nsswitch.conf: unsupported sudoers action: " ++ token)
-    else
-      return token :: (← sourceTokens rest)
-
-private def firstEntry : List String → Except String (List String)
-  | [] => .ok ["files"]
-  | line :: rest =>
-    if line.toLower.startsWith "sudoers:" then
-      sourceTokens ((String.ofList (line.toList.drop 8)).splitOn " "
-        |>.flatMap (·.splitOn "\t") |>.filter (!·.isEmpty))
-    else firstEntry rest
-
-/-- Parse the first sudoers entry, preserving every configured source. The
-absence of an entry is distinct from an explicit entry with no sources. -/
-def parse (text : String) : Except String (List String) :=
-  if text.toList.contains '\x00' then
-    .error "/etc/nsswitch.conf: invalid NUL in configuration"
-  else firstEntry (joinLines (text.splitOn "\n") "")
-
-private def checkSources : List String → Except String Unit
-  | [] => .ok ()
-  | source :: rest =>
-    if source = "files" ∨ source = "sss" then checkSources rest
-    else .error ("/etc/nsswitch.conf: unsupported sudoers source: " ++ source)
-
-/-- Approval requires at least one supported backend and no unsupported source. -/
-def approveSources : List String → Except String Unit
-  | [] => .error "/etc/nsswitch.conf: sudoers entry has no files source"
-  | source :: rest => checkSources (source :: rest)
-
-/-- The shell must call this before Sudoers.load, and must not load policy after
-an error. Only a missing nsswitch.conf may be supplied as empty text; other IO
-errors must not silently select the files backend. -/
-def approve (text : String) : Except String Unit := do
-  approveSources (← parse text)
-
-private theorem checkSources_supported_only (sources : List String)
-    (h : checkSources sources = .ok ()) :
-    ∀ source ∈ sources, source = "files" ∨ source = "sss" := by
-  induction sources with
-  | nil => simp
-  | cons source rest ih =>
-    by_cases hs : source = "files" ∨ source = "sss"
-    · have hr : checkSources rest = .ok () := by
-        simpa [checkSources, hs] using h
-      intro candidate hc
-      rcases List.mem_cons.mp hc with hc | hc
-      · subst candidate; exact hs
-      · exact ih hr candidate hc
-    · simp [checkSources, hs] at h
-
-/-- Approval cannot silently ignore a configured backend or approve an empty
-source list. This is the condition needed before consulting local sudoers. -/
-theorem approveSources_supported_only (sources : List String)
-    (h : approveSources sources = .ok ()) :
-    sources ≠ [] ∧ ∀ source ∈ sources, source = "files" ∨ source = "sss" := by
-  cases sources with
-  | nil => simp [approveSources] at h
-  | cons source rest =>
-    exact ⟨by simp, checkSources_supported_only _ h⟩
-
-/-- Successful approval cannot silently ignore an unsupported source. -/
-theorem approve_supported_only (text : String) (sources : List String)
-    (parsed : parse text = .ok sources) (h : approve text = .ok ()) :
-    sources ≠ [] ∧ ∀ source ∈ sources, source = "files" ∨ source = "sss" := by
-  unfold approve at h
-  rw [parsed] at h
-  exact approveSources_supported_only sources h
 
 structure Source where
   name : String
@@ -128,24 +51,97 @@ private def rawEntry : List String → List String
         |>.flatMap (·.splitOn "\t") |>.filter (!·.isEmpty)).map String.toLower
     else rawEntry rest
 
-def configure (text : String) : Except String (List Source) := do
-  approve text
-  let mut sources : List Source := []
-  let mut attached := false
-  for token in rawEntry (joinLines (text.splitOn "\n") "") do
-    if token == "files" || token == "sss" then
-      if sources.any (·.name == token) then attached := false
-      else
-        sources := { name := token } :: sources
-        attached := true
-    else
-      if attached then
-        sources := sources.modifyHead fun s =>
-          if token == "[success=return]" then { s with returnIfFound := true }
-          else if token == "[notfound=return]" then { s with returnIfNotFound := true }
-          else s
-      attached := false
-  return sources.reverse
+private def sourceStep (state : List Source × Bool) (token : String) : List Source × Bool :=
+  let (sources, attached) := state
+  if token == "files" || token == "sss" then
+    if sources.any (·.name == token) then (sources, false)
+    else ({ name := token } :: sources, true)
+  else
+    let sources := match sources with
+      | [] => []
+      | source :: rest =>
+        { source with
+          returnIfFound := source.returnIfFound || (attached && token == "[success=return]")
+          returnIfNotFound := source.returnIfNotFound || (attached && token == "[notfound=return]") } :: rest
+    (sources, false)
+
+private theorem sourceStep_supported (state : List Source × Bool) (token : String)
+    (h : ∀ source ∈ state.1, source.name = "files" ∨ source.name = "sss") :
+    ∀ source ∈ (sourceStep state token).1, source.name = "files" ∨ source.name = "sss" := by
+  rcases state with ⟨sources, attached⟩
+  dsimp only [sourceStep]
+  split
+  · rename_i ht
+    split
+    · exact h
+    · intro source hs
+      rcases List.mem_cons.mp hs with hs | hs
+      · subst source
+        simpa only [Bool.or_eq_true, beq_iff_eq] using ht
+      · exact h source hs
+  · cases sources with
+    | nil => simp
+    | cons source rest =>
+      intro candidate hc
+      rcases List.mem_cons.mp hc with hc | hc
+      · subst candidate
+        exact h source (by simp)
+      · exact h candidate (by simp [hc])
+
+private theorem checkSources_supported_only (tokens : List String) (state : List Source × Bool)
+    (h : ∀ source ∈ state.1, source.name = "files" ∨ source.name = "sss") :
+    ∀ source ∈ (tokens.foldl sourceStep state).1,
+      source.name = "files" ∨ source.name = "sss" := by
+  induction tokens generalizing state with
+  | nil => exact h
+  | cons token rest ih => exact ih _ (sourceStep_supported state token h)
+
+/-- Select compiled-in backends from normalized tokens, retaining order and
+return actions. Unrecognized tokens break action attachment, but never warn.
+An empty selection falls back to files, not an unavailable supported backend. -/
+def approveSources (tokens : List String) : List Source :=
+  let sources := (tokens.foldl sourceStep ([], false)).1
+  if sources = [] then [{ name := "files" }] else sources.reverse
+
+/-- Every backend the runtime can consult is supported, and selection is never
+empty. This applies to the selected chain, not ignored configuration words. -/
+theorem approveSources_supported_only (tokens : List String) :
+    approveSources tokens ≠ [] ∧ ∀ source ∈ approveSources tokens,
+      source.name = "files" ∨ source.name = "sss" := by
+  have supported := checkSources_supported_only tokens ([], false) (by simp)
+  dsimp only [approveSources]
+  split
+  · constructor
+    · simp
+    · intro source hs
+      simp only [List.mem_singleton] at hs
+      subst source
+      simp
+  · rename_i nonempty
+    constructor
+    · intro h
+      apply nonempty
+      simpa using congrArg List.reverse h
+    · intro source hs
+      exact supported source (by simpa using hs)
+
+/-- Parse the first sudoers entry. Unsupported source/action words are ignored
+as in sudo_nss.c; no recognized source means the ordinary files default. -/
+def configure (text : String) : Except String (List Source) :=
+  if text.toList.contains '\x00' then
+    .error "/etc/nsswitch.conf: invalid NUL in configuration"
+  else .ok (approveSources (rawEntry (joinLines (text.splitOn "\n") "")))
+
+/-- The configured runtime chain is nonempty and contains only files/SSSD.
+In particular, an explicit supported SSSD source is not replaced by files. -/
+theorem approve_supported_only (text : String) (sources : List Source)
+    (configured : configure text = .ok sources) :
+    sources ≠ [] ∧ ∀ source ∈ sources, source.name = "files" ∨ source.name = "sss" := by
+  unfold configure at configured
+  split at configured
+  · contradiction
+  · cases Except.ok.inj configured
+    exact approveSources_supported_only _
 
 /-- Retain the visited prefix. Pseudo-command lookup passes cumulative matches;
 execution passes the current source's match, as lookup.c does. -/
