@@ -1005,6 +1005,14 @@ private def authFailure (ctx : Core.Context) (decision : Core.Decision)
     if ctx.settings.passwdTries == 0 then
       if let .fail text _ := decision.action then Sys.writeStderr (← I18n.translate text)
 
+private def userInterrupted : IO Bool := do
+  let (error, pending) ← Sys.Prim.LogSrv.sigpending
+  if error != 0 then return false
+  let member (signal : UInt32) : IO Bool := do
+    let (failed, present) ← Sys.Prim.LogSrv.sigismember pending signal
+    return failed == 0 && present != 0
+  return (← member (Sys.Prim.Posix.SIGINT ())) || (← member (Sys.Prim.Posix.SIGQUIT ()))
+
 private def authenticate (ctx : Core.Context) (h : Sys.PamHandle) : IO (Option EventLog.AuthFailure) := do
   if ctx.opts.nonInteractive && !ctx.settings.noninteractiveAuth then
     return some { noInput := true, error := true }
@@ -1021,6 +1029,7 @@ private def authenticate (ctx : Core.Context) (h : Sys.PamHandle) : IO (Option E
       warn err
       return some { error := true }
     if attempt + 1 < ctx.settings.passwdTries then
+      if ← userInterrupted then return some { attempts := attempt + 1 }
       let seed ← Sys.bootTimeNanos
       let message ← if ctx.settings.insults then
         I18n.gettext (Insults.select seed)

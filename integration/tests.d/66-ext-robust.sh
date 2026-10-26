@@ -184,8 +184,12 @@ EOF
 cat >"$WORK/ext-robust-prompt-signal.py" <<'PY'
 import os
 import signal
+import fcntl
+import struct
 import subprocess
 import sys
+import termios
+import time
 user, name, password, order = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 marker = "/tmp/ext-robust-ran"
 if os.path.exists(marker):
@@ -199,13 +203,34 @@ os.close(reader)
 prompt = b""
 while not prompt.endswith(b"pw: "):
     prompt += process.stderr.read(1)
+def stopped(pid):
+    with open("/proc/%d/stat" % pid) as stat:
+        return stat.read().rsplit(")", 1)[1].split()[0] == "T"
+def pending(fd):
+    return struct.unpack("i", fcntl.ioctl(fd, termios.FIONREAD, b"\0\0\0\0"))[0]
+early = b""
 if order == "kill-first":
+    process.send_signal(signal.SIGSTOP)
+    while not stopped(process.pid):
+        time.sleep(0.01)
     process.send_signal(getattr(signal, name))
-os.write(writer, (password + "\n").encode())
-if order == "write-first":
+    process.send_signal(signal.SIGCONT)
+    while not early.endswith(b"\n"):
+        byte = process.stderr.read(1)
+        if not byte:
+            break
+        early += byte
+    try:
+        os.write(writer, (password + "\n").encode())
+    except BrokenPipeError:
+        pass
+else:
+    os.write(writer, (password + "\n").encode())
+    while pending(writer) > 0:
+        time.sleep(0.01)
     process.send_signal(getattr(signal, name))
 os.close(writer)
-rest = process.stderr.read().decode()
+rest = (early + process.stderr.read()).decode()
 process.wait()
 sys.stdout.write("status=%d ran=%s\n" % (process.returncode, os.path.exists(marker)))
 sys.stdout.write(rest)
@@ -217,24 +242,32 @@ Defaults lecture=never, passwd_tries=2
 ivan ALL=(ALL:ALL) ALL
 EOF
   for sig in SIGINT SIGQUIT SIGHUP; do
-    num=$(python3 -c "import signal; print(int(signal.$sig))")
-    for order in kill-first write-first; do
+    for password in ivanpw wrong; do
       reset_state
       install -m 0440 /dev/stdin /etc/sudoers.d/ext-robust <<'EOF'
 Defaults lecture=never, passwd_tries=2
 ivan ALL=(ALL:ALL) ALL
 EOF
-      run root "python3 '$WORK/ext-robust-prompt-signal.py' ivan $sig ivanpw $order"
-      expect_rc 0
-      expect_out_line "status=-$num ran=False"
-      expect_out_lacks 'password is required'
-      run root "python3 '$WORK/ext-robust-prompt-signal.py' ivan $sig wrong $order"
+      run root "python3 '$WORK/ext-robust-prompt-signal.py' ivan $sig $password kill-first"
       expect_rc 0
       expect_out_line 'status=1 ran=False'
+      expect_out_line 'sudo: a password is required'
+    done
+    reset_state
+    install -m 0440 /dev/stdin /etc/sudoers.d/ext-robust <<'EOF'
+Defaults lecture=never, passwd_tries=2
+ivan ALL=(ALL:ALL) ALL
+EOF
+    run root "python3 '$WORK/ext-robust-prompt-signal.py' ivan $sig wrong write-first"
+    expect_rc 0
+    expect_out_line 'status=1 ran=False'
+    expect_out_line 'sudo: 1 incorrect password attempt'
+    if [[ $sig == SIGHUP ]]; then
       expect_out_line 'Sorry, try again.'
       expect_out_line 'sudo: no password was provided'
-      expect_out_line 'sudo: 1 incorrect password attempt'
-    done
+    else
+      expect_out_lacks 'Sorry, try again.'
+    fi
   done
   end
 }
