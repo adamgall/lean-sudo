@@ -19,17 +19,32 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-usage() { echo "usage: $0 [--visudo] reference|sudo-rs|--build|<path-to-binary> [test-name-filter]" >&2; exit 2; }
+usage() {
+  echo "usage: $0 [--arch amd64|arm64] [--visudo] reference|sudo-rs|--build|<binary> [filter]" >&2
+  exit 2
+}
+case $(uname -m) in
+  arm64|aarch64) arch=arm64 ;;
+  x86_64|amd64) arch=amd64 ;;
+  *) usage ;;
+esac
 visudo=0
-if [[ ${1:-} == --visudo ]]; then visudo=1; shift; fi
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --arch) [[ $# -ge 2 ]] || usage; arch=$2; shift 2 ;;
+    --visudo) visudo=1; shift ;;
+    *) break ;;
+  esac
+done
+[[ $arch =~ ^(amd64|arm64)$ ]] || usage
 [[ $# -ge 1 && $# -le 2 ]] || usage
 impl=$1
 filter=${2:-}
-image=${SUDO_IT_IMAGE:-lean-sudo-it}
+image="${SUDO_IT_IMAGE:-lean-sudo-it}-$arch"
 if [[ $impl == --build ]]; then
-  "$here/build.sh" >/dev/null
-  impl="$(dirname "$here")/.lake/linux/sudo"
-  [[ $visudo == 1 ]] && impl="$(dirname "$here")/.lake/linux/visudo"
+  "$here/build.sh" --arch "$arch" >/dev/null
+  impl="$(dirname "$here")/.lake/linux-$arch/sudo"
+  [[ $visudo == 1 ]] && impl="$(dirname "$here")/.lake/linux-$arch/visudo"
 fi
 
 host_bin=
@@ -65,10 +80,14 @@ if [[ $visudo == 1 ]]; then
   entry=(--entrypoint /opt/impl/visudo-tests.sh)
 fi
 
-mkdir -p "$here/out"
-buildlog="$here/out/build.log"
+impl_label=$label
+label="${SUDO_IT_LABEL:-$label-$arch}"
+out="${SUDO_IT_OUT:-$here/out}"
+mkdir -p "$out"
+buildlog="$out/build-$arch-$label.log"
 build() {
-  docker build --build-arg "BASE=$1" -t "$image" "$here" >"$buildlog" 2>&1
+  docker build --platform "linux/$arch" --build-arg "BASE=$1" \
+    -t "$image" "$here" >"$buildlog" 2>&1
 }
 if [[ -n ${SUDO_IT_BASE:-} ]]; then
   build "$SUDO_IT_BASE" || { cat "$buildlog" >&2; exit 2; }
@@ -78,10 +97,11 @@ elif ! build ubuntu:26.04; then
 fi
 
 
-cid=$(docker create \
+cid=$(docker create --platform "linux/$arch" \
   --hostname sudo-it --network none --cap-add SYS_PTRACE --cap-add SYS_ADMIN \
-  -v "$here/out:/out" \
-  -e IMPL_LABEL="$label" -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+  -v "$out:/out" \
+  -e IMPL_LABEL="$impl_label" -e IMPL_OUTPUT_LABEL="$label" \
+  -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
   "${visudo_env[@]}" "${entry[@]}" "$image" "$bin" "$filter")
 trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 
@@ -97,5 +117,5 @@ set +e
 docker start -a "$cid"
 rc=$?
 set -e
-echo "# logs: $here/out/$label.tap, $here/out/$label.log" >&2
+echo "# logs: $out/$label.tap, $out/$label.log" >&2
 exit "$rc"

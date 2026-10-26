@@ -137,8 +137,9 @@ one source module; the C table also lists shared headers.
 | `Sudoedit.lean` | Descriptor-based file preparation, editor execution and checked copy-back. |
 | `Sudoedit/Check.lean` | Pure editor selection, separator, temporary-file and write-back checks. |
 | `Sudoers/Ast.lean` | Located sudoers syntax, aliases, Defaults, tags and command options. |
-| `Sudoers/Parser.lean` | Sudoers parser, diagnostics and successful-parse invariants. |
-| `Sudoers/Load.lean` | Include resolution, ordering and source ownership/mode checks. |
+| `Sudoers/Gram.lean` | sudo.ws-faithful sudoers scanner: flex rule emulation (start conditions, longest match, token spans per line buffer) driving bison's LALR tables from gram.c with yacc.c error recovery; yields every syntax/action diagnostic with sudo.ws line, byte column and `^~~~` underline, duplicate-alias errors, CHROOT warnings, include events and Defaults positions. |
+| `Sudoers/Parser.lean` | Sudoers parser: rejects what `Gram.lean` reports, then builds the AST; diagnostics and successful-parse invariants. |
+| `Sudoers/Load.lean` | Include resolution, ordering and source ownership/mode checks; `@include`/`@includedir` paths are colon-separated search lists (first existing entry wins, as sudo.ws `sudo_open_conf_path`). |
 | `Sys/Core.lean` | Identity/filesystem wrappers and helper-backed mail/admin operations. |
 | `Sys/CoreLogs.lean` | Log safety, locking, UUID encoding, time and terminal orchestration. |
 | `Sys/TimeFormat.lean` | Lean date directives over native time fields and locale text. |
@@ -146,6 +147,8 @@ one source module; the C table also lists shared headers.
 | `Sys/Prim/Posix.lean` | Runtime platform constants without native-host extern initialization. |
 | `Sys/Edit.lean` | Credential-scoped descriptor-relative sudoedit worker operations. |
 | `Sys/Exec.lean` | Checked execution specification and command supervisor bindings. |
+| `Sys/Limits.lean` | Port of sudo.ws `limits.c`: `unlimit_sudo`/`restore_limits`, sudoers `unlimit_nproc`/`restore_nproc`, warnings and order. |
+| `Sys/FrontSignals.lean` | sudo.ws front-end pending-signal set (`init_signals`/`sudo_handler`/`sudo_terminated`). |
 | `Sys/Extra.lean` | Matching validation, locale scopes, native-result walking and audit transport. |
 | `Sys/GroupPlugin.lean` | Group-provider ABI validation, path fallback, lifecycle and result acceptance. |
 | `Sys/Intercept.lean` | Parent-owned monitor lifecycle, execution preparation and relay hooks. |
@@ -154,7 +157,7 @@ one source module; the C table also lists shared headers.
 | `Sys/IoLog.lean` | I/O directories, sequence locks, gzip lifecycle, filtering and relay hooks. |
 | `Sys/LogSrv.lean` | Remote session protocol, failover, relay callbacks and commit validation. |
 | `Sys/Lookup.lean` | Credential-scoped batched path inspection and executable-bit criterion. |
-| `Sys/Pam.lean` | PAM lifecycle, Lean conversation, terminal/signalfd password loop and diagnostics. |
+| `Sys/Pam.lean` | PAM lifecycle, Lean conversation, terminal password loop with tgetpass signal semantics and diagnostics. |
 | `Sys/PamHelpers.lean` | Re-exec askpass, mailer and admin-flag helper plans and handlers. |
 | `Sys/Plugins.lean` | Front-end metadata and restriction-only approval theorems. |
 | `Sys/PluginHost.lean` | ABI validation, lifecycle/audit/approval sequencing and relay hooks. |
@@ -175,7 +178,7 @@ one source module; the C table also lists shared headers.
 
 | C source/header | Purpose |
 |---|---|
-| `c/core.c` | Single-call identity, terminal-presence and umask primitives. |
+| `c/core.c` | Runtime bootstrap constructor plus single-call identity, terminal-presence and umask primitives. |
 | `c/prim_posix.c` | Allocation-free accessors for target-platform constants. |
 | `c/prim_corefacts.c` | NSS, environment, directory and filesystem one-call primitives. |
 | `c/prim_corelogs.c` | One-call calendar, locale-data, syslog and log-file primitives. |
@@ -215,23 +218,29 @@ logic, loops over data, state machines) is Lean.
 3. **The post-fork boundary.** A multithreaded process's forked child may only call
    async-signal-safe functions. The stub resolves `_Fork` in the parent and fails
    closed if unavailable, so no `pthread_atfork` handlers run. It clears
-   close-on-exec on the descriptors Lean listed, moves the plan socket
-   to descriptor 63 and immediately `fexecve`s the pinned lean-sudo binary
+   close-on-exec on the descriptors Lean listed, performs at most one Lean-chosen
+   source→target descriptor move (placing a digest-pinned command descriptor on the
+   number sudo.ws would use) and immediately `fexecve`s the pinned lean-sudo binary
    (`/proc/self/exe`, opened `O_PATH|O_CLOEXEC` above descriptor 2 before runtime
-   startup). The parent never holds an inheritable plan descriptor, so concurrent
-   forks by PAM, NSS or plugins cannot capture it. The Lean-serialised plan travels
-   over one end of an `AF_UNIX` socketpair created by the spawning process. If that
+   startup) with the original process's argv, so a monitor shows the same command
+   line as sudo.ws's forked monitor, and the parent's environment plus
+   `LEAN_SUDO_HELPER=<fd>` naming the plan socket, which keeps its own descriptor
+   number (moves use descriptors 3 and up, so a low `RLIMIT_NOFILE` still works).
+   The parent never holds an inheritable plan descriptor, so concurrent forks by
+   PAM, NSS or plugins cannot capture it. The Lean-serialised plan travels over one
+   end of an `AF_UNIX` socketpair created by the spawning process. If that
    process runs with a lowered effective UID, only the calling thread's effective UID
    is set to the saved UID around `socketpair` (raw per-thread `setresuid`, so no
-   other thread gains it), and a failed restore terminates the process. Before
-   reading any plan byte, dispatch requires descriptor 63 to be a socket whose
-   `SO_PEERCRED` process is the helper's parent and whose credential UID (the
-   creator's effective UID when the pair was made) equals the helper's effective
-   UID. An unprivileged user can run the setuid binary with a socket of their own,
-   even below a waiting sudo process, but that socket carries their own effective
-   UID and is rejected. Only then are the parent PID, effective UID and protocol
-   magic in the envelope checked and a registered helper selected. Unauthenticated
-   helper arguments take the ordinary usage-error path. The fresh helper performs
+   other thread gains it), and a failed restore terminates the process. Without the
+   marker, or unless the named descriptor is a socket whose credential UID (the
+   creator's effective UID when the pair was made) equals the helper's effective UID,
+   the binary runs as ordinary sudo. An unprivileged user can run the setuid binary
+   with the marker and a socket of their own, even below a waiting sudo process, but
+   that socket carries their own effective UID and is ignored. A root-created socket
+   whose `SO_PEERCRED` process is not the helper's parent exits 127. Only then is the
+   marker removed and are the parent PID, effective UID and protocol magic in the
+   envelope checked and a registered helper selected; every later failure exits
+   127. The fresh helper performs
    privilege changes and verification, chroot/cwd, limits, AppArmor and final exec
    through primitives. Mailer, askpass, sudoedit and lookup workers use this same
    transport.
@@ -242,8 +251,22 @@ logic, loops over data, state machines) is Lean.
    The helper owns the complete policy/PAM/plugin/log lifecycle and detaches its
    process group only at the command-execution boundary. There is no post-fork
    Lean continuation and no assumption that the runtime remains single-threaded.
+4. **Runtime bootstrap.** One constructor in `c/core.c` runs before every other shim
+   constructor (priority 101; the `c/prim_exec.c` constructors, which pin the binary,
+   save the original argv for helpers and record which descriptors 0–63 were
+   inherited, use 102–104) and before the Lean runtime
+   starts. A single bounded loop over descriptors 0–2 reopens each closed one on
+   `/dev/null` with `O_RDWR`, exiting 1 if that open does not return the missing
+   descriptor; this is sudo.ws `fix_fds`, which runs first in its `main`, and it must
+   precede runtime start because libuv asserts when it closes a descriptor ≤ 2 that
+   it was handed. The constructor then sets the Lean thread stack reservation to
+   64 MiB: the runtime otherwise reserves 1 GiB for the main-function and event-loop
+   threads, which fails under an `RLIMIT_AS` of 1 GiB that sudo.ws keeps (it is not
+   below its 1 GiB `unlimit_sudo` threshold). A non-root caller execs the setuid
+   binary with `AT_SECURE`, so glibc has already reopened closed descriptors (0 on
+   `/dev/full`, 1–2 on `/dev/null`) for both implementations.
 
-The sole scoped exception is the timestamp `F_SETLKW` wait primitive. POSIX
+The first scoped exception is the timestamp `F_SETLKW` wait primitive. POSIX
 interoperability requires the waiting lock to belong to sudo's own PID, and
 `signalfd` consumption cannot interrupt a blocking `fcntl`. For one `F_SETLKW`
 call in the calling thread, this primitive temporarily installs handlers for the
@@ -257,6 +280,24 @@ stored-signal check but before `fcntl` enters the kernel can delay interruption
 until the lock is granted, as in sudo.ws. The signal number remains recorded;
 Lean then releases any acquired lock and falls back to authentication. The C
 primitive never synthesizes `EINTR` for a signal received before the syscall.
+
+The password read is the second scoped exception, because sudo.ws's `tgetpass`
+lets the kernel decide whether a signal interrupts the blocked read. For each
+prompt Lean installs, through the `c/prim_exec.c` signal-action primitive, a
+`c/prim_pam.c` handler that only sets a per-signal `volatile sig_atomic_t` flag
+for SIGHUP, SIGINT, SIGQUIT, SIGALRM, SIGTERM, SIGTSTP, SIGTTIN and SIGTTOU, and
+every wait is one primitive that unblocks exactly those signals in the calling
+thread around a single `poll` on the input descriptor. As for sudo.ws's blocked
+`read`, input that is readable when the thread wakes wins and is read; otherwise
+the wait fails with `EINTR` and the password is abandoned. A signal already
+pending when the wait unblocks runs its handler first and the wait then blocks for
+input, like a signal caught before sudo.ws enters `read`. After the read Lean
+mirrors `tgetpass`: a newline when echo was off or the read failed, terminal and
+disposition restore, terminating signals recorded for the pre-exec check, and
+SIGTSTP/SIGTTIN/SIGTTOU re-sent to sudo bracketed by the suspend and resume
+hooks (the sudoers policy closes and reopens/relocks its time-stamp record, a
+zero `timestamp_timeout` makes resuming fail; plugins get their conversation
+callback) followed by a fresh prompt when resuming succeeded.
 
 Primitive signatures match the prototypes emitted by Lean: `BaseIO` returns the
 bare value, while `IO` returns `IO.Result`. Scalar results are unboxed; products
@@ -286,18 +327,199 @@ Consequences: event loops (pty relay, signal relay via `signalfd`, job control, 
 ptrace tracer, the I/O-log writer, the log-server client, the interception broker)
 are Lean loops over `poll`/`read`/`write`/`waitpid`/`ptrace` primitives. Signals are
 blocked in every thread before the runtime starts additional threads and consumed
-through `signalfd`, except for the scoped timestamp-lock wait above. Seccomp BPF is built in
-Lean as bytes. Structures crossing the boundary (plugin `command_info`, ptrace
-register sets, timestamp records) are encoded and decoded in Lean.
-Lean removes glibc's internal realtime signals from every execution mask, using
-native kernel and libc realtime minima. Signal-action primitives return the raw
-previous handler, flags and mask; Lean chooses ignore/default policy and restores
+through `signalfd`, except for the scoped timestamp-lock and password waits above.
+Seccomp BPF is built in Lean as bytes. Structures crossing the boundary (plugin
+`command_info`, ptrace register sets, timestamp records) are encoded and decoded in Lean.
+Lean removes glibc's internal realtime signals from masks constructed for blocking,
+`signalfd` and restoration, using native kernel and libc realtime minima. The
+caller's original mask is preserved through helper serialization, then the existing
+reserved-signal filtering is applied before restoration. Signal-action primitives
+return the raw previous handler, flags and mask;
+Lean chooses ignore/default policy and restores
 the complete disposition after job-control stops. Execution vector, group and poll
 marshalling uses bounded heap allocations, and native structure access rejects
 incorrect byte-array sizes. Background environment replacement occurs only in the
 authenticated session helper, never in the spawning process.
 Command helpers initialize the inherited locale after re-exec, before formatting
 native errno diagnostics through thread-safe `strerror_r`.
+
+## Security decisions in the imperative shell
+
+The helper channel and envelope, credential observations, execution/PAM/background
+plans, plugin inputs, signal masks, relay composition, and timestamp storage now
+have total Lean decision functions used by the corresponding IO paths. Proofs
+characterize those decisions; they do not verify libc, kernel syscalls, foreign
+plugin code, or successful physical delivery of every requested operation.
+
+`Helper.channelAccepted` requires socket mode, a parent PID greater than one,
+and peer PID/UID equality with the parent/effective UID. `envelopeAccepted`
+separately checks magic, parent, effective UID and a representable 64-bit mask.
+`channelDescriptor` accepts only a bounded descriptor number from the marker;
+`helperDescriptors` inherits the keep descriptors plus exactly the channel.
+The original mask's Nat/UInt64 round trip is exact.
+
+`Helper.credentialsAccepted` is the shared gate actually called by
+`dropCredentials` and `ExecChild.commandAuthorized`. Both glibc process-wide and raw
+per-thread changes call the same gate; there is no mode parameter in its decision. It
+requires exact real/effective/saved and filesystem IDs, a permutation of the
+requested supplementary groups, and false root-regain observations. The existing
+probe conditions are unchanged: UID regain is attempted only when both requested
+real and effective UIDs are nonzero; GID regain only for nonzero UID and GID.
+The proofs characterize observations, not the success of a syscall or an
+unperformed regain probe.
+
+`commandDescriptorOpen` specifies the intended ordinary-exec descriptor set:
+initially exec-inheritable descriptors below `closeFrom`, union `plan.keepFds`,
+minus the error and executable descriptors marked CLOEXEC. The IO sequence is
+designed to implement this specification, but its equivalence to the specification
+is not proved. The descriptor theorems below are explicitly specification properties.
+
+The actual sweep uses the proved `completeSweep` and `sweepDescriptors` combinators.
+If `close_range(CLOSE_RANGE_CLOEXEC)` fails, it visits every descriptor from
+`closeFrom` up to the hard `RLIMIT_NOFILE`, exclusively, using `fcntl(FD_CLOEXEC)`.
+EBADF means the descriptor is already absent; any other failed visit aborts before
+exec. Failure to obtain a representable hard bound also aborts. The proofs establish
+completion over this interval from the visit results, not kernel syscall effects
+or the absence of descriptors above a previously lowered hard limit.
+A failed keep-descriptor `fcntl` can lose a requested descriptor, but cannot add one.
+The existing `fexecve` ENOENT script retry deliberately clears the executable fd's
+CLOEXEC flag so an interpreter can open the script; it is outside the normal-exec
+specification. Invalid child-plan descriptors are rejected before narrowing;
+the helper reports the error on `errorFd` when that descriptor itself is valid.
+
+Timestamp storage selection uses the existing `LocatedEntry.matches` model;
+record extraction uses `recordFor`; storage updates use `updateEntry`. The linked
+authorization theorem includes UID/scope equality, valid start/time encoding,
+session matching, a non-disabled record, no future timestamp and the model's
+timeout condition. Fresh disabled records and invalidated records cannot authorize.
+
+Relay composition uses generic total monadic combinators, not a detached trace
+simulation. `allThen` runs input/output/stream hooks left-to-right and stops at
+the first false result, preserving all preceding effects. `anyThen` runs
+needs-stream, force-pty and child-handled queries left-to-right until true.
+`inOrder` sequences window, spawn, suspend, signal, tick, finish and exec-error
+notifications left-to-right. Exceptions retain the underlying monad's short circuit.
+`allThen_abort_after` covers a first hook that performs effects and then returns
+false; it does not assume that the entire first action is an effect-free `pure false`.
+
+### Security-decision theorem inventory
+
+Names below are relative to `LeanSudo`. Supporting definitional characterizations
+remain in the source where used by proofs, but are not counted as security results.
+
+Helper boundary and credential decisions:
+
+- `Helper.authenticatedEnvelope_peer`: accepted channel/envelope observations match socket and peer IDs.
+- `Helper.helperDescriptors_exact`: inheritance selects exactly the keep descriptors and the channel.
+- `Helper.helperDescriptors_channel`: the channel descriptor is always inherited.
+- `Helper.channelDescriptor_bounded`: an accepted marker descriptor is at most `0x7FFFFFFF`.
+- `Helper.restoredMask_exact`: an accepted serialized mask converts to UInt64 without truncation.
+- `Helper.restoredMask_roundtrip`: serializing and restoring a UInt64 mask preserves every bit.
+- `Helper.groupsEqual_multiset`: accepted supplementary groups are a permutation, including duplicates.
+- `Helper.credentialsAccepted_secure`: either drop mode requires all IDs, group multiset and no regain.
+
+Execution plans and descriptors (`Sys.Exec`):
+
+- `validDescriptor_bounds`: accepted command descriptors lie between 3 and INT_MAX.
+- `validDescriptor_exact`: accepted command descriptors narrow exactly and exclude the invalid sentinel.
+- `checkGroups_bounds`: every successfully converted supplementary group is at most `maxId`.
+- `check_valid`: successful plan checking implies all string, ID, mask, timeout and descriptor bounds.
+- `stringsSafe_noNul`: every selected execution-plan string field is NUL-free.
+- `check_noNul`: a successfully checked execution plan contains no NUL in any string field.
+- `check_rejects_nul`: a NUL in any execution-plan string prevents success.
+- `check_rejects_uid`: an out-of-range target UID prevents success.
+- `check_rejects_gid`: an out-of-range target GID prevents success.
+- `check_rejects_group`: an out-of-range supplementary GID prevents success.
+- `check_rejects_closeFrom`: an invalid close-from descriptor prevents success.
+- `check_rejects_execFd`: an invalid executable descriptor prevents success.
+- `childIdentityValid_exact`: child identity validation is exactly the real-UID/GID bounds.
+- `childFdValid_exact`: auxiliary descriptors are bounded and narrow without truncation.
+- `childDescriptorsValid_exact`: every error, redirect, close, keep, gate and slave fd is bounded.
+- `commandDescriptorOpen_managed`: the specification selects only explicit non-CLOEXEC managed fds.
+- `commandDescriptorOpen_no_other`: the specification excludes every unlisted managed-range descriptor.
+- `sweepDescriptors_complete`: the fallback combinator succeeds exactly when every interval visit does.
+- `completeSweep_spec`: a successful range sweep or all successful fallback visits are necessary and sufficient.
+- `completeSweep_results`: acceptance requires range success or only success/EBADF fallback results.
+- `completeSweep_rejects_failed_visit`: range failure plus any failed fallback visit rejects the sweep.
+
+Timestamp storage (`Sys.TimestampStorage`):
+
+- `selectEntry_uid`: a selected record has the requested authentication UID.
+- `lookup_model`: storage authorization is exactly model validity of an extracted record.
+- `authorized_sound`: authorization requires matching identity/scope, valid encoding/session and freshness.
+- `recordsFor_invalid_start`: invalid process start-time encoding yields no record.
+- `recordsFor_invalid_time`: invalid timestamp encoding yields no record.
+- `recordsFor_wrong_session`: a non-global record for another session yields no record.
+- `updateFor_sound`: accepted updates preserve record identity and encode a matching disk entry.
+- `updateFor_wrong_uid`: updates for another authentication UID are rejected.
+- `updateFor_wrong_scope`: updates for another scope are rejected.
+- `initialEntry_model`: fresh storage entries decode as disabled records at time zero.
+- `initialEntry_denied`: fresh storage entries never authorize authentication.
+- `invalidated_records_denied`: invalidated storage records never authorize authentication.
+
+PAM helper plans (`Sys.PamHelpers`):
+
+- `validPlan_rejects_uid`: an invalid UID is rejected.
+- `validPlan_rejects_gid`: an invalid GID is rejected.
+- `validPlan_rejects_group`: an invalid supplementary group is rejected.
+- `validPlan_rejects_descriptor`: an out-of-range descriptor is rejected.
+- `validPlan_rejects_path_nul`: a NUL in the executable path is rejected.
+- `validPlan_rejects_arg_nul`: a NUL in any argument is rejected.
+- `validPlan_rejects_prompt_byte`: zero or out-of-byte-range prompt values are rejected.
+- `validMailInput_rejects_nul`: a NUL in any mail input rejects that input.
+
+Plugin host (`Sys.Plugins`):
+
+- `validPluginString_rejects_nul`: embedded NULs are rejected.
+- `validPluginIdentity_rejects_nul`: a NUL in either plugin identity field rejects loading.
+- `validSubmitIndex_rejects_overflow`: an excessive submit index is rejected.
+- `supportedType_range`: supported external plugin types are exactly 2 through 4.
+
+Plugin callbacks (`Sys.Plugins.Callbacks`):
+
+- `validEventPlan_preserves_valid`: bounded descriptors retain the existing event decision.
+- `validEventPlan_rejects_descriptor`: an oversized read/write descriptor is rejected.
+- `validEventPlan_signal_bounds`: signal events have valid, catchable signals and no read/write flags.
+- `validEventPlan_has_callback`: every accepted event has a non-null callback.
+
+Signal masks (`Sys.Prim.Exec`):
+
+- `signalSupported_excludes_internal`: signals in glibc's reserved realtime interval are unsupported.
+- `clearSignalRange_preserves_clear`: clearing a signal range never sets an already-cleared bit.
+- `clearSignalRange_excludes`: every signal bit in the selected interval is cleared.
+- `supportedMask_excludes_internal`: constructed masks exclude every glibc-internal realtime signal.
+
+Relay composition (`Sys.RelayHooks`):
+
+- `allThen_abort`: an immediate false result skips the second hook.
+- `allThen_continue`: a true result runs the second hook.
+- `allThen_abort_after`: a false result after arbitrary preceding effects skips the second hook.
+- `allThen_assoc`: regrouping chained acceptance hooks preserves execution and results.
+- `anyThen_stop`: an immediate true result skips the second query.
+- `anyThen_continue`: a false result runs the second query.
+- `anyThen_stop_after`: a true result after arbitrary preceding effects skips the second query.
+- `anyThen_assoc`: regrouping handled-event queries preserves execution and results.
+- `inOrder_assoc`: regrouping notifications preserves execution order.
+
+Background session plans (`Background`):
+
+- `validSession_safe`: accepted plans have bounded fds/PIDs, NUL-free strings and valid env names.
+- `validSession_rejects_descriptor`: an oversized directory or status fd is rejected.
+- `validSession_rejects_process`: zero child PID or out-of-range child/parent PID is rejected.
+- `validSession_rejects_nul`: a NUL in argv or environment is rejected.
+- `validSession_rejects_environment_name`: empty or equals-containing environment names are rejected.
+
+### Startup state shared with sudo.ws's front end
+
+If `getcwd` fails (deleted working directory) the context has no cwd, as in sudo.ws
+(`cwd=` is omitted from user_info): sudo-format log lines omit `PWD=`, JSON events
+omit `submitcwd`/`runcwd`, the I/O log `log` file records `unknown` and `log.json`
+omits `submitcwd`, the command is not chdir'ed, and relative command names are not
+found. `Sys/FrontSignals.lean` keeps sudo.ws's front-end pending-signal set
+(`init_signals`/`sudo_handler`): HUP, INT, QUIT, TERM, TSTP, ALRM, USR1 and USR2
+stay blocked from startup and are drained into the set before prompt reads and at
+the `sudo_terminated` checkpoint before the command is spawned, where a pending
+terminating signal skips the command and sudo exits by that signal.
 
 ## Sys API contract
 
@@ -425,8 +647,8 @@ PAM's C conversation entry point forwards raw message/response pointers to a
 retained Lean closure and returns its answer. Lean validates the bounded message
 count, reads native fields, allocates responses, and erases/frees failed responses.
 Prompt selection, lecture state, stdin/tty/askpass selection, feedback editing,
-deadlines and signal handling are Lean. The password loop consumes blocked signals
-through signalfd and restores terminal attributes on exit. Native termios field
+deadlines and signal handling are Lean. The password loop waits through the scoped
+`tgetpass` primitive above and restores terminal attributes on exit. Native termios field
 accessors validate buffers; Lean chooses every edit. Lean also walks PAM environment
 vectors and builds NULL-terminated helper argument vectors.
 Askpass, mail and admin-flag operations use authenticated helper plans; helpers
@@ -464,7 +686,7 @@ inductive ExitStatus where
   | exited (code : Nat)
   | signaled (sig : Nat)
 initializeProcess (disableCoredump : Bool := true) : IO Unit
-restoreCoreLimit : IO Unit
+restoreLimits (progname : String) : IO Unit
 lastDumpedCore : IO Bool
 runCommand : ExecSpec → IO ExitStatus
 exitWith : ExitStatus → IO α
@@ -499,6 +721,10 @@ preserves the caller's limit. Ubuntu's systemd package installs
 limit to zero.
 
 Authentication-failure file events follow sudo.ws's combined log/mail gate.
+As in sudo.ws's eventlog, a mail-only event (mail without the matching log flag)
+skips syslog, still writes the logfile when syslog is enabled, and sends no mail
+when neither syslog nor a logfile is configured; `mail_always` also mails the EXIT
+line.
 When a usable mailer will report a policy denial, the redundant bad-password
 event is omitted from both logfile and syslog; the diagnostic still goes to
 stderr. Without that denial mail, `mail_badpass` can produce a file-only
@@ -701,8 +927,8 @@ proved. Names are unqualified within the module named in each item.
    `invalidateScope_other` leaves nonmatching slots untouched, and `lookup_update_other`
    prevents a written record authorizing another key. `decodeEntry_encodeEntry` and
    `decode_encode` round-trip representable fixed-slot entries.
-   `scanStep_bounds` gives `offset + 4 ≤ next ≤ extent`; `scanStep_decoded` ties emitted
-   entries to `decodeSlot`, whose `decodeSlot_validity` characterizes raw timespec flags.
+   The record walk follows sudo.ws `timestamp_lock`/`ts_find_record`; `decodeSlot`
+   decodes each examined slot, and `decodeSlot_validity` characterizes raw timespec flags.
    `LocatedEntry.authorized_sound`
    additionally requires successful `recordFor` and `valid`, and yields UID/scope,
    valid timespecs, global-or-matching SID, non-disabled/nonfuture time and strict
@@ -713,7 +939,8 @@ proved. Names are unqualified within the module named in each item.
    `exec_noauth` gives `AuthExemption` when an exec decision has `.auth = .none`;
    it does not prove PAM success. `exec_identity` fixes UID to target, GID to the
    invoking real GID under stay-setuid or selected target GID otherwise, and groups
-   to invoking or target groups according to preserve-groups. `exec_environment`
+   to `targetGroups`: the invoking groups under preserve-groups, otherwise the
+   selected GID followed by the target's other groups, as sudo.ws. `exec_environment`
    fixes the plan's inputs and empty pre-PAM environment, not the final post-PAM
    bytes. `timestamp_update_allowed` implies policy allow and neither `-N` nor
    reset; `reset_never_waives_auth` requires `policyNeedsAuth = true`.
@@ -766,21 +993,41 @@ As stated in README's **Fail-closed by design**, where sudo.ws keeps a partial
 policy, lean-sudo stops because a dropped line can be a `!` rule:
 
 * A syntax error anywhere in the policy stops lean-sudo; sudo.ws reports it and
-  continues with the rules it could parse.
+  continues with the rules it could parse. This includes sudo.ws's own parser
+  errors such as `too many levels of includes` for an include loop.
+* A NUL byte that would end a sudoers line or word early in sudo.ws is a syntax
+  error, unless only NULs or blanks follow it on its line or it is in a comment.
+  A NUL in `/etc/nsswitch.conf` is an error.
 * An insecure or unreadable include stops lean-sudo: an included file or
   `@includedir` directory that is world-writable, group-writable by a group other
   than root, or not owned by root, and an `@include` file that is missing or cannot
-  be read. sudo.ws warns and skips them.
+  be read. sudo.ws warns and skips them. A missing or unusable main sudoers file
+  stops lean-sudo even when `sss` also supplies rules.
 * Undefined aliases and alias cycles are errors (sudo warns), because a
   `!UNDEFINED` matching nothing would widen access.
 * Invalid Defaults values (for example `timestamp_timeout=abc`) are errors, rather
   than falling back to defaults that could widen access.
 * Non-UTF-8 command-line arguments are refused; non-UTF-8 environment entries are
-  dropped.
+  dropped, from the command's environment and from logged `submitenv`. A non-UTF-8
+  sudoers file stops lean-sudo.
 
 The README's **Other differences from sudo.ws** are:
 
 * Fractional `timestamp_timeout` is rounded down to whole seconds.
+* A credential-cache record dated in the future is never honoured
+  (`valid_not_future`); sudo.ws accepts it when `timestamp_timeout` is negative.
+* The executed path is the canonical parent directory plus basename that the
+  policy compared (`exec_path_is_canonical`); sudo.ws executes the typed path for
+  `ALL` or the rule's path, which a script observes in `$0`.
+* sudoedit writes back a temporary file only while it has exactly one link
+  (`tempSafe_sound`); sudo.ws checks only type, mode 0600 and owner.
+* sudoedit never edits a relative path (`edit_files_normalized`): from a deleted
+  working directory it refuses where sudo.ws runs the editor and then fails to write.
+* A `SUDO_PS1` value starting with `() ` does not set `PS1`
+  (`buildEnv_no_bash_fn`); sudo.ws sets it.
+* The credential cache is refreshed only for allowed requests
+  (`timestamp_update_allowed`), not after an authenticated `-l -U other` for a user
+  without rules as in sudo.ws.
 * Chroot lookup rejects host-prefixed canonical commands or parents escaping the
   selected root. It also avoids three upstream false “command not found” cases:
   losing a selected command when a later NSS source is empty, dropping privileges

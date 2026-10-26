@@ -1,5 +1,6 @@
 import LeanSudo.EventLog
 import LeanSudo.Sys.Prim.CoreLogs
+import LeanSudo.Sys.Prim.Exec
 import LeanSudo.Sys.Prim.Extra
 import LeanSudo.Sys.Prim.Posix
 import LeanSudo.Sys.TimeFormat
@@ -212,12 +213,23 @@ private partial def writeAll (fd : UInt32) (bytes : ByteArray) (offset : Nat := 
   if count == 0 then errno (EIO ())
   writeAll fd bytes (offset + count)
 
+private def openAsRoot (path : String) (flags : UInt32) : IO Int := do
+  let (rgid, egid, sgid) ← Prim.Exec.getresgid
+  let changed ← if egid == 0 then pure false else
+    try Prim.Exec.threadSetresgid rgid 0 sgid; pure true catch _ => pure false
+  let mask ← Prim.Exec.umask (S_IRWXG () ||| S_IRWXO ())
+  try Prim.CoreLogs.openFile path flags (S_IRUSR () ||| S_IWUSR ())
+  finally
+    discard <| Prim.Exec.umask mask
+    if changed then
+      try Prim.Exec.threadSetresgid rgid egid sgid catch _ => IO.Process.exit 1
+
 private def append (path text : String) (json : Bool) : IO Unit := do
   checkString path
   checkString text
   let access := if json then O_RDWR () else O_WRONLY () ||| O_APPEND ()
   let flags := access ||| O_CREAT () ||| O_NOFOLLOW () ||| O_CLOEXEC () ||| O_NONBLOCK ()
-  let descriptor ← Prim.CoreLogs.openFile path flags (S_IRUSR () ||| S_IWUSR ())
+  let descriptor ← openAsRoot path flags
   if descriptor < 0 then
     let error ← Prim.CoreLogs.strerror (-descriptor).toNat.toUInt32
     let message := s!"unable to open log file {path}: {error}".toUTF8

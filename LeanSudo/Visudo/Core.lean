@@ -119,11 +119,14 @@ where
 def locPos (l : Located) : String := s!"{l.file}:{l.line}"
 
 def renderSyntaxError (e : ParseError) (text : String) : String :=
-  let message := if e.msg.startsWith "expected a fully-qualified path name" then
+  if let some rendered := e.rendered then rendered else
+  let message := if e.plain then e.msg
+    else if e.msg.startsWith "expected a fully-qualified path name" then
       "expected a fully-qualified path name" else "syntax error"
   let header := s!"{e.file}:{e.line}:{e.col}: {message}"
   match (text.splitOn "\n")[e.line - 1]? with
   | some ln =>
+    let ln := (ln.splitOn "\x00").head!
     if e.line == 0 || ln.isEmpty then header
     else
       let chars := ln.toList
@@ -147,17 +150,6 @@ def aliasDefs (es : List Located) : List (String × String × Located) :=
 def refsByKind (r : Refs) : List (String × List String) :=
   [("User_Alias", r.user), ("Runas_Alias", r.runas), ("Host_Alias", r.host),
    ("Cmnd_Alias", r.cmnd)]
-
-def duplicateErrors (es : List Located) : List String :=
-  go (aliasDefs es) []
-where
-  go : List (String × String × Located) → List (String × String × Located) → List String
-  | [], _ => []
-  | (k, n, l) :: ds, seen =>
-    match seen.find? (fun (k', n', _) => k' == k && n' == n) with
-    | some (_, _, l0) =>
-      s!"{locPos l}: duplicate {k} \"{n}\", previously defined at {locPos l0}" :: go ds seen
-    | none => go ds ((k, n, l) :: seen)
 
 structure AliasScan where
   errors : List String := []
@@ -222,7 +214,7 @@ def defaultsErrors (es : List Located) : List String :=
     | _ => []
 
 def semanticErrors (es : List Located) (_strict : Bool := false) : List String :=
-  let errors := duplicateErrors es ++ defaultsErrors es
+  let errors := defaultsErrors es
   match validate (es.map (·.entry)) with
   | .ok () => errors
   | .error message =>

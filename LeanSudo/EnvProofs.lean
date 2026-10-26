@@ -9,7 +9,28 @@ theorem nodup_filter {e : EnvList} (p : String × String → Bool) (h : NodupKey
 
 theorem mem_setVar {e : EnvList} {k v : String} {kv : String × String} :
     kv ∈ setVar e k v ↔ (kv ∈ e ∧ kv.1 ≠ k) ∨ kv = (k, v) := by
-  simp [setVar, List.mem_filter]
+  unfold setVar
+  split
+  · rename_i hk
+    simp only [List.mem_map]
+    constructor
+    · rintro ⟨x, hx, rfl⟩
+      by_cases hxk : x.1 = k
+      · exact Or.inr (by simp [hxk])
+      · exact Or.inl (by simp [hxk, hx])
+    · rintro (⟨hm, hne⟩ | rfl)
+      · exact ⟨kv, hm, by simp [hne]⟩
+      · obtain ⟨x, hx, hxk⟩ := List.any_eq_true.1 hk
+        exact ⟨x, hx, by simp at hxk; simp [hxk]⟩
+  · rename_i hk
+    simp only [List.mem_append, List.mem_singleton]
+    constructor
+    · rintro (hm | rfl)
+      · exact Or.inl ⟨hm, fun he => hk (List.any_eq_true.2 ⟨kv, hm, by simp [he]⟩)⟩
+      · exact Or.inr rfl
+    · rintro (⟨hm, -⟩ | rfl)
+      · exact Or.inl hm
+      · exact Or.inr rfl
 
 theorem mem_setVar_self (e : EnvList) (k v : String) : (k, v) ∈ setVar e k v :=
   mem_setVar.2 (Or.inr rfl)
@@ -135,15 +156,25 @@ theorem lookup_mem {e : EnvList} {k v : String} (h : lookup e k = some v) : (k, 
 theorem nodup_setVar {e : EnvList} (k v : String) (h : NodupKeys e) :
     NodupKeys (setVar e k v) := by
   unfold NodupKeys setVar
-  rw [List.map_append, List.nodup_append]
-  refine ⟨?_, by simp, ?_⟩
-  · exact (List.filter_sublist.map _).nodup h
-  · intro a ha b hb
+  split
+  · rw [List.map_map]
+    have hf : (Prod.fst ∘ fun kv : String × String => if kv.1 == k then (k, v) else kv) =
+        Prod.fst := by
+      funext kv
+      by_cases hk : kv.1 = k <;> simp [hk]
+    rw [hf]
+    exact h
+  · rename_i hk
+    rw [List.map_append, List.nodup_append]
+    refine ⟨h, by simp, ?_⟩
+    intro a ha b hb
     simp only [List.map_cons, List.map_nil, List.mem_singleton] at hb
-    simp only [List.mem_map, List.mem_filter] at ha
-    obtain ⟨kv, ⟨_, hne⟩, rfl⟩ := ha
     subst hb
-    simpa using hne
+    intro hab
+    subst hab
+    simp only [List.mem_map] at ha
+    obtain ⟨kv, hkv, rfl⟩ := ha
+    exact hk (List.any_eq_true.2 ⟨kv, hkv, by simp⟩)
 
 theorem nodup_setDefault {e : EnvList} (k v : String) (h : NodupKeys e) :
     NodupKeys (setDefault e k v) := by
@@ -217,6 +248,10 @@ theorem inv_setDefault {P : String × String → Prop} {e : EnvList} {k v : Stri
   · exact h kv hm'
   · exact hkv
 
+theorem inv_filter {P : String × String → Prop} {e : EnvList} (p : String × String → Bool)
+    (h : Inv P e) : Inv P (e.filter p) :=
+  fun kv hm => h kv (List.mem_filter.1 hm).1
+
 theorem inv_setAll {P : String × String → Prop} {e l : EnvList}
     (h : Inv P e) (hl : ∀ kv ∈ l, P kv) : Inv P (setAll e l) := by
   intro kv hm
@@ -277,54 +312,48 @@ theorem inv_defaultsReset (i : EnvInput) (reset : Bool) (extra : EnvList) :
       Origin i reset extra (k, v) := fun k k' v hk hm => by
     have := baseEnv_user hm
     exact Or.inr (Or.inl ⟨hk, k', this.1, this.2⟩)
-  have h1 : Inv (Origin i reset extra)
-      (if i.loginShell then
-        setVar (setVar (setVar (baseEnv i reset) "SHELL" i.target.shell) "LOGNAME" i.target.name)
-          "USER" i.target.name
-      else if i.settings.setLogname then lognameReset i (baseEnv i reset)
-      else setDefault (setDefault (baseEnv i reset) "LOGNAME" i.invoking.name)
-        "USER" i.invoking.name) := by
-    split
-    · exact inv_setVar (inv_setVar (inv_setVar hb (sv _ (by simp [sudoValues])))
-        (sv _ (by simp [sudoValues]))) (sv _ (by simp [sudoValues]))
-    · split
-      · unfold lognameReset
-        split
-        · exact inv_setVar (inv_setVar hb (sv _ (by simp [sudoValues])))
-            (sv _ (by simp [sudoValues]))
-        · rename_i l _ hl _
-          exact inv_setVar hb (copy _ _ _ (by simp) (lookup_mem hl))
-        · rename_i u _ hu
-          exact inv_setVar hb (copy _ _ _ (by simp) (lookup_mem hu))
-        · exact hb
-      · exact inv_setDefault (inv_setDefault hb (sv _ (by simp [sudoValues])))
-          (sv _ (by simp [sudoValues]))
-  unfold defaultsReset
+  have hpath : ∀ p, effectiveSecurePath i = some p → Origin i reset extra ("PATH", p) :=
+    fun p hp => sv _ (by simp [sudoValues, hp])
+  have copyL : ∀ l, lookup (baseEnv i reset) "LOGNAME" = some l →
+      Origin i reset extra ("USER", l) := fun l hl => copy _ _ _ (by simp) (lookup_mem hl)
+  have copyU : ∀ u, lookup (baseEnv i reset) "USER" = some u →
+      Origin i reset extra ("LOGNAME", u) := fun u hu => copy _ _ _ (by simp) (lookup_mem hu)
+  have : Origin i reset extra ("HOME", i.target.home) := sv _ (by simp [sudoValues])
+  have : Origin i reset extra ("LOGNAME", i.invoking.name) := sv _ (by simp [sudoValues])
+  have : Origin i reset extra ("LOGNAME", i.target.name) := sv _ (by simp [sudoValues])
+  have : Origin i reset extra ("USER", i.invoking.name) := sv _ (by simp [sudoValues])
+  have : Origin i reset extra ("USER", i.target.name) := sv _ (by simp [sudoValues])
+  have : Origin i reset extra ("MAIL", "/var/mail/" ++ i.target.name) :=
+    sv _ (by simp [sudoValues])
+  have : Origin i reset extra ("SHELL", i.target.shell) := sv _ (by simp [sudoValues])
+  unfold defaultsReset lognameReset applySecurePath
   simp only
-  split <;> split
-  all_goals first
-    | exact inv_setVar (inv_setVar h1 (sv _ (by simp [sudoValues])))
-        (sv _ (by simp [sudoValues]))
-    | exact inv_setVar h1 (sv _ (by simp [sudoValues]))
-    | exact h1
+  repeat' split
+  all_goals
+    repeat' first
+      | with_reducible exact hb
+      | with_reducible assumption
+      | (apply hpath; with_reducible assumption)
+      | (apply copyL; with_reducible assumption)
+      | (apply copyU; with_reducible assumption)
+      | with_reducible apply inv_setVar
+      | with_reducible apply inv_setDefault
 
 theorem inv_defaultsCopy (i : EnvInput) (reset : Bool) (extra : EnvList) :
     Inv (Origin i reset extra) (defaultsCopy i (baseEnv i reset)) := by
   have hb := inv_baseEnv i reset extra
   have sv := @origin_of_sudoValues i reset extra
-  unfold defaultsCopy
+  have hpath : ∀ p, effectiveSecurePath i = some p → Origin i reset extra ("PATH", p) :=
+    fun p hp => sv _ (by simp [sudoValues, hp])
+  unfold defaultsCopy applySecurePath
   simp only
-  have h1 : Inv (Origin i reset extra)
-      (if i.settings.setLogname then
-        setVar (setVar (baseEnv i reset) "LOGNAME" i.target.name) "USER" i.target.name
-       else baseEnv i reset) := by
-    split
-    · exact inv_setVar (inv_setVar hb (sv _ (by simp [sudoValues])))
-        (sv _ (by simp [sudoValues]))
-    · exact hb
-  split
-  · exact inv_setVar h1 (sv _ (by simp [sudoValues]))
-  · exact h1
+  repeat' split
+  all_goals
+    repeat' first
+      | with_reducible exact hb
+      | (apply hpath; assumption)
+      | (apply sv; simp [sudoValues]; done)
+      | with_reducible apply inv_setVar
 
 theorem inv_commonDefaults (i : EnvInput) (reset : Bool) (extra : EnvList) {e : EnvList}
     (he : Inv (Origin i reset extra) e) : Inv (Origin i reset extra) (commonDefaults i e) := by
@@ -350,29 +379,15 @@ theorem mem_assemble_origin {i : EnvInput} {reset : Bool} {extra : EnvList} {kv 
     · exact inv_defaultsReset i reset extra
     · exact inv_defaultsCopy i reset extra
   have h2 := inv_commonDefaults i reset extra h1
-  have h4 : Inv (Origin i reset extra) (applySecurePath i (commonDefaults i
+  have h5 : Inv (Origin i reset extra) (sudoVars i (commonDefaults i
       (if reset then defaultsReset i (baseEnv i reset) else defaultsCopy i (baseEnv i reset)))) := by
-    unfold applySecurePath
-    split
-    · rename_i p hp
-      exact inv_setVar h2 (sv _ (by simp [sudoValues, hp]))
-    · exact h2
-  have hh := inv_setVar h4 (sv ("SUDO_HOME", i.invoking.home) (by simp [sudoValues]))
-  let eh := setVar (applySecurePath i (commonDefaults i
-    (if reset then defaultsReset i (baseEnv i reset) else defaultsCopy i (baseEnv i reset))))
-      "SUDO_HOME" i.invoking.home
-  have ht : Inv (Origin i reset extra)
-      (match i.ttyName with
-       | some tty => setVar eh "SUDO_TTY" tty
-       | none => eh.filter (fun kv => kv.1 != "SUDO_TTY")) := by
-    cases ht : i.ttyName with
-    | some tty => exact inv_setVar hh (sv _ (by simp [sudoValues, ht]))
-    | none => intro kv hm; exact hh kv (List.mem_filter.1 hm).1
-  have h5 := inv_setVar (inv_setVar (inv_setVar (inv_setVar ht
-    (sv ("SUDO_COMMAND", i.command) (by simp [sudoValues])))
-    (sv ("SUDO_USER", i.invoking.name) (by simp [sudoValues])))
-    (sv ("SUDO_UID", toString i.invoking.uid) (by simp [sudoValues])))
-    (sv ("SUDO_GID", toString (i.invokingRealGid.getD i.invoking.gid)) (by simp [sudoValues]))
+    unfold sudoVars
+    cases ht : i.ttyName <;> (try simp only) <;>
+      repeat' first
+        | with_reducible exact h2
+        | (apply sv; simp [sudoValues, ht]; done)
+        | with_reducible apply inv_setVar
+        | with_reducible apply inv_filter
   rcases mem_mergePam h with he | hp
   · rcases mem_setAll he with he | hx
     · rcases mem_addDefaults he with he | hf
@@ -387,27 +402,28 @@ theorem nodup_assemble (i : EnvInput) (reset : Bool) (extra : EnvList) :
   have h1 : NodupKeys
       (if reset then defaultsReset i (baseEnv i reset) else defaultsCopy i (baseEnv i reset)) := by
     split
-    · unfold defaultsReset lognameReset
+    · unfold defaultsReset lognameReset applySecurePath
       simp only
-      split <;> split <;> (try split) <;> (try split) <;> (try split)
+      repeat' split
       all_goals
         repeat first
-          | exact h0
-          | apply nodup_setVar
-          | apply nodup_setDefault
-    · unfold defaultsCopy
+          | with_reducible exact h0
+          | with_reducible apply nodup_setVar
+          | with_reducible apply nodup_setDefault
+    · unfold defaultsCopy applySecurePath
       simp only
-      split <;> (try split) <;> repeat first | exact h0 | apply nodup_setVar
-  unfold assemble commonDefaults applySecurePath sudoVars
+      repeat' split
+      all_goals repeat first | with_reducible exact h0 | with_reducible apply nodup_setVar
+  unfold assemble commonDefaults sudoVars
   simp only
   repeat first
-    | exact h1
-    | apply nodup_addDefaults
-    | apply nodup_mergePam
-    | apply nodup_setVar
-    | apply nodup_setDefault
-    | apply nodup_setAll
-    | apply nodup_filter
+    | with_reducible exact h1
+    | with_reducible apply nodup_addDefaults
+    | with_reducible apply nodup_mergePam
+    | with_reducible apply nodup_setVar
+    | with_reducible apply nodup_setDefault
+    | with_reducible apply nodup_setAll
+    | with_reducible apply nodup_filter
     | split
 
 theorem buildEnv_ok {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out) :
@@ -570,7 +586,7 @@ theorem buildEnv_no_LD {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok out)
   have hu : k ≠ "USER" := by intro he; subst k; cases hld
   obtain ⟨r, hr⟩ := (patMatch_LD_iff k).1 hld
   have hp : (entryPattern "LD_*" k v).isSome = true := by
-    simp [entryPattern, hn, hu, String.toList_append, hr, envPatternL]
+    simp [entryPattern, entryPatternL, entryChars, hn, hu, String.toList_append, hr, envPatternL]
   have hd : matchesAny i.settings.envDelete k v = true :=
     List.any_eq_true.2 ⟨_, hdel, hp⟩
   rcases buildEnv_delete_respected h hs hm hd with hf | hk | hpam | ⟨hreset, hkeep⟩
@@ -620,12 +636,36 @@ def BindingSafe (i : EnvInput) (k v : String) : Prop :=
 
 theorem mem_assemble_of_bindingSafe {i : EnvInput} {k v : String}
     (hs : BindingSafe i k v)
-    (hm : (k, v) ∈ sudoVars i (applySecurePath i (commonDefaults i
+    (hm : (k, v) ∈ sudoVars i (commonDefaults i
       (if resetMode i then defaultsReset i (baseEnv i (resetMode i))
-       else defaultsCopy i (baseEnv i (resetMode i)))))) :
+       else defaultsCopy i (baseEnv i (resetMode i))))) :
     (k, v) ∈ assemble i (resetMode i) (extraVars i) := by
   exact mem_mergePam_of_compatible
     (mem_setAll_of_compatible (mem_addDefaults_of_mem hm) hs.1) hs.2
+
+theorem mem_commonDefaults_of_mem {i : EnvInput} {e : EnvList} {kv : String × String}
+    (h : kv ∈ e) (hk : kv.1 ≠ "PS1") : kv ∈ commonDefaults i e := by
+  unfold commonDefaults
+  simp only
+  split
+  · exact mem_setVar_of_ne (mem_setDefault_of_mem (mem_setDefault_of_mem
+      (mem_setDefault_of_mem h))) hk
+  · exact mem_setDefault_of_mem (mem_setDefault_of_mem (mem_setDefault_of_mem h))
+
+theorem mem_sudoVars_of_mem {i : EnvInput} {e : EnvList} {kv : String × String}
+    (h : kv ∈ e) (hk : kv.1 ∉ ["SUDO_COMMAND", "SUDO_USER", "SUDO_UID", "SUDO_GID",
+      "SUDO_HOME", "SUDO_TTY"]) : kv ∈ sudoVars i e := by
+  simp only [List.mem_cons, List.not_mem_nil, or_false, not_or] at hk
+  obtain ⟨h1, h2, h3, h4, h5, h6⟩ := hk
+  have hg : kv ∈ setVar (setVar (setVar (setVar (setVar e "SUDO_COMMAND" i.command)
+      "SUDO_USER" i.invoking.name) "SUDO_UID" (toString i.invoking.uid))
+      "SUDO_GID" (toString (i.invokingRealGid.getD i.invoking.gid))) "SUDO_HOME" i.invoking.home :=
+    mem_setVar_of_ne (mem_setVar_of_ne (mem_setVar_of_ne (mem_setVar_of_ne
+      (mem_setVar_of_ne h h1) h2) h3) h4) h5
+  unfold sudoVars
+  cases i.ttyName with
+  | some tty => exact mem_setVar_of_ne hg h6
+  | none => exact List.mem_filter.2 ⟨hg, by simpa using h6⟩
 
 theorem buildEnv_securePath_of_bindingSafe {i : EnvInput} {out : EnvList}
     (h : buildEnv i = .ok out)
@@ -634,11 +674,15 @@ theorem buildEnv_securePath_of_bindingSafe {i : EnvInput} {out : EnvList}
   have hmem : ("PATH", p) ∈ out := by
     obtain ⟨rfl, -, -⟩ := buildEnv_ok h
     apply mem_assemble_of_bindingSafe hs
-    unfold sudoVars applySecurePath
+    refine mem_sudoVars_of_mem (mem_commonDefaults_of_mem ?_ (by simp)) (by simp)
+    unfold defaultsReset defaultsCopy lognameReset applySecurePath
     simp only [hp]
-    cases i.ttyName <;>
-      simp only [mem_setVar, List.mem_filter] <;>
-      simp
+    repeat' split
+    all_goals
+      repeat' first
+        | with_reducible exact mem_setVar_self _ _ _
+        | with_reducible refine mem_setVar_of_ne ?_ (by simp)
+        | with_reducible apply mem_setDefault_of_mem
   exact ⟨hmem, fun v hv => buildEnv_unique h hv hmem⟩
 
 theorem buildEnv_securePath_no_extra {i : EnvInput} {out : EnvList}
@@ -672,10 +716,11 @@ theorem buildEnv_sudo_vars {i : EnvInput} {out : EnvList} (h : buildEnv i = .ok 
     mem_assemble_of_bindingSafe hi ?_, mem_assemble_of_bindingSafe hg ?_⟩
   all_goals
     unfold sudoVars
-    repeat first
-      | exact mem_setVar_self _ _ _
-      | apply mem_setVar_of_ne
-    all_goals simp
+    simp only
+    split <;> (try with_reducible refine List.mem_filter.2 ⟨?_, by simp⟩) <;>
+      repeat first
+        | with_reducible exact mem_setVar_self _ _ _
+        | with_reducible refine mem_setVar_of_ne ?_ (by simp)
 
 theorem fileVars_origin {i : EnvInput} {kv : String × String} (h : kv ∈ fileVars i) :
     (kv ∈ i.restrictedEnvFile ∧ userPass i (resetMode i) kv.1 kv.2 = true) ∨

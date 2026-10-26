@@ -10,7 +10,7 @@ def main (args : List String) : IO UInt32 := do
   LeanSudo.Sys.PamHelpers.register
   LeanSudo.Helper.register "logsrv-resolve" LeanSudo.Sys.LogSrv.resolverHelper
   LeanSudo.Background.register LeanSudo.Shell.run
-  if let some status ← LeanSudo.Helper.dispatch args then return status
+  if let some status ← LeanSudo.Helper.dispatch then return status
   try
     if let some status ← LeanSudo.Background.launchIfRequested args then return status
   catch error =>

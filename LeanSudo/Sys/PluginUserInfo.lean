@@ -2,6 +2,7 @@ import LeanSudo.Sys.Core
 import LeanSudo.Sys.Prim.Plugins
 import LeanSudo.Sys.Prim.Posix
 import LeanSudo.Background
+import LeanSudo.Sys.Limits
 
 namespace LeanSudo.Sys.Plugins
 
@@ -93,7 +94,7 @@ def userInfo (groupSource : String) (maxGroups : UInt32) : IO (Array String) := 
     info := info ++ #["host=" ++ host, s!"lines={rows}", s!"cols={cols}"]
     for (name, index) in (#["as", "core", "cpu", "data", "fsize", "locks", "memlock",
         "nofile", "nproc", "rss", "stack"] : Array String).zipIdx do
-      if let some (soft, hard) ← Prim.Plugins.rlimit (Prim.Plugins.limitResource index) then
+      if let some (soft, hard) ← Limits.original (Prim.Plugins.limitResource index) then
         let format := fun (n : UInt64) =>
           if n == Prim.Plugins.limitInfinity () then "infinity" else toString n
         info := info.push s!"rlimit_{name}={format soft},{format hard}"

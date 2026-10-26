@@ -1,18 +1,7 @@
 import LeanSudo.Sudoers.Ast
+import LeanSudo.Sudoers.Gram
 
 namespace LeanSudo.Sudoers
-
-structure ParseError where
-  file : String
-  line : Nat
-  col : Nat
-  msg : String
-  deriving Repr, BEq, Inhabited
-
-def ParseError.toString (e : ParseError) : String :=
-  s!"{e.file}:{e.line}:{e.col}: syntax error" ++ (if e.msg.isEmpty then "" else s!": {e.msg}")
-
-instance : ToString ParseError := ⟨ParseError.toString⟩
 
 namespace Parser
 
@@ -40,7 +29,6 @@ structure Ctx where
 
 structure ParseState where
   input : List PChar
-  warnings : List String := []
 
 abbrev P := ReaderT Ctx (StateT ParseState (Except ParseError))
 
@@ -52,15 +40,11 @@ def set (input : List PChar) : P Unit :=
 def modify (f : List PChar → List PChar) : P Unit :=
   modifyThe ParseState fun s => { s with input := f s.input }
 
-def warnAt (pos : Nat × Nat) (message : String) : P Unit := do
-  let warning := s!"{(← read).file}:{pos.1}:{pos.2}: {message}"
-  modifyThe ParseState fun s => { s with warnings := warning :: s.warnings }
-
 def isBlank (c : Char) : Bool := c == ' ' || c == '\t' || c == '\r'
 
 def isWordChar (c : Char) : Bool :=
   !(isBlank c || c == '\n' || c == '#' || c == '>' || c == '!' || c == '=' || c == ':' ||
-    c == ',' || c == '(' || c == ')' || c == '"' || c == '\\')
+    c == ',' || c == '(' || c == ')' || c == '"' || c == '\\' || c == '\x00')
 
 def isAliasName (s : String) : Bool :=
   match s.toList with
@@ -105,6 +89,9 @@ def curPos : P (Nat × Nat) := do
 def errAt (pos : Nat × Nat) (msg : String) : P α := do
   throw { file := (← read).file, line := pos.1, col := pos.2, msg }
 
+def plainErrAt (pos : Nat × Nat) (msg : String) : P α := do
+  throw { file := (← read).file, line := pos.1, col := pos.2, msg, plain := true }
+
 def err (msg : String) : P α := do
   errAt (← curPos) msg
 
@@ -124,6 +111,7 @@ def fuel : P Nat := do return (← read).fuel
 def describe : Option Char → String
   | none => "end of file"
   | some '\n' => "end of line"
+  | some '\x00' => "NUL byte"
   | some c => s!"'{c}'"
 
 def expect (c : Char) : P Unit := do
@@ -139,8 +127,8 @@ def hexDigit (c : Char) : Option Nat :=
 def charBytes (c : Char) : List UInt8 := (String.singleton c).toUTF8.data.toList
 
 def decodedWord (reversed : List UInt8) : P String := do
-  let bytes := reversed.reverse.takeWhile (· != 0)
-  match String.fromUTF8? (ByteArray.mk bytes.toArray) with
+  if reversed.contains 0 then err "escaped NUL byte"
+  match String.fromUTF8? (ByteArray.mk reversed.reverse.toArray) with
   | some s => return s
   | none => err "non-UTF-8 escaped string"
 
@@ -166,7 +154,7 @@ def escapedRun (breakEscape : Char → Bool) (stop : Bool → Char → Bool) :
       if c.c == '\\' then
         match cs with
         | d :: _ =>
-          if breakEscape d.c || isCont cs then break
+          if breakEscape d.c || d.c == '\x00' || isCont cs then break
           set cs
           esc := true
           acc := (← wordEscape).reverse ++ acc
@@ -193,7 +181,7 @@ def readQuoted : P String := do
         set cs
         if acc.isEmpty then err "empty string"
         return (← decodedWord acc)
-      else if c.c == '\n' then err "unterminated quoted string"
+      else if c.c == '\n' || c.c == '\x00' then err "unterminated quoted string"
       else if c.c == '\\' then
         if isCont cs then set (skipWsAux false (c :: cs))
         else
@@ -389,7 +377,7 @@ def hostAtom : P HostAtom := do
     return .netgroup w
   let inp ← get
   let candidate := takeChars (fun c =>
-    !isBlank c && c != '\n' && c != ',' && c != '=' && c != '#') inp
+    !isBlank c && c != '\n' && c != ',' && c != '=' && c != '#' && c != '\x00') inp
   if let some net := network (String.ofList candidate) then
     set (inp.drop candidate.length)
     return net
@@ -401,7 +389,7 @@ def hostAtom : P HostAtom := do
   return .name w
 
 def isCmdTerminator (c : Char) : Bool :=
-  isBlank c || c == '\n' || c == '#' || c == ':' || c == ','
+  isBlank c || c == '\n' || c == '#' || c == ':' || c == ',' || c == '\x00'
 
 def readCmdWord (isPath : Bool) : P String := do
   let mut acc : List Char := []
@@ -410,7 +398,7 @@ def readCmdWord (isPath : Bool) : P String := do
     | [] => break
     | c :: cs =>
       if c.c == '\\' then
-        if isCont cs then break
+        if isCont cs || (cs.head?.map (·.c)) == some '\x00' then break
         match cs with
         | d :: ds =>
           if d.c == '*' || d.c == '?' || d.c == '[' || d.c == ']' || d.c == '!' || d.c == '^' then
@@ -449,7 +437,7 @@ def readPathRegex : P String := do
     match (← get) with
     | [] => return (← finish best)
     | c :: cs =>
-      if c.c == '\n' || c.c == '\r' || c.c == '#' then return (← finish best)
+      if c.c == '\n' || c.c == '\r' || c.c == '#' || c.c == '\x00' then return (← finish best)
       if c.c == '\\' then
         if let d :: ds := cs then
           if d.c == '#' || d.c == '$' then
@@ -469,13 +457,15 @@ def readRegex : P String := do
     match (← get) with
     | [] => err "unterminated regular expression"
     | c :: cs =>
-      if c.c == '\n' || c.c == '\r' || c.c == '#' then err "unterminated regular expression"
+      if c.c == '\n' || c.c == '\r' || c.c == '#' || c.c == '\x00' then
+        err "unterminated regular expression"
       if c.c == '\\' then
         if isCont cs then ws
         else
           match cs with
           | d :: ds =>
-            if d.c == '\n' || d.c == '\r' then err "unterminated regular expression"
+            if d.c == '\n' || d.c == '\r' || d.c == '\x00' then
+              err "unterminated regular expression"
             set ds
             acc := d.c :: '\\' :: acc
           | [] => err "unterminated regular expression"
@@ -702,10 +692,17 @@ def optionValue : P String := do
   if w.isEmpty then err "missing option value"
   return w
 
-def directoryValue (name : String) : P String := do
+def directoryValue (name : String) : P (String × (Nat × Nat)) := do
+  ws
+  let start ← curPos
+  let quoted := (← peek) == some '"'
   let w ← optionValue
-  if w == "*" || w.startsWith "/" || w.startsWith "~" then return w
-  err s!"{name} must begin with '/', '~', or '*'"
+  let finish ← curPos
+  let pos := if quoted then (finish.1, finish.2 - 1) else start
+  if w != "*" && !w.startsWith "/" && !w.startsWith "~" then
+    plainErrAt pos s!"values for \"{name}\" must start with a '/', '~', or '*'"
+  if w.utf8ByteSize ≥ 4096 then plainErrAt pos s!"\"{name}\" path too long"
+  return (w, pos)
 
 def optionNames : List String :=
   ["CWD", "CHROOT", "TIMEOUT", "NOTBEFORE", "NOTAFTER", "ROLE", "TYPE",
@@ -731,16 +728,10 @@ def cmndSpec (inh : Inherit) : P (CmndSpec × Inherit) := do
         optionsExplicit := w :: optionsExplicit
       match w with
       | "CWD" =>
-        let v ← directoryValue w
+        let (v, _) ← directoryValue w
         options := { options with cwd := some (if v == "*" then none else some v) }
       | "CHROOT" =>
-        ws
-        let start ← curPos
-        let quoted := (← peek) == some '"'
-        let value ← directoryValue w
-        let finish ← curPos
-        let pos := if quoted then (finish.1, finish.2 - 1) else start
-        warnAt pos "\"CHROOT\" is deprecated"
+        let (value, _) ← directoryValue w
         options := { options with chroot := some value }
       | "TIMEOUT" =>
         let some n := parseTimeout (← optionValue) | err "invalid timeout"
@@ -851,7 +842,7 @@ def aliasDefs (item : P α) : P (List (String × List α)) :=
 def bareValue : P String := do
   let (acc, _) ← escapedRun (fun _ => false) fun empty c =>
     isBlank c || c == '\n' || c == '"' || c == '#' || c == '=' ||
-      c == ',' || (empty && c == '!')
+      c == ',' || c == '\x00' || (empty && c == '!')
   if acc.isEmpty then err "missing value"
   return (← decodedWord acc)
 
@@ -912,7 +903,7 @@ def defaultsEntry : P Entry := do
 def includePath : P String := do
   ws
   if (← peek) == some '"' then return (← readQuoted)
-  let (acc, _) ← escapedRun (fun _ => false) (fun _ c => isBlank c || c == '\n')
+  let (acc, _) ← escapedRun (fun _ => false) (fun _ c => isBlank c || c == '\n' || c == '\x00')
   if acc.isEmpty then err "missing include path"
   return (← decodedWord acc)
 
@@ -997,9 +988,7 @@ def entries : P (List Located) := do
         continue
       let es ← entry
       endOfEntry
-      let warnings := (← getThe ParseState).warnings.reverse
-      modifyThe ParseState fun s => { s with warnings := [] }
-      acc := (es.reverse.map fun e => { file, line := c.line, entry := e, warnings }) ++ acc
+      acc := (es.reverse.map fun e => { file, line := c.line, entry := e }) ++ acc
   err "input too long"
 
 def cmndAtoms : Entry → List CmndAtom
@@ -1032,25 +1021,89 @@ theorem check_ok {file : String} {es es' : List Located} (h : check file es = .o
     intro l hl
     simpa using List.find?_eq_none.mp hf l hl
 
+def sourceChars (text : String) : List Char :=
+  ("\n".intercalate ((text.splitOn "\n").map fun line =>
+    let cs := line.toList
+    if (cs.dropWhile (· != '\x00')).all (fun c => c == '\x00' || isBlank c) then
+      String.ofList (cs.takeWhile (· != '\x00'))
+    else line)).toList
+
 def context (file text : String) : Ctx :=
-  let cs := text.toList
+  let cs := sourceChars text
   let (el, ec) := endPos cs 1 1
   { file, eofLine := el, eofCol := ec, fuel := cs.length + 1 }
+
+def settingCount (es : List Located) : Nat :=
+  es.foldl (fun n l => match l.entry with | .defaults _ ds => n + ds.length | _ => n) 0
+
+def decorate (file : String) (s : Gram.Scan) (es : List Located) : List Located := Id.run do
+  let incs := s.events.toList.filterMap fun | .include d p _ _ => some (d, p) | _ => none
+  let warns := s.events.toList.filterMap fun | .warning l m => some (l, m) | _ => none
+  let incCount := es.countP fun l => match l.entry with
+    | .include _ | .includeDir _ => true
+    | _ => false
+  let positioned := settingCount es == s.defaults.size
+  let mut out : Array Located := #[]
+  let mut di := 0
+  let mut ii := 0
+  for l in es do
+    match l.entry with
+    | .defaults scope ds =>
+      let ds' := ds.zipIdx.map fun (d, k) =>
+        match (if positioned then s.defaults[di + k]? else none) with
+        | some (line, col) => { d with source := some (file, line, col) }
+        | none => d
+      di := di + ds.length
+      out := out.push { l with entry := .defaults scope ds' }
+    | .include _ | .includeDir _ =>
+      match (if incCount == incs.length then incs[ii]? else none) with
+      | some (dir, p) =>
+        out := out.push { l with entry := if dir then .includeDir p else .include p }
+      | none => out := out.push l
+      ii := ii + 1
+    | _ => out := out.push l
+  for (line, message) in warns do
+    let before := out.toList.zipIdx.filter fun (l, _) => l.line ≤ line
+    let target := match before.getLast? with
+      | some (l, _) => (before.find? fun (m, _) => m.line == l.line).map (·.2)
+      | none => if out.isEmpty then none else some 0
+    if let some j := target then
+      out := out.modify j fun l => { l with warnings := l.warnings ++ [message] }
+  return out.toList
+
+def blankOutside (text : String) (spans : Array (Nat × Nat)) : String :=
+  "\n".intercalate ((text.splitOn "\n").zipIdx.map fun (line, i) =>
+    if spans.any (fun (a, b) => a ≤ i && i ≤ b) then line else "")
+
+def parseScanned (file text : String) (s : Gram.Scan) : Except ParseError (List Located) :=
+  match s.errors with
+  | e :: _ => .error e
+  | [] =>
+    match (entries (context file text)).run { input := annotate (sourceChars text) 1 1 [] } with
+    | .error e => .error e
+    | .ok (es, _) => .ok (decorate file s es)
 
 end Parser
 
 open Parser in
-def parse (file : String) (text : String) : Except ParseError (List Located) :=
-  match (entries (context file text)).run { input := annotate text.toList 1 1 [] } with
+def parseWith (file : String) (text : String) (s : Gram.Scan) : Except ParseError (List Located) :=
+  match parseScanned file text s with
   | .error e => .error e
-  | .ok (es, _) => check file es
+  | .ok es => check file es
 
-theorem parse_wellFormed {file text : String} {es : List Located}
-    (h : parse file text = .ok es) : ∀ l ∈ es, Parser.wellFormed file l = true := by
-  unfold parse at h
+def parse (file : String) (text : String) : Except ParseError (List Located) :=
+  parseWith file text (Gram.scan file text)
+
+theorem parseWith_wellFormed {file text : String} {s : Gram.Scan} {es : List Located}
+    (h : parseWith file text s = .ok es) : ∀ l ∈ es, Parser.wellFormed file l = true := by
+  unfold parseWith at h
   split at h
   · cases h
   · exact Parser.check_ok h
+
+theorem parse_wellFormed {file text : String} {es : List Located}
+    (h : parse file text = .ok es) : ∀ l ∈ es, Parser.wellFormed file l = true :=
+  parseWith_wellFormed h
 
 theorem parse_line_pos {file text : String} {es : List Located}
     (h : parse file text = .ok es) : ∀ l ∈ es, 1 ≤ l.line := by

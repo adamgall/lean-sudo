@@ -279,7 +279,7 @@ def exportSudoers (input output : String) : IO Unit := do
   let args := #["cvtsudoers", "-f", "json", "-o", output, "--", input]
   let env := (← LeanSudo.Sys.environ).toArray.map fun (key, value) => key ++ "=" ++ value
   let error ← try
-    LeanSudo.Sys.Prim.Exec.signalMask (← LeanSudo.Sys.Prim.Exec.startupMask)
+    LeanSudo.Sys.Prim.Exec.restoreSignalMask (← LeanSudo.Sys.Prim.Exec.startupMask)
     executeExport search args env
   finally LeanSudo.Sys.Prim.Exec.signalMask (~~~(0 : UInt64))
   checkResult "unable to execute" "cvtsudoers" error
@@ -298,7 +298,7 @@ private def editorHelper (payload : Lean.Json) : IO UInt32 := do
     let maximum ← openMax
     if maximum > (P.INT_MAX ()).toUInt64 then return 127
     for fd in [first.toNat:maximum.toNat] do closeQuietly fd.toUInt32
-  LeanSudo.Sys.Prim.Exec.signalMask mask
+  LeanSudo.Sys.Prim.Exec.restoreSignalMask mask
   let error ← LeanSudo.Sys.Prim.Exec.execve path args env
   try
     (← IO.getStderr).putStr s!"visudo: unable to run {path}: {← errorText error}\n"
@@ -323,7 +323,16 @@ def runEditor (path : String) (args : Array String) : IO Bool := do
     catch error => throw (IO.userError s!"unable to execute {path}: {error}")
   waitEditor pid
 
-private def setOwnerModeRaw (path : String) (uid gid mode : UInt32) : IO Unit := do
+private def octalMode (mode : UInt32) : String := "0" ++ String.ofList (Nat.toDigits 8 mode.toNat)
+
+private def ownerFailure (path : String) (uid gid error : UInt32) : IO String := do
+  return s!"unable to set (uid, gid) of {path} to ({uid}, {gid}): {← errorText error}"
+
+private def modeFailure (path : String) (mode error : UInt32) : IO String := do
+  return s!"unable to change mode of {path} to {octalMode mode}: {← errorText error}"
+
+private def setOwnerModeRaw (path : String) (uid gid mode : UInt32)
+    (ownerFatal modeFatal : Bool) : IO (Array String) := do
   validPath path
   if uid == noUid () || gid == noGid () || mode > modeBits () then
     throw (IO.userError "invalid owner or mode")
@@ -334,18 +343,29 @@ private def setOwnerModeRaw (path : String) (uid gid mode : UInt32) : IO Unit :=
   try
     let st ← descriptorStat fd path
     unless regularFile st do throw (IO.userError s!"{path} is not a regular file")
-    checkResult "unable to set (uid, gid) of" path (← chownRaw fd uid gid)
-    checkResult "unable to change mode of" path (← chmodRaw fd mode)
+    let mut warnings : Array String := #[]
+    let error ← chownRaw fd uid gid
+    if error != 0 then
+      let message ← ownerFailure path uid gid error
+      if ownerFatal then throw (IO.userError message)
+      warnings := warnings.push message
+    let error ← chmodRaw fd mode
+    if error != 0 then
+      let message ← modeFailure path mode error
+      if modeFatal then throw (IO.userError message)
+      warnings := warnings.push message
     checkResult "unable to sync" path (← syncRaw fd)
+    return warnings
   finally closeQuietly fd
 
-def setOwnerMode (path : String) (uid gid mode : Nat) : IO Unit :=
+def setOwnerMode (path : String) (uid gid mode : Nat) (ownerFatal modeFatal : Bool) :
+    IO (Array String) :=
   if uid < (noUid ()).toNat && gid < (noGid ()).toNat && mode ≤ (modeBits ()).toNat then
-    setOwnerModeRaw path uid.toUInt32 gid.toUInt32 mode.toUInt32
+    setOwnerModeRaw path uid.toUInt32 gid.toUInt32 mode.toUInt32 ownerFatal modeFatal
   else throw (IO.userError s!"invalid owner {uid}:{gid} or mode {mode}")
 
 def correctLockedMetadata (path : String) (uid gid mode : UInt32)
-    (owner perms : Bool) : IO Unit := do
+    (owner perms : Bool) : IO (Array String) := do
   validPath path
   if uid == noUid () || gid == noGid () || mode > modeBits () then
     throw (IO.userError "invalid owner or mode")
@@ -357,9 +377,17 @@ def correctLockedMetadata (path : String) (uid gid mode : UInt32)
       pure (files.find? (sameFile · st))
   let some file := file | throw (IO.userError "sudoers file is not locked")
   let st ← descriptorStat file.fd path
+  let mut warnings : Array String := #[]
   if owner && (st.uid != uid.toNat || st.gid != gid.toNat) then
-    checkResult "unable to set (uid, gid) of" path (← chownRaw file.fd uid gid)
+    let error ← chownRaw file.fd uid gid
+    if error != 0 then
+      let message ← ownerFailure path uid gid error
+      warnings := warnings.push message
   if perms && st.mode &&& (permissionBits ()).toNat != mode.toNat then
-    checkResult "unable to change mode of" path (← chmodRaw file.fd mode)
+    let error ← chmodRaw file.fd mode
+    if error != 0 then
+      let message ← modeFailure path mode error
+      warnings := warnings.push message
+  return warnings
 
 end LeanSudo.Visudo

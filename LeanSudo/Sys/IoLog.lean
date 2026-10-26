@@ -34,6 +34,11 @@ private structure State where
 
 private initialize current : IO.Ref State ← IO.mkRef {}
 private initialize compression : IO.Ref Zlib ← IO.mkRef {}
+private initialize builtinPlugin : IO.Ref Bool ← IO.mkRef true
+
+def disableBuiltin : IO Unit := builtinPlugin.set false
+
+def builtin : IO Bool := builtinPlugin.get
 
 private def discard (action : IO α) : IO Unit := do
   try let _ ← action; pure () catch _ => pure ()
@@ -248,7 +253,7 @@ private def start (path legacy json : String) (flags : UInt32)
   finally discard (Prim.IoLog.close d)
 
 def «open» (p : LeanSudo.IoLog.Plan) (m : LeanSudo.IoLog.Metadata)
-    (locale : String) : IO (Option String) := do
+    (locale : String) : IO (Option (String × String)) := do
   try
     let keys := (LeanSudo.IoLog.timeKeys p.dir.toList ++
       LeanSudo.IoLog.timeKeys p.file.toList).eraseDups
@@ -268,9 +273,10 @@ def «open» (p : LeanSudo.IoLog.Plan) (m : LeanSudo.IoLog.Metadata)
       p.compress, p.flush, p.ignoreErrors, p.logPasswords]
     let flags := (streams.zipIdx.foldl
       (fun (n : Nat) (b, i) => if b then n + 2 ^ i else n) 0).toUInt32
+    unless ← builtin do return some (path, file)
     start path (LeanSudo.IoLog.legacyLog m seconds) (LeanSudo.IoLog.jsonLog m seconds nanos)
       flags p.passpromptRegex
-    return some path
+    return some (path, file)
   catch e =>
     abort
     if !p.ignoreErrors then throw e

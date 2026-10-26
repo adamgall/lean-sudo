@@ -1,0 +1,18 @@
+FROM ubuntu:26.04 AS reference
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends sudo procps sshpass rsyslog socat acl \
+ && rm -rf /var/lib/apt/lists/* \
+ && rm /etc/sudoers \
+ && chsh -s /bin/sh \
+ && userdel ubuntu \
+ && rm -f /usr/bin/sudo /usr/bin/sudoedit /usr/sbin/visudo \
+ && install -o root -g root -m 4755 /usr/bin/sudo.ws /usr/bin/sudo \
+ && install -o root -g root -m 0755 /usr/sbin/visudo.ws /usr/sbin/visudo \
+ && ln -s sudo /usr/bin/sudoedit
+WORKDIR /tmp
+
+FROM reference AS lean
+COPY sudo visudo /opt/lean-sudo/
+RUN install -o root -g root -m 4755 /opt/lean-sudo/sudo /usr/bin/sudo \
+ && install -o root -g root -m 0755 /opt/lean-sudo/visudo /usr/sbin/visudo

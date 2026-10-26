@@ -36,6 +36,10 @@ structure LoadState where
   sources : List (String × String) := []
   overrides : List (String × String) := []
   createMode : Option UInt32 := none
+  aliases : Array Gram.Alias := #[]
+  scans : ScanCache := #[]
+  parses : Array (String × String × Except ParseError (List Located)) := #[]
+  invalidUtf8 : Array String := #[]
 
 abbrev LoadM := StateT LoadState IO
 
@@ -49,7 +53,10 @@ def lockOrFail (path : String) (mode : UInt32) : IO Unit := do
 def readSudoers (path : String) : IO (Except String String) := do
   match ← (readFileFollow path).toBaseIO with
   | .ok (_, text) => pure (.ok text)
-  | .error e => pure (.error (toString e))
+  | .error e =>
+    if (toString e).endsWith ": file is not valid UTF-8" then
+      return .ok (Gram.utf8 (← IO.FS.readBinFile path))
+    pure (.error (toString e))
 
 def commandRegexes : CmndAtom → List String
   | .commandRegex re _ => [re]
@@ -77,42 +84,89 @@ def checkRegexes (loc : Located) (text : String) : LoadM Unit := do
       let underline := String.ofList (List.replicate (re.length - 1) '~')
       addError s!"{loc.file}:{line}:{col}: {e}\n{ln}\n{pad}^{underline}"
 
+def addDiagnostic (warning : String) : LoadM Unit := do
+  let s ← get
+  match s.errors.back? with
+  | none => addWarning warning
+  | some last =>
+    let joined := if last.isEmpty then warning else last ++ "\n" ++ warning
+    set { s with errors := s.errors.pop.push joined }
+
+def includeExists (path : String) : LoadM Bool := do
+  if ((← get).overrides.lookup path).isSome then return true
+  return (← stat path).isSome
+
 mutual
-partial def loadText (host : String) (depth : Nat) (path text : String) : LoadM Unit := do
+partial def loadText (host : String) (depth : Nat) (path searchPath text : String) :
+    LoadM Unit := do
   modify fun s => { s with
     files := if s.files.contains path then s.files else s.files.push path
-    sources := (path, text) :: s.sources }
-  match parse path text with
-  | .error e => addError (renderSyntaxError e text)
-  | .ok es =>
-    for l in es do
-      for warning in l.warnings do addWarning warning
-      if (← get).strict then checkRegexes l text
-      match l.entry with
-      | .include raw =>
-        let target := resolveIncludePath path host raw
-        unless (← get).files.contains target do
-          modify fun s => { s with editable := s.editable.push target }
-        includeFile host (depth + 1) target
-      | .includeDir raw => includeDir host (depth + 1) (resolveIncludePath path host raw)
-      | _ => modify fun s => { s with entries := s.entries.push l }
-
-partial def includeFile (host : String) (depth : Nat) (path : String) : LoadM Unit := do
-  if depth > maxDepth then
-    addError s!"{path}: too many levels of includes"
+    sources := if (s.sources.lookup path).isSome then s.sources else (path, text) :: s.sources
+    invalidUtf8 :=
+      if s.invalidUtf8.contains path || !text.any (fun c : Char => c.toNat ≥ Gram.escapeBase)
+      then s.invalidUtf8 else s.invalidUtf8.push path }
+  let (scan, scans) := scanCached (← get).scans path text (← get).aliases
+    fun p t a => Gram.scanBytes p (Gram.rawBytes t) a
+  modify fun s => { s with aliases := scan.aliases, scans }
+  if scan.errors.isEmpty then
+    let parsed ← match (← get).parses.find? (fun (p, t, _) => p == path && t == text) with
+      | some (_, _, r) => pure r
+      | none =>
+        let r := parseWith path text scan
+        unless scan.definesAliases do
+          modify fun s => { s with parses := s.parses.push (path, text, r) }
+        pure r
+    match parsed with
+    | .error e => addError (renderSyntaxError e text)
+    | .ok es =>
+      for l in es do
+        for warning in l.warnings do addWarning warning
+        if (← get).strict then checkRegexes l text
+        match l.entry with
+        | .include raw => includeFile host (depth + 1) (resolveIncludePath searchPath host raw)
+        | .includeDir raw => includeDir host (depth + 1) (resolveIncludePath searchPath host raw)
+        | _ => modify fun s => { s with entries := s.entries.push l }
   else
-    if let some mode := (← get).createMode then
-      lockOrFail path mode
-    let source := ((← get).overrides.lookup path).getD path
-    match ← readSudoers source with
-    | .ok text => loadText host depth path text
-    | .error e =>
-      let e := if e.startsWith "unable to open " then (e.drop 15).toString else e
-      addError s!"visudo: {e}"
+    for event in scan.events do
+      match event with
+      | .error e => addError (renderSyntaxError e text)
+      | .warning _ message => addDiagnostic message
+      | .include dir raw _ _ =>
+        let target := resolveIncludePath searchPath host raw
+        if dir then includeDir host (depth + 1) target else includeFile host (depth + 1) target
 
-partial def includeDir (host : String) (depth : Nat) (dir : String) : LoadM Unit := do
+partial def includeFile (host : String) (depth : Nat) (searchPath : String) : LoadM Unit := do
+  if depth > maxDepth then
+    addError s!"{searchPath}: too many levels of includes"
+    return
+  let mut path := (searchPath.splitOn ":").headD searchPath
+  for candidate in searchComponents searchPath do
+    if ← includeExists candidate then
+      path := candidate
+      break
+  unless (← get).files.contains path do
+    modify fun s => { s with editable := s.editable.push path }
+  if let some mode := (← get).createMode then
+    lockOrFail path mode
+  let source := ((← get).overrides.lookup path).getD path
+  match ← readSudoers source with
+  | .ok text => loadText host depth path searchPath text
+  | .error e =>
+    let e := if e.startsWith "unable to open " then (e.drop 15).toString else e
+    addError s!"visudo: {e}"
+
+partial def includeDir (host : String) (depth : Nat) (searchPath : String) : LoadM Unit := do
+  if depth > maxDepth then
+    addError s!"{searchPath}: too many levels of includes"
+    return
+  let mut found : Option String := none
+  for candidate in searchComponents searchPath do
+    if (← stat candidate).isSome then
+      found := some candidate
+      break
+  let some dir := found | return
   let some st ← stat dir | return
-  match checkDirPerms dir st with
+  match checkDirPerms searchPath st with
   | .error msg => addWarning s!"visudo: {msg}"
   | .ok () =>
     match ← (listDir dir).toBaseIO with
@@ -124,13 +178,10 @@ partial def includeDir (host : String) (depth : Nat) (dir : String) : LoadM Unit
         if !st.isReg then continue
         if let some mode := (← get).createMode then
           lockOrFail path mode
-        if depth > maxDepth then
-          addError s!"{path}: too many levels of includes"
-        else
-          let source := ((← get).overrides.lookup path).getD path
-          match ← readSudoers source with
-          | .ok text => loadText host depth path text
-          | .error e => addWarning s!"visudo: {e}"
+        let source := ((← get).overrides.lookup path).getD path
+        match ← readSudoers source with
+        | .ok text => loadText host depth path path text
+        | .error e => addWarning s!"visudo: {e}"
 end
 
 structure Analysis where
@@ -139,6 +190,7 @@ structure Analysis where
   errors : List String
   warnings : List String
   initialWarnings : List String
+  preEditErrors : List String
   settings : Settings
   editable : Array String
 
@@ -157,28 +209,14 @@ def semanticDiagnostic (sources : List (String × String)) (entries : List Locat
   let some loc := entries.find? (fun l => body.startsWith (locPos l ++ ": ")) | return message
   let line := sourceLine sources loc
   let detail := (body.drop (locPos loc).length).toString
-  let column := match loc.entry with
-    | .userSpec _ => line.length + 1
+  let position := match loc.entry with
+    | .userSpec _ => s!"{locPos loc}:{line.length + 1}"
     | .defaults _ settings =>
-      let relevant := settings.find? fun d => detail.contains d.name
-      match relevant with
-      | none => line.length + 1
-      | some d =>
-        let before := (line.splitOn d.name).head!
-        before.length + d.name.length + 1 +
-          (match d.op with | .assign _ => 1 | .add _ | .remove _ => 2 | _ => 0)
-    | _ => if detail.startsWith ": duplicate " then line.length + 1 else aliasColumn line
-  let mut rendered := (if warning then "Warning: " else "") ++
-    s!"{locPos loc}:{column}{detail}"
-  if detail.startsWith ": duplicate " then
-    for previous in entries do
-      let marker := "previously defined at " ++ locPos previous
-      if rendered.endsWith marker then
-        rendered := rendered ++ s!":{aliasColumn (sourceLine sources previous)}"
-        break
-    rendered := rendered ++ "\n" ++ line ++ "\n" ++
-      String.ofList (List.replicate (column - 1) ' ') ++ "^"
-  return rendered
+      match (settings.find? fun d => detail.contains d.name).bind (·.source) with
+      | some (file, ln, col) => s!"{file}:{ln}:{col}"
+      | none => s!"{locPos loc}:{line.length + 1}"
+    | _ => s!"{locPos loc}:{aliasColumn line}"
+  return (if warning then "Warning: " else "") ++ position ++ detail
 
 def invokingPrincipal : IO (Option Principal) := do
   let uid ← getuid
@@ -196,26 +234,37 @@ def invokingPrincipal : IO (Option Principal) := do
 def analyze (host path text : String) (strict : Bool)
     (overrides : List (String × String) := []) (createMode : Option UInt32 := none) :
     IO Analysis := do
-  let ((), s) ← (loadText host 0 path text).run { strict, overrides, createMode }
+  let ((), s) ← (loadText host 0 path path text).run { strict, overrides, createMode }
   let entries := s.entries.toList
   let sem := if s.errors.isEmpty then semanticErrors entries strict else []
+  let parseTime :=
+    if s.errors.isEmpty then defaultsErrors entries else []
   let warnings := if s.errors.isEmpty then semanticWarnings entries strict else []
   let user ← if s.errors.isEmpty then invokingPrincipal else pure none
   let applied : Settings × List String := (user.bind fun user =>
     (resolveDefaults (entries.map (·.entry)) user host none none (verbose := true)).toOption).getD ({}, [])
-  let callbacks := applied.2.filter fun warning => !sem.any (·.endsWith warning)
+  let rendered := sem.map (semanticDiagnostic s.sources entries)
+  let callbacks := applied.2.filter fun warning =>
+    !sem.any (·.endsWith warning) && !rendered.contains warning
+  let invalid := s.invalidUtf8.toList.map (s!"{·}: file is not valid UTF-8")
+  let orInvalid (errors : List String) := if errors.isEmpty then invalid else errors
   pure { files := s.files, entries,
-         errors := s.errors.toList ++ sem.map (semanticDiagnostic s.sources entries),
+         errors := orInvalid (s.errors.toList ++ rendered),
          warnings := warnings.map (semanticDiagnostic s.sources entries),
-         initialWarnings := s.warnings.toList ++ callbacks, settings := applied.1,
-         editable := s.editable }
+         initialWarnings := s.warnings.toList ++ callbacks,
+         preEditErrors := orInvalid
+           (s.errors.toList ++ parseTime.map (semanticDiagnostic s.sources entries)),
+         settings := applied.1, editable := s.editable }
 
 def shortHost : IO String := do
   match (← gethostname).splitOn "." with
   | h :: _ => pure h
   | [] => pure ""
 
-def eprint (s : String) : IO Unit := do IO.eprintln (← I18n.translate s)
+def eprint (s : String) : IO Unit := do
+  let stderr ← IO.getStderr
+  stderr.write (Gram.rawBytes ((← I18n.translate s) ++ "\n"))
+  stderr.flush
 
 def readStdin : IO String := do
   let stdin ← IO.getStdin
@@ -242,7 +291,7 @@ def checkMode (o : Options) (path : String) : IO UInt32 := do
     | .error e => say s!"visudo: {e}"; return 1
   let a ← analyze (← shortHost) name text o.strict
   a.initialWarnings.forM say
-  for error in a.errors do
+  for error in a.errors.filter (!·.isEmpty) do
     if error.startsWith "visudo: " then eprint error else say error
   a.warnings.forM say
   unless a.errors.isEmpty do return 1
@@ -278,31 +327,32 @@ def resolveCmd (env : List (String × String)) (cmd : String) : IO (Option Strin
   return none
 
 def chooseEditor (st : Settings) (env : List (String × String)) :
-    IO (Except String (String × String × List String)) := do
+    IO (Except (List String) (String × String × List String)) := do
   let list := (st.editor.splitOn ":").filter (!·.isEmpty)
   let envVals := envEditorValues env
-  if st.envEditor && !envVals.isEmpty then
-    let mut last := ""
-    for v in envVals do
-      last := v
-      match splitWords v with
-      | cmd :: args =>
-        if let some p ← resolveCmd env cmd then return .ok (p, cmd, args)
-      | [] => pure ()
-    return .error s!"specified editor ({last}) doesn't exist"
-  if !st.envEditor then
-    for v in envVals do
-      match splitWords v with
-      | cmd :: args =>
-        if let some p ← resolveCmd env cmd then
-          if list.any (fun e => e == p || e == cmd) then return .ok (p, cmd, args)
-      | [] => pure ()
+  let notFound := s!"no editor found (editor path = {st.editor})"
+  let invalid := fun (v : String) =>
+    [s!"ignoring editor: {v}", "editor arguments may not contain \"--\""] ++
+      (if st.envEditor && !envVals.isEmpty then [] else [notFound])
+  for v in envVals do
+    match splitWords v with
+    | cmd :: args =>
+      if let some p ← resolveCmd env cmd then
+        if st.envEditor || list.any (fun e => e == p || e == cmd) then
+          if args.contains "--" then return .error (invalid v)
+          return .ok (p, cmd, args)
+    | [] => pure ()
   for e in list do
     match splitWords e with
     | cmd :: args =>
-      if let some p ← resolveCmd env cmd then return .ok (p, cmd, args)
+      if let some p ← resolveCmd env cmd then
+        if args.contains "--" then return .error (invalid e)
+        return .ok (p, cmd, args)
     | [] => pure ()
-  return .error s!"no editor found (editor path = {st.editor})"
+  if st.envEditor then
+    if let some last := envVals.getLast? then
+      return .error [s!"specified editor ({last}) doesn't exist"]
+  return .error [notFound]
 
 partial def whatNow : IO Char := do
   let out ← IO.getStdout
@@ -383,13 +433,16 @@ def installFile (o : Options) (f : EditFile) (mainFile : Bool) : IO Unit := do
   let gid := if useOwner then 0 else f.original.gid
   let mode := if usePerms then (readMode ()).toNat else f.original.mode &&& (permissionBits ()).toNat
   if f.modified then
-    setOwnerMode f.tmp uid gid mode
+    for warning in ← setOwnerMode f.tmp uid gid mode useOwner usePerms do
+      eprint s!"visudo: {warning}"
     IO.FS.rename f.tmp f.path
   else
     removeQuietly f.tmp
     if mainFile && f.created then removeQuietly f.path
     else if useOwner || usePerms then
-      correctLockedMetadata f.path uid.toUInt32 gid.toUInt32 mode.toUInt32 useOwner usePerms
+      let warnings ← correctLockedMetadata f.path uid.toUInt32 gid.toUInt32 mode.toUInt32
+        useOwner usePerms
+      for warning in warnings do eprint s!"visudo: {warning}"
 
 partial def checkEdits (o : Options) (host : String) (session : IO.Ref (Array EditFile))
     (known : IO.Ref (Array String)) (editor : String × String × List String)
@@ -405,7 +458,7 @@ partial def checkEdits (o : Options) (host : String) (session : IO.Ref (Array Ed
   let a ← analyze host mainFile.path text o.strict overrides (some mode)
   unless o.quiet do
     a.initialWarnings.forM eprint
-    a.errors.forM eprint
+    (a.errors.filter (!·.isEmpty)).forM eprint
     a.warnings.forM eprint
   let mut files := files
   let mut reparse := false
@@ -447,10 +500,12 @@ def editMode (o : Options) (path : String) : IO UInt32 := do
     let current ← analyze host path text o.strict [] (some mode)
     unless o.quiet do
       current.initialWarnings.forM eprint
-      current.errors.forM eprint
+      (current.preEditErrors.filter (!·.isEmpty)).forM eprint
     let editor ← match ← chooseEditor current.settings (← environ) with
       | .ok ed => pure ed
-      | .error e => throw (IO.userError e)
+      | .error messages =>
+        messages.forM fun m => eprint s!"visudo: {m}"
+        return 1
     let first ← openEditFile path mode
     let first := { first with created }
     files.set #[first]
@@ -517,7 +572,7 @@ def main (args : List String) : IO UInt32 := do
   LeanSudo.Sys.Lookup.register
   LeanSudo.Sys.PamHelpers.register
   LeanSudo.Helper.register "logsrv-resolve" LeanSudo.Sys.LogSrv.resolverHelper
-  if let some code ← LeanSudo.Helper.dispatch args then return code
+  if let some code ← LeanSudo.Helper.dispatch then return code
   LeanSudo.Visudo.initializeSignals
   try runVisudo args
   finally LeanSudo.Visudo.shutdownSignals

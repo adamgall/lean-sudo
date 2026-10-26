@@ -234,7 +234,6 @@ structure AuthFailure where
   attempts : Nat := 0
   noInput : Bool := false
   error : Bool := false
-  signal : Nat := 0
   deriving Repr, Inhabited
 
 def logAuthFailure (allowed logDenied listOrValidate : Bool) (f : AuthFailure) : Bool :=

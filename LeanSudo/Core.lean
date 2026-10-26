@@ -12,8 +12,9 @@ def displayUser (ctx : Context) : Principal :=
     ctx.previousUser.getD ctx.invoking else ctx.invoking
 
 def files (ctx : Context) : List String :=
-  ctx.opts.command.map fun p => if p.startsWith "/" then p
-    else ctx.cwd ++ (if ctx.cwd.endsWith "/" then "" else "/") ++ p
+  ctx.opts.command.map fun p => if p.startsWith "/" then p else match ctx.cwd with
+    | some cwd => cwd ++ (if cwd.endsWith "/" then "" else "/") ++ p
+    | none => p
 
 def normalizedEditFile (p : String) : Bool :=
   p.startsWith "/" && !p.contains '\x00'
@@ -21,9 +22,17 @@ def normalizedEditFile (p : String) : Bool :=
 def invalidEditFile (ctx : Context) : Option String :=
   (files ctx).find? (fun p => !normalizedEditFile p)
 
+def unescapeNonSpace : List Char → List Char
+  | '\\' :: c :: rest =>
+    if [' ', '\t', '\n', '\x0b', '\x0c', '\r'].contains c then '\\' :: unescapeNonSpace (c :: rest)
+    else c :: unescapeNonSpace rest
+  | c :: rest => c :: unescapeNonSpace rest
+  | [] => []
+
 def policyArgs (ctx : Context) (rc : ResolvedCmd) : List String :=
   if ctx.opts.shell || ctx.opts.login then
-    if ctx.opts.command.isEmpty then [] else ["-c", String.intercalate " " ctx.opts.command]
+    if ctx.opts.command.isEmpty then []
+    else ["-c", String.ofList (unescapeNonSpace (Cli.shellEscape ctx.opts.command).toList)]
   else rc.args
 
 def runCommand (ctx : Context) : Command :=
@@ -99,8 +108,20 @@ def sameSecurityContext (ctx : Context) (a : Allowed) : Bool :=
   (a.privs.or ctx.settings.privs).isNone &&
   (a.limitprivs.or ctx.settings.limitprivs).isNone
 
+def deniedMatch (ctx : Context) : Option Allowed :=
+  if ctx.opts.mode == .run || ctx.opts.mode == .edit then
+    let st := authorizationSettings ctx
+    (candidates ctx.sudoers st (request ctx)).getLast?.map (allowedOf st)
+  else none
+
+def runningAsSelf (ctx : Context) : Bool :=
+  (ctx.opts.mode == .run || ctx.opts.mode == .edit) && sameIdentity ctx &&
+    sameSecurityContext ctx
+      ((deniedMatch ctx).getD { needsAuth := false, setenv := false, cwd := none })
+
 def deniedNeedsAuth (ctx : Context) : Bool :=
-  ctx.settings.authenticate && (ctx.opts.mode != .validate ||
+  ((deniedMatch ctx).map (·.needsAuth)).getD ctx.settings.authenticate &&
+    !runningAsSelf ctx && (ctx.opts.mode != .validate ||
     let st := authorizationSettings ctx
     pwNeedsAuth st.verifypw st (candidates ctx.sudoers st (request ctx)))
 
@@ -122,8 +143,10 @@ def commandGid (ctx : Context) : Nat :=
   if ctx.settings.staySetuid then ctx.invokingRealGid.getD ctx.invoking.gid else targetGid ctx
 
 def targetGroups (ctx : Context) : List Nat :=
-  (if ctx.opts.preserveGroups || ctx.settings.preserveGroups then ctx.invoking.groups
-   else ctx.target.groups).map (·.2)
+  if ctx.opts.preserveGroups || ctx.settings.preserveGroups then ctx.invoking.groups.map (·.2)
+  else
+    let egid := targetGid ctx
+    egid :: ((ctx.target.groups.map (·.2)).filter (· != egid))
 
 def commandUmask (ctx : Context) : Nat :=
   (if ctx.settings.umask == 0o777 then ctx.userUmask
@@ -264,8 +287,17 @@ def editPlan (ctx : Context) (a : Allowed) : EditPlan :=
     editorPath := (if userIsExempt ctx.settings ctx.invoking then none else ctx.settings.securePath).getD
       ((lookup ctx.userEnv "PATH").getD stdPath) }
 
+def unresolvedLogCommand (ctx : Context) : String × List String :=
+  if ctx.opts.mode == .edit then ("sudoedit", ctx.opts.command)
+  else if ctx.opts.shell || ctx.opts.login || ctx.opts.impliedShell then
+    let shell := Cli.userShell (if ctx.opts.login then none else ctx.userEnv.lookup "SHELL")
+      (if ctx.opts.login then ctx.target.shell else ctx.invoking.shell)
+    let command := Cli.shellCommand shell false ctx.opts.command
+    (command.path, command.argv.tail)
+  else (ctx.opts.command.headD "", ctx.opts.command.tail)
+
 def notFoundText (ctx : Context) : String :=
-  let command := ctx.opts.command.headD ""
+  let command := (unresolvedLogCommand ctx).1
   if ctx.commandFoundInDot then
     s!"sudo: ignoring \"{command}\" found in '.'\nUse \"sudo ./{command}\" if this is the \"{command}\" you wish to run.\n"
   else
@@ -367,8 +399,39 @@ def allowedFailure (ctx : Context) (a : Allowed) : Option FailureInfo :=
       some {
         message := notFoundText ctx, prefixed := false, adminFlag := true,
         auditReason := some (if ctx.commandFoundInDot then "command in current directory"
-          else s!"{ctx.opts.command.headD ""}: command not found") }
+          else s!"{(unresolvedLogCommand ctx).1}: command not found") }
     else postLookupFailure ctx a
+
+def relativeLookupMissing (fuel : Nat) (cs : List Char) : Bool :=
+  match fuel with
+  | 0 => false
+  | n + 1 =>
+    let cs := cs.dropWhile (· == '/')
+    if !cs.contains '/' then false
+    else if cs.takeWhile (· != '/') == ['.'] then relativeLookupMissing n (cs.drop 1)
+    else true
+
+def editRefusal (ctx : Context) (path : String) : String :=
+  let cs := path.toList
+  let rest := match cs with
+    | '.' :: '/' :: r => r
+    | r => r
+  let prefixText := s!"{ctx.progname}: {path}: "
+  if ctx.cwd.isNone && !path.startsWith "/" && !cs.contains '\x00' &&
+      relativeLookupMissing rest.length rest then
+    prefixText ++ "No such file or directory\n"
+  else if ctx.cwd.isNone && !path.startsWith "/" && !cs.contains '\x00' &&
+      ctx.settings.sudoeditCheckdir && ctx.invoking.uid != 0 && ctx.cwdWritable then
+    prefixText ++ "editing files in a writable directory is not permitted\n"
+  else prefixText ++ "path is not absolute or contains a NUL byte, refusing\n"
+
+def privilegesText (ctx : Context) : String :=
+  let sources := ctx.policySources.flatMap (·.2)
+  let located := if sources.isEmpty then ctx.locatedSudoers else sources
+  let policy := if sources.isEmpty then ctx.sudoers else located.map (·.entry)
+  listPrivileges policy ctx.settings (ctx.listUser.getD ctx.invoking)
+    (displayShortHost ctx) (ctx.opts.listVerbose > 1) located
+      (some (request ctx)) ctx.listColumns
 
 def allowedAction (ctx : Context) (a : Allowed)
     (failure : Option FailureInfo := allowedFailure ctx a) : Action :=
@@ -377,15 +440,11 @@ def allowedAction (ctx : Context) (a : Allowed)
   | none, .run => match resolvedFor ctx a with
     | none => notFound ctx
     | some rc => .exec (execPlan ctx a rc)
-  | none, .edit => .edit (editPlan ctx a)
+  | none, .edit => match invalidEditFile ctx with
+    | none => .edit (editPlan ctx a)
+    | some bad => .fail (editRefusal ctx bad) 1
   | none, .list =>
-    if ctx.opts.command.isEmpty then
-      let sources := ctx.policySources.flatMap (·.2)
-      let located := if sources.isEmpty then ctx.locatedSudoers else sources
-      let policy := if sources.isEmpty then ctx.sudoers else located.map (·.entry)
-      .print (listPrivileges policy ctx.settings (ctx.listUser.getD ctx.invoking)
-        (displayShortHost ctx) (ctx.opts.listVerbose > 1) located
-          (some (request ctx)) ctx.listColumns) 0
+    if ctx.opts.command.isEmpty then .print (privilegesText ctx) 0
     else match resolvedFor ctx a with
       | none => notFound ctx
       | some _ => .print (listCommand ctx.sudoers (authorizationSettings ctx) (request ctx)
@@ -417,17 +476,26 @@ def denialMail (ctx : Context) : Bool :=
 def incident (ctx : Context) : String :=
   if denialMail ctx then "This incident has been reported to the administrator.\n" else ""
 
+def pseudoValidated (ctx : Context) : Bool :=
+  (ctx.opts.mode == .validate && ctx.invoking.uid == 0) ||
+  ctx.opts.mode == .list && !listOtherDenied ctx && (ctx.invoking.uid == 0 ||
+    (ctx.opts.otherUser.isSome && (ctx.listUser.getD ctx.invoking).uid != ctx.invoking.uid) ||
+    match evaluate ctx.sudoers (authorizationSettings ctx)
+        { request ctx with user := ctx.invoking, command := .list } with
+    | .allow _ => true
+    | .deny => false)
+
 def deniedAction (ctx : Context) : Action :=
-  if listOtherDenied ctx then
-    .fail (s!"Sorry, user {ctx.invoking.name} is not allowed to execute '{if ctx.opts.command.isEmpty then "list" else "list " ++ commandText ctx}' as {(ctx.listUser.getD ctx.invoking).name} on {displayHost ctx}.\n" ++
-      (ctx.settings.cmddenialMessage.map (· ++ "\n")).getD "") 1
-  else if ctx.opts.mode = .list then
-    if !ctx.opts.command.isEmpty then .print "" 1
-    else if ctx.opts.otherUser.isSome && (ctx.listUser.getD ctx.invoking).uid != ctx.invoking.uid then
-      .fail (notAllowedMessage (ctx.listUser.getD ctx.invoking).name (displayShortHost ctx) ++ "\n") 1
+  if ctx.opts.mode = .list then
+    if pseudoValidated ctx then
+      if ctx.opts.command.isEmpty then .print (privilegesText ctx) 0 else .print "" 1
+    else if ctx.opts.otherUser.isSome then
+      .fail (s!"Sorry, user {ctx.invoking.name} is not allowed to execute '{String.intercalate " " ("list" :: ctx.opts.command)}' as {(ctx.listUser.getD ctx.invoking).name} on {displayHost ctx}.\n" ++
+        (ctx.settings.cmddenialMessage.map (· ++ "\n")).getD "") 1
     else .fail s!"Sorry, user {ctx.invoking.name} may not run sudo on {displayShortHost ctx}.\n" 1
   else if ctx.opts.mode = .validate then
-    .fail s!"Sorry, user {ctx.invoking.name} may not run sudo on {displayShortHost ctx}.\n" 1
+    if pseudoValidated ctx then .validate
+    else .fail s!"Sorry, user {ctx.invoking.name} may not run sudo on {displayShortHost ctx}.\n" 1
   else if !userMatches ctx then .fail (s!"{(displayUser ctx).name} is not in the sudoers file.\n" ++ incident ctx) 1
   else if !hostMatches ctx then
     .fail (s!"{(displayUser ctx).name} is not allowed to run sudo on {displayShortHost ctx}.\n" ++ incident ctx) 1
@@ -449,22 +517,20 @@ def logArgument (arg : String) : String :=
   if arg.contains ' ' then "'" ++ logEscape arg false true ++ "'"
   else logEscape arg true true
 
-def logCommand (ctx : Context) : String :=
+def shellLogArgs (ctx : Context) (accepted : Bool) (path : String) : Option (List String) :=
+  if (ctx.opts.shell || ctx.opts.login) && !ctx.opts.command.isEmpty then
+    let login := accepted && ctx.opts.login && Policy.baseOf path == "bash"
+    some ((if login then ["--login"] else []) ++ ["-c", Cli.shellEscape ctx.opts.command])
+  else none
+
+def logCommand (ctx : Context) (accepted : Bool) : String :=
   match (request ctx).command with
   | .run p _ args =>
     let path := if p.startsWith "/" then p else (ctx.command.map (executionPath ctx)).getD p
+    let args := (shellLogArgs ctx accepted p).getD args
     logEscape path true ++ String.join (args.map (" " ++ logArgument ·))
   | .sudoedit fs => "sudoedit" ++ String.join (fs.map (" " ++ logArgument ·))
   | _ => commandText ctx
-
-def unresolvedLogCommand (ctx : Context) : String × List String :=
-  if ctx.opts.mode == .edit then ("sudoedit", ctx.opts.command)
-  else if ctx.opts.shell || ctx.opts.login || ctx.opts.impliedShell then
-    let shell := Cli.userShell (if ctx.opts.login then none else ctx.userEnv.lookup "SHELL")
-      (if ctx.opts.login then ctx.target.shell else ctx.invoking.shell)
-    let command := Cli.shellCommand shell ctx.opts.login ctx.opts.command
-    (command.path, command.argv.tail)
-  else (ctx.opts.command.headD "", ctx.opts.command.tail)
 
 def logLine (ctx : Context) (reason : Option String) (allowed : Option Allowed := none)
     (commandOverride : Option (String × List String) := none)
@@ -473,7 +539,8 @@ def logLine (ctx : Context) (reason : Option String) (allowed : Option Allowed :
     logEscape (if t.startsWith "/dev/" then String.ofList (t.toList.drop 5) else t)
   let cwd := (allowed.map (configuredCwd ctx)).getD
     ((ctx.opts.chdir.or ctx.settings.runcwd).filter (· != "*"))
-  let cwd := (cwd.bind (expandHome ctx)).getD (if ctx.opts.login then ctx.target.home else ctx.cwd)
+  let cwd := (cwd.bind (expandHome ctx)).or
+    (if ctx.opts.login then some ctx.target.home else ctx.cwd)
   let chroot := match allowed with
     | some a =>
       if rootApplied then commandChroot ctx a
@@ -481,21 +548,34 @@ def logLine (ctx : Context) (reason : Option String) (allowed : Option Allowed :
         (if ctx.opts.mode == .edit then ctx.target.home else (ctx.policyTarget.getD ctx.target).home) ctx.homes)
     | none => ((ctx.opts.chroot.or ctx.settings.runchroot).filter (· != "*")).bind (expandHome ctx)
   let commandCtx := (allowed.map (fun a => { ctx with command := resolvedFor ctx a })).getD ctx
+  let tail := (if ctx.opts.envVars.isEmpty then "" else
+      "ENV=" ++ logEscape (String.intercalate " " (ctx.opts.envVars.map fun (k,v) => k ++ "=" ++ v)) ++ " ; ") ++
+    "COMMAND=" ++ (match commandOverride with
+      | some (path, args) => logEscape path ++
+          (if args.isEmpty then "" else " " ++ String.intercalate " " (args.map logArgument))
+      | none => logCommand commandCtx reason.isNone)
   { format := ctx.settings.logFormat, reason,
     event := if reason.isSome then .reject else .accept,
-    runcwd := some cwd, runchroot := chroot,
+    runcwd := cwd, runchroot := chroot,
     priority := (if reason.isSome then ctx.settings.syslogBadpri else ctx.settings.syslogGoodpri).getD "none",
     msg := logEscape (displayUser ctx).name ++ " : " ++ (reason.map (fun s => logEscape s ++ " ; ")).getD "" ++
       (tty.map (fun t => s!"TTY={t} ; ")).getD "" ++
       (chroot.map (fun p => s!"CHROOT={logEscape p} ; ")).getD "" ++
-      s!"PWD={logEscape cwd} ; USER={logEscape ctx.target.name} ; " ++
-      (ctx.targetGroup.map (fun g => s!"GROUP={logEscape g.name} ; ")).getD "" ++
-      (if ctx.opts.envVars.isEmpty then "" else
-        "ENV=" ++ logEscape (String.intercalate " " (ctx.opts.envVars.map fun (k,v) => k ++ "=" ++ v)) ++ " ; ") ++
-      "COMMAND=" ++ (match commandOverride with
-        | some (path, args) => logEscape path ++
-            (if args.isEmpty then "" else " " ++ String.intercalate " " (args.map logArgument))
-        | none => logCommand commandCtx) }
+      (cwd.map (fun c => s!"PWD={logEscape c} ; ")).getD "" ++
+      s!"USER={logEscape ctx.target.name} ; " ++
+      (ctx.targetGroup.map (fun g => s!"GROUP={logEscape g.name} ; ")).getD "" ++ tail,
+    tail }
+
+def tsidText (file : String) : String :=
+  match file.toList with
+  | [a, b, '/', c, d, '/', e, f] =>
+    if [a, b, c, d, e, f].all Char.isAlphanum then String.ofList [a, b, c, d, e, f] else file
+  | _ => file
+
+def withTsid (line : LogLine) (file : String) : LogLine :=
+  if line.tail.isEmpty || !line.msg.endsWith line.tail then line else
+    { line with msg := String.ofList (line.msg.toList.take (line.msg.length - line.tail.length)) ++
+      "TSID=" ++ logEscape (tsidText file) ++ " ; " ++ line.tail }
 
 theorem logLine_format (ctx : Context) (reason : Option String) (allowed : Option Allowed) :
     (logLine ctx reason allowed).format = ctx.settings.logFormat := rfl
@@ -543,11 +623,28 @@ def successAdminFlag (ctx : Context) : Option String :=
       if p.startsWith "~/" then (displayUser ctx).home ++ String.ofList (p.toList.drop 1) else p
   else none
 
+def copiesEnvironment (ctx : Context) : Bool :=
+  !ctx.opts.login && (ctx.opts.mode == .edit || !ctx.settings.envReset ||
+    match ctx.opts.preserveEnv with
+    | .all => match policyJudgement ctx with
+      | .allow a => a.setenv
+      | .deny => ctx.settings.setenv
+    | _ => false)
+
+def rawEnvDeleted (st : Settings) (raw : String) : Bool :=
+  let listed := fun (pats : List String) =>
+    pats.any fun p => (envPatternL p.toList raw.toList false false).isSome
+  let value := (raw.toList.dropWhile (· != '=')).drop 1
+  listed st.envDelete ||
+    (listed st.envCheck && raw.contains '=' && (value.contains '/' || value.contains '%'))
+
+def rebuildEnvFails (ctx : Context) : Bool :=
+  copiesEnvironment ctx && ctx.rawEnv.any fun raw =>
+    (raw.startsWith "=" || !raw.contains '=') && !rawEnvDeleted ctx.settings raw
+
 def earlyFailure (ctx : Context) : Option FailureInfo :=
   if (Cli.timeoutError ctx.opts).isSome then
     some { message := s!"sudo: {(Cli.timeoutError ctx.opts).getD ""}\nsudo: error initializing audit plugin sudoers_audit\n", prefixed := false }
-  else if ctx.opts.mode = .edit ∧ (invalidEditFile ctx).isSome then
-    some { message := s!"sudoedit: {(invalidEditFile ctx).getD ""}: path is not absolute or contains a NUL byte, refusing\n", prefixed := false }
   else if ctx.opts.host.isSome && ctx.opts.mode != .list then
     some { (warningInfo "a remote host may only be specified when listing privileges."
       "user not allowed to set remote host for command") with commandReady := false, lookupComplete := false }
@@ -571,6 +668,9 @@ def earlyFailure (ctx : Context) : Option FailureInfo :=
       ctx.settings.runasCheckShell && !ctx.validShells.contains ctx.target.shell then
     let message := s!"invalid shell for user {ctx.target.name}: {ctx.target.shell}"
     some { (warningInfo message message) with raw := true }
+  else if rebuildEnvFails ctx then
+    let message := s!"{ctx.progname}: unable to rebuild the environment: Invalid argument\n"
+    some { message, prefixed := false }
   else if ctx.opts.mode != .list && !ctx.settings.rootpw && ctx.settings.runaspw &&
       ctx.runasDefaultUser.isNone && ctx.settings.runasDefault != ctx.root.name then
     let message := s!"unknown user {ctx.settings.runasDefault}"
@@ -611,19 +711,23 @@ def policyDecision (ctx : Context) (j : Judgement) : Decision :=
       | some info => failureLog ctx info allowed
       | none => match j with
         | .allow a => if accepted && ctx.settings.logAllowed then some (logLine ctx none (some a)) else none
-        | .deny => if ctx.settings.logDenied then some (logLine ctx (some (denialReason ctx))) else none,
+        | .deny => if (ctx.settings.logDenied || denialMail ctx) && !pseudoValidated ctx then
+            some (logLine ctx (some (denialReason ctx))) else none,
+    mailOnly := failure.isNone && allowed.isNone && !ctx.settings.logDenied,
+    refusedEdit := if failure.isNone && ctx.opts.mode == .edit && (invalidEditFile ctx).isSome then
+      allowed.map (editPlan ctx) else none,
     audit := match failure with
       | some info => info.auditReason.map AuditEvent.reject
       | none => match j with
         | .allow _ => if accepted && ctx.settings.logAllowed then some .accept else none
-        | .deny => some (.reject (denialReason ctx)),
+        | .deny => if pseudoValidated ctx then none else some (.reject (denialReason ctx)),
     adminFlag := if allowed.isSome && failure.all (·.adminFlag) then successAdminFlag ctx else none,
     mail := match failure with
       | some info => info.denial && ctx.mailerAvailable &&
           (ctx.settings.mailAlways || (commandMode && ctx.settings.mailAllCmnds) ||
             allowed.any (fun a => a.mail.getD false))
       | none => match j with
-        | .deny => denialMail ctx
+        | .deny => denialMail ctx && !pseudoValidated ctx
         | .allow a => accepted && ctx.mailerAvailable &&
             (a.mail.getD false || ctx.settings.mailAlways || ctx.settings.mailAllCmnds) }
 

@@ -34,7 +34,7 @@ StrictModes no
 EOF
   /usr/sbin/sshd -D -e -f "$WORK/ssh/sshd_config" >"$WORK/ssh/daemon.log" 2>&1 &
   shell_sshd_pid=$!
-  for ((shell_wait=0; shell_wait<100; shell_wait++)); do
+  for ((shell_wait=0; shell_wait<600; shell_wait++)); do
     ssh-keyscan -T 1 -p 2222 127.0.0.1 >"$WORK/ssh/known_hosts" 2>/dev/null && break
     kill -0 "$shell_sshd_pid" 2>/dev/null || break
     sleep 0.05
@@ -53,7 +53,7 @@ shell_run_askpass() {
   local mode=$1 xvfb_pid driver_pid
   Xvfb :99 -screen 0 640x480x24 -nolisten tcp -ac >"$WORK/askpass-xvfb.log" 2>&1 &
   xvfb_pid=$!
-  for ((shell_wait=0; shell_wait<100; shell_wait++)); do
+  for ((shell_wait=0; shell_wait<600; shell_wait++)); do
     DISPLAY=:99 xdotool getdisplaygeometry >/dev/null 2>&1 && break
     kill -0 "$xvfb_pid" 2>/dev/null || break
     sleep 0.05

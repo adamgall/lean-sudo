@@ -56,8 +56,6 @@ opaque openAt (dir : UInt32) (path : @& String) (flags mode : UInt32) : IO (Resu
 opaque accessAt (dir : UInt32) (path : @& String) (mode : UInt32) : IO (Result Unit)
 @[extern "leansudo_prim_edit_unlinkat"]
 opaque unlinkAt (dir : UInt32) (path : @& String) : IO (Result Unit)
-@[extern "leansudo_prim_edit_mkostemps"]
-opaque makeTemp (path : @& String) (suffix : UInt32) : IO (Result (String × UInt32))
 @[extern "leansudo_prim_edit_fstat"]
 opaque stat (fd : UInt32) : IO (Result (Array Nat))
 @[extern "leansudo_prim_edit_pread"]

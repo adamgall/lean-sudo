@@ -96,7 +96,7 @@ flowchart LR
 | Area | Guarantee | Theorems |
 |---|---|---|
 | **Decision core** | A command is executed only if the policy allows that exact request (path, arguments, run-as user and group). The file executed is the one the policy compared: the canonical parent directory resolved before the check plus the basename, or the very descriptor that was digested. | `exec_allowed`, `exec_origin`, `exec_path_is_canonical`, `exec_fd_is_pinned` |
-| | It runs with exactly the target's uid, the target's (or `-g`) gid, and the target's groups (with `stay_setuid`, sudo's exact real/effective split). | `exec_identity`, `edit_identity` |
+| | It runs with exactly the target's uid, the target's (or `-g`) gid, and the target's groups led by that gid, plus any groups a PAM module adds in `pam_setcred` (e.g. `pam_group`), as in sudo.ws (with `stay_setuid`, sudo's exact real/effective split). | `exec_identity`, `edit_identity` |
 | | No password is skipped except for root, a `NOPASSWD`/`!authenticate` rule, `exempt_group`, a valid timestamp for the same user and terminal, or running as yourself with an unchanged security context. | `exec_noauth`, `edit_noauth`, `exempt_user_no_auth` |
 | | A denied request, a command that was not found, an invalid target shell (`runas_check_shell`), an invalid timeout, a forbidden `-l -U`, or a rule needing a feature lean-sudo cannot provide never executes anything. | `deny_no_execution`, `command_not_found_no_exec`, `invalid_runas_shell_no_exec`, `invalid_timeout_no_execution`, `list_other_denied_no_execution`, `enforcement_error_no_exec` |
 | | `-k` always forces authentication; the timestamp is only refreshed for allowed requests. | `decide_reset_requires_auth`, `timestamp_update_allowed` |
@@ -115,6 +115,13 @@ flowchart LR
 | **Environment** | Without `SETENV`, `LD_*` variables and `env_delete` entries reach the command only from trusted sources (`env_file`, PAM) or through the reset-mode whitelist the administrator configured; with `env_reset`, every variable is set by sudo, whitelisted (sudo's full `env_keep`/`env_check` pattern syntax) or trusted; a caller without `SETENV` cannot override `secure_path`; `SUDO_USER/UID/GID/COMMAND` are correct unless an explicitly permitted later write (`SETENV`, an `env_keep` pattern covering them, PAM) sets them, exactly as in sudo; no duplicate keys. As in sudo, `!env_reset` copies exported bash functions that pass the `env_delete`/`env_check` filters. | `buildEnv_no_LD`, `buildEnv_no_bash_fn`, `buildEnv_delete_respected`, `buildEnv_reset_whitelist`, `buildEnv_securePath`, `buildEnv_sudo_vars`, `buildEnv_nodup`, `fileVars_origin` |
 | **Command line** | The command run is exactly the words you typed after the options, never reordered or rewritten; `--` ends option parsing; conflicting modes are rejected. The `-s`/`-i` shell escaping round-trips. | `parseArgs_command`, `parseArgs_command_suffix`, `parseArgs_dashdash`, `parseArgs_login_shell`, `lex_escapeJoin` |
 | **Credential cache** | A cached authentication is honoured only for the same uid, the same scope (terminal device, session id and the session leader's start time; or parent process and its start time), within the timeout and not from the future; `sudo -k` invalidates the records of the current scope, as in sudo; records for one scope never authorise another. | `lookup_sound`, `lookup_invalidateScope`, `invalidateScope_other`, `lookup_update_other`, `kernel_scope_terminal_separation`, `valid_not_future`, `decode_encode` |
+| **Helper authentication** | Accepted channel/envelope observations require a socket and matching peer, parent and effective identities; native peer-credential correctness remains trusted. The channel descriptor named by the marker is bounded and is the only descriptor a helper inherits beyond the planned ones. | `Helper.authenticatedEnvelope_peer`, `Helper.channelDescriptor_bounded`, `Helper.helperDescriptors_exact` |
+| **Credential verification** | Both drop modes call the same gate, requiring exact real/effective/saved and filesystem IDs, the supplementary-group multiset, and no successful applicable root-regain probe. | `Helper.credentialsAccepted_secure`, `Helper.groupsEqual_multiset` |
+| **Helper plan validation** | Execution, background and PAM plans reject NUL strings and out-of-range identities/descriptors; plugin strings and event descriptors are checked before native calls. | `Sys.Exec.check_valid`, `Sys.Exec.check_noNul`, `Sys.Exec.childDescriptorsValid_exact`, `Sys.PamHelpers.validPlan_rejects_descriptor`, `Sys.Plugins.validPluginIdentity_rejects_nul` |
+| **Descriptor sweep** | The shared sweep combinator succeeds only if close_range succeeds or every fallback descriptor visit succeeds or reports EBADF. The intended command-descriptor set is specified separately; equivalence between that specification and the complete IO sequence is not proved. | `Sys.Exec.sweepDescriptors_complete`, `Sys.Exec.completeSweep_results`, `Sys.Exec.completeSweep_rejects_failed_visit` |
+| **Timestamp storage** | Storage selection, record conversion and updates use the proved timestamp model; stale, disabled, wrong-user, wrong-session and invalid records cannot authorize a cached authentication. | `Sys.TimestampStorage.lookup_model`, `Sys.TimestampStorage.authorized_sound`, `Sys.TimestampStorage.updateFor_sound`, `Sys.TimestampStorage.invalidated_records_denied` |
+| **Signal masks** | Blocking, signalfd and restore masks exclude glibc-internal realtime signals. The original mask survives helper serialization exactly; restore retains the prior reserved-signal filtering. | `Sys.Prim.Exec.supportedMask_excludes_internal`, `Helper.restoredMask_roundtrip` |
+| **Relay hooks** | The generic combinators used by composition preserve preceding effects and stop acceptance hooks on `false` or handled-event queries on `true`; regrouping preserves behavior. | `Sys.RelayHooks.allThen_abort_after`, `Sys.RelayHooks.allThen_assoc`, `Sys.RelayHooks.anyThen_stop_after`, `Sys.RelayHooks.inOrder_assoc` |
 | **sudoedit** | The chosen editor is the first resolvable candidate; a file is written back only if it changed and passed the safety checks. | `selectEditor_first`, `writeBack_sound`, `tempSafe_sound` |
 | **Parser and config** | Every command path in a parsed rule is absolute; regex commands are anchored; digests always guard a command. Additional `sudo.conf` plugins must be loaded, never silently bypassed; approval plugins can only restrict a policy decision. | `parse_command_absolute`, `parse_regex_anchored`, `parse_digest_command_absolute`, `unknown_plugin_refused`, `approval_only_restricts`, `denied_never_approved` |
 | **Plugin host** | Enforced intercepted commands use the supplied policy metadata without merging an earlier command; registered events must have a callback; loaded ABI versions have major 1 and external policy plugins are refused. | `enforced_subcommand_info`, `validEvent_has_callback`, `compatibleVersion_major`, `policy_plugin_not_supported` |
@@ -138,11 +145,16 @@ files within the read limit; `Sys.CoreLogs.logFileSafe_iff` requires root-owned 
 log files without group or other write permission.
 
 The helper boundary preserves requested identities (`Sys.Exec.specOfPlan_ids`,
-`Sys.Exec.childPlan_ids`).
-Its pure execution gate accepts only verified credential observations
-(`Helper.authorize_requires_verification`,
-`Sys.Exec.commandAuthorized_requires_verification`). These theorems concern the
-Lean plan and gate; syscall correctness remains an operating-system assumption.
+`Sys.Exec.childPlan_ids`). The actual credential-drop gate is shared by process-wide
+and per-thread changes and requires exact observed IDs, a permutation of the requested
+supplementary groups, and unsuccessful applicable root-regain probes.
+The helper envelope preserves the caller's original mask exactly through serialization
+(`Helper.restoredMask_exact`, `Helper.restoredMask_roundtrip`).
+Before native restoration, the existing `supportedMask` filtering removes reserved
+glibc-internal realtime signals; exact serialization is not an unfiltered-restore claim.
+These theorems concern Lean decisions and arguments passed to native primitives;
+syscall correctness, successful credential changes and kernel descriptor effects
+remain operating-system assumptions. `DESIGN.md` details the boundaries and theorem inventory.
 Credentialed file helpers require regular files (`Sys.Edit.authorizeFile_regular`),
 and lookup's executable and unavailable-error classifications are characterized by
 `Sys.Lookup.executable_iff` and `Sys.Lookup.unavailable_iff`.
@@ -174,8 +186,8 @@ byte for byte where it matters:
 
 | Suite | sudo.ws 1.9.17p2 | lean-sudo |
 |---|---|---|
-| `sudo` end-to-end: authentication and PAM, run-as users/groups, `!` rules and aliases, globs/regex/digests/netgroups/networks/FQDN hosts, group plugins, SSSD rules (real slapd + sssd), `Defaults` scoping, environment, `-l`/`-ll`/`-U` output, timestamps (interoperating with sudo.ws), `-i`/`-s`/`-b`, exit status, signals and job control, `NOEXEC`, `TIMEOUT`, `CHROOT`, rlimits, `stay_setuid`, utmp, command interception and `log_subcmds`, sudoedit, `sudo.conf` with audit/approval/I/O plugins, `nsswitch.conf`, askpass, mail, audit records, accept/reject/alert events compared in syslog, logfile and JSON, remote log servers (`sudo_logsrvd`, TLS), I/O logs replayed with the system's `sudoreplay`, translations (German, French), command-line errors, security regressions | 918/918 | 918/918 |
-| `visudo` (check mode, edit mode with includes, locking, permissions, export) | 154/154 | 154/154 |
+| `sudo` end-to-end: authentication and PAM, run-as users/groups, `!` rules and aliases, globs/regex/digests/netgroups/networks/FQDN hosts, group plugins, SSSD rules (real slapd + sssd), `Defaults` scoping, environment, `-l`/`-ll`/`-U` output, timestamps (interoperating with sudo.ws), `-i`/`-s`/`-b`, exit status, signals and job control, `NOEXEC`, `TIMEOUT`, `CHROOT`, rlimits, `stay_setuid`, utmp, command interception and `log_subcmds`, sudoedit, `sudo.conf` with audit/approval/I/O plugins, `nsswitch.conf`, askpass, mail, audit records, accept/reject/alert events compared in syslog, logfile and JSON, remote log servers (`sudo_logsrvd`, TLS), I/O logs replayed with the system's `sudoreplay`, translations (German, French), command-line errors, security regressions | 1104/1104 | 1104/1104 |
+| `visudo` (check mode, edit mode with includes, locking, permissions, export) | 193/193 | 193/193 |
 
 ## Features
 
@@ -256,25 +268,56 @@ Where sudo.ws keeps going with a partial policy, lean-sudo stops, because a drop
 line can be a `!` rule:
 
 * **A syntax error anywhere in the policy stops lean-sudo.** sudo.ws reports the error
-  and carries on with the rules it could parse.
+  and carries on with the rules it could parse. This includes errors sudo.ws's own
+  parser raises, such as `too many levels of includes` for an include loop.
+* **A NUL byte never shortens a policy word.** sudo.ws ends a sudoers line at its first
+  NUL, so `root ALL=ALL\0, !/bin/sh` silently loses `!/bin/sh`, and it ends a word at
+  a `\x00` escape, so `ferris\x00evil` matches `ferris`. lean-sudo makes both a syntax
+  error; a NUL followed only by NULs or blanks up to the end of its line, or inside a
+  comment, is ignored as in sudo.ws. A NUL anywhere in `/etc/nsswitch.conf` stops
+  lean-sudo; sudo.ws ends the line there, which can drop a `[SUCCESS=return]` action.
 * **An insecure or unreadable include stops lean-sudo**: an included file or
   `@includedir` directory that is world-writable, group-writable by a group other than
   root, or not owned by root, and an `@include` file that is missing or cannot be read.
-  sudo.ws warns and skips them.
+  sudo.ws warns and skips them. A missing or unusable main sudoers file also stops
+  lean-sudo when `sss` supplies rules too; sudo.ws continues with the `sss` rules.
 * **Undefined aliases and alias cycles are errors** (sudo warns), because a
   `!UNDEFINED` that matches nothing would widen access.
 * **An invalid `Defaults` value is an error** (e.g. `timestamp_timeout=abc`), because
   falling back to the default could widen access.
 * Non-UTF-8 command-line arguments are refused; non-UTF-8 environment entries are
-  dropped.
+  dropped, both from the command's environment and from logged `submitenv`. A sudoers
+  file that is not valid UTF-8 stops lean-sudo; sudo.ws parses its bytes.
 
 None of this changes the behaviour of a valid policy. lean-sudo's `visudo` rejects every
 one of these conditions before they can be installed (where `visudo.ws` only warns about
-undefined aliases), so it cannot install a policy that lean-sudo would then refuse.
+undefined aliases and alias cycles and accepts the NUL cases), so it cannot install a
+policy that lean-sudo would then refuse.
 
 ## Other differences from sudo.ws
 
+* A credential-cache record dated in the future is never honoured (`valid_not_future`);
+  with a negative `timestamp_timeout` sudo.ws accepts it.
 * A fractional `timestamp_timeout` is rounded down to whole seconds.
+* The command is executed by the path the policy compared: its canonical parent
+  directory plus its basename (`exec_path_is_canonical`). A script started through a
+  symlinked directory therefore sees that path in `$0`; sudo.ws executes the path as
+  typed (for `ALL`) or as written in the matching rule. `argv[0]` is unchanged.
+* sudoedit writes a temporary file back only if it still has exactly one link
+  (`tempSafe_sound`): an editor that hard-links its temporary file gets `unsafe temporary
+  file` and `left unmodified`, and the temporary file is kept. sudo.ws checks only
+  type, mode 0600 and owner, and writes it back.
+* sudoedit never edits a relative path (`edit_files_normalized`). When the working
+  directory has been deleted and sudo.ws would run the editor on such a file and only
+  then fail to write it back (as root, with `!sudoedit_checkdir`, or in a directory
+  the user cannot write), lean-sudo refuses it before the editor runs with `path is
+  not absolute or contains a NUL byte, refusing`.
+* A `SUDO_PS1` value that starts with `() ` (a bash function definition) does not
+  set `PS1`: `buildEnv_no_bash_fn` admits such values only from sudo itself, PAM,
+  `env_file` or explicitly permitted variables. sudo.ws sets `PS1` from it.
+* The credential cache is refreshed only for allowed requests
+  (`timestamp_update_allowed`); after a password-authenticated `sudo -l -U other`
+  for a user with no rules, sudo.ws also refreshes it.
 * Plugin environment hooks run on Lean's main thread in the process that loaded
   the plugins, including sudo's own environment calls between plugin invocations.
   Other threads and forked children use plain libc environment functions rather

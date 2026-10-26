@@ -152,6 +152,11 @@ def getcwd : IO String := do
   Prim.CoreFacts.check rc
   Prim.CoreFacts.decode bytes "current directory is not valid UTF-8"
 
+def currentDirectory : IO (Option String) := do
+  let (rc, bytes) ← Prim.CoreFacts.getcwd
+  if rc < 0 then return none
+  some <$> Prim.CoreFacts.decode bytes "current directory is not valid UTF-8"
+
 def writeStderr (s : String) : IO Unit := Prim.CoreFacts.writeStderr s.toUTF8
 
 @[extern "lean_sudo_umask"] private opaque umaskRaw (mask : UInt32) : IO UInt32

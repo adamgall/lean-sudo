@@ -1,0 +1,22 @@
+FROM ubuntu:26.04
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl cargo rustc build-essential docker.io docker-buildx python3 \
+ && rm -rf /var/lib/apt/lists/*
+ARG REVISION=5edfc693694224d43166821fdd112411a4c1b2bd
+ARG SHA256=369ac95040d5d84f69494e28527f11634913f2f9bac03ab0877ce1c371466aa6
+RUN curl -fsSL \
+      "https://codeload.github.com/trifectatechfoundation/sudo-rs/tar.gz/${REVISION}" \
+      -o /tmp/suite.tar.gz \
+ && printf '%s  /tmp/suite.tar.gz\n' "$SHA256" | sha256sum -c - \
+ && mkdir /suite \
+ && tar -xzf /tmp/suite.tar.gz --strip-components=1 -C /suite \
+ && rm /tmp/suite.tar.gz \
+ && printf '%s\n%s\n' "$REVISION" "$SHA256" >/suite/pin
+WORKDIR /suite/test-framework
+RUN cargo test --locked -p sudo-compliance-tests --no-run
+COPY execute.sh compare.py cases.py /opt/external/
+COPY docker /usr/local/bin/docker
+RUN chmod 0755 /usr/local/bin/docker
+ENTRYPOINT ["bash", "/opt/external/execute.sh"]

@@ -44,8 +44,8 @@ cp -a /etc/sudoers.d "$WORK/sudoers.d.orig"
 touch /tmp/frankfile
 
 mkdir -p "$OUTDIR"
-LOG="$OUTDIR/$LABEL.log"
-TAP="$OUTDIR/$LABEL.tap"
+LOG="$OUTDIR/${IMPL_OUTPUT_LABEL:-$LABEL}.log"
+TAP="$OUTDIR/${IMPL_OUTPUT_LABEL:-$LABEL}.tap"
 : >"$LOG"
 : >"$TAP"
 

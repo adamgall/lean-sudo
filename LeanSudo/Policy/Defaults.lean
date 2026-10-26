@@ -111,7 +111,7 @@ def defaultKind : String → Option DefaultKind
   | "timestamp_timeout" => some (.minutes (fun st v => { st with timestampTimeout := v }))
   | "passwd_timeout" => some (.minutes (fun st v => { st with passwdTimeout := v }))
   | "passwd_tries" => some (.unsigned false (fun st v => { st with passwdTries := v }))
-  | "umask" => some (.mode true (fun st v => { st with umask := v }))
+  | "umask" => some (.mode true (fun st v => { st with umask := v, umaskExplicit := v != 0o777 }))
   | "logfile" => some (.string true .absolute (fun st v => { st with logfile := v }))
   | "mailerpath" => some (.string true .absolute (fun st v => { st with mailerpath := v }))
   | "mailerflags" => some (.string true .unrestricted (fun st v => { st with mailerflags := v }))
@@ -370,8 +370,7 @@ def applySetting (st : Settings) (d : DefaultsSetting) (callbacks : Bool := true
         some (some text)
       else none) set
   return (result, if callbacks && verbose && n == "runchroot" then
-    let location := (d.source.map fun (file, line, column) => s!"{file}:{line}:{column}: ").getD ""
-    some (location ++ "\"runchroot\" is deprecated and will be removed in a future sudo release")
+    some "\"runchroot\" is deprecated and will be removed in a future sudo release"
     else none)
 
 def applySettings (st : Settings) (ds : List DefaultsSetting) (verbose : Bool := false)
@@ -389,10 +388,15 @@ def earlyDefaults : List String :=
   ["ignore_unknown_defaults", "fqdn", "match_group_by_gid", "group_plugin",
    "runas_default", "sudoers_locale"]
 
+def located (d : DefaultsSetting) (message : String) : String :=
+  match d.source with
+  | some (file, line, column) =>
+    if line > 0 then s!"{file}:{line}:{column}: {message}" else s!"{file}: {message}"
+  | none => message
+
 private def scopePhase : DefaultsScope → Nat
-  | .global | .host _ | .user _ => 0
-  | .runas _ => 1
-  | .cmnd _ => 2
+  | .global | .host _ | .user _ | .runas _ => 0
+  | .cmnd _ => 1
 
 private def scopeMatches (al : Aliases) (st : Settings) (user : Principal) (host : String)
     (runas : Option Principal) (cmd : Option Command) (canon : String → String)
@@ -405,18 +409,35 @@ private def scopeMatches (al : Aliases) (st : Settings) (user : Principal) (host
     cmndListResult al al.fuel canon cm cs
       (facts.map fun r => { r with command := cm, fastGlob := st.fastGlob }) == some true
 
-def resolveDefaults (s : Sudoers) (user : Principal) (host : String) (runas : Option Principal)
-    (cmd : Option Command) (canon : String → String := id) (facts : Option Request := none)
-    (initial : Settings := {}) (verbose : Bool := false) : Except String (Settings × List String) := do
+def resolveDefaultsTrace (s : Sudoers) (user : Principal) (host : String)
+    (runas : Option Principal) (cmd : Option Command) (canon : String → String := id)
+    (facts : Option Request := none) (initial : Settings := {}) (verbose : Bool := false)
+    (initialRunas : Option Principal := runas) : Settings × List (Settings × String) × Bool :=
   let al := aliasesOf s
   let ds := defaultsOf s
-  [0, 1, 2].foldlM (fun acc phase =>
-    [true, false].foldlM (fun acc early =>
-      ds.foldlM (fun (acc : Settings × List String) (sc, ss) => do
-        if scopePhase sc != phase || !scopeMatches al acc.1 user host runas cmd canon facts sc then
-          return acc
-        let (st, warnings) ← applySettings acc.1 (ss.filter fun d => earlyDefaults.contains d.name == early) verbose
-        return (st, acc.2 ++ warnings)) acc) acc) (initial, [])
+  [0, 1].foldl (fun acc phase =>
+    [true, false].foldl (fun acc early =>
+      let matchRunas := if phase == 0 && early then initialRunas else runas
+      ds.foldl (fun (acc : Settings × List (Settings × String) × Bool) (sc, ss) =>
+        if scopePhase sc != phase ||
+            !scopeMatches al acc.1 user host matchRunas cmd canon facts sc then
+          acc
+        else (ss.filter fun d => earlyDefaults.contains d.name == early).foldl
+          (fun (st, diagnostics, failed) d =>
+            match applySetting st d true verbose with
+            | .ok (st', warning) =>
+              (st', diagnostics ++ warning.toList.map fun w => (st, located d w), failed)
+            | .error message => (st, diagnostics ++ [(st, located d message)], true)) acc) acc) acc)
+    (initial, [], false)
+
+def resolveDefaults (s : Sudoers) (user : Principal) (host : String) (runas : Option Principal)
+    (cmd : Option Command) (canon : String → String := id) (facts : Option Request := none)
+    (initial : Settings := {}) (verbose : Bool := false)
+    (initialRunas : Option Principal := runas) : Except String (Settings × List String) :=
+  let (st, diagnostics, failed) :=
+    resolveDefaultsTrace s user host runas cmd canon facts initial verbose initialRunas
+  let diagnostics := diagnostics.map (·.2)
+  if failed then .error ("\n".intercalate diagnostics) else .ok (st, diagnostics)
 
 theorem applySetting_unknown (st : Settings) (d : DefaultsSetting)
     (h : defaultKind d.name = none) :

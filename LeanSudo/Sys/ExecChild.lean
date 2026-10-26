@@ -1,6 +1,7 @@
 import LeanSudo.Helper
 import LeanSudo.Sys.ExecPlan
 import LeanSudo.Sys.Prim.CoreFacts
+import LeanSudo.Sys.Limits
 
 namespace LeanSudo.Sys.Exec
 
@@ -28,6 +29,68 @@ structure ChildPlan where
   commandGroup : Bool := false
   deriving ToJson, FromJson
 
+def sudoExecSlot (inherited : UInt64) : Option Nat :=
+  ((List.range 64).filter fun fd =>
+    3 ≤ fd && inherited &&& ((1 : UInt64) <<< fd.toUInt64) == 0)[3]?
+
+def childIdentityValid (plan : ChildPlan) : Bool :=
+  decide (plan.ruid ≤ maxId ∧ plan.gid ≤ maxId)
+
+def childFdValid (fd : Nat) : Bool := decide (fd ≤ 0x7FFFFFFF)
+
+def childDescriptorsValid (plan : ChildPlan) : Bool :=
+  childFdValid plan.errorFd &&
+  plan.redirects.all (fun (source, target) => childFdValid source && childFdValid target) &&
+  plan.closeFds.all childFdValid && plan.keepFds.all childFdValid &&
+  (plan.gate.map childFdValid).getD true && (plan.slave.map childFdValid).getD true
+
+theorem childIdentityValid_exact (plan : ChildPlan) :
+    childIdentityValid plan = true ↔ plan.ruid ≤ maxId ∧ plan.gid ≤ maxId := by
+  simp [childIdentityValid]
+
+theorem childFdValid_exact (fd : Nat) (h : childFdValid fd = true) :
+    fd ≤ 0x7FFFFFFF ∧ fd.toUInt32.toNat = fd := by
+  have bound : fd ≤ 0x7FFFFFFF := by simpa [childFdValid] using h
+  exact ⟨bound, toUInt32_toNat_of_lt (by omega)⟩
+
+theorem childDescriptorsValid_exact (plan : ChildPlan) :
+    childDescriptorsValid plan = true ↔
+      plan.errorFd ≤ 0x7FFFFFFF ∧
+      (∀ pair ∈ plan.redirects, pair.1 ≤ 0x7FFFFFFF ∧ pair.2 ≤ 0x7FFFFFFF) ∧
+      (∀ fd ∈ plan.closeFds, fd ≤ 0x7FFFFFFF) ∧
+      (∀ fd ∈ plan.keepFds, fd ≤ 0x7FFFFFFF) ∧
+      (∀ fd ∈ plan.gate, fd ≤ 0x7FFFFFFF) ∧
+      (∀ fd ∈ plan.slave, fd ≤ 0x7FFFFFFF) := by
+  simp only [childDescriptorsValid, Bool.and_eq_true, Array.all_eq_true']
+  cases plan.gate <;> cases plan.slave <;>
+    simp [childFdValid, and_assoc]
+
+def commandDescriptorOpen (plan : ChildPlan) (inherited : Nat → Bool) (fd : Nat) : Bool :=
+  ((inherited fd && decide (fd < plan.spec.closeFrom)) ||
+    plan.keepFds.contains fd) &&
+    fd != plan.errorFd && plan.spec.execFd != some fd
+
+theorem commandDescriptorOpen_exact (plan : ChildPlan) (inherited : Nat → Bool) (fd : Nat) :
+    commandDescriptorOpen plan inherited fd = true ↔
+      ((inherited fd = true ∧ fd < plan.spec.closeFrom) ∨ fd ∈ plan.keepFds) ∧
+      fd ≠ plan.errorFd ∧ plan.spec.execFd ≠ some fd := by
+  simp [commandDescriptorOpen, Bool.and_eq_true, Bool.or_eq_true, and_assoc]
+
+theorem commandDescriptorOpen_managed (plan : ChildPlan) (inherited : Nat → Bool)
+    (fd : Nat) (managed : plan.spec.closeFrom ≤ fd) :
+    commandDescriptorOpen plan inherited fd = true ↔
+      fd ∈ plan.keepFds ∧ fd ≠ plan.errorFd ∧ plan.spec.execFd ≠ some fd := by
+  rw [commandDescriptorOpen_exact]
+  have outside : ¬ fd < plan.spec.closeFrom := by omega
+  simp [outside]
+
+theorem commandDescriptorOpen_no_other (plan : ChildPlan) (inherited : Nat → Bool)
+    (fd : Nat) (managed : plan.spec.closeFrom ≤ fd) (absent : fd ∉ plan.keepFds) :
+    commandDescriptorOpen plan inherited fd = false := by
+  apply Bool.eq_false_iff.mpr
+  intro accepted
+  exact absent ((commandDescriptorOpen_managed plan inherited fd managed).mp accepted).1
+
 structure ChildError where
   message : String
   error : Nat := 0
@@ -50,13 +113,12 @@ theorem childPlan_ids (plan : Core.ExecPlan) (env : Array String) (child : Child
   exact specOfPlan_ids plan env
 
 def commandAuthorized (plan : Helper.Credentials) (actual : Helper.Verification) : Bool :=
-  (Helper.authorize plan actual).isSome
+  Helper.credentialsAccepted plan actual
 
 theorem commandAuthorized_requires_verification (plan : Helper.Credentials)
     (actual : Helper.Verification) (h : commandAuthorized plan actual = true) :
     Helper.verified plan actual = true := by
-  simp [commandAuthorized, Helper.authorize] at h
-  exact h
+  exact (Helper.credentialsAccepted_exact plan actual).mp h
 
 def errnoFailure (message : String) (error : UInt32) : IO α := do
   throw (IO.userError s!"{message}: {← Prim.Exec.strerror error}")
@@ -73,14 +135,80 @@ def closeQuiet (fd : UInt32) : IO Unit := do
 
 def stderr (message : String) : IO Unit := Prim.Exec.writeAll 2 message.toUTF8
 
+def fcntlSweepAccepted (result : Int64) (badDescriptor : UInt32) : Bool :=
+  result >= 0 || result == -(Int64.ofInt badDescriptor.toNat)
+
+def sweepDescriptors [Monad m] (visit : Nat → m Bool) (first : Nat) : Nat → m Bool
+  | 0 => pure true
+  | count + 1 => do
+    if !(← visit first) then return false
+    sweepDescriptors visit (first + 1) count
+
+def completeSweep [Monad m] (rangeError : UInt32) (fallback : m Bool) : m Bool :=
+  if rangeError == 0 then pure true else fallback
+
+theorem sweepDescriptors_complete (visit : Nat → Bool) (first count : Nat) :
+    sweepDescriptors (m := Id) visit first count = true ↔
+      ∀ fd, first ≤ fd → fd < first + count → visit fd = true := by
+  induction count generalizing first with
+  | zero =>
+    change true = true ↔ _
+    constructor
+    · intro _ fd lower upper
+      omega
+    · intro _
+      rfl
+  | succ count ih =>
+    simp only [sweepDescriptors, bind, pure]
+    cases h : visit first <;> simp [ih]
+    · exact ⟨first, by omega, by omega, h⟩
+    · constructor
+      · intro rest fd lower upper
+        by_cases same : fd = first
+        · simpa [same] using h
+        · exact rest fd (by omega) (by omega)
+      · intro all fd lower upper
+        exact all fd (by omega) (by omega)
+
+theorem completeSweep_spec (rangeError : UInt32) (visit : Nat → Bool) (first count : Nat) :
+    completeSweep rangeError (sweepDescriptors (m := Id) visit first count) = true ↔
+      rangeError = 0 ∨ ∀ fd, first ≤ fd → fd < first + count → visit fd = true := by
+  simp only [completeSweep]
+  split
+  · simp_all [pure]
+  · simp_all [sweepDescriptors_complete]
+
+theorem completeSweep_rejects_failed_visit (rangeError : UInt32) (visit : Nat → Bool)
+    (first count fd : Nat) (failedRange : rangeError ≠ 0)
+    (lower : first ≤ fd) (upper : fd < first + count) (failedVisit : visit fd = false) :
+    completeSweep rangeError (sweepDescriptors (m := Id) visit first count) = false := by
+  apply Bool.eq_false_iff.mpr
+  intro accepted
+  rcases (completeSweep_spec rangeError visit first count).mp accepted with success | all
+  · exact failedRange success
+  · have := all fd lower upper
+    simp [failedVisit] at this
+
+theorem completeSweep_results (rangeError badDescriptor : UInt32) (results : Nat → Int64)
+    (first count : Nat) :
+    completeSweep rangeError
+      (sweepDescriptors (m := Id) (fun fd => fcntlSweepAccepted (results fd) badDescriptor)
+        first count) = true ↔
+      rangeError = 0 ∨ ∀ fd, first ≤ fd → fd < first + count →
+        0 ≤ results fd ∨ results fd = -(Int64.ofInt badDescriptor.toNat) := by
+  rw [completeSweep_spec]
+  simp [fcntlSweepAccepted]
+
 def cloexecFrom (first : UInt32) : IO Unit := do
-  if (← Prim.Exec.closeRange first 0xFFFFFFFF (K.CLOSE_RANGE_CLOEXEC ())) == 0 then return
-  let maximum ← try
-      let (limit, _) ← Prim.Exec.getrlimit (K.RLIMIT_NOFILE ())
-      pure (if limit.toNat < 1073741824 then limit.toNat else 65536)
-    catch _ => pure 65536
-  for fd in [first.toNat:maximum] do
-    discard <| Prim.Exec.fcntl fd.toUInt32 (K.F_SETFD ()) (K.FD_CLOEXEC ())
+  let error ← Prim.Exec.closeRange first 0xFFFFFFFF (K.CLOSE_RANGE_CLOEXEC ())
+  let accepted ← completeSweep error do
+    let (_, hard) ← Prim.Exec.getrlimit (K.RLIMIT_NOFILE ())
+    if hard.toNat > UInt32.size then return false
+    sweepDescriptors (fun fd => do
+      let result ← Prim.Exec.fcntl fd.toUInt32 (K.F_SETFD ()) (K.FD_CLOEXEC ())
+      return fcntlSweepAccepted result (K.EBADF ()))
+      first.toNat (hard.toNat - first.toNat)
+  unless accepted do errnoFailure "unable to close inherited descriptors" (K.EIO ())
 
 def limitNames : Array (String × UInt32) := #[
   ("rlimit_as", (K.RLIMIT_AS ())),
@@ -171,7 +299,7 @@ private def execute (plan : ChildPlan) : IO UInt32 := do
   let checked ← match check plan.spec with
     | .ok value => pure value
     | .error error => throw (IO.userError error)
-  if plan.ruid > maxId || plan.gid > maxId then throw (IO.userError "invalid helper identity")
+  unless childIdentityValid plan do throw (IO.userError "invalid helper identity")
   if plan.session then discard <| checkResult "unable to create session" (← Prim.Exec.setsid)
   if plan.commandGroup then checkErr "unable to create process group" (← Prim.Exec.setpgid 0 0)
   if let some slave := plan.slave then
@@ -193,8 +321,7 @@ private def execute (plan : ChildPlan) : IO UInt32 := do
       throw (IO.userError "invalid seccomp program")
     checkErr s!"unable to execute {plan.spec.path}" (← Prim.Exec.seccomp bytes)
   if let some (low, high) := plan.coreLimit then
-    let error ← Prim.Exec.setrlimit (K.RLIMIT_CORE ()) low.toUInt64 high.toUInt64
-    if error != 0 then warnLimit (K.RLIMIT_CORE ()) error
+    discard <| Prim.Exec.setrlimit (K.RLIMIT_CORE ()) low.toUInt64 high.toUInt64
   if plan.dumpable >= 0 then
     discard <| Prim.Exec.prctl (K.PR_SET_DUMPABLE ()) plan.dumpable.toNat.toUInt64
   for (resource, low, high, userMax) in plan.limits do
@@ -209,17 +336,10 @@ private def execute (plan : ChildPlan) : IO UInt32 := do
   if let some root := plan.spec.chroot then
     checkErr s!"unable to change root to {root}" (← Prim.Exec.chroot root)
     checkErr s!"unable to change root to {root}" (← Prim.Exec.chdir "/")
-  let savedNproc ← try pure (some
-    (← Prim.Exec.getrlimit (K.RLIMIT_NPROC ()))) catch _ => pure none
-  if let some (_, maximum) := savedNproc then
-    let error ← Prim.Exec.setrlimit (K.RLIMIT_NPROC ()) (K.RLIM_INFINITY ()) (K.RLIM_INFINITY ())
-    if error != 0 then
-      let error ← Prim.Exec.setrlimit (K.RLIMIT_NPROC ()) maximum maximum
-      if error != 0 then warnLimit (K.RLIMIT_NPROC ()) error
+  Limits.unlimitNproc "sudo"
   Helper.dropCredentials checked.uid plan.gid.toUInt32 checked.groups
     (some plan.ruid.toUInt32) true (threadOnly := true)
-  if let some (low, high) := savedNproc then
-    discard <| Prim.Exec.setrlimit (K.RLIMIT_NPROC ()) low high
+  Limits.restoreNproc none
   if let some file := plan.spec.noexecFile then noexec file
   if let some cwd := plan.spec.cwd then
     let error ← Prim.Exec.chdir cwd
@@ -245,7 +365,7 @@ private def execute (plan : ChildPlan) : IO UInt32 := do
       discard <| Prim.Exec.signalAction signal.toUInt32
         (if plan.ignored.contains signal then Prim.Exec.ignoreHandler ()
           else Prim.Exec.defaultHandler ())
-  Prim.Exec.signalMask (← Helper.inheritedMask)
+  Prim.Exec.restoreSignalMask (← Helper.inheritedMask)
   let mut error ← if let some fd := plan.spec.execFd then
       discard <| checkResult s!"unable to execute {plan.spec.path}"
         (← Prim.Exec.fcntl fd.toUInt32 (K.F_SETFD ()) (K.FD_CLOEXEC ()))
@@ -267,6 +387,12 @@ private def execute (plan : ChildPlan) : IO UInt32 := do
 
 def childHelper (json : Json) : IO UInt32 := do
   let .ok plan := (fromJson? json : Except String ChildPlan) | return 127
+  unless childDescriptorsValid plan do
+    if childFdValid plan.errorFd then
+      let failure : ChildError := { message := "invalid helper descriptor" }
+      try Prim.Exec.writeAll plan.errorFd.toUInt32 (toJson failure).compress.toUTF8
+      catch _ => pure ()
+    return 127
   Prim.CoreFacts.setlocale
   try execute plan catch error =>
     let failure : ChildError := { message := error.toString }

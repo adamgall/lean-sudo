@@ -1,6 +1,8 @@
 import LeanSudo.Sys.Core
 import LeanSudo.Sys.Prim.Pam
 import LeanSudo.Sys.Prim.Store
+import LeanSudo.I18n.Load
+import LeanSudo.Sys.FrontSignals
 
 namespace LeanSudo.Sys
 
@@ -29,7 +31,6 @@ private structure Conversation where
   lecture : String := ""
   lectured : Bool := false
   error : Int := 0
-  interrupted : UInt32 := 0
   deriving Inhabited
 
 private structure PamState where
@@ -53,23 +54,76 @@ private def signalMask (signals : List UInt32) : IO ByteArray := do
   for signal in signals do bytes ← Prim.Pam.sigaddset bytes signal
   return bytes
 
+private def caughtSignals : List UInt32 :=
+  [SIGHUP (), SIGINT (), SIGQUIT (), Prim.Exec.K.SIGALRM (), SIGTERM (), SIGTSTP (), SIGTTIN (),
+    SIGTTOU ()]
+
 private initialize ttySignalMask : IO.Ref (Option ByteArray) ← IO.mkRef none
 
 private def ttySignals : IO ByteArray := do
   if let some mask ← ttySignalMask.get then return mask
-  let mask ← signalMask [SIGHUP (), SIGINT (), SIGQUIT (), SIGTERM (),
-    SIGTSTP (), SIGTTIN (), SIGTTOU ()]
+  let mask ← signalMask caughtSignals
   ttySignalMask.set (some mask)
   return mask
 
-private def tell (text : ByteArray) : IO Unit := do
-  let fd ← Prim.Pam.open "/dev/tty" (O_WRONLY () ||| O_NOCTTY () ||| O_CLOEXEC ())
-  try Prim.Pam.writeAll (if fd < 0 then STDERR_FILENO () else fd.toNat.toUInt32) text
+private initialize suspendHooks : IO.Ref (IO Unit × IO Bool) ← IO.mkRef (pure (), pure true)
+
+def withAuthSuspend (suspend : IO Unit) (resume : IO Bool) (action : IO α) : IO α := do
+  let saved ← suspendHooks.get
+  suspendHooks.set (suspend, resume)
+  try action finally suspendHooks.set saved
+
+private def catching (action : IO α) : IO (α × Array UInt32) := do
+  let mut saved := #[]
+  for signal in caughtSignals do
+    let _ ← Prim.Pam.caught signal
+    saved := saved.push (signal, ← Prim.Exec.signalAction signal (Prim.Pam.catchHandler ()))
+  let result ← try
+      let result ← action
+      let (_, old) ← Prim.Pam.sigmask (SIG_UNBLOCK ()) (← ttySignals)
+      let _ ← Prim.Pam.sigmask (SIG_SETMASK ()) old
+      pure result
+    finally
+      for (signal, old) in saved do
+        if old[0]! == 0 then
+          discard <| Prim.Exec.signalAction signal old[1]!.toUSize old[2]!.toUInt32 old[3]!
+  let caught ← caughtSignals.filterM Prim.Pam.caught
+  return (result, caught.toArray.qsort (· < ·))
+
+private def suspendFor (callback : USize) (plugin : Bool) (signo : UInt32) : IO Bool := do
+  let (onSuspend, onResume) ← suspendHooks.get
+  let before ← if callback != 0 then
+      (· != -1) <$> Prim.Pam.callbackSuspend callback signo
+    else onSuspend *> pure true
+  if plugin && signo == SIGTSTP () then FrontSignals.mark signo else
+    let forced := signo == SIGTSTP ()
+    let old ← if forced then Prim.Exec.signalAction signo (Prim.Exec.defaultHandler ())
+      else pure #[]
+    let one ← signalMask [signo]
+    let _ ← Prim.Pam.kill (← Prim.Exec.getpid) signo
+    let _ ← Prim.Pam.sigmask (SIG_UNBLOCK ()) one
+    let _ ← Prim.Pam.sigmask (SIG_BLOCK ()) one
+    if forced && old[0]! == 0 then
+      discard <| Prim.Exec.signalAction signo old[1]!.toUSize old[2]!.toUInt32 old[3]!
+  let after ← if callback != 0 then (· != -1) <$> Prim.Pam.callbackResume callback signo
+    else onResume
+  return before && after
+
+private def tell (useStdin info : Bool) (text : ByteArray) : IO Unit := do
+  let fd ← if useStdin then pure (-1)
+    else Prim.Pam.open "/dev/tty" (O_WRONLY () ||| O_NOCTTY () ||| O_CLOEXEC ())
+  let fallback := if info then STDOUT_FILENO () else STDERR_FILENO ()
+  try Prim.Pam.writeAll (if fd < 0 then fallback else fd.toNat.toUInt32) text
   finally if fd >= 0 then let _ ← Prim.Pam.close fd.toNat.toUInt32; pure ()
+
+private initialize readErrno : IO.Ref UInt32 ← IO.mkRef 0
 
 private def convErrorMessage (code : Int) : IO (Option String) := do
   let ssh ← IO.getEnv "SSH_CONNECTION"
   let tty ← IO.getEnv "SSH_TTY"
+  let errno ← readErrno.get
+  let reason ← if errno == 0 then pure "" else
+    pure (": " ++ (← Prim.CoreLogs.strerror errno))
   return match code with
   | 1 => some "a password is required"
   | 2 => some (if ssh.isSome && tty.isNone then
@@ -79,9 +133,10 @@ private def convErrorMessage (code : Int) : IO (Option String) := do
       "read from standard input or configure an askpass helper")
   | 3 => some "timed out reading password"
   | 4 => some "no password was provided"
-  | 5 => some "unable to read password"
+  | 5 => some ("unable to read password" ++ reason)
   | 6 => some "unable to allocate memory"
   | 7 => some "unsupported PAM conversation message"
+  | 8 => some ""
   | _ => none
 
 private def genericPrompt (prompt : ByteArray) : Bool :=
@@ -100,109 +155,112 @@ theorem pamSelectPrompt_override (cfg : ConvConfig) (user : String)
     pamSelectPrompt cfg user prompt translated space = cfg.prompt.toUTF8 := by
   simp [pamSelectPrompt, h]
 
-private def erasePassword (bytes : ByteArray) : ByteArray := Id.run do
-  let mut size := bytes.size
-  for _ in [:bytes.size] do
-    if size > 0 && bytes[size - 1]! &&& 192 == 128 then size := size - 1
-  return bytes.extract 0 (size - 1)
-
 private partial def setTerminal (fd action : UInt32) (attrs : ByteArray) : IO Int := do
   let result ← Prim.Pam.tcsetattr fd action attrs
   if result == errorCode (EINTR ()) then setTerminal fd action attrs else pure result
 
+private def restoreTerminal (fd : UInt32) (saved : ByteArray) : IO Unit := do
+  let result ← setTerminal fd (TCSADRAIN ()) saved
+  if result == 0 then return
+  let offset ← Prim.CoreLogs.seek fd 0 (SEEK_SET ())
+  let error := if offset < 0 then offset else result
+  writeStderr ("sudo: " ++ (← I18n.translate "unable to restore terminal settings" false) ++
+    ": " ++ (← Prim.CoreLogs.strerror error.natAbs.toUInt32) ++ "\n")
+
+private partial def writeNewline (fd : UInt32) : IO Bool := do
+  let count ← Prim.Pam.write fd "\n".toUTF8 0
+  if count == errorCode (EINTR ()) then writeNewline fd else pure (count == 1)
+
+private partial def writeOnce (fd : UInt32) (bytes : ByteArray) : IO Int := do
+  let count ← Prim.Pam.write fd bytes 0
+  if count == errorCode (EINTR ()) then writeOnce fd bytes else pure count
+
+private partial def abortSignalPending (fd : UInt32) (found : Bool := false) : IO Bool := do
+  let (count, signo) ← Prim.Pam.readSignal fd
+  if count == errorCode (EINTR ()) then return ← abortSignalPending fd found
+  if count != Int.ofNat (signalInfoSize ()).toNat then return found
+  FrontSignals.mark signo
+  abortSignalPending fd true
+
 private structure ReadState where
   input : UInt32
   output : UInt32
-  signals : UInt32
-  saved : ByteArray
-  hidden : ByteArray
+  unblock : ByteArray
   erase : UInt32
   kill : UInt32
   eof : UInt32
-  noecho : Bool
   feedback : Bool
   deadline : Nat
-  callback : USize
 
-private partial def passwordLoop (st : ReadState) (bytes : ByteArray := ByteArray.empty)
-    (gotAny : Bool := false) : IO (Int × ByteArray × UInt32) := do
+private def eraseFeedback (st : ReadState) (count : Nat) : IO Unit := do
+  for _ in [:count] do
+    if (← Prim.Pam.write st.output "\u0008 \u0008".toUTF8 0) != 3 then return
+
+private partial def readLoop (st : ReadState) (bytes : ByteArray) :
+    IO (Int × ByteArray) := do
   let now ← IO.monoMsNow
-  if st.deadline != 0 && now >= st.deadline then return (3, ByteArray.empty, 0)
+  if st.deadline != 0 && now >= st.deadline then return (3, bytes)
   let timeout := if st.deadline == 0 then invalidFd ()
     else (min (st.deadline - now) (INT_MAX ()).toNat).toUInt32
-  let ready ← Prim.Pam.poll st.input st.signals timeout
-  if ready == errorCode (EINTR ()) then return ← passwordLoop st bytes gotAny
-  if ready < 0 then return (5, ByteArray.empty, 0)
-  if ready == 0 then return (3, ByteArray.empty, 0)
-  if ready.toNat &&& 2 != 0 then
-    let (count, signo) ← Prim.Pam.readSignal st.signals
-    if count == errorCode (EAGAIN ()) || count == errorCode (EINTR ()) then
-      return ← passwordLoop st bytes gotAny
-    if count != Int.ofNat (signalInfoSize ()).toNat then return (5, ByteArray.empty, 0)
-    if signo == SIGINT () || signo == SIGQUIT () then return (4, ByteArray.empty, signo)
-    if st.noecho then let _ ← setTerminal st.input (TCSANOW ()) st.saved; pure ()
-    let suspend := signo == SIGTSTP () || signo == SIGTTIN () || signo == SIGTTOU ()
-    let before ← if suspend then Prim.Pam.callbackSuspend st.callback signo else pure 0
-    let one ← signalMask [signo]
-    let _ ← Prim.Pam.kill (← Prim.Pam.getpid) signo
-    let _ ← Prim.Pam.sigmask (SIG_UNBLOCK ()) one
-    let _ ← Prim.Pam.sigmask (SIG_BLOCK ()) one
-    let after ← if suspend then Prim.Pam.callbackResume st.callback signo else pure 0
-    if before == -1 || after == -1 then return (5, ByteArray.empty, 0)
-    if st.noecho && (← setTerminal st.input (TCSANOW ()) st.hidden) != 0 then
-      return (5, ByteArray.empty, 0)
-    return ← passwordLoop st bytes gotAny
+  let ready ← Prim.Pam.poll st.input timeout st.unblock
+  if ready == errorCode (EINTR ()) then return (8, bytes)
+  if ready < 0 then return (5, bytes)
+  if ready == 0 then return (3, bytes)
   let (count, input) ← Prim.Pam.read st.input 1
   if count == errorCode (EINTR ()) || count == errorCode (EAGAIN ()) then
-    return ← passwordLoop st bytes gotAny
-  if count < 0 then return (5, ByteArray.empty, 0)
-  if count == 0 then return (if gotAny then 0 else 4, bytes, 0)
+    return ← readLoop st bytes
+  if count < 0 then
+    readErrno.set count.natAbs.toUInt32
+    return (5, bytes)
+  let eof := fun (bytes : ByteArray) =>
+    ((if bytes.isEmpty || bytes[0]! == 0 then 4 else 0 : Int), bytes)
+  if count == 0 then return eof bytes
   let byte := input[0]!
-  if byte == 10 || (st.feedback && byte == 13) then return (0, bytes, 0)
+  if byte == 10 || byte == 13 then return (0, bytes)
   if st.feedback then
-    if byte.toUInt32 == st.erase || byte == 127 || byte == 8 then
-      if !bytes.isEmpty then Prim.Pam.writeAll st.output "\u0008 \u0008".toUTF8
-      return ← passwordLoop st (erasePassword bytes) true
+    if byte.toUInt32 == st.eof then return eof bytes
     if byte.toUInt32 == st.kill then
-      let mut remaining := bytes
-      for _ in [:bytes.size] do
-        if !remaining.isEmpty then
-          remaining := erasePassword remaining
-          Prim.Pam.writeAll st.output "\u0008 \u0008".toUTF8
-      return ← passwordLoop st ByteArray.empty true
-    if byte.toUInt32 == st.eof then
-      return (if bytes.isEmpty then 4 else 0, bytes, 0)
-  if bytes.size < 1023 then
-    if st.feedback && byte &&& 192 != 128 then Prim.Pam.writeAll st.output "*".toUTF8
-    return ← passwordLoop st (bytes.push byte) true
-  passwordLoop st bytes true
+      eraseFeedback st bytes.size
+      return ← readLoop st ByteArray.empty
+    if byte.toUInt32 == st.erase then
+      if bytes.isEmpty then return ← readLoop st bytes
+      eraseFeedback st 1
+      return ← readLoop st (bytes.extract 0 (bytes.size - 1))
+    Prim.Pam.writeAll st.output "*".toUTF8
+  let bytes := bytes.push byte
+  if bytes.size >= 1023 then return (0, bytes)
+  readLoop st bytes
 
-private def readPassword (st : Conversation) (prompt : ByteArray) (echo : Bool)
-    (callback : USize := 0) (plugin : Bool := false) : IO (Int × ByteArray × UInt32) := do
-  if !st.askpass.isEmpty then
-    let (error, bytes) ← PamHelpers.readAskpass st.askpass prompt st.uid st.gid st.groups
-      (min st.cfg.timeout (UInt32.size - 1)).toUInt32
-    return (error, bytes, 0)
+private def passwordLoop (st : ReadState) : IO (Int × ByteArray) := do
+  let (error, bytes) ← readLoop st ByteArray.empty
+  if st.feedback then eraseFeedback st bytes.size
+  return (error, if error == 0 then bytes else ByteArray.empty)
+
+private def readAttempt (st : Conversation) (prompt : ByteArray) (echo : Bool)
+    (callback : USize) (plugin : Bool) : IO ((Int × ByteArray) × Bool) := do
   let own ← if st.cfg.useStdin then pure (-1)
     else Prim.Pam.open "/dev/tty" (O_RDWR () ||| O_NOCTTY () ||| O_CLOEXEC ())
   if !st.cfg.useStdin && own < 0 && !echo && !st.cfg.visiblepw then
-    return (2, ByteArray.empty, 0)
+    return ((2, ByteArray.empty), false)
   let input := if own < 0 then STDIN_FILENO () else own.toNat.toUInt32
   let output := if own < 0 then STDERR_FILENO () else own.toNat.toUInt32
   try
     let mask ← ttySignals
     let (error, oldmask) ← Prim.Pam.sigmask (SIG_BLOCK ()) mask
-    if error != 0 then return (5, ByteArray.empty, 0)
+    if error != 0 then return ((5, ByteArray.empty), false)
     try
-      let signals ← Prim.Pam.signalfd mask
-      if signals < 0 then return (5, ByteArray.empty, 0)
+      let aborts ← Prim.Pam.signalfd
+        (← signalMask [SIGINT (), SIGQUIT (), SIGHUP (), SIGTERM ()])
+      if aborts < 0 then return ((5, ByteArray.empty), false)
       try
-        let (error, saved) ← if echo then pure (-1, ByteArray.empty) else Prim.Pam.tcgetattr input
+        let (error, saved) ← if echo then pure (-1, ByteArray.empty)
+          else Prim.Pam.tcgetattr input
         let mut hidden := saved
         let mut noecho := false
         let feedback := st.cfg.pwfeedback && own >= 0
         if error == 0 then
-          hidden ← termiosSetLflag hidden ((← termiosLflag hidden) &&& ~~~(ECHO () ||| ECHONL ()))
+          hidden ← termiosSetLflag hidden
+            ((← termiosLflag hidden) &&& ~~~(ECHO () ||| ECHONL ()))
           if feedback then
             hidden ← termiosSetLflag hidden
               ((← termiosLflag hidden) &&& ~~~(ICANON () ||| IEXTEN ()))
@@ -210,32 +268,52 @@ private def readPassword (st : Conversation) (prompt : ByteArray) (echo : Bool)
             hidden ← termiosSetCC hidden (VTIME ()) 0
           noecho := (← setTerminal input (TCSADRAIN ()) hidden) == 0
         if plugin && !echo && !noecho && !st.cfg.useStdin && !st.cfg.visiblepw then
-          return (5, ByteArray.empty, 0)
-        try
-          if st.bell && own >= 0 then Prim.Pam.writeAll output "\u0007".toUTF8
-          Prim.Pam.writeAll output prompt
-          let deadline ← if st.cfg.timeout == 0 then pure 0
-            else pure ((← IO.monoMsNow) + st.cfg.timeout * 1000)
-          passwordLoop {
-            input := input
-            output := output
-            signals := signals.toNat.toUInt32
-            saved := saved
-            hidden := hidden
-            erase := ← if feedback && noecho then termiosCC saved (VERASE ()) else pure 0
-            kill := ← if feedback && noecho then termiosCC saved (VKILL ()) else pure 0
-            eof := ← if feedback && noecho then termiosCC saved (VEOF ()) else pure 0
-            noecho := noecho
-            feedback := feedback && noecho
-            deadline := deadline
-            callback := callback }
-        finally
-          if noecho then
-            let _ ← setTerminal input (TCSADRAIN ()) saved
-            Prim.Pam.writeAll output "\n".toUTF8
-      finally let _ ← Prim.Pam.close signals.toNat.toUInt32; pure ()
+          return ((5, ByteArray.empty), false)
+        FrontSignals.collect
+        let ((error, bytes, shown), caught) ← try
+            catching do
+              let bell ← if st.bell && own >= 0 then writeOnce output "\u0007".toUTF8 else pure 1
+              let written ← if bell != 1 then pure (-1) else writeOnce output prompt
+              if written < 0 then pure (9, ByteArray.empty, true) else do
+                let deadline ← if st.cfg.timeout == 0 then pure 0
+                  else pure ((← IO.monoMsNow) + st.cfg.timeout * 1000)
+                let (error, bytes) ← passwordLoop {
+                  input := input
+                  output := output
+                  unblock := mask
+                  erase := ← if feedback && noecho then termiosCC saved (VERASE ()) else pure 0
+                  kill := ← if feedback && noecho then termiosCC saved (VKILL ()) else pure 0
+                  eof := ← if feedback && noecho then termiosCC saved (VEOF ()) else pure 0
+                  feedback := feedback && noecho
+                  deadline := deadline }
+                let shown ← if noecho || error != 0 then writeNewline output else pure true
+                pure (error, bytes, shown)
+          catch e =>
+            if noecho then let _ ← setTerminal input (TCSADRAIN ()) saved; pure ()
+            throw e
+        if noecho then restoreTerminal input saved
+        let mut restart := false
+        for signal in caught do
+          if signal == SIGTSTP () || signal == SIGTTIN () || signal == SIGTTOU () then
+            if ← suspendFor callback plugin signal then restart := true
+          else if signal != Prim.Exec.K.SIGALRM () then FrontSignals.mark signal
+        let _ ← abortSignalPending aborts.toNat.toUInt32
+        let error := if error == 8 && caught.contains (Prim.Exec.K.SIGALRM ()) then 3 else error
+        if error == 9 || (error != 0 && !shown) then return ((8, ByteArray.empty), restart)
+        return ((error, bytes), restart)
+      finally let _ ← Prim.Pam.close aborts.toNat.toUInt32; pure ()
     finally let _ ← Prim.Pam.sigmask (SIG_SETMASK ()) oldmask; pure ()
   finally if own >= 0 then let _ ← Prim.Pam.close own.toNat.toUInt32; pure ()
+
+private partial def readPassword (st : Conversation) (prompt : ByteArray) (echo : Bool)
+    (callback : USize := 0) (plugin : Bool := false) : IO (Int × ByteArray) := do
+  readErrno.set 0
+  if !st.askpass.isEmpty then
+    let failure := "sudo: " ++ (← I18n.translate ("unable to run " ++ st.askpass) false)
+    return ← PamHelpers.readAskpass st.askpass prompt st.uid st.gid st.groups
+      (min st.cfg.timeout (UInt32.size - 1)).toUInt32 failure
+  let (result, restart) ← readAttempt st prompt echo callback plugin
+  if restart then readPassword st prompt echo callback plugin else return result
 
 private def conversation (state : IO.Ref Conversation)
     (messages : Array (Int × Option ByteArray)) : IO (Int × Array (Option ByteArray)) := do
@@ -248,18 +326,22 @@ private def conversation (state : IO.Ref Conversation)
         state.modify fun s => { s with error := 1 }
         return (Int.ofNat (PAM_CONV_ERR ()).toNat, #[])
       if !st.lecture.isEmpty && !st.lectured then
-        tell st.lecture.toUTF8
+        tell st.cfg.useStdin false st.lecture.toUTF8
         state.modify fun s => { s with lectured := true }
       let prompt := pamSelectPrompt st.cfg st.user (text.getD ByteArray.empty)
         (← Prim.Pam.dgettext "Password:") (← Prim.Pam.dgettext "Password: ")
-      let (error, bytes, interrupted) ← readPassword st prompt
+      let (error, bytes) ← readPassword st prompt
         (style == Int.ofNat (PAM_PROMPT_ECHO_ON ()).toNat)
-      state.modify fun s => { s with error, interrupted }
+      state.modify fun s => { s with error }
       if error != 0 then return (Int.ofNat (PAM_CONV_ERR ()).toNat, #[])
+      if (bytes.data.toList.takeWhile (· != 0)).length >= (PAM_MAX_RESP_SIZE ()).toNat then
+        return (Int.ofNat (PAM_CONV_ERR ()).toNat, #[])
       answers := answers.push (some bytes)
     else if style == Int.ofNat (PAM_ERROR_MSG ()).toNat ||
         style == Int.ofNat (PAM_TEXT_INFO ()).toNat then
-      if let some text := text then tell (text.push 10)
+      if let some text := text then
+        tell (← state.get).cfg.useStdin (style == Int.ofNat (PAM_TEXT_INFO ()).toNat)
+          (text.push 10)
       answers := answers.push none
     else
       state.modify fun s => { s with error := 7 }
@@ -418,7 +500,7 @@ theorem pamUserAccepted_identity (expected : String) (status : Int) (actual : Op
 private def pamCall (h : PamHandle) (function : Nat) (flags : UInt32)
     (checkUser : Bool := false) : IO Int := do
   requirePam h
-  h.conversation.modify fun st => { st with error := 0, interrupted := 0 }
+  h.conversation.modify fun st => { st with error := 0 }
   let mut status ← Prim.Pam.call h.functions[function]! h.native flags
   if status == Int.ofNat (PAM_SUCCESS ()).toNat && checkUser then
     let (code, user) ← Prim.Pam.getItem h.functions[11]! h.native (PAM_USER ())
@@ -487,7 +569,12 @@ def pamAvailable : IO Bool := do
 def pamLastConvError (h : PamHandle) : IO (Option String) := do
   convErrorMessage (← h.conversation.get).error
 
-def pamInterrupted (h : PamHandle) : IO UInt32 := return (← h.conversation.get).interrupted
+def pamTell (h : PamHandle) (text : String) : IO Unit := do
+  tell (← h.conversation.get).cfg.useStdin false text.toUTF8
+
+def pamSetGroups (groups : List Nat) : IO Unit := do
+  try Prim.Exec.setgroups (groups.toArray.map Nat.toUInt32)
+  catch _ => throw (IO.userError "unable to set supplementary group IDs")
 
 private initialize pluginConversation : IO.Ref Conversation ←
   IO.mkRef { cfg := {}, user := "" }
@@ -509,9 +596,10 @@ def pluginReadReply (prompt : String) (msgType timeout : UInt32) (useStdin : Boo
       pwfeedback := msgType &&& SUDO_CONV_TYPE_MASK () == SUDO_CONV_PROMPT_MASK ()
       visiblepw := msgType &&& SUDO_CONV_PROMPT_ECHO_OK () != 0 }
     let echo := msgType &&& SUDO_CONV_TYPE_MASK () == SUDO_CONV_PROMPT_ECHO_ON ()
-    let (error, bytes, _) ← readPassword { st with cfg } prompt.toUTF8 echo callback true
+    let (error, bytes) ← readPassword { st with cfg } prompt.toUTF8 echo callback true
     if error == 0 then return some bytes
-    if let some text ← convErrorMessage error then writeStderr ("sudo: " ++ text ++ "\n")
+    if let some text ← convErrorMessage error then
+      if !text.isEmpty then writeStderr ("sudo: " ++ text ++ "\n")
     return none
   finally pluginReading.set false
 

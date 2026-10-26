@@ -1,6 +1,7 @@
 import LeanSudo.Core
 import LeanSudo.SudoConf
 import LeanSudo.Sys.PluginHost
+import LeanSudo.Sys.IoLog
 
 namespace LeanSudo.Sys.Plugins
 
@@ -19,6 +20,9 @@ def load (conf : SudoConf.Config) : IO Unit := do
     if !plugin.path.startsWith "/" && conf.pluginDir.isEmpty then
       throw (IO.userError s!"error in /etc/sudo.conf, line {plugin.line} while loading plugin \"{plugin.symbol}\"\nsudo: {plugin.path}: No such file or directory\nsudo: fatal error, unable to load plugins")
     loadRaw plugin.symbol path plugin.line.toUInt32 plugin.options.toArray
+  let builtin := fun name => conf.plugins.any fun p => p.symbol == name && isBuiltin conf p
+  unless builtin "sudoers_io" || (!builtin "sudoers_policy" && !(← hasIo)) do
+    IoLog.disableBuiltin
 
 private def opt (name : String) (value : Option String) : List String :=
   value.toList.map (name ++ "=" ++ ·)

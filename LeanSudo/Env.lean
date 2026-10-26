@@ -35,7 +35,8 @@ def hasKey (e : EnvList) (k : String) : Bool := e.any (fun kv => kv.1 == k)
 
 def lookup (e : EnvList) (k : String) : Option String := (e.find? (fun kv => kv.1 == k)).map (·.2)
 
-def setVar (e : EnvList) (k v : String) : EnvList := e.filter (fun kv => kv.1 != k) ++ [(k, v)]
+def setVar (e : EnvList) (k v : String) : EnvList :=
+  if hasKey e k then e.map (fun kv => if kv.1 == k then (k, v) else kv) else e ++ [(k, v)]
 
 def setDefault (e : EnvList) (k v : String) : EnvList := if hasKey e k then e else e ++ [(k, v)]
 
@@ -67,28 +68,32 @@ def patMatchL (pat value : List Char) : Bool :=
 
 def patMatch (pat value : String) : Bool := patMatchL pat.toList value.toList
 
-def entryPattern (pat k v : String) : Option Bool :=
+def entryChars (k v : String) : List Char := (k ++ "=" ++ v).toList
+
+def entryPatternL (pat : List Char) (k : String) (entry : List Char) : Option Bool :=
   if k == "LOGNAME" || k == "USER" then
-    (envPatternL pat.toList "LOGNAME".toList false false).orElse fun _ =>
-      envPatternL pat.toList "USER".toList false false
-  else envPatternL pat.toList (k ++ "=" ++ v).toList false false
+    (envPatternL pat "LOGNAME".toList false false).orElse fun _ =>
+      envPatternL pat "USER".toList false false
+  else envPatternL pat entry false false
+
+def entryPattern (pat k v : String) : Option Bool := entryPatternL pat.toList k (entryChars k v)
 
 def matchesAny (pats : List String) (k v : String) : Bool :=
-  pats.any fun p => (entryPattern p k v).isSome
+  let entry := entryChars k v
+  pats.any fun p => (entryPatternL p.toList k entry).isSome
 
-def matchFull : List String → String → String → Bool
-  | [], _, _ => false
-  | p :: ps, k, v =>
-    match entryPattern p k v with
+def matchFullL (k : String) (entry : List Char) : List String → Bool
+  | [] => false
+  | p :: ps =>
+    match entryPatternL p.toList k entry with
     | some full => full
-    | none => matchFull ps k v
+    | none => matchFullL k entry ps
 
-def validName (k : String) : Bool := !k.toList.isEmpty && !k.toList.contains '='
+def matchFull (pats : List String) (k v : String) : Bool := matchFullL k (entryChars k v) pats
 
-def isBashFn (v : String) : Bool :=
-  match v.toList with
-  | '(' :: ')' :: ' ' :: _ => true
-  | _ => false
+def validName (k : String) : Bool := !k.isEmpty && !k.contains '='
+
+def isBashFn (v : String) : Bool := v.startsWith "() "
 
 def entryOk (k v : String) : Bool := validName k && !isBashFn v
 
@@ -156,25 +161,34 @@ def resetHome (i : EnvInput) : Bool :=
 def baseEnv (i : EnvInput) (reset : Bool) : EnvList :=
   setAll [] (i.userEnv.filter fun kv => userPass i reset kv.1 kv.2)
 
-def lognameReset (i : EnvInput) (e : EnvList) : EnvList :=
-  match lookup e "LOGNAME", lookup e "USER" with
+def lognameReset (i : EnvInput) (src e : EnvList) : EnvList :=
+  match lookup src "LOGNAME", lookup src "USER" with
   | none, none => setVar (setVar e "LOGNAME" i.target.name) "USER" i.target.name
   | some l, none => setVar e "USER" l
   | none, some u => setVar e "LOGNAME" u
   | some _, some _ => e
 
+def applySecurePath (i : EnvInput) (e : EnvList) : EnvList :=
+  match effectiveSecurePath i with
+  | some p => setVar e "PATH" p
+  | none => e
+
 def defaultsReset (i : EnvInput) (e : EnvList) : EnvList :=
   let e1 := if i.loginShell then
       setVar (setVar (setVar e "SHELL" i.target.shell) "LOGNAME" i.target.name) "USER" i.target.name
-    else if i.settings.setLogname then lognameReset i e
+    else if i.settings.setLogname then e
     else setDefault (setDefault e "LOGNAME" i.invoking.name) "USER" i.invoking.name
   let e2 := if i.loginShell || !hasKey e "MAIL" then setVar e1 "MAIL" ("/var/mail/" ++ i.target.name)
     else e1
-  if resetHome i || !hasKey e "HOME" then setVar e2 "HOME" i.target.home else e2
+  let e3 := applySecurePath i e2
+  let e4 := if !i.loginShell && i.settings.setLogname then lognameReset i e e3 else e3
+  if resetHome i || !hasKey e "HOME" then setVar e4 "HOME" i.target.home else e4
 
 def defaultsCopy (i : EnvInput) (e : EnvList) : EnvList :=
-  let e1 := if i.settings.setLogname then setVar (setVar e "LOGNAME" i.target.name) "USER" i.target.name else e
-  if resetHome i then setVar e1 "HOME" i.target.home else e1
+  let e1 := applySecurePath i e
+  let e2 := if i.settings.setLogname then setVar (setVar e1 "LOGNAME" i.target.name) "USER" i.target.name
+    else e1
+  if resetHome i then setVar e2 "HOME" i.target.home else e2
 
 def commonDefaults (i : EnvInput) (e : EnvList) : EnvList :=
   let e1 := setDefault e "SHELL" i.target.shell
@@ -184,18 +198,13 @@ def commonDefaults (i : EnvInput) (e : EnvList) : EnvList :=
   | some ps1 => setVar e3 "PS1" ps1
   | none => e3
 
-def applySecurePath (i : EnvInput) (e : EnvList) : EnvList :=
-  match effectiveSecurePath i with
-  | some p => setVar e "PATH" p
-  | none => e
-
 def sudoVars (i : EnvInput) (e : EnvList) : EnvList :=
-  let e := setVar e "SUDO_HOME" i.invoking.home
-  let e := match i.ttyName with
-    | some tty => setVar e "SUDO_TTY" tty
-    | none => e.filter (fun kv => kv.1 != "SUDO_TTY")
-  setVar (setVar (setVar (setVar e "SUDO_COMMAND" i.command) "SUDO_USER" i.invoking.name)
+  let e := setVar (setVar (setVar (setVar e "SUDO_COMMAND" i.command) "SUDO_USER" i.invoking.name)
     "SUDO_UID" (toString i.invoking.uid)) "SUDO_GID" (toString (i.invokingRealGid.getD i.invoking.gid))
+  let e := setVar e "SUDO_HOME" i.invoking.home
+  match i.ttyName with
+  | some tty => setVar e "SUDO_TTY" tty
+  | none => e.filter (fun kv => kv.1 != "SUDO_TTY")
 
 def pamVars (i : EnvInput) : EnvList := i.pamEnv.filter fun kv => pamPass i kv.1 kv.2
 
@@ -215,11 +224,10 @@ def assemble (i : EnvInput) (reset : Bool) (extra : EnvList) : EnvList :=
   let e0 := baseEnv i reset
   let e1 := if reset then defaultsReset i e0 else defaultsCopy i e0
   let e2 := commonDefaults i e1
-  let e3 := applySecurePath i e2
-  let e4 := sudoVars i e3
-  let e5 := addDefaults e4 (fileVars i)
-  let e6 := setAll e5 extra
-  mergePam i e6 (pamVars i)
+  let e3 := sudoVars i e2
+  let e4 := addDefaults e3 (fileVars i)
+  let e5 := setAll e4 extra
+  mergePam i e5 (pamVars i)
 
 def preserveDeniedMsg : String := "sorry, you are not allowed to preserve the environment"
 

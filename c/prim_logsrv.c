@@ -101,6 +101,9 @@ LEAN_EXPORT lean_obj_res ls_logprim_error(uint32_t error) {
   return lean_mk_string(buffer);
 #endif
 }
+LEAN_EXPORT lean_obj_res ls_logprim_gai_error(uint32_t error) {
+  return lean_mk_string(gai_strerror((int)error));
+}
 LEAN_EXPORT lean_obj_res ls_logprim_resolve(b_lean_obj_arg host, b_lean_obj_arg service,
     uint32_t family, uint32_t kind, uint32_t protocol) {
   struct addrinfo hints = {

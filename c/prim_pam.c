@@ -12,7 +12,7 @@
 #include <unistd.h>
 
 enum {
-    PAM_SUCCESS = 0, PAM_BUF_ERR = 5, PAM_AUTH_ERR = 7, PAM_CONV_ERR = 19,
+    PAM_SUCCESS = 0, PAM_BUF_ERR = 5, PAM_AUTH_ERR = 7, PAM_CONV_ERR = 19, PAM_MAX_RESP_SIZE = 512,
     PAM_SILENT = 0x8000, PAM_CHANGE_EXPIRED_AUTHTOK = 0x20,
     PAM_REINITIALIZE_CRED = 8, PAM_DELETE_CRED = 4,
     PAM_TTY = 3, PAM_RUSER = 8, PAM_RHOST = 4, PAM_USER = 2,
@@ -45,6 +45,7 @@ PAM_CONSTANT(PAM_DELETE_CRED, PAM_DELETE_CRED)
 PAM_CONSTANT(PAM_TTY, PAM_TTY)
 PAM_CONSTANT(PAM_RUSER, PAM_RUSER)
 PAM_CONSTANT(PAM_RHOST, PAM_RHOST)
+PAM_CONSTANT(PAM_MAX_RESP_SIZE, PAM_MAX_RESP_SIZE)
 PAM_CONSTANT(PAM_USER, PAM_USER)
 PAM_CONSTANT(PAM_PROMPT_ECHO_OFF, PAM_PROMPT_ECHO_OFF)
 PAM_CONSTANT(PAM_PROMPT_ECHO_ON, PAM_PROMPT_ECHO_ON)
@@ -56,7 +57,6 @@ PAM_CONSTANT(SUDO_CONV_PROMPT_ECHO_ON, SUDO_CONV_PROMPT_ECHO_ON)
 PAM_CONSTANT(SUDO_CONV_TYPE_MASK, 0xff)
 PAM_CONSTANT(signalInfoSize, sizeof(struct signalfd_siginfo))
 PAM_CONSTANT(invalidFd, -1)
-PAM_CONSTANT(POLLIN, POLLIN)
 PAM_CONSTANT(callbackSuspendOffset, offsetof(struct sudo_conv_callback, on_suspend))
 PAM_CONSTANT(callbackResumeOffset, offsetof(struct sudo_conv_callback, on_resume))
 PAM_CONSTANT(callbackClosureOffset, offsetof(struct sudo_conv_callback, closure))
@@ -113,13 +113,34 @@ LEAN_EXPORT lean_obj_res lean_pam_write(uint32_t fd, b_lean_obj_arg bytes, uint3
     return ls_ok(lean_int_to_int(rc < 0 ? -errno : rc));
 }
 
-LEAN_EXPORT lean_obj_res lean_pam_poll(uint32_t fd, uint32_t signal_fd,
-        uint32_t events, uint32_t timeout) {
-    struct pollfd fds[2] = {{.fd = fd, .events = events},
-        {.fd = signal_fd, .events = events}};
-    int rc = poll(fds, 2, (int32_t)timeout);
-    return ls_ok(ls_pair(lean_int_to_int(rc < 0 ? -errno : rc),
-        ls_pair(lean_box_uint32(fds[0].revents), lean_box_uint32(fds[1].revents))));
+static volatile sig_atomic_t pam_caught[NSIG];
+
+static void pam_catch(int signo) {
+    pam_caught[signo] = 1;
+}
+
+LEAN_EXPORT size_t lean_pam_catch_handler(b_lean_obj_arg unit) {
+    (void)unit;
+    return (size_t)pam_catch;
+}
+
+LEAN_EXPORT lean_obj_res lean_pam_caught(uint32_t signal) {
+    uint32_t index = signal < NSIG ? signal : 0;
+    int caught = pam_caught[index] != 0;
+    pam_caught[index] = 0;
+    return ls_ok(lean_box(caught));
+}
+
+LEAN_EXPORT lean_obj_res lean_pam_poll(uint32_t fd, uint32_t timeout, b_lean_obj_arg unblock) {
+    if (lean_sarray_size(unblock) != sizeof(sigset_t)) return ls_ok(lean_int_to_int(-EINVAL));
+    sigset_t saved;
+    int error = pthread_sigmask(SIG_UNBLOCK, (const sigset_t *)lean_sarray_cptr(unblock), &saved);
+    if (error != 0) return ls_ok(lean_int_to_int(-error));
+    struct pollfd input = {.fd = (int)fd, .events = POLLIN};
+    int rc = poll(&input, 1, (int32_t)timeout);
+    error = errno;
+    pthread_sigmask(SIG_SETMASK, &saved, NULL);
+    return ls_ok(lean_int_to_int(rc < 0 ? -error : rc));
 }
 
 LEAN_EXPORT lean_obj_res lean_pam_tcgetattr(uint32_t fd) {
@@ -188,10 +209,6 @@ LEAN_EXPORT lean_obj_res lean_pam_signalfd(b_lean_obj_arg bytes) {
 LEAN_EXPORT lean_obj_res lean_pam_kill(uint32_t pid, uint32_t sig) {
     int rc = kill(pid, sig);
     return ls_ok(lean_int_to_int(rc < 0 ? -errno : rc));
-}
-
-LEAN_EXPORT lean_obj_res lean_pam_getpid(void) {
-    return ls_ok(lean_box_uint32(getpid()));
 }
 
 LEAN_EXPORT lean_obj_res lean_pam_dgettext(b_lean_obj_arg text) {

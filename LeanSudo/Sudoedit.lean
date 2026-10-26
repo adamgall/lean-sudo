@@ -26,20 +26,23 @@ private def writableDir (invoker : Sys.Edit.Identity) (fd : UInt32) : IO Bool :=
   return st[1]! == invoker.uid.toNat || (← Sys.Edit.operation invoker 3 fd).value == 1
 
 private def parentDir (invoker target : Sys.Edit.Identity) (checkdir : Bool)
-    (dirs : List String) (file : String) : IO UInt32 := do
+    (dirs : List String) (file : String) : IO (UInt32 × Bool) := do
   let current ← IO.mkRef (← Sys.Edit.operation target 7 Sys.Edit.noneFd "/").value
+  let ancestor ← IO.mkRef false
   let check := checkdir && invoker.uid != 0
   try
     for dir in dirs do
       let fd ← current.get
       let nofollow := check && (← writableDir invoker fd)
-      let next := (← Sys.Edit.operation target (if nofollow then 0 else 7) fd dir).value
+      ancestor.set nofollow
+      let next ← try pure (← Sys.Edit.operation target (if nofollow then 0 else 7) fd dir).value
+        catch e => throw (fileError file e)
       Sys.Edit.close fd
       current.set next
     let fd ← current.get
     if check && (← writableDir invoker fd) then
       throw (IO.userError s!"{file}: editing files in a writable directory is not permitted")
-    return fd
+    return (fd, ← ancestor.get)
   catch e =>
     Sys.Edit.close (← current.get)
     throw e
@@ -80,24 +83,28 @@ private def removeTemp (who : Sys.Edit.Identity) (path : String) : IO Unit := do
   let _ ← Sys.Edit.operation who 5 Sys.Edit.noneFd path
 
 private def prepare (progname : String) (invoker target : Sys.Edit.Identity) (follow checkdir : Bool)
-    (file displayFile : String) : IO (Option Session) := do
+    (mask : Nat) (file displayFile : String) : IO (Option Session) := do
   let some (dirs, name) := pathParts file
     | warn progname s!"{displayFile}: unsafe edit path"; return none
-  let parent ← try parentDir invoker target checkdir dirs displayFile
+  let (parent, ancestorWritable) ← try parentDir invoker target checkdir dirs displayFile
     catch e => warn progname e.toString; return none
   let fd ← try pure (← Sys.Edit.operation target (if follow then 8 else 1) parent name).value
     catch e =>
       Sys.Edit.close parent
       warn progname (fileError displayFile e).toString
       return none
+  if fd == Sys.Edit.noneFd && ancestorWritable then
+    Sys.Edit.close parent
+    warn progname s!"{displayFile}: No such file or directory"
+    return none
   let temporary ← IO.mkRef ""
   try
     let (original, originalStat) ← if fd == Sys.Edit.noneFd then pure (ByteArray.empty, #[])
       else try pure (← Sys.Edit.read fd, ← Sys.Edit.stat fd) finally Sys.Edit.close fd
     let suffixLen := if name.contains '.' then (name.splitOn ".").getLast!.utf8ByteSize + 1 else 0
     let template := tempName name
-    let made ← try Sys.Edit.operation invoker 4 Sys.Edit.noneFd s!"/var/tmp/{template}" 0o077 suffixLen
-      catch _ => Sys.Edit.operation invoker 4 Sys.Edit.noneFd s!"/tmp/{template}" 0o077 suffixLen
+    let made ← try Sys.Edit.operation invoker 4 Sys.Edit.noneFd s!"/var/tmp/{template}" mask suffixLen
+      catch _ => Sys.Edit.operation invoker 4 Sys.Edit.noneFd s!"/tmp/{template}" mask suffixLen
     let temp := made.name
     temporary.set temp
     let tempStat ← try
@@ -115,24 +122,51 @@ private def prepare (progname : String) (invoker target : Sys.Edit.Identity) (fo
       try removeTemp invoker temp catch _ => pure ()
     throw e
 
+private def tempProblem (invoker : Sys.Edit.Identity) (temp : String) (st : Array Nat) :
+    Option String :=
+  let perms := Sys.Prim.Posix.S_ISUID () ||| Sys.Prim.Posix.S_ISGID () |||
+    Sys.Prim.Posix.S_ISVTX () ||| Sys.Prim.Posix.S_IRWXU () ||| Sys.Prim.Posix.S_IRWXG () |||
+    Sys.Prim.Posix.S_IRWXO ()
+  let mode := st[0]! &&& perms.toNat
+  if (st[0]! &&& (Sys.Prim.Posix.S_IFMT ()).toNat) != (Sys.Prim.Posix.S_IFREG ()).toNat then
+    some s!"{temp}: not a regular file"
+  else if mode != (Sys.Prim.Posix.S_IRUSR () ||| Sys.Prim.Posix.S_IWUSR ()).toNat then
+    some s!"{temp}: bad file mode: 0{String.ofList (Nat.toDigits 8 mode)}"
+  else if st[1]! != invoker.uid.toNat then
+    some s!"{temp} is owned by uid {st[1]!}, should be {invoker.uid}"
+  else if st[6]! != 1 then some s!"{temp}: unsafe temporary file"
+  else none
+
 private def copyBack (progname : String) (invoker target : Sys.Edit.Identity) (mask : Nat)
     (follow checkdir elapsed : Bool) (s : Session) : IO Bool := do
   try
     let fd ← try pure (← Sys.Edit.operation invoker 1 Sys.Edit.noneFd s.temp).value
-      catch e => throw (fileError s.temp e)
-    if fd == Sys.Edit.noneFd then throw (IO.userError s!"{s.temp}: No such file or directory")
-    let (bytes, checked, changed) ← try
+      catch e =>
+        if e.toString == "Invalid argument" then warn progname s!"{s.temp}: not a regular file"
+        pure Sys.Edit.noneFd
+    if fd == Sys.Edit.noneFd then
+      warn progname s!"{s.displayFile} left unmodified"
+      return false
+    let contents ← try
         let st ← Sys.Edit.stat fd
-        let checked := tempSafe
-          ((st[0]! &&& (Sys.Prim.Posix.S_IFMT ()).toNat) == (Sys.Prim.Posix.S_IFREG ()).toNat)
-          (st[1]! == invoker.uid.toNat) (st[6]! == 1)
-        unless checked do throw (IO.userError s!"{s.temp}: unsafe temporary file")
-        let changed := fileChanged s.tempStat st elapsed
-        pure ((← if changed then Sys.Edit.read fd else pure ByteArray.empty), checked, changed)
+        match tempProblem invoker s.temp st with
+        | some problem =>
+          warn progname problem
+          pure none
+        | none =>
+          let checked := tempSafe
+            ((st[0]! &&& (Sys.Prim.Posix.S_IFMT ()).toNat) == (Sys.Prim.Posix.S_IFREG ()).toNat)
+            (st[1]! == invoker.uid.toNat) (st[6]! == 1)
+          let changed := fileChanged s.tempStat st elapsed
+          let bytes ← if changed then Sys.Edit.read fd else pure ByteArray.empty
+          pure (some (bytes, checked, changed))
       finally Sys.Edit.close fd
+    let some (bytes, checked, changed) := contents | do
+      warn progname s!"{s.displayFile} left unmodified"
+      return false
     if writeBack changed checked then
       let some (dirs, _) := pathParts s.file | throw (IO.userError "unsafe edit path")
-      let current ← parentDir invoker target checkdir dirs s.displayFile
+      let (current, _) ← parentDir invoker target checkdir dirs s.displayFile
       try
         let now ← Sys.Edit.stat current
         let pinned ← Sys.Edit.stat s.parent
@@ -186,15 +220,19 @@ def select (progname : String) (plan : Core.EditPlan) : IO (Option Editor) := do
     return none
 
 def run (progname : String) (plan : Core.EditPlan) (editor : Editor)
-    (env : Array String) : IO Sys.ExitStatus := do
+    (withSession : (Array String → IO Sys.ExitStatus) → IO Sys.ExitStatus) :
+    IO Sys.ExitStatus := do
   let sessions ← IO.mkRef (#[] : Array Session)
   try
     let invoker ← Sys.Edit.identity plan.editUid plan.editGid plan.editGroups
     let target ← Sys.Edit.identity plan.fileUid plan.fileGid plan.fileGroups
+    let mask ← Sys.umask 0
+    discard <| Sys.umask mask
     let mut failed := false
     try
       for (file, displayFile) in plan.files.zip plan.policyFiles do
-        if let some session ← prepare progname invoker target plan.follow plan.checkdir file displayFile then
+        if let some session ←
+            prepare progname invoker target plan.follow plan.checkdir mask.toNat file displayFile then
           sessions.modify (·.push session)
     catch e =>
       for s in (← sessions.get) do
@@ -203,14 +241,15 @@ def run (progname : String) (plan : Core.EditPlan) (editor : Editor)
     if (← sessions.get).isEmpty then return .exited 1
     let started ← Sys.Edit.clock
     let status ← try
-        Sys.Plugins.execBegin
-        let prepared ← Sys.Intercept.prepare env
-        let hooks := Sys.RelayHooks.compose Sys.Plugins.relayHooks
-          (Sys.RelayHooks.compose Sys.IoLog.relayHooks Sys.Intercept.relayHooks)
-        Sys.runCommandPrepared (plan.toRunPlan.toSpec editor.path
-          (editor.words.toArray ++ (← sessions.get).map (·.temp)) prepared.env
-          plan.editUid plan.editGid plan.editGroups)
-          hooks prepared.seccompFilter prepared.trace #[] prepared.keepFds
+        withSession fun env => do
+          Sys.Plugins.execBegin
+          let prepared ← Sys.Intercept.prepare env
+          let hooks := Sys.RelayHooks.compose Sys.Plugins.relayHooks
+            (Sys.RelayHooks.compose Sys.IoLog.relayHooks Sys.Intercept.relayHooks)
+          Sys.runCommandPrepared (plan.toRunPlan.toSpec editor.path
+            (editor.words.toArray ++ (← sessions.get).map (·.temp)) prepared.env
+            plan.editUid plan.editGid plan.editGroups)
+            hooks prepared.seccompFilter prepared.trace #[] prepared.keepFds
       catch e =>
         warn progname e.toString
         pure (.exited 1)

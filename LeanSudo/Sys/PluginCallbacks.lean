@@ -169,6 +169,46 @@ theorem validEvent_has_callback (fd flags : UInt32) (callback : USize)
   simp only [validEvent, Bool.and_eq_true] at h
   exact h.1.1
 
+def validEventPlan (fd flags : UInt32) (callback : USize)
+    (signalCount kill stop descriptorMax : UInt32) : Bool :=
+  validEvent fd flags callback signalCount kill stop &&
+    (flags &&& 6 == 0 || fd ≤ descriptorMax)
+
+theorem validEventPlan_iff (fd flags : UInt32) (callback : USize)
+    (signalCount kill stop descriptorMax : UInt32) :
+    validEventPlan fd flags callback signalCount kill stop descriptorMax = true ↔
+      validEvent fd flags callback signalCount kill stop = true ∧
+      (flags &&& 6 = 0 ∨ fd ≤ descriptorMax) := by
+  simp [validEventPlan]
+
+theorem validEventPlan_preserves_valid (fd flags : UInt32) (callback : USize)
+    (signalCount kill stop descriptorMax : UInt32) (h : fd ≤ descriptorMax) :
+    validEventPlan fd flags callback signalCount kill stop descriptorMax =
+      validEvent fd flags callback signalCount kill stop := by
+  simp [validEventPlan, h]
+
+theorem validEventPlan_rejects_descriptor (fd flags : UInt32) (callback : USize)
+    (signalCount kill stop descriptorMax : UInt32)
+    (io : flags &&& 6 ≠ 0) (overflow : descriptorMax < fd) :
+    validEventPlan fd flags callback signalCount kill stop descriptorMax = false := by
+  simp [validEventPlan, io, UInt32.not_le.mpr overflow]
+
+theorem validEventPlan_signal_bounds (fd flags : UInt32) (callback : USize)
+    (signalCount kill stop descriptorMax : UInt32) (signal : flags &&& 16 ≠ 0)
+    (h : validEventPlan fd flags callback signalCount kill stop descriptorMax = true) :
+    0 < fd ∧ fd < signalCount ∧ fd ≠ kill ∧ fd ≠ stop ∧ flags &&& 6 = 0 := by
+  have valid := ((validEventPlan_iff fd flags callback
+    signalCount kill stop descriptorMax).mp h).1
+  simp only [validEvent, Bool.and_eq_true] at valid
+  simpa [signal, and_assoc] using valid.2
+
+theorem validEventPlan_has_callback (fd flags : UInt32) (callback : USize)
+    (signalCount kill stop descriptorMax : UInt32)
+    (h : validEventPlan fd flags callback signalCount kill stop descriptorMax = true) :
+    callback != 0 :=
+  validEvent_has_callback fd flags callback signalCount kill stop
+    ((validEventPlan_iff fd flags callback signalCount kill stop descriptorMax).mp h).1
+
 private def modifyEvent (ptr : USize) (f : Event → Event) : IO Unit :=
   state.modify fun s => { s with events := s.events.map fun e => if e.ptr == ptr then f e else e }
 
@@ -185,8 +225,9 @@ private def eventOperation (op : UInt32) (ptr b c d e : USize) : IO USize := do
     return 0
   let some event := (← state.get).events.find? (·.ptr == ptr) | return ← error
   if op == 20 then
-    if !validEvent b.toUInt32 c.toUInt32 d (P.signalCount ())
-        (Prim.Posix.SIGKILL ()) (Prim.Posix.SIGSTOP ()) then return ← error
+    if !validEventPlan b.toUInt32 c.toUInt32 d (P.signalCount ())
+        (Prim.Posix.SIGKILL ()) (Prim.Posix.SIGSTOP ()) (Prim.Posix.INT_MAX ()) then
+      return ← error
     modifyEvent ptr fun ev => { ev with
       fd := b.toUInt32
       flags := c.toUInt32

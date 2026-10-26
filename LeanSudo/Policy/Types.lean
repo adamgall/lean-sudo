@@ -132,6 +132,7 @@ structure Settings where
   runasDefault : String := "root"
   umask : Nat := 0o022
   umaskOverride : Bool := false
+  umaskExplicit : Bool := false
   setenv : Bool := false
   shellNoargs : Bool := false
   editor : String := "/usr/bin/editor"

@@ -52,7 +52,13 @@ def interfaceAddresses : IO (Array (String × String)) := do
     Prim.Extra.interfacesFree head
 
 @[extern "leansudo_sys_netgroup"]
-opaque inNetgroup (group : @& String) (host user domain : @& Option String) : IO Bool
+private opaque netgroupMember (group : @& String) (host user domain : @& Option String) : IO Bool
+
+private def hasNul (value : String) : Bool := value.contains '\x00'
+
+def inNetgroup (group : String) (host user domain : Option String) : IO Bool :=
+  if hasNul group || host.any hasNul || user.any hasNul || domain.any hasNul then pure false
+  else netgroupMember group host user domain
 
 private def regexNumber (limit : Nat) : List Char → Nat → Nat × List Char
   | [], n => (n, [])
@@ -135,10 +141,10 @@ theorem regexCaseAdjustment_flags (c : Prim.Extra.Constants) (pattern : String) 
 
 def regexMatches (pattern text : String) (locale : String := "C") : IO Bool := do
   let c := Prim.Extra.constants ()
-  let pattern := cString pattern
+  if hasNul pattern || hasNul text || hasNul locale then return false
   if pattern.toUTF8.size > 1024 then throw (IO.userError "regular expression too large")
   let (pattern, flags) := regexCaseAdjustment c pattern
-  Prim.Extra.withLocale (cString locale) "unable to initialize matching locale" do
+  Prim.Extra.withLocale locale "unable to initialize matching locale" do
     let value ← Prim.Extra.regexAlloc
     try
       let checked := regexCheck c pattern
@@ -153,7 +159,8 @@ def regexMatches (pattern text : String) (locale : String := "C") : IO Bool := d
       Prim.Extra.free value
 
 def globPaths (pattern : String) (locale : String := "C") : IO (List String) :=
-  Prim.Extra.withLocale (cString locale) "unable to initialize matching locale" do
+  if hasNul pattern || hasNul locale then pure [] else
+  Prim.Extra.withLocale locale "unable to initialize matching locale" do
     let value ← Prim.Extra.globAlloc
     try
       try
@@ -172,10 +179,11 @@ def globPaths (pattern : String) (locale : String := "C") : IO (List String) :=
       Prim.Extra.free value
 
 def canonicalHostname (host : String) : IO (Except String String) := do
+  if hasNul host then return .error "invalid host name"
   let (status, value) ← Prim.Extra.hostname host
   if status != 0 then return .error (← Prim.Extra.hostnameError status)
   try
-    return .ok ((← Prim.Extra.hostnameName value).getD (cString host))
+    return .ok ((← Prim.Extra.hostnameName value).getD host)
   finally
     Prim.Extra.hostnameFree value
 

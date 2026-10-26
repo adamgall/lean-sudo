@@ -15,6 +15,42 @@ private def Vector.free (v : Vector) : IO Unit := do
     Prim.Plugins.free (← Prim.Plugins.readPtr v.ptr (i.toUSize * Prim.Plugins.pointerSize ()))
   Prim.Plugins.free v.ptr
 
+def validPluginString (value : String) : Bool :=
+  !value.contains '\x00'
+
+def validPluginIdentity (name path : String) : Bool :=
+  validPluginString name && validPluginString path
+
+def validSubmitIndex (index maximum : UInt32) : Bool :=
+  index ≤ maximum
+
+theorem validPluginString_iff (value : String) :
+    validPluginString value = true ↔ value.contains '\x00' = false := by
+  simp [validPluginString]
+
+theorem validPluginString_rejects_nul (value : String)
+    (h : value.contains '\x00' = true) : validPluginString value = false := by
+  simp [validPluginString, h]
+
+theorem validPluginIdentity_iff (name path : String) :
+    validPluginIdentity name path = true ↔
+      name.contains '\x00' = false ∧ path.contains '\x00' = false := by
+  simp [validPluginIdentity, validPluginString]
+
+theorem validPluginIdentity_rejects_nul (name path : String)
+    (h : name.contains '\x00' = true ∨ path.contains '\x00' = true) :
+    validPluginIdentity name path = false := by
+  rcases h with h | h <;> simp [validPluginIdentity, validPluginString, h]
+
+theorem validSubmitIndex_iff (index maximum : UInt32) :
+    validSubmitIndex index maximum = true ↔ index ≤ maximum := by
+  simp [validSubmitIndex]
+
+theorem validSubmitIndex_rejects_overflow (index maximum : UInt32)
+    (h : maximum < index) : validSubmitIndex index maximum = false := by
+  simp only [validSubmitIndex, decide_eq_false_iff_not]
+  exact UInt32.not_le.mpr h
+
 private def vector (values : Array String) : IO Vector := do
   let ptr ← Prim.Plugins.alloc ((values.size + 1).toUSize * Prim.Plugins.pointerSize ())
   if ptr == 0 then throw (IO.userError "unable to allocate plugin context")
@@ -22,7 +58,8 @@ private def vector (values : Array String) : IO Vector := do
   try
     let mut index := 0
     for value in values do
-      if value.contains '\x00' then throw (IO.userError "unable to allocate plugin context")
+      unless validPluginString value do
+        throw (IO.userError "unable to allocate plugin context")
       let item ← Prim.Plugins.dup value
       if item == 0 then throw (IO.userError "unable to allocate plugin context")
       Prim.Plugins.writePtr ptr (index.toUSize * Prim.Plugins.pointerSize ()) item
@@ -110,7 +147,13 @@ theorem compatibleVersion_major (version : UInt32) (h : compatibleVersion versio
 theorem policy_plugin_not_supported : supportedType 1 = false := by
   rfl
 
+theorem supportedType_range (type : UInt32) :
+    supportedType type = true ↔ 2 ≤ type ∧ type ≤ 4 := by
+  simp [supportedType]
+
 def loadRaw (name path : String) (line : UInt32) (options : Array String) : IO Unit := do
+  unless validPluginIdentity name path do
+    throw (IO.userError "plugin name or path contains a NUL byte")
   Callbacks.install
   let handle ← Prim.Plugins.dlopen path
   let location := s!"error in /etc/sudo.conf, line {line} while loading plugin \"{name}\""
@@ -253,7 +296,8 @@ def configureConversation (useStdin nonInteractive bell : Bool) (askpass : Strin
 def openAudit (settings userInfo submitArgv submitEnv : Array String)
     (optind : UInt32) : IO Unit := do
   if (← session.get).settings.isSome then throw (IO.userError "plugins already opened")
-  if optind > Prim.Posix.INT_MAX () then throw (IO.userError "invalid submit argument index")
+  unless validSubmitIndex optind (Prim.Posix.INT_MAX ()) do
+    throw (IO.userError "invalid submit argument index")
   let context ← command userInfo submitArgv submitEnv
   session.modify fun s => { s with
     settings := some settings
@@ -351,9 +395,7 @@ def checkSubcommand (commandInfo argv env : Array String) (enforce : Bool) : IO 
 
 def reject (message : String) (isError : Bool) (commandInfo : Array String) : IO Unit := do
   let info ← vector commandInfo
-  try
-    if !(← auditMessage "sudoers_policy" 1 message info.ptr isError) then
-      throw (IO.userError "unable to log policy event")
+  try discard <| auditMessage "sudoers_policy" 1 message info.ptr isError
   finally info.free
 
 def hasIo : IO Bool := do

@@ -29,15 +29,23 @@
 
 static sigset_t exec_startup_mask;
 static int exec_binary_fd = -1;
+static char **exec_argv;
+static uint64_t exec_inherited_fds;
 
-__attribute__((constructor(101))) static void exec_block_signals(void) {
+__attribute__((constructor(102))) static void exec_block_signals(void) {
   sigset_t all;
   memset(&all, 0xff, sizeof all);
   if (sigprocmask(SIG_SETMASK, &all, &exec_startup_mask) != 0) _exit(1);
+  for (int fd = 0; fd < 64; fd++)
+    if (fcntl(fd, F_GETFD) != -1) exec_inherited_fds |= (uint64_t)1 << fd;
+}
+
+LEAN_EXPORT lean_obj_res leansudo_prim_exec_inherited_fds(void) {
+  return ls_ok(lean_box_uint64(exec_inherited_fds));
 }
 
 #ifdef __linux__
-__attribute__((constructor(102))) static void exec_pin_binary(void) {
+__attribute__((constructor(103))) static void exec_pin_binary(void) {
   int fd = open("/proc/self/exe", O_PATH | O_CLOEXEC);
   if (fd < 0) _exit(1);
   exec_binary_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
@@ -45,6 +53,12 @@ __attribute__((constructor(102))) static void exec_pin_binary(void) {
   close(fd);
 }
 #endif
+
+__attribute__((constructor(104))) static void exec_save_argv(int argc, char **argv, char **envp) {
+  (void)argc;
+  (void)envp;
+  exec_argv = argv;
+}
 
 LEAN_EXPORT uint32_t ls_exec_rt_min(lean_obj_arg unit) {
   (void)unit;
@@ -197,29 +211,38 @@ LEAN_EXPORT lean_obj_res leansudo_prim_exec_peer_credentials(uint32_t fd) {
 #endif
 }
 
-LEAN_EXPORT lean_obj_res leansudo_prim_exec_fork_helper(uint32_t executable, uint32_t plan,
-    b_lean_obj_arg keep) {
-  char *argv[] = {(char *)"sudo", (char *)"--lean-sudo-helper", NULL};
+LEAN_EXPORT lean_obj_res leansudo_prim_exec_fork_helper(uint32_t executable, b_lean_obj_arg keep,
+    uint32_t source, uint32_t target, b_lean_obj_arg marker) {
   extern char **environ;
   size_t count = lean_array_size(keep);
   if (count > 1048576)
     return lean_io_result_mk_error(lean_decode_io_error(EINVAL, NULL));
   pid_t (*fork_process)(void) = dlsym(RTLD_DEFAULT, "_Fork");
   if (!fork_process) return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
+  size_t entries = 0;
+  while (environ && environ[entries]) entries++;
+  char **envp = calloc(entries + 2, sizeof *envp);
   int *fds = calloc(count + 1, sizeof *fds);
-  if (!fds) return lean_io_result_mk_error(lean_decode_io_error(ENOMEM, NULL));
+  if (!fds || !envp) {
+    free(fds);
+    free(envp);
+    return lean_io_result_mk_error(lean_decode_io_error(ENOMEM, NULL));
+  }
+  envp[0] = (char *)lean_string_cstr(marker);
+  for (size_t i = 0; i < entries; i++) envp[i + 1] = environ[i];
   for (size_t i = 0; i < count; i++)
     fds[i] = (int)lean_unbox_uint32(lean_array_get_core(keep, i));
   pid_t pid = fork_process();
   if (pid == 0) {
     for (size_t i = 0; i < count; i++)
       if (fcntl(fds[i], F_SETFD, 0) != 0) _exit(127);
-    if (dup2((int)plan, 63) != 63) _exit(127);
-    fexecve((int)executable, argv, environ);
+    if (target != UINT32_MAX && dup2((int)source, (int)target) != (int)target) _exit(127);
+    fexecve((int)executable, exec_argv, envp);
     _exit(127);
   }
   int error = errno;
   free(fds);
+  free(envp);
   if (pid < 0) return lean_io_result_mk_error(lean_decode_io_error(error, NULL));
   return ls_ok(lean_box_uint32((uint32_t)pid));
 }

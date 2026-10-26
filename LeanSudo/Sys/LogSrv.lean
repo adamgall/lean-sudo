@@ -11,7 +11,8 @@ open LeanSudo.LogSrv
 
 private abbrev NetM := EIO UInt32
 namespace Prim
-export LeanSudo.Sys.Prim.LogSrv (Result clock errorText resolve address freeAddresses socketpair
+export LeanSudo.Sys.Prim.LogSrv (Result clock errorText gaiErrorText resolve address freeAddresses
+  socketpair
   socket fcntl keepalive connect socketError close poll send recv peer numeric sigpending
   sigemptyset sigaddset sigismember sigtimedwait openLibrary symbol closeLibrary
   ptr0 ptr1 ulong0 void0 void1 int1 long1 int2 ctrl
@@ -40,6 +41,8 @@ private structure Transport where
   pipeMask : ByteArray := ByteArray.empty
   tlsErrno : UInt32 := 0
   nativeErrno : UInt32 := 0
+  handshaking : Bool := false
+  initMessages : Array String := #[]
   deriving Inhabited
 
 private structure Frame where
@@ -54,6 +57,9 @@ private initialize transport : IO.Ref Transport ← IO.mkRef {}
 private initialize incoming : IO.Ref Frame ← IO.mkRef {}
 private initialize pendingMessages : IO.Ref (Array ByteArray) ← IO.mkRef #[]
 private initialize broker : IO.Ref Bool ← IO.mkRef false
+private initialize lookupFailure : IO.Ref (Option UInt32) ← IO.mkRef none
+private initialize connectCause : IO.Ref (Option String) ← IO.mkRef none
+private initialize tlsInitFailed : IO.Ref Bool ← IO.mkRef false
 
 def withBroker (action : IO α) : IO α := do
   let previous ← broker.get
@@ -271,7 +277,10 @@ def resolverHelper (payload : Lean.Json) : IO UInt32 := do
   let service ← IO.ofExcept (payload.getObjValAs? String "service")
   let fd ← IO.ofExcept (payload.getObjValAs? Nat "fd")
   let (error, node) ← Prim.resolve host service (K.unspec ()) (K.stream ()) (K.tcp ())
-  if error != 0 then return 1
+  if error != 0 then
+    discard <| (resolverWrite fd.toUInt32 (word 4 ++ word error.toNat)).toBaseIO
+    discard <| Prim.close fd.toUInt32
+    return 1
   try
     match ← (resolverNodes fd.toUInt32 node).toBaseIO with
     | .ok _ => return 0
@@ -287,6 +296,9 @@ private partial def resolverRead (fd : UInt32) (deadline : Nat)
   if bytes.isEmpty then
     if addresses.isEmpty then throw (K.ehostunreach ())
     return addresses
+  if bytes.size == 4 then
+    lookupFailure.set (some (wordAt bytes 0).toUInt32)
+    throw (K.ehostunreach ())
   if bytes.size < 12 then throw (K.ehostunreach ())
   let address : Address := {
     family := (wordAt bytes 0).toUInt32
@@ -416,6 +428,15 @@ private def tlsCall (action : UInt32 → BaseIO (Prim.Result α)) : NetM α := d
 private def tlsInitError : NetM α := do
   throw (← transport.get).nativeErrno
 
+private def tlsInitFailure (messages : String → Array String) : NetM α := do
+  let c ← transport.get
+  let reason ← Prim.reason c.api[26]! (← Prim.ulong0 c.api[25]!)
+  let reason ← match reason with
+    | some reason => pure reason
+    | none => Prim.errorText c.nativeErrno
+  transport.modify fun c => { c with initMessages := messages reason }
+  tlsInitError
+
 private def tlsStart (host : String) (verify : Bool) (ca cert key : String) (deadline : Nat) :
     NetM Unit := do
   tlsLoad
@@ -423,22 +444,31 @@ private def tlsStart (host : String) (verify : Bool) (ca cert key : String) (dea
   let c ← transport.get
   let method ← tlsCall (Prim.ptr0 c.api[0]!)
   let ctx ← tlsCall (Prim.ptr1 c.api[1]! method)
-  if ctx == 0 then tlsInitError
+  if ctx == 0 then
+    tlsInitFailure fun reason => #[s!"Creation of new SSL_CTX object failed: {reason}"]
   transport.modify fun c => { c with ctx }
   if (← tlsCall (Prim.ctrl c.api[3]! ctx K.minProtoVersion K.tls12.toUInt64)) != 1 then
     tlsInitError
   tlsCall (Prim.verify c.api[4]! ctx (if verify then K.verifyPeer else K.verifyNone))
   if verify then
-    let rc ← tlsCall (if ca.isEmpty then Prim.int1 c.api[6]! ctx else Prim.ca c.api[5]! ctx ca)
-    if rc != 1 then tlsInitError
+    if ca.isEmpty then
+      if (← tlsCall (Prim.int1 c.api[6]! ctx)) != 1 then
+        tlsInitFailure fun reason => #[s!"SSL_CTX_set_default_verify_paths: {reason}"]
+    else if (← tlsCall (Prim.ca c.api[5]! ctx ca)) != 1 then
+      tlsInitFailure fun reason =>
+        #[s!"{ca}: {reason}", s!"unable to load certificate authority bundle {ca}"]
   if !cert.isEmpty then
-    if (← tlsCall (Prim.cert c.api[7]! ctx cert)) != 1 then tlsInitError
-    if (← tlsCall (Prim.key c.api[8]! ctx (if key.isEmpty then cert else key))) != 1 then
-      tlsInitError
-    if (← tlsCall (Prim.int1 c.api[9]! ctx)) != 1 then tlsInitError
+    if (← tlsCall (Prim.cert c.api[7]! ctx cert)) != 1 then
+      tlsInitFailure fun reason => #[s!"{cert}: {reason}", s!"unable to load certificate {cert}"]
+    let keyFile := if key.isEmpty then cert else key
+    let keyFailure : NetM Unit := tlsInitFailure fun reason =>
+      #[s!"{keyFile}: {reason}", s!"unable to load private key {keyFile}"]
+    if (← tlsCall (Prim.key c.api[8]! ctx keyFile)) != 1 then keyFailure
+    if (← tlsCall (Prim.int1 c.api[9]! ctx)) != 1 then keyFailure
   let ssl ← tlsCall (Prim.ptr1 c.api[10]! ctx)
   transport.modify fun c => { c with ssl }
-  if ssl == 0 then tlsInitError
+  if ssl == 0 then
+    tlsInitFailure fun reason => #[s!"Unable to allocate ssl object: {reason}"]
   let some fd := c.fd | throw (K.enotconn ())
   if (← tlsCall (Prim.int2 c.api[12]! ssl fd)) != 1 then tlsInitError
   let ipv4 ← Prim.numeric (K.inet ()) host
@@ -447,7 +477,7 @@ private def tlsStart (host : String) (verify : Bool) (ca cert key : String) (dea
   if !numeric && (← tlsCall (Prim.sni c.api[13]! ssl host)) != 1 then tlsInitError
   let pipeMask ← checked (← Prim.sigemptyset)
   let pipeMask ← checked (← Prim.sigaddset pipeMask (K.sigpipe ()))
-  transport.modify fun c => { c with pipeMask }
+  transport.modify fun c => { c with pipeMask, handshaking := true }
   tlsHandshake deadline
   if verify then
     if (← Prim.long1 c.api[15]! ssl) != 0 then throw (K.eacces ())
@@ -458,26 +488,41 @@ private def connect (host service : String) (tls : Bool) (timeout : UInt32)
   reset
   transport.modify fun c => { c with timeout }
   let deadline ← runNet "clock" (deadlineNew timeout)
-  let addresses ← resolve host service deadline
+  lookupFailure.set none
+  let addresses ← try resolve host service deadline catch error =>
+    if let some code ← lookupFailure.get then
+      Sys.writeStderr s!"sudo: unable to look up {host}:{service}: {← Prim.gaiErrorText code}\n"
+    throw error
+  connectCause.set none
   runNet "connect" (connectAddresses addresses keepalive deadline)
   if tls then
+    if ← tlsInitFailed.get then
+      let detail ← Prim.errorText (← transport.get).nativeErrno
+      connectCause.set (some s!"TLS initialization was unsuccessful: {detail}")
+      reset
+      throw (IO.userError "TLS initialization was unsuccessful")
     match ← (tlsStart host verify ca cert key deadline).toBaseIO with
     | .ok _ => pure ()
     | .error error =>
       let c ← transport.get
-      let reason ← if c.api.size > 26 then
-          Prim.reason c.api[26]! (← Prim.ulong0 c.api[25]!)
-        else pure none
+      if !c.handshaking then
+        for message in c.initMessages do Sys.writeStderr ("sudo: " ++ message ++ "\n")
+        tlsInitFailed.set true
+        let detail ← Prim.errorText c.nativeErrno
+        connectCause.set (some s!"TLS initialization was unsuccessful: {detail}")
+        reset
+        throw (IO.userError "TLS initialization was unsuccessful")
+      let reason ← Prim.reason c.api[26]! (← Prim.ulong0 c.api[25]!)
       let reason ← match reason with
         | some reason => pure reason
         | none =>
           if error == K.eacces () then pure "certificate verify failed"
           else Prim.errorText error
       let detail ← Prim.errorText c.tlsErrno
-      let stage := if c.ssl != 0 then "handshake" else "initialization"
+      Sys.writeStderr s!"sudo: TLS connection to {host}:{service} failed: {reason}\n"
+      connectCause.set (some s!"TLS handshake was unsuccessful: {detail}")
       reset
-      throw (IO.userError (s!"TLS connection to {host}:{service} failed: {reason}\n" ++
-        s!"TLS {stage} was unsuccessful: {detail}"))
+      throw (IO.userError "TLS handshake was unsuccessful")
 
 private def relay (mask : UInt32) : IO Unit := do
   if mask &&& 4294967264 != 0 then transportFailure "relay" (K.einval ())
@@ -555,21 +600,17 @@ private def handshake : IO Bool := do
   | _ => throw (IO.userError "invalid ServerHello")
 
 private def connectFirst (st : Settings) (servers : List String) : IO Bool := do
-  let mut cause : Option String := none
+  connectCause.set none
+  tlsInitFailed.set false
   for server in servers do
     let connected ← try
       connectServer st server
       pure true
-    catch error =>
-      let message := error.toString
-      if message.startsWith "TLS connection to " then
-        let lines := message.splitOn "\n"
-        Sys.writeStderr ("sudo: " ++ lines.headD message ++ "\n")
-        cause := (lines.drop 1).head?
+    catch _ =>
       closeTransport
       pure false
     if connected then return ← handshake
-  for message in cause do Sys.writeStderr ("sudo: " ++ message ++ "\n")
+  for message in ← connectCause.get do Sys.writeStderr ("sudo: " ++ message ++ "\n")
   throw (IO.userError "unable to connect to log server")
 
 private def consume (s : Session) (message : ServerMessage) : IO Session := do

@@ -61,6 +61,7 @@ end Constants
 
 @[extern "ls_logprim_clock"] opaque clock : BaseIO (Result (UInt64 × UInt64))
 @[extern "ls_logprim_error"] opaque errorText (error : UInt32) : BaseIO String
+@[extern "ls_logprim_gai_error"] opaque gaiErrorText (error : UInt32) : BaseIO String
 @[extern "ls_logprim_resolve"] opaque resolve (host service : @& String)
     (family kind protocol : UInt32) : BaseIO (Result UInt64)
 @[extern "ls_logprim_address"] opaque address (node : UInt64) :

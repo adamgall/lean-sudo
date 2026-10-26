@@ -56,8 +56,8 @@ EOF
 chmod 0755 "$ED"/*
 
 mkdir -p "$OUTDIR"
-LOG="$OUTDIR/$LABEL.log"
-TAP="$OUTDIR/$LABEL.tap"
+LOG="$OUTDIR/${IMPL_OUTPUT_LABEL:-$LABEL}.log"
+TAP="$OUTDIR/${IMPL_OUTPUT_LABEL:-$LABEL}.tap"
 : >"$LOG"
 : >"$TAP"
 if [[ -n ${HOST_UID:-} ]]; then chown "$HOST_UID:${HOST_GID:-$HOST_UID}" "$LOG" "$TAP"; fi
@@ -1110,6 +1110,314 @@ for scope in global unset user other-user host other-host runas command sudo-use
     }
   done
 done
+
+VP=${VISUDO##*/}
+
+ext_owned_file() {
+  mkdir -p "$WORK/scratch/ivan"
+  chown ivan:ivan "$WORK/scratch/ivan"
+  F=$WORK/scratch/ivan/s
+  printf 'root ALL=(ALL:ALL) ALL\n' >"$F"
+  chown ivan:root "$F"
+  chmod 0666 "$F"
+}
+
+begin ext-visudo-f-owned-file-foreign-group-installs && {
+  ext_owned_file
+  XENV=(EDLOG=/dev/null EDITOR="$ED/append" LINE='ivan ALL=(ALL:ALL) ALL')
+  vrun -u ivan -f "$F"
+  expect_rc 0
+  expect_out_empty
+  want="$VP: unable to set (uid, gid) of $F.tmp to ($(id -u ivan), 0): Operation not permitted"
+  [[ $ERR == "$want" ]] || fail "stderr: expected exactly '$want'"
+  expect_last_line "$F" 'ivan ALL=(ALL:ALL) ALL'
+  expect_stat "$F" '666 ivan ivan'
+  expect_no_tmp "$F.tmp"
+  end
+}
+
+begin ext-visudo-f-owner-flag-chown-failure-is-fatal && {
+  ext_owned_file
+  XENV=(EDLOG=/dev/null EDITOR="$ED/append" LINE='ivan ALL=(ALL:ALL) ALL')
+  vrun -u ivan -O -f "$F"
+  expect_rc 1
+  want="$VP: unable to set (uid, gid) of $F.tmp to (0, 0): Operation not permitted"
+  want+=$'\n'"$VP: contents of edit session left in $F.tmp"
+  [[ $ERR == "$want" ]] || fail "stderr: expected exactly '$want'"
+  [[ $(cat "$F") == 'root ALL=(ALL:ALL) ALL' ]] || fail "$F was modified"
+  expect_stat "$F" '666 ivan root'
+  expect_last_line "$F.tmp" 'ivan ALL=(ALL:ALL) ALL'
+  end
+}
+
+begin ext-visudo-f-unmodified-owner-fix-failure-warns && {
+  ext_owned_file
+  XENV=(EDLOG=/dev/null EDITOR="$ED/noop")
+  vrun -u ivan -O -P -f "$F"
+  expect_rc 0
+  want="$VP: $F.tmp unchanged"$'\n'
+  want+="$VP: unable to set (uid, gid) of $F to (0, 0): Operation not permitted"
+  [[ $ERR == "$want" ]] || fail "stderr: expected exactly '$want'"
+  expect_stat "$F" '440 ivan root'
+  expect_no_tmp "$F.tmp"
+  end
+}
+
+cat >"$ED/replace" <<'EOF'
+#!/bin/sh
+for a; do f=$a; done
+printf '%s\n' "$LINE" >"$f"
+EOF
+chmod 0755 "$ED/replace"
+
+for kind in cycle undefined; do
+  begin "ext-visudo-preedit-alias-$kind-not-reported" && {
+    if [[ $kind == cycle ]]; then
+      printf 'User_Alias FOO = FOO\nFOO ALL=(ALL:ALL) ALL\n' >"$WORK/scratch/s"
+    else
+      printf 'ADMINS ALL=(ALL:ALL) ALL\n' >"$WORK/scratch/s"
+    fi
+    XENV=(EDITOR="$ED/replace" LINE='root ALL=(ALL:ALL) ALL')
+    vrun -f "$WORK/scratch/s"
+    expect_rc 0
+    expect_out_empty
+    expect_err_empty
+    expect_last_line "$WORK/scratch/s" 'root ALL=(ALL:ALL) ALL'
+    expect_no_tmp "$WORK/scratch/s.tmp"
+    end
+  }
+
+  begin "ext-visudo-strict-alias-$kind-reported-once" && {
+    if [[ $kind == cycle ]]; then
+      printf 'User_Alias FOO = FOO\nFOO ALL=(ALL:ALL) ALL\n' >"$WORK/scratch/s"
+      want="$WORK/scratch/s:1:12: cycle in User_Alias \"FOO\""
+    else
+      printf 'ADMINS ALL=(ALL:ALL) ALL\n' >"$WORK/scratch/s"
+      want="$WORK/scratch/s:1:25: User_Alias \"ADMINS\" referenced but not defined"
+    fi
+    cp -a "$WORK/scratch/s" "$WORK/scratch/expected"
+    XENV=(EDITOR="$ED/append" LINE='#')
+    answer $'x\n'
+    vrun --strict -f "$WORK/scratch/s"
+    expect_rc 0
+    expect_out_exactly 'What now? '
+    [[ $ERR == "$want" ]] || fail "stderr: expected exactly '$want'"
+    cmp -s "$WORK/scratch/s" "$WORK/scratch/expected" || fail "$WORK/scratch/s was modified"
+    expect_no_tmp "$WORK/scratch/s.tmp"
+    end
+  }
+done
+
+for kind in mode000 mode644 missing bare; do
+  for var in SUDO_EDITOR VISUAL EDITOR; do
+    begin "ext-visudo-env-editor-falls-back-$kind-$var" && {
+      printf 'Defaults editor=%s\nroot ALL=(ALL:ALL) ALL\n' "$ED/append" >"$WORK/scratch/s"
+      env_editor=$WORK/scratch/env-editor
+      printf '#!/bin/sh\nexit 3\n' >"$env_editor"
+      case $kind in
+        mode000) chmod 0000 "$env_editor";;
+        mode644) chmod 0644 "$env_editor";;
+        missing) rm -f "$env_editor";;
+        bare) env_editor=ext-no-such-editor;;
+      esac
+      XENV=("$var=$env_editor" LINE='# fallback')
+      vrun -f "$WORK/scratch/s"
+      expect_rc 0
+      expect_out_empty
+      expect_err_empty
+      expect_last_line "$WORK/scratch/s" '# fallback'
+      expect_no_tmp "$WORK/scratch/s.tmp"
+      end
+    }
+  done
+done
+
+begin ext-visudo-env-editor-fallback-list-missing && {
+  printf 'Defaults editor=/nonexistent1\nroot ALL=(ALL:ALL) ALL\n' >"$WORK/scratch/s"
+  printf '#!/bin/sh\nexit 3\n' >"$WORK/scratch/env-editor"
+  chmod 0644 "$WORK/scratch/env-editor"
+  XENV=(SUDO_EDITOR=/nonexistent2 EDITOR="$WORK/scratch/env-editor")
+  vrun -f "$WORK/scratch/s"
+  expect_rc 1
+  expect_out_empty
+  want="$VP: specified editor ($WORK/scratch/env-editor) doesn't exist"
+  [[ $ERR == "$want" ]] || fail "stderr: expected exactly '$want'"
+  expect_no_tmp "$WORK/scratch/s.tmp"
+  end
+}
+
+begin ext-visudo-env-editor-double-dash-refused && {
+  printf 'Defaults editor=%s\nroot ALL=(ALL:ALL) ALL\n' "$ED/append" >"$WORK/scratch/s"
+  cp -a "$WORK/scratch/s" "$WORK/scratch/expected"
+  XENV=(SUDO_EDITOR=/nonexistent EDITOR="$ED/append -- x" LINE='# edited')
+  vrun -f "$WORK/scratch/s"
+  expect_rc 1
+  expect_out_empty
+  want="$VP: ignoring editor: $ED/append -- x"$'\n'
+  want+="$VP: editor arguments may not contain \"--\""
+  [[ $ERR == "$want" ]] || fail "stderr: expected exactly '$want'"
+  cmp -s "$WORK/scratch/s" "$WORK/scratch/expected" || fail "$WORK/scratch/s was modified"
+  expect_no_tmp "$WORK/scratch/s.tmp"
+  end
+}
+
+begin ext-visudo-no-env-editor-double-dash-refused && {
+  printf 'Defaults !env_editor, editor=%s\nroot ALL=(ALL:ALL) ALL\n' "$ED/append" >"$WORK/scratch/s"
+  cp -a "$WORK/scratch/s" "$WORK/scratch/expected"
+  XENV=(EDITOR="$ED/append --" LINE='# edited')
+  vrun -f "$WORK/scratch/s"
+  expect_rc 1
+  expect_out_empty
+  want="$VP: ignoring editor: $ED/append --"$'\n'
+  want+="$VP: editor arguments may not contain \"--\""$'\n'
+  want+="$VP: no editor found (editor path = $ED/append)"
+  [[ $ERR == "$want" ]] || fail "stderr: expected exactly '$want'"
+  cmp -s "$WORK/scratch/s" "$WORK/scratch/expected" || fail "$WORK/scratch/s was modified"
+  expect_no_tmp "$WORK/scratch/s.tmp"
+  end
+}
+
+ext_visudo_check() {
+  local name=$1 policy=$2 rc=$3 want=$4 out=${5:-}
+  begin "$name" && {
+    printf '%s' "$policy" >"$WORK/scratch/s"
+    printf 'Cmnd_Alias X = /bin/a :\n' >"$WORK/scratch/inc"
+    printf 'ivan ALL=(ALL) NOPASSWD: /usr/bin/id\n' >"$WORK/scratch/rel"
+    chmod 0440 "$WORK/scratch/s" "$WORK/scratch/inc" "$WORK/scratch/rel"
+    vrun -c -f "$WORK/scratch/s"
+    expect_rc "$rc"
+    want=${want//@S@/$WORK/scratch}
+    want=${want//@VP@/$VP}
+    out=${out//@S@/$WORK/scratch}
+    [[ $ERR == "$want" ]] || fail "stderr: expected exactly '$want'"
+    [[ $OUT == "$out" ]] || fail "stdout: expected exactly '$out'"
+    end
+  }
+}
+
+ext_err() {
+  local where=$1 line=$2 col=$3 msg=$4 text=$5 width=${6:-1}
+  printf '%s:%s:%s: %s\n%s\n%*s^' "$where" "$line" "$col" "$msg" "$text" $((col - 1)) ''
+  printf '%*s\n' $((width - 1)) '' | tr ' ' '~'
+}
+
+EXT_NOPASSWD='ivan ALL=(root NOPASSWD: ALL'
+ext_visudo_check ext-visudo-syntax-error-underlines-token "$EXT_NOPASSWD"$'\n' 1 \
+  "$(ext_err @S@/s 1 16 'syntax error' "$EXT_NOPASSWD" 9)"
+EXT_USE_PTY='Defaults lecture=never, !use_pt:y'
+ext_visudo_check ext-visudo-syntax-error-underlines-lexer-token "$EXT_USE_PTY"$'\n' 1 \
+  "$(ext_err @S@/s 1 32 'syntax error' "$EXT_USE_PTY" 2)"
+EXT_RUNAS='root ALL=(ALL:AL L) NOPASSWD: ALL'
+ext_visudo_check ext-visudo-syntax-errors-all-lines $'Cmnd_Alias BROKEN =\n'"$EXT_RUNAS"$'\n' 1 \
+  "$(ext_err @S@/s 1 20 'syntax error' 'Cmnd_Alias BROKEN ='
+    ext_err @S@/s 2 18 'syntax error' "$EXT_RUNAS")"
+EXT_TAG='root ALL=(ALL:ALL) NOPAS:SWD: ALL'
+ext_visudo_check ext-visudo-syntax-errors-privilege-recovery "$EXT_TAG"$'\n' 1 \
+  "$(ext_err @S@/s 1 29 'syntax error' "$EXT_TAG"; ext_err @S@/s 1 34 'syntax error' "$EXT_TAG")"
+EXT_PENDING='ivan host1=/bin/a : host2=(root /bin/b'
+ext_visudo_check ext-visudo-syntax-errors-pending-command-token "$EXT_PENDING"$'\nfoo bar\n' 1 \
+  "$(ext_err @S@/s 1 39 'syntax error' "$EXT_PENDING"
+    ext_err @S@/s 1 39 'syntax error' "$EXT_PENDING"
+    ext_err @S@/s 2 8 'syntax error' 'foo bar')"
+EXT_ESCAPED='Cmnd_Alias COMMANDS = /usr/bin/id, /usr/bin/t\rue'
+ext_visudo_check ext-visudo-escaped-command-path-rejected "$EXT_ESCAPED"$'\n' 1 \
+  "$(ext_err @S@/s 1 36 'expected a fully-qualified path name' "$EXT_ESCAPED" 14)"
+EXT_ESCAPED_DEFAULTS='Defaults!/usr/local/bin/\conformance-record rlimit_nofile=256'
+ext_visudo_check ext-visudo-escaped-defaults-command-path-rejected "$EXT_ESCAPED_DEFAULTS"$'\n' 1 \
+  "$(ext_err @S@/s 1 10 'expected a fully-qualified path name' "$EXT_ESCAPED_DEFAULTS" 34)"
+EXT_DUPLICATE='duplicate User_Alias "ADMINS", previously defined at @S@/s:1:12'
+ext_visudo_check ext-visudo-duplicate-alias-then-syntax-error \
+  $'User_Alias ADMINS = ivan\nUser_Alias ADMINS = judy\nivan=%n ALL=(ALL:ALL) ALL\n' 1 \
+  "$(ext_err @S@/s 2 25 "$EXT_DUPLICATE" 'User_Alias ADMINS = judy'
+    ext_err @S@/s 3 5 'syntax error' 'ivan=%n ALL=(ALL:ALL) ALL')"
+ext_visudo_check ext-visudo-chroot-warning-between-syntax-errors \
+  $'foo bar\nroot ALL=(ALL) CHROOT=/ ALL\nbaz qux\n' 1 \
+  "$(ext_err @S@/s 1 8 'syntax error' 'foo bar'
+    printf '%s\n' '@S@/s:2:23: "CHROOT" is deprecated'
+    ext_err @S@/s 3 8 'syntax error' 'baz qux')"
+ext_visudo_check ext-visudo-defaults-quoted-value-column \
+  $'Defaults logfile="\\/var/log/conformance.log", loglinelen=0\n' 1 \
+  $'@S@/s:1:44: values for "logfile" must start with a \'/\''
+ext_visudo_check ext-visudo-include-search-path-missing \
+  $'@include /etc/66-ext-visudo-missing:66-ext-visudo-rel\n' 1 \
+  '@VP@: /etc/66-ext-visudo-missing: No such file or directory'
+ext_visudo_check ext-visudo-include-search-path-second-entry \
+  "@include /etc/66-ext-visudo-missing:$WORK/scratch/rel"$'\n' 0 '' \
+  $'@S@/s: parsed OK\n@S@/rel: parsed OK'
+ext_visudo_check ext-visudo-include-errors-before-later-errors \
+  "@include $WORK/scratch/inc"$'\nfoo bar\n' 1 \
+  "$(ext_err @S@/inc 1 24 'syntax error' 'Cmnd_Alias X = /bin/a :'
+    ext_err @S@/s 2 8 'syntax error' 'foo bar')"
+
+ext_visudo_same_as_reference() {
+  local name=$1 file=$2 content=$3 extra=${4:-}
+  begin "$name" && {
+    [[ -z $extra ]] || printf "$extra" >"$WORK/scratch/bin"
+    printf '%s' "$content" >"$file"
+    chmod 0440 "$file"
+    vrun -c -f "$file"
+    local lean_rc=$RC
+    sed 's/^visudo\.ws: /visudo: /' "$WORK/err" >"$WORK/lean.err"
+    cp "$WORK/out" "$WORK/lean.out"
+    env -i HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      LANG=C.UTF-8 timeout -k 5 "$CMD_TIMEOUT" /usr/sbin/visudo.ws -c -f "$file" \
+      >"$WORK/ref.out" 2>"$WORK/ref.raw" </dev/null
+    local ref_rc=$?
+    sed 's/^visudo\.ws: /visudo: /' "$WORK/ref.raw" >"$WORK/ref.err"
+    rm -f "$file"
+    [[ $lean_rc == "$ref_rc" ]] || fail "exit status: expected $ref_rc (visudo.ws), got $lean_rc"
+    cmp -s "$WORK/lean.err" "$WORK/ref.err" || fail "stderr differs from visudo.ws"
+    cmp -s "$WORK/lean.out" "$WORK/ref.out" || fail "stdout differs from visudo.ws"
+    [[ -s $WORK/ref.err ]] || fail "visudo.ws reported nothing"
+    end
+  }
+}
+
+ext_visudo_same_as_reference ext-visudo-includedir-etc-recursion /etc/ext-visudo-etc \
+  $'@includedir /etc/ conformance.d\n'
+ext_visudo_same_as_reference ext-visudo-include-invalid-utf8 "$WORK/scratch/s" \
+  "@include $WORK/scratch/bin"$'\n' 'ivan ALL=(ALL) /bin/\xff\xfe\nfoo \xc3(bar\n'
+
+ext_visudo_non_utf8_files() {
+  printf 'root ALL=(ALL:ALL) ALL\n@include %s\n' "$WORK/scratch/bin" >"$WORK/scratch/s"
+  printf '# caf\xe9\nroot ALL=(ALL:ALL) ALL\n' >"$WORK/scratch/bin"
+  chmod 0440 "$WORK/scratch/s" "$WORK/scratch/bin"
+}
+
+begin ext-visudo-non-utf8-include-check && {
+  ext_visudo_non_utf8_files
+  vrun -c -f "$WORK/scratch/s"
+  if [[ $IS_REF == 1 ]]; then
+    expect_rc 0
+    expect_err_empty
+    expect_out_exactly "$WORK/scratch/s: parsed OK"$'\n'"$WORK/scratch/bin: parsed OK"
+  else
+    expect_rc 1
+    expect_out_empty
+    [[ $ERR == "$WORK/scratch/bin: file is not valid UTF-8" ]] ||
+      fail "stderr: expected exactly '$WORK/scratch/bin: file is not valid UTF-8'"
+  fi
+  end
+}
+
+begin ext-visudo-non-utf8-include-edit-not-installed && {
+  ext_visudo_non_utf8_files
+  cp -a "$WORK/scratch/s" "$WORK/scratch/expected"
+  XENV=(EDITOR="$ED/append" LINE='# edited')
+  answer $'x\n'
+  vrun -I -f "$WORK/scratch/s"
+  expect_rc 0
+  if [[ $IS_REF == 1 ]]; then
+    expect_out_lacks 'What now?'
+    cmp -s "$WORK/scratch/s" "$WORK/scratch/expected" && fail "edit was not installed"
+  else
+    expect_out_has 'What now?'
+    expect_err_has "$WORK/scratch/bin: file is not valid UTF-8"
+    cmp -s "$WORK/scratch/s" "$WORK/scratch/expected" || fail "edit was installed"
+  fi
+  expect_no_tmp "$WORK/scratch/s.tmp"
+  end
+}
 
 
 

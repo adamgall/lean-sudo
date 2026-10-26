@@ -216,6 +216,7 @@ def versionFor (root : Bool) (s : Settings := {}) (interfaces : List String := [
   line "Password prompt timeout" (minutesText s.passwdTimeout ++ " minutes") ++
   line "Number of tries to enter a password" (toString s.passwdTries) ++
   line "Umask to use or 0777 to use user's" (octalText s.umask) ++
+  opt "Path to log file" s.logfile ++
   opt "Path to mail program" s.mailerpath ++ opt "Flags for mail program" s.mailerflags ++
   opt "Address to send mail to" s.mailto ++ opt "Address to send mail from" s.mailfrom ++
   line "Subject line for mail messages" s.mailsub ++

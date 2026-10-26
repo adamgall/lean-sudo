@@ -105,20 +105,6 @@ LEAN_EXPORT lean_obj_res leansudo_prim_edit_unlinkat(uint32_t dir, b_lean_obj_ar
     return edit_ok(lean_box(0));
 }
 
-LEAN_EXPORT lean_obj_res leansudo_prim_edit_mkostemps(b_lean_obj_arg path,
-        uint32_t suffix) {
-    char name[PATH_MAX];
-    size_t length = lean_string_size(path);
-    if (length > sizeof name || suffix > INT_MAX) return edit_error(EINVAL);
-    memcpy(name, lean_string_cstr(path), length);
-    int fd = mkostemps(name, (int)suffix, O_CLOEXEC);
-    if (fd < 0) return edit_error(errno);
-    lean_object *pair = lean_alloc_ctor(0, 2, 0);
-    lean_ctor_set(pair, 0, lean_mk_string(name));
-    lean_ctor_set(pair, 1, lean_box_uint32((uint32_t)fd));
-    return edit_ok(pair);
-}
-
 LEAN_EXPORT lean_obj_res leansudo_prim_edit_fstat(uint32_t fd) {
     struct stat st;
     if (fstat((int)fd, &st)) return edit_error(errno);

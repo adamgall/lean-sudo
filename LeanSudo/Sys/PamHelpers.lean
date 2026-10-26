@@ -1,4 +1,6 @@
 import LeanSudo.Helper
+import LeanSudo.Sys.ExecChild
+import LeanSudo.Sys.Limits
 import LeanSudo.Sys.Prim.Pam
 
 namespace LeanSudo.Sys.PamHelpers
@@ -6,7 +8,7 @@ namespace LeanSudo.Sys.PamHelpers
 open Lean Prim.Posix
 open Prim.Pam (errorCode invalidFd)
 namespace E
-export Prim.Exec (pipe close dup2 openFile closeRange signalMask waitpid kill getuid getgid
+export Prim.Exec (pipe close dup2 openFile restoreSignalMask waitpid kill getuid getgid
   getgroups writeAll readSignal signalFd)
 end E
 
@@ -38,17 +40,77 @@ private structure Plan where
   args : Array String := #[]
   prompt : Array Nat := #[]
   descriptor : Nat := 0
+  failure : String := ""
+  limits : Array Limits.Restoration := #[]
   deriving ToJson, FromJson
 
-private def validPlan (plan : Plan) : Bool :=
+private def validPlan (descriptorMax : Nat) (plan : Plan) : Bool :=
   plan.uid < UInt32.size - 1 && plan.gid < UInt32.size - 1 &&
-    plan.groups.all (· < UInt32.size - 1) && plan.descriptor ≤ (INT_MAX ()).toNat &&
+    plan.groups.all (· < UInt32.size - 1) && plan.descriptor ≤ descriptorMax &&
     !plan.path.contains '\x00' && plan.args.all (fun value => !value.contains '\x00') &&
     plan.prompt.all (fun byte => byte > 0 && byte < 256)
 
+theorem validPlan_iff (descriptorMax : Nat) (plan : Plan) :
+    validPlan descriptorMax plan = true ↔
+      plan.uid < UInt32.size - 1 ∧ plan.gid < UInt32.size - 1 ∧
+      (∀ group ∈ plan.groups, group < UInt32.size - 1) ∧
+      plan.descriptor ≤ descriptorMax ∧ plan.path.contains '\x00' = false ∧
+      (∀ arg ∈ plan.args, arg.contains '\x00' = false) ∧
+      (∀ byte ∈ plan.prompt, 0 < byte ∧ byte < 256) := by
+  simp [validPlan, Array.all_eq_true, Array.forall_mem_iff_forall_getElem, and_assoc]
+
+theorem validPlan_rejects_uid (descriptorMax : Nat) (plan : Plan)
+    (h : UInt32.size - 1 ≤ plan.uid) : validPlan descriptorMax plan = false := by
+  apply Bool.eq_false_iff.mpr
+  intro accepted
+  have safe := (validPlan_iff descriptorMax plan).mp accepted
+  omega
+
+theorem validPlan_rejects_gid (descriptorMax : Nat) (plan : Plan)
+    (h : UInt32.size - 1 ≤ plan.gid) : validPlan descriptorMax plan = false := by
+  apply Bool.eq_false_iff.mpr
+  intro accepted
+  have safe := (validPlan_iff descriptorMax plan).mp accepted
+  omega
+
+theorem validPlan_rejects_group (descriptorMax : Nat) (plan : Plan) (group : Nat)
+    (member : group ∈ plan.groups) (h : UInt32.size - 1 ≤ group) :
+    validPlan descriptorMax plan = false := by
+  apply Bool.eq_false_iff.mpr
+  intro accepted
+  have safe := ((validPlan_iff descriptorMax plan).mp accepted).2.2.1 group member
+  omega
+
+theorem validPlan_rejects_descriptor (descriptorMax : Nat) (plan : Plan)
+    (h : descriptorMax < plan.descriptor) : validPlan descriptorMax plan = false := by
+  apply Bool.eq_false_iff.mpr
+  intro accepted
+  have safe := (validPlan_iff descriptorMax plan).mp accepted
+  omega
+
+theorem validPlan_rejects_path_nul (descriptorMax : Nat) (plan : Plan)
+    (h : plan.path.contains '\x00' = true) : validPlan descriptorMax plan = false := by
+  simp [validPlan, h]
+
+theorem validPlan_rejects_arg_nul (descriptorMax : Nat) (plan : Plan) (arg : String)
+    (member : arg ∈ plan.args) (h : arg.contains '\x00' = true) :
+    validPlan descriptorMax plan = false := by
+  apply Bool.eq_false_iff.mpr
+  intro accepted
+  have safe := ((validPlan_iff descriptorMax plan).mp accepted).2.2.2.2.2.1 arg member
+  simp [h] at safe
+
+theorem validPlan_rejects_prompt_byte (descriptorMax : Nat) (plan : Plan) (byte : Nat)
+    (member : byte ∈ plan.prompt) (h : byte = 0 ∨ 256 ≤ byte) :
+    validPlan descriptorMax plan = false := by
+  apply Bool.eq_false_iff.mpr
+  intro accepted
+  have safe := ((validPlan_iff descriptorMax plan).mp accepted).2.2.2.2.2.2 byte member
+  omega
+
 private def decode (json : Json) : IO Plan := do
   let plan ← IO.ofExcept (fromJson? json)
-  unless validPlan plan do throw (IO.userError "invalid helper plan")
+  unless validPlan (INT_MAX ()).toNat plan do throw (IO.userError "invalid helper plan")
   return plan
 
 private def drop (plan : Plan) : IO Unit :=
@@ -60,8 +122,8 @@ private def openNull (flags : UInt32) : IO UInt32 := do
   return fd.toInt.toNat.toUInt32
 
 private def execPlan (plan : Plan) : IO UInt32 := do
-  if (← E.closeRange (STDERR_FILENO () + 1) (invalidFd ()) 0) != 0 then return 126
-  E.signalMask (← Helper.inheritedMask)
+  Exec.cloexecFrom (STDERR_FILENO () + 1)
+  E.restoreSignalMask (← Helper.inheritedMask)
   let _ ← withArgv (plan.args.map String.toUTF8) (execInherited plan.path)
   return 127
 
@@ -70,11 +132,17 @@ private def askpassChild (json : Json) : IO UInt32 := do
   try
     E.dup2 plan.descriptor.toUInt32 (STDOUT_FILENO ())
     E.dup2 (← openNull (O_RDONLY ())) (STDIN_FILENO ())
+    Exec.cloexecFrom (STDERR_FILENO () + 1)
+    Limits.restoreFrom "sudo" plan.limits
+    Limits.unlimitNproc "sudo"
     drop plan
-    if (← E.closeRange (STDERR_FILENO () + 1) (invalidFd ()) 0) != 0 then return 126
-    E.signalMask (← Helper.inheritedMask)
+    Limits.restoreNproc none
+    E.restoreSignalMask (← Helper.inheritedMask)
     let args := #[plan.path.toUTF8, ByteArray.mk (plan.prompt.map Nat.toUInt8)]
-    let _ ← withArgv args (execInherited plan.path)
+    let rc ← withArgv args (execInherited plan.path)
+    let reason ← Prim.Exec.strerror rc.natAbs.toUInt32
+    try E.writeAll (STDERR_FILENO ()) (plan.failure ++ ": " ++ reason ++ "\n").toUTF8
+    catch _ => pure ()
     return 127
   catch _ => return 126
 
@@ -123,19 +191,21 @@ private partial def askpassLoop (fd : UInt32) (deadline : Nat)
   if deadline != 0 && now >= deadline then return (3, ByteArray.empty)
   let timeout := if deadline == 0 then invalidFd ()
     else (min (deadline - now) (INT_MAX ()).toNat).toUInt32
-  let ready ← Prim.Pam.poll fd (invalidFd ()) timeout
+  let ready ← Prim.Pam.poll fd timeout (← Prim.Pam.sigemptyset)
   if ready == errorCode (EINTR ()) then return ← askpassLoop fd deadline bytes
   if ready == 0 then return (3, ByteArray.empty)
   if ready < 0 then return (5, ByteArray.empty)
   let (count, input) ← Prim.Pam.read fd 1
   if count == errorCode (EINTR ()) then return ← askpassLoop fd deadline bytes
   if count < 0 then return (5, ByteArray.empty)
-  if count == 0 || input[0]! == 10 then
-    return (if bytes.isEmpty then 4 else 0, bytes)
-  askpassLoop fd deadline (if bytes.size < 1023 then bytes.push input[0]! else bytes)
+  if count == 0 then return (if bytes.isEmpty || bytes[0]! == 0 then 4 else 0, bytes)
+  if input[0]! == 10 || input[0]! == 13 then return (0, bytes)
+  let bytes := bytes.push input[0]!
+  if bytes.size >= 1023 then return (0, bytes)
+  askpassLoop fd deadline bytes
 
 def readAskpass (path : String) (prompt : ByteArray) (uid gid : UInt32)
-    (groups : Array UInt32) (timeout : UInt32) : IO (Int × ByteArray) := do
+    (groups : Array UInt32) (timeout : UInt32) (failure : String) : IO (Int × ByteArray) := do
   let descriptors ← try pure (some (← E.pipe (O_CLOEXEC ()))) catch _ => pure none
   let some (reader, writer) := descriptors | return (5, ByteArray.empty)
   let plan : Plan := {
@@ -144,7 +214,9 @@ def readAskpass (path : String) (prompt : ByteArray) (uid gid : UInt32)
     groups := groups.map UInt32.toNat
     path := path
     prompt := prompt.data.map UInt8.toNat
-    descriptor := writer.toNat }
+    descriptor := writer.toNat
+    failure
+    limits := ← Limits.pending }
   let spawned ← try pure (some (← Helper.spawn "pam-askpass" (toJson plan) #[writer]))
     catch _ => pure none
     finally quietClose writer
@@ -167,12 +239,34 @@ def createAdminFlag (path : String) (uid gid : UInt32) (groups : Array UInt32) :
     gid := gid.toNat
     groups := groups.map UInt32.toNat
     path := path }
-  unless validPlan plan do throw (IO.userError "invalid admin flag arguments")
+  unless validPlan (INT_MAX ()).toNat plan do
+    throw (IO.userError "invalid admin flag arguments")
   let child ← Helper.spawn "pam-admin" (toJson plan)
   if (← wait child) != 0 then throw (IO.userError "unable to create admin flag")
 
+def validMailInput (path : String) (args : Array String) (body : String) : Bool :=
+  !(path.contains '\x00' || body.contains '\x00' || args.any (·.contains '\x00'))
+
+theorem validMailInput_iff (path : String) (args : Array String) (body : String) :
+    validMailInput path args body = true ↔
+      path.contains '\x00' = false ∧ body.contains '\x00' = false ∧
+      ∀ arg ∈ args, arg.contains '\x00' = false := by
+  simp [validMailInput, Array.forall_mem_iff_forall_getElem, and_assoc]
+
+theorem validMailInput_rejects_nul (path : String) (args : Array String) (body : String)
+    (h : path.contains '\x00' = true ∨ body.contains '\x00' = true ∨
+      ∃ arg ∈ args, arg.contains '\x00' = true) : validMailInput path args body = false := by
+  apply Bool.eq_false_iff.mpr
+  intro accepted
+  have safe := (validMailInput_iff path args body).mp accepted
+  rcases h with h | h | ⟨arg, member, h⟩
+  · simp [h] at safe
+  · simp [h] at safe
+  · have clean := safe.2.2 arg member
+    simp [h] at clean
+
 def sendMail (path : String) (args : Array String) (body : String) : IO Unit := do
-  if path.contains '\x00' || body.contains '\x00' || args.any (·.contains '\x00') then
+  unless validMailInput path args body do
     throw (IO.userError "argument contains a NUL byte")
   if args.size > 63 then throw (IO.userError "too many mailer flags")
   let uid ← E.getuid

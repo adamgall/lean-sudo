@@ -20,6 +20,7 @@ namespace LeanSudo.Sys.Prim.Pam
 @[extern "lean_pam_const_PAM_BUF_ERR"] opaque PAM_BUF_ERR : Unit → UInt32
 @[extern "lean_pam_const_PAM_AUTH_ERR"] opaque PAM_AUTH_ERR : Unit → UInt32
 @[extern "lean_pam_const_PAM_CONV_ERR"] opaque PAM_CONV_ERR : Unit → UInt32
+@[extern "lean_pam_const_PAM_MAX_RESP_SIZE"] opaque PAM_MAX_RESP_SIZE : Unit → UInt32
 @[extern "lean_pam_const_PAM_SILENT"] opaque PAM_SILENT : Unit → UInt32
 @[extern "lean_pam_const_PAM_CHANGE_EXPIRED_AUTHTOK"]
 opaque PAM_CHANGE_EXPIRED_AUTHTOK : Unit → UInt32
@@ -39,7 +40,6 @@ opaque PAM_CHANGE_EXPIRED_AUTHTOK : Unit → UInt32
 @[extern "lean_pam_const_SUDO_CONV_TYPE_MASK"] opaque SUDO_CONV_TYPE_MASK : Unit → UInt32
 @[extern "lean_pam_const_signalInfoSize"] opaque signalInfoSize : Unit → UInt32
 @[extern "lean_pam_const_invalidFd"] opaque invalidFd : Unit → UInt32
-@[extern "lean_pam_const_POLLIN"] private opaque POLLIN : Unit → UInt32
 @[extern "lean_pam_const_callbackSuspendOffset"]
 private opaque callbackSuspendOffset : Unit → UInt32
 @[extern "lean_pam_const_callbackResumeOffset"]
@@ -62,13 +62,9 @@ def errorCode (code : UInt32) : Int := -Int.ofNat code.toNat
 @[extern "lean_pam_read"] opaque read (fd size : UInt32) : IO (Int × ByteArray)
 @[extern "lean_pam_write"] opaque write (fd : UInt32) (bytes : @& ByteArray)
     (offset : UInt32) : IO Int
-@[extern "lean_pam_poll"] private opaque pollRaw (fd signalFd events timeout : UInt32) :
-    IO (Int × UInt32 × UInt32)
-
-def poll (fd signalFd timeout : UInt32) : IO Int := do
-  let (count, input, signal) ← pollRaw fd signalFd (POLLIN ()) timeout
-  if count <= 0 then return count
-  return (if input != 0 then 1 else 0) + (if signal != 0 then 2 else 0)
+@[extern "lean_pam_poll"] opaque poll (fd timeout : UInt32) (unblock : @& ByteArray) : IO Int
+@[extern "lean_pam_catch_handler"] opaque catchHandler : Unit → USize
+@[extern "lean_pam_caught"] opaque caught (signal : UInt32) : IO Bool
 
 @[extern "lean_pam_tcgetattr"] opaque tcgetattr (fd : UInt32) : IO (Int × ByteArray)
 @[extern "lean_pam_tcsetattr"] opaque tcsetattr (fd action : UInt32)
@@ -84,7 +80,6 @@ def poll (fd signalFd timeout : UInt32) : IO Int := do
     (mask : @& ByteArray) : IO (Int × ByteArray)
 @[extern "lean_pam_signalfd"] opaque signalfd (mask : @& ByteArray) : IO Int
 @[extern "lean_pam_kill"] opaque kill (pid signal : UInt32) : IO Int
-@[extern "lean_pam_getpid"] opaque getpid : IO UInt32
 @[extern "lean_pam_dgettext"] opaque dgettext (text : @& String) : IO ByteArray
 @[extern "lean_pam_callback_call"] private opaque callbackCall (fn : USize)
     (signal : UInt32) (closure : USize) : IO Int

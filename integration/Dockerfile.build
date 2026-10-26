@@ -6,7 +6,8 @@
 
 
 ARG BASE=ubuntu:26.04
-FROM ${BASE} AS build
+FROM ${BASE} AS toolchain
+ARG TARGETARCH
 
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 PATH=/root/.elan/bin:$PATH
 RUN apt-get update \
@@ -22,7 +23,10 @@ RUN curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init
 COPY . /src
 WORKDIR /src
 
-RUN --mount=type=cache,id=lean-sudo-lake,sharing=locked,target=/src/.lake \
+FROM toolchain AS build
+ARG TARGETARCH
+
+RUN --mount=type=cache,id=lean-sudo-lake-${TARGETARCH},sharing=locked,target=/src/.lake \
     lake build sudo visudo \
  && scripts/check-ffi.sh \
  && scripts/check-c-boundary.sh \
@@ -31,3 +35,22 @@ RUN --mount=type=cache,id=lean-sudo-lake,sharing=locked,target=/src/.lake \
 
 FROM scratch AS artifact
 COPY --from=build /out/ /
+
+FROM toolchain AS variant
+ARG TARGETARCH
+ARG VARIANT=sanitize
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends clang libclang-rt-dev \
+ && rm -rf /var/lib/apt/lists/*
+ENV VARIANT=${VARIANT} LEAN_CC=/src/integration/coverage/compiler.py
+RUN mkdir -p /variant-bin \
+ && ln -s /src/integration/coverage/compiler.py /variant-bin/cc
+ENV PATH=/variant-bin:$PATH
+RUN --mount=type=cache,id=lean-sudo-${VARIANT}-${TARGETARCH},sharing=locked,target=/src/.lake \
+    /src/integration/coverage/build.sh
+
+FROM scratch AS variant-artifact
+COPY --from=variant /out/ /
+
+FROM variant AS coverage-report
+ENTRYPOINT ["python3", "/src/integration/coverage/report.py"]

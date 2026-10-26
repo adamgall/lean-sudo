@@ -360,52 +360,6 @@ theorem decodeSlot_validity {bytes : ByteArray} {offset : Nat} {located : Locate
     · contradiction
   · contradiction
 
-inductive ScanStep where
-  | stop
-  | next (offset : Nat) (entry : Option LocatedEntry)
-  deriving DecidableEq, Repr, Inhabited
-
-def scanStep (bytes : ByteArray) (offset extent : Nat) : ScanStep :=
-  if bytes.size < 4 then .stop else
-    let version := slotWord bytes 0 2
-    let size := slotWord bytes 2 2
-    if size < 4 ∨ offset + size > extent then .stop else
-      if version = 2 ∧ size = recordSize then
-        if bytes.size ≠ recordSize then .stop else
-          .next (offset + size) (decodeSlot bytes offset)
-      else .next (offset + size) none
-
-theorem scanStep_bounds {bytes : ByteArray} {offset extent next : Nat}
-    {entry : Option LocatedEntry} (h : scanStep bytes offset extent = .next next entry) :
-    offset + 4 ≤ next ∧ next ≤ extent := by
-  dsimp only [scanStep] at h
-  split at h
-  · contradiction
-  · split at h
-    · contradiction
-    · rename_i hb
-      split at h
-      · split at h
-        · contradiction
-        · cases h
-          omega
-      · cases h
-        omega
-
-theorem scanStep_decoded {bytes : ByteArray} {offset extent next : Nat}
-    {entry : LocatedEntry} (h : scanStep bytes offset extent = .next next (some entry)) :
-    decodeSlot bytes offset = some entry := by
-  dsimp only [scanStep] at h
-  split at h
-  · contradiction
-  · split at h
-    · contradiction
-    · split at h
-      · split at h
-        · contradiction
-        · exact (ScanStep.next.inj h).2
-      · cases h
-
 def DiskEntry.forSession (e : DiskEntry) (sid : Nat) : Option Record :=
   if e.kind = 1 ∨ e.sid = sid then e.toRecord else none
 

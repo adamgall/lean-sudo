@@ -31,7 +31,9 @@ structure Context extends Facts where
   command : Option ResolvedCmd
   commandSetid : Bool := false
   userEnv : EnvList
-  cwd : String
+  rawEnv : List String := []
+  cwd : Option String
+  cwdWritable : Bool := false
   userUmask : Nat
   ttyName : Option String
   now : Nat
@@ -129,6 +131,7 @@ inductive Action where
 structure LogLine where
   priority : String
   msg : String
+  tail : String := ""
   format : String := "sudo"
   reason : Option String := none
   event : EventLog.EventType := .accept
@@ -151,6 +154,8 @@ structure Decision where
   log : Option LogLine
   adminFlag : Option String := none
   mail : Bool := false
+  mailOnly : Bool := false
+  refusedEdit : Option EditPlan := none
   audit : Option AuditEvent := none
   deriving Inhabited
 

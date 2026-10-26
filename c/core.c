@@ -1,6 +1,15 @@
 #include "shim.h"
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+LEAN_EXPORT lean_obj_res lean_internal_set_thread_stack_size(size_t size);
+
+__attribute__((constructor(101))) static void core_bootstrap(void) {
+    for (int fd = 0; fd <= 2; fd++)
+        if (fcntl(fd, F_GETFL) == -1 && open("/dev/null", O_RDWR) != fd) _exit(1);
+    lean_internal_set_thread_stack_size(64 * 1024 * 1024);
+}
 
 LEAN_EXPORT lean_obj_res lean_sudo_getuid(void) {
     return ls_ok(lean_uint64_to_nat(getuid()));

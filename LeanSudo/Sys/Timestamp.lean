@@ -2,6 +2,7 @@ import LeanSudo.Timestamp
 import LeanSudo.Background
 import LeanSudo.Sys.Prim.Timestamp
 import LeanSudo.Sys.Prim.Exec
+import LeanSudo.Sys.FrontSignals
 import Std.Sync.Mutex
 
 namespace LeanSudo.Sys
@@ -150,70 +151,185 @@ theorem timestamp_directory_rejects_world_write
   intro safe
   exact writable safe.2.2.1
 
-private def checkDirectory (fd uid gid : UInt32) : Fs UInt32 := do
-  let platform ← getPlatform
-  try
-    let st ← call (Prim.Timestamp.stat fd)
-    if st.mode &&& platform.typeMask != platform.directory then
-      throw platform.notDirectory.toUInt32
-    if !decide (directorySafe platform
-        st.mode.toNat st.uid.toNat st.gid.toNat uid.toNat gid.toNat) then
-      throw platform.denied.toUInt32
-    return fd
-  catch error =>
-    discardClose fd
-    throw error
+private def octal (n : Nat) : String := String.ofList (Nat.toDigits 8 n)
+
+private def pathPrefixes (path : String) : List (String × String) := Id.run do
+  let mut out := #[]
+  let mut seen := ""
+  let mut name := ""
+  for c in path.toList do
+    if c == '/' then
+      if !name.isEmpty then out := out.push (name, seen)
+      name := ""
+    else name := name.push c
+    seen := seen.push c
+  if !name.isEmpty then out := out.push (name, seen)
+  return out.toList
+
+private def insecureDirectory (path : String) (st : Prim.Timestamp.Stat) (uid gid : UInt32) :
+    IO (Option (UInt32 × String)) := do
+  let p ← getPlatform
+  if decide (directorySafe p st.mode.toNat st.uid.toNat st.gid.toNat uid.toNat gid.toNat) then
+    return none
+  if st.mode &&& p.typeMask != p.directory then
+    return some (p.notDirectory.toUInt32,
+      s!"{path}: {← Prim.Timestamp.errorText p.notDirectory.toUInt32}")
+  if st.uid != uid.toUInt64 then
+    return some (p.denied.toUInt32, s!"{path} is owned by uid {st.uid}, should be {uid}")
+  if st.mode &&& p.otherWrite != 0 then
+    return some (p.denied.toUInt32, s!"{path} is world writable")
+  return some (p.denied.toUInt32, s!"{path} is owned by gid {st.gid}, should be {gid}")
+
+private def searchFlags (p : Prim.Timestamp.Constants) : UInt32 :=
+  (p.openReadOnly ||| p.openNonblock ||| p.openCloexec).toUInt32
+
+private def cwdFd (platform : Prim.Timestamp.Constants) : UInt32 :=
+  platform.currentDirectory.toUInt32
 
 private def rootFlags (platform : Prim.Timestamp.Constants) : UInt32 :=
   (platform.openReadOnly ||| platform.openDirectory ||| platform.openCloexec).toUInt32
 
-private def directoryFlags (platform : Prim.Timestamp.Constants) : UInt32 :=
-  rootFlags platform ||| platform.openNonblock.toUInt32
-private def cwdFd (platform : Prim.Timestamp.Constants) : UInt32 :=
-  platform.currentDirectory.toUInt32
+private abbrev DirResult := Except (UInt32 × List String) UInt32
 
-private def timestampDirectory (path : String) (uid gid : UInt32) (create : Bool) :
+private structure DirLog where
+  lastError : IO.Ref UInt32
+  messages : IO.Ref (List String)
+
+private def DirLog.fail (log : DirLog) (error : UInt32) (message : String) : Fs α := do
+  log.lastError.set error
+  log.messages.modify (· ++ [s!"{message}: {← Prim.Timestamp.errorText error}"])
+  throw error
+
+private def DirLog.note (log : DirLog) (action : IO (Prim.Timestamp.Result Unit)) : IO Unit := do
+  if let .error error ← action then log.lastError.set error
+
+private def attempt (action : IO (Prim.Timestamp.Result α)) : Fs (Prim.Timestamp.Result α) :=
+  liftM (retry action)
+
+private def requireDirectory (log : DirLog) (fd : UInt32) (pathPrefix : String) : Fs Unit := do
+  let p ← getPlatform
+  let checked : Fs Unit := do
+    match ← attempt (Prim.Timestamp.stat fd) with
+    | .error error => log.fail error s!"unable to stat {pathPrefix}"
+    | .ok st =>
+      if st.mode &&& p.typeMask != p.directory then
+        log.messages.modify (· ++
+          [s!"{pathPrefix} exists but is not a directory (0{octal st.mode.toNat})"])
+        throw (← log.lastError.get)
+  tryCatch checked fun error => do
+    discardClose fd
+    throw error
+
+private def openComponent (log : DirLog) (uid gid dir : UInt32) (name pathPrefix : String) :
     Fs UInt32 := do
-  let platform ← getPlatform
-  let cwdFd := cwdFd platform
-  let rootFlags := rootFlags platform
-  let directoryFlags := directoryFlags platform
-  match ← liftM (retry (Prim.Timestamp.openAt cwdFd path directoryFlags 0)) with
-  | .ok fd => checkDirectory fd uid gid
+  let p ← getPlatform
+  let flags := searchFlags p
+  let reopen : Fs UInt32 := do
+    match ← attempt (Prim.Timestamp.openAt dir name flags 0) with
+    | .error error => log.fail error s!"unable to open {pathPrefix}"
+    | .ok fd =>
+      requireDirectory log fd pathPrefix
+      pure fd
+  match ← attempt (Prim.Timestamp.openAt dir name flags 0) with
+  | .ok fd =>
+    requireDirectory log fd pathPrefix
+    pure fd
   | .error error =>
-    if !create || error.toUInt64 != platform.noEntry then throw error
-    let current ← IO.mkRef (← call (Prim.Timestamp.openAt cwdFd "/" rootFlags 0))
-    try
-      let names := (components path).toArray
-      for i in [:names.size] do
-        let dir ← current.get
-        let name := names[i]!
-        let final := i + 1 == names.size
-        let mut created := false
-        let fd ← match ← liftM (retry (Prim.Timestamp.openAt dir name directoryFlags 0)) with
-          | .ok fd => pure fd
-          | .error error => do
-            if error.toUInt64 != platform.noEntry then throw error
-            match ← liftM (retry
-                (Prim.Timestamp.mkdirAt dir name platform.privateDir.toUInt32)) with
-            | .ok _ => created := true
-            | .error error => if error.toUInt64 != platform.alreadyExists then throw error
-            let nofollow := if created && !final then platform.openNofollow.toUInt32 else 0
-            call (Prim.Timestamp.openAt dir name (directoryFlags ||| nofollow) 0)
-        discardClose dir
-        current.set fd
-        let dir := fd
-        let st ← call (Prim.Timestamp.stat dir)
-        if st.mode &&& platform.typeMask != platform.directory then
-          throw platform.notDirectory.toUInt32
-        if created || final then
-          call (Prim.Timestamp.chown dir uid gid)
-          if created then call (Prim.Timestamp.chmod dir
-            (if final then platform.privateDir else platform.traverseDir).toUInt32)
-    catch error =>
-      discardClose (← current.get)
+    log.lastError.set error
+    if error.toUInt64 != p.noEntry then log.fail error s!"unable to open {pathPrefix}"
+    match ← attempt (Prim.Timestamp.mkdirAt dir name p.traverseDir.toUInt32) with
+    | .error error =>
+      if error.toUInt64 != p.alreadyExists then log.fail error s!"unable to mkdir {pathPrefix}"
+      else
+        log.lastError.set error
+        reopen
+    | .ok () =>
+      match ← attempt (Prim.Timestamp.openAt dir name (flags ||| p.openNofollow.toUInt32) 0) with
+      | .error error => log.fail error s!"unable to open {pathPrefix}"
+      | .ok fd =>
+        requireDirectory log fd pathPrefix
+        log.note (Prim.Timestamp.chown fd uid gid)
+        log.note (Prim.Timestamp.chmod fd p.traverseDir.toUInt32)
+        pure fd
+
+private def openParent (log : DirLog) (path : String) (uid gid : UInt32) : Fs UInt32 := do
+  let p ← getPlatform
+  let root ← match ← attempt (Prim.Timestamp.openAt (cwdFd p) "/" (searchFlags p) 0) with
+    | .ok fd => pure fd
+    | .error error => log.fail error "unable to open /"
+  let parent ← IO.mkRef root
+  tryFinally (do
+    for (name, pathPrefix) in (pathPrefixes path).dropLast do
+      let dir ← parent.get
+      let next ← openComponent log uid gid dir name pathPrefix
+      discardClose dir
+      parent.set next
+    let fd ← parent.get
+    parent.set (UInt32.size - 1).toUInt32
+    pure fd) (do
+    let fd ← parent.get
+    if fd != (UInt32.size - 1).toUInt32 then discardClose fd)
+
+private def makeDirectory (log : DirLog) (path : String) (uid gid : UInt32) : Fs UInt32 := do
+  let p ← getPlatform
+  let some (base, _) := (pathPrefixes path).getLast? | throw (← log.lastError.get)
+  let parent ← openParent log path uid gid
+  tryFinally (do
+    let made ← attempt (Prim.Timestamp.mkdirAt parent base p.privateDir.toUInt32)
+    if let .error error := made then
+      if error.toUInt64 != p.alreadyExists then log.fail error s!"unable to mkdir {path}"
+      log.lastError.set error
+    match ← attempt (Prim.Timestamp.openAt parent base (searchFlags p) 0) with
+    | .error error =>
+      log.lastError.set error
       throw error
-    checkDirectory (← current.get) uid gid
+    | .ok fd =>
+      log.note (Prim.Timestamp.chown fd uid gid)
+      if made matches .ok () then log.note (Prim.Timestamp.chmod fd p.privateDir.toUInt32)
+      pure fd) (discardClose parent)
+
+structure TimestampNotice where
+  message : String
+  errstr : Option String := none
+  alert : Bool := false
+
+def TimestampNotice.text (notice : TimestampNotice) : String :=
+  match notice.errstr with
+  | some errstr => s!"{notice.message}: {errstr}"
+  | none => notice.message
+
+def TimestampNotice.logReason (notice : TimestampNotice) : String :=
+  match notice.errstr with
+  | some errstr => s!"{notice.message} : {errstr}"
+  | none => notice.message
+
+private abbrev Notices := IO.Ref (Array TimestampNotice)
+
+private def raise (sink : Notices) (notices : List TimestampNotice) : IO α := do
+  sink.modify (· ++ notices.toArray)
+  throw (IO.userError ("\n".intercalate (notices.map (·.text))))
+
+private def secureOpenDir (path : String) (uid gid : UInt32) (create : Bool) : IO DirResult := do
+  let p ← getPlatform
+  let missing (error : UInt32) : IO DirResult := do
+    if !create then return .error (error, [s!"{path}: {← Prim.Timestamp.errorText error}"])
+    let log : DirLog := { lastError := ← IO.mkRef error, messages := ← IO.mkRef [] }
+    match ← (makeDirectory log path uid gid).run with
+    | .ok fd => return .ok fd
+    | .error _ =>
+      let error ← log.lastError.get
+      return .error (error,
+        (← log.messages.get) ++ [s!"{path}: {← Prim.Timestamp.errorText error}"])
+  match ← retry (Prim.Timestamp.openAt (cwdFd p) path (searchFlags p) 0) with
+  | .error error => missing error
+  | .ok fd =>
+    match ← retry (Prim.Timestamp.stat fd) with
+    | .error error => discardClose fd; missing error
+    | .ok st =>
+      if let some (error, message) ← insecureDirectory path st uid gid then
+        discardClose fd
+        return .error (error, [message])
+      return .ok fd
 
 private def ownerOpen (dir : UInt32) (name : String) (uid : UInt32) (create : Bool) :
     Fs UInt32 := do
@@ -270,36 +386,31 @@ private def predatesBoot (st : Prim.Timestamp.Stat) : IO Bool := do
   if now.seconds.toNat == boot && now.fraction > platform.longMax then return false
   return st.mtime > platform.timeMax || st.mtime.toNat < boot
 
-private def tsOpen (directory name : String) (uid gid : UInt32) (create : Bool) :
+private def tsOpen (sink : Notices) (directory name : String) (uid gid : UInt32) (create : Bool) :
     IO (Option UInt32) := do
   let platform ← getPlatform
   if !validPath platform directory name uid gid then
     failure "timestamp path or owner" platform.invalid.toUInt32
-  let opened ← (timestampDirectory directory uid gid create).run
-  if !create && hasError opened platform.noEntry then return none
-  let dir ← finish "timestamp directory" opened
-  let action : Fs UInt32 := do
-    let fd ← ownerOpen dir name uid create
-    let current ← IO.mkRef fd
-    try
-      let st ← call (Prim.Timestamp.stat fd)
-      if ← predatesBoot st then
-        discardClose fd
-        current.set (UInt32.size - 1).toUInt32
-        match ← liftM (retry (Prim.Timestamp.unlinkAt dir name)) with
-        | .error error => if error.toUInt64 != platform.noEntry then throw error
-        | .ok _ => pure ()
-        let reopened ← ownerOpen dir name uid create
-        current.set reopened
-        let _ ← call (Prim.Timestamp.stat reopened)
-      return ← current.get
-    catch error =>
-      let fd ← current.get
-      if fd != (UInt32.size - 1).toUInt32 then discardClose fd
-      throw error
-  let result ← try action.run finally discardClose dir
-  if !create && hasError result platform.noEntry then return none
-  return some (← finish "timestamp open" result)
+  let directoryResult ← secureOpenDir directory uid gid create
+  if let .error (error, messages) := directoryResult then
+    if !create && error.toUInt64 == platform.noEntry then return none
+    raise sink (messages.map fun message => { message })
+  let .ok dir := directoryResult | return none
+  let reopenIfStale (first : Except UInt32 UInt32) : IO (Except UInt32 UInt32) := do
+    let .ok fd := first | return first
+    let .ok st ← retry (Prim.Timestamp.stat fd) | return first
+    if !(← predatesBoot st) then return first
+    discardClose fd
+    let _ ← retry (Prim.Timestamp.unlinkAt dir name)
+    (ownerOpen dir name uid create).run
+  let opened ← tryFinally (do reopenIfStale (← (ownerOpen dir name uid create).run))
+    (discardClose dir)
+  match opened with
+  | .ok fd => return some fd
+  | .error error =>
+    if !create && error.toUInt64 == platform.noEntry then return none
+    let errstr := some (← Prim.Timestamp.errorText error)
+    raise sink [{ message := s!"unable to open {directory}/{name}", errstr, alert := true }]
 
 private def validFd (what : String) (fd : UInt32) : IO Unit := do
   let platform ← getPlatform
@@ -327,23 +438,6 @@ private def tsReadAt (fd : UInt32) (offset : UInt64) (length : UInt32) : IO Byte
     bytes := bytes ++ part
   return bytes
 
-private def tsWriteAt (fd : UInt32) (offset : UInt64) (bytes : ByteArray) : IO Unit := do
-  let platform ← getPlatform
-  validFd "timestamp pwrite" fd
-  validExtent "timestamp pwrite" offset.toNat bytes.size
-  let mut total := 0
-  while total < bytes.size do
-    let count := min (bytes.size - total) platform.ssizeMax.toNat
-    let n ← finish "timestamp pwrite" (← retry
-      (Prim.Timestamp.pwrite fd (offset + total.toUInt64) bytes total.toUInt64 count.toUInt64))
-    if n == 0 then failure "timestamp pwrite" platform.ioError.toUInt32
-    total := total + n.toNat
-
-private def tsTruncate (fd : UInt32) (length : UInt64) : IO Unit := do
-  validFd "timestamp truncate" fd
-  validExtent "timestamp truncate" length.toNat 0
-  finish "timestamp truncate" (← retry (Prim.Timestamp.truncate fd length))
-
 private def interrupted : IO α := do
   let platform ← getPlatform
   throw (.interrupted "timestamp lock" platform.interrupted.toUInt32
@@ -368,6 +462,7 @@ private def tsLock (fd : UInt32) (offset length : UInt64) (lock : Bool) : IO Uni
   let action : IO Unit := do
     let mask := (1 : UInt64) <<< (platform.sigInt - 1) |||
       (1 : UInt64) <<< (platform.sigQuit - 1)
+    FrontSignals.collect
     let signals ← Prim.Exec.signalFd mask
     let attempt : IO Unit := do
       repeat
@@ -402,9 +497,12 @@ private def tsRemove (directory name : String) (uid gid : UInt32) : IO Unit := d
   let platform ← getPlatform
   if !validPath platform directory name uid gid then
     failure "timestamp path or owner" platform.invalid.toUInt32
-  let opened ← (timestampDirectory directory uid gid false).run
-  if hasError opened platform.noEntry then return
-  let dir ← finish "timestamp directory" opened
+  let dir ← match ← secureOpenDir directory uid gid false with
+    | .ok dir => pure dir
+    | .error (error, messages) =>
+      if error.toUInt64 == platform.noEntry then pure (UInt32.size - 1).toUInt32
+      else throw (IO.userError ("\n".intercalate messages))
+  if dir == (UInt32.size - 1).toUInt32 then return
   let result ← try retry (Prim.Timestamp.unlinkAt dir name) finally discardClose dir
   if hasError result platform.noEntry then return
   finish "timestamp remove" result
@@ -478,160 +576,416 @@ def stateMarker (dir : String) (uid : Nat) (create : Bool) : IO Bool := do
     let fd ← current.get
     if fd != (UInt32.size - 1).toUInt32 then discardClose fd
 
-private def openTimestamp (config : TimestampConfig) (create : Bool) : IO (Option UInt32) := do
+private def openTimestamp (sink : Notices) (config : TimestampConfig) (create : Bool) :
+    IO (Option UInt32) := do
   let _ ← uidToUInt32 config.uid
-  tsOpen config.directory (toString config.uid)
+  tsOpen sink config.directory (toString config.uid)
     (← uidToUInt32 config.ownerUid) (← uidToUInt32 config.ownerGid) create
 
 private def lockRecord (fd : UInt32) (offset : Nat) (lock : Bool) : IO Unit := do
   if offset >= UInt64.size then throw (IO.userError "timestamp offset out of range")
   tsLock fd offset.toUInt64 Timestamp.recordSize.toUInt64 lock
 
-private def writeEntry (fd : UInt32) (offset : Nat) (entry : Timestamp.DiskEntry) : IO Unit := do
+private def writeBytes (sink : Notices) (fd : UInt32) (fname : String) (offset : Nat)
+    (bytes : ByteArray) : IO Unit := do
+  let failed (errstr : Option String) : IO Unit :=
+    raise sink [{ message := s!"unable to write to {fname}", errstr, alert := true }]
+  if offset + bytes.size >= UInt64.size then failed none
+  match ← retry (Prim.Timestamp.pwrite fd offset.toUInt64 bytes 0 bytes.size.toUInt64) with
+  | .error error => failed (some (← Prim.Timestamp.errorText error))
+  | .ok n =>
+    if n.toNat != bytes.size then
+      if n != 0 then
+        let _ ← retry (Prim.Timestamp.truncate fd offset.toUInt64)
+      failed none
+
+private def writeEntry (sink : Notices) (fd : UInt32) (fname : String) (offset : Nat)
+    (entry : Timestamp.DiskEntry) : IO Unit := do
   if !decide entry.Representable then throw (IO.userError "timestamp record is out of range")
-  if offset >= UInt64.size then throw (IO.userError "timestamp offset out of range")
-  tsWriteAt fd offset.toUInt64 (Timestamp.encodeEntry entry)
+  writeBytes sink fd fname offset (Timestamp.encodeEntry entry)
 
 private def headerWord (bytes : ByteArray) (offset : Nat) : Nat :=
   (bytes[offset]?.getD 0).toNat + 256 * (bytes[offset + 1]?.getD 0).toNat
 
-private def initializeHeader (fd : UInt32) (extent : Nat) : IO Nat := do
-  let bytes ← tsReadAt fd 0 Timestamp.recordSize.toUInt32
-  let size := headerWord bytes 2
-  let kind := headerWord bytes 4
-  if bytes.size >= 40 && kind == 4 && size >= 8 && size <= extent then return extent
-  if bytes.size >= 40 && size == 40 then
-    let header := ByteArray.mk #[bytes[0]!, bytes[1]!, 40, 0, 4, 0] ++
-      ByteArray.mk (Array.replicate 34 0)
-    tsWriteAt fd 0 header
-    return extent
-  tsTruncate fd 0
-  tsWriteAt fd 0 (Timestamp.encodeEntry Timestamp.lockEntry)
-  return Timestamp.recordSize
+private structure TsFile where
+  size : IO Nat
+  readAt : Nat → Nat → IO ByteArray
+  writeAt : Nat → ByteArray → IO Unit
+  truncate : IO Unit
+
+private def readOrEmpty (fd : UInt32) (offset length : Nat) : IO ByteArray := do
+  if length == 0 || offset + length >= UInt64.size then return ByteArray.empty
+  try tsReadAt fd offset.toUInt64 length.toUInt32 catch _ => pure ByteArray.empty
+
+private def realFile (sink : Notices) (fd : UInt32) (fname : String) : TsFile where
+  size := do return (← tsSize fd).toNat
+  readAt := readOrEmpty fd
+  writeAt := writeBytes sink fd fname
+  truncate := do
+    match ← retry (Prim.Timestamp.truncate fd 0) with
+    | .ok () => pure ()
+    | .error error =>
+      let errstr := some (← Prim.Timestamp.errorText error)
+      raise sink [{ message := "unable to truncate time stamp file to 0 bytes", errstr }]
+
+private def overlayFile (fd : UInt32) : IO TsFile := do
+  let base ← try pure (← tsSize fd).toNat catch _ => pure 0
+  let state ← IO.mkRef (base, ([] : List (Nat × ByteArray)))
+  let total : IO Nat := do
+    let (baseSize, writes) ← state.get
+    return writes.foldl (fun m (offset, bytes) => max m (offset + bytes.size)) baseSize
+  return {
+    size := total
+    readAt := fun offset length => do
+      let (baseSize, writes) ← state.get
+      let size ← total
+      if offset >= size then return ByteArray.empty
+      let n := min length (size - offset)
+      let original ← if offset < baseSize then readOrEmpty fd offset (min n (baseSize - offset))
+        else pure ByteArray.empty
+      return ByteArray.mk ((List.range n).map fun i =>
+        match writes.find? (fun (o, b) => o ≤ offset + i && offset + i < o + b.size) with
+        | some (o, b) => b[offset + i - o]!
+        | none => original[i]?.getD 0).toArray
+    writeAt := fun offset bytes => state.modify fun (b, ws) => (b, (offset, bytes) :: ws)
+    truncate := state.set (0, []) }
+
+private def findRecord (file : TsFile) (start : Nat) (accept : Timestamp.LocatedEntry → Bool) :
+    IO (Option Timestamp.LocatedEntry × Nat) := do
+  let mut pos := start
+  for _ in [:(← file.size) + 2] do
+    let bytes ← file.readAt pos Timestamp.recordSize
+    if bytes.size != Timestamp.recordSize then return (none, pos + bytes.size)
+    pos := pos + Timestamp.recordSize
+    let size := headerWord bytes 2
+    if size != Timestamp.recordSize then
+      pos := pos + size - Timestamp.recordSize
+      if size == 0 then return (none, pos)
+      continue
+    if let some located := Timestamp.decodeSlot bytes (pos - Timestamp.recordSize) then
+      if accept located then return (some located, pos)
+  return (none, pos)
 
 private structure Ticket where
+  sink : Notices
   fd : UInt32
+  fname : String
   offset : Nat
   key : TimestampKey
   global : Bool
-
-private def scanFile (fd : UInt32) (extent : Nat) (initial : α)
-    (step : α → Timestamp.LocatedEntry → IO (ForInStep α)) : IO α := do
-  let mut state := initial
-  let mut offset := 0
-  for _ in [:extent / 4] do
-    let bytes ← tsReadAt fd offset.toUInt64 Timestamp.recordSize.toUInt32
-    match Timestamp.scanStep bytes offset extent with
-    | .stop => break
-    | .next next located =>
-      offset := next
-      if let some located := located then
-        match ← step state located with
-        | .done result => return result
-        | .yield result => state := result
-  return state
 
 private def initialEntry (key : TimestampKey) (scope : Timestamp.Scope) : Timestamp.DiskEntry :=
   Timestamp.entryFor key.lockScope key.sid
     { scope, authUid := key.authUid, time := 0, disabled := true }
 
-private def findEntry (fd : UInt32) (extent : Nat) (scope : Timestamp.Scope) (authUid : Nat) :
-    IO (Option Timestamp.LocatedEntry) :=
-  scanFile fd extent none fun _ located =>
-    pure (if located.matches scope authUid then .done (some located) else .yield none)
+namespace TimestampStorage
 
-private def openTicket (config : TimestampConfig) (key : TimestampKey) : IO Ticket := do
-  if key.lockScope == .global then throw (IO.userError "timestamp lock scope must be terminal or process")
-  let some fd ← openTimestamp config true | throw (IO.userError "unable to open timestamp file")
+def selectEntry (scope : Timestamp.Scope) (authUid : Nat) (located : Timestamp.LocatedEntry) :
+    ForInStep (Option Timestamp.LocatedEntry) :=
+  if located.matches scope authUid then .done (some located) else .yield none
+
+def recordsFor (key : TimestampKey) (located : Timestamp.LocatedEntry) :
+    List Timestamp.Record :=
+  (located.recordFor key.scope key.authUid key.sid).toList
+
+def updateFor (key : TimestampKey) (record : Timestamp.Record) :
+    Option Timestamp.DiskEntry :=
+  Timestamp.updateEntry key.scope key.lockScope key.sid key.authUid record
+
+theorem selectEntry_model (scope : Timestamp.Scope) (authUid : Nat)
+    (located : Timestamp.LocatedEntry) :
+    selectEntry scope authUid located = .done (some located) ↔
+      located.matches scope authUid = true := by
+  simp [selectEntry]
+
+theorem selectEntry_uid (scope : Timestamp.Scope) (authUid : Nat)
+    (located : Timestamp.LocatedEntry)
+    (h : selectEntry scope authUid located = .done (some located)) :
+    located.entry.authUid = authUid :=
+  Timestamp.LocatedEntry.matches_uid ((selectEntry_model scope authUid located).mp h)
+
+theorem recordsFor_model (key : TimestampKey) (located : Timestamp.LocatedEntry)
+    (record : Timestamp.Record) :
+    record ∈ recordsFor key located ↔
+      located.recordFor key.scope key.authUid key.sid = some record := by
+  simp [recordsFor]
+
+theorem lookup_model (key : TimestampKey) (located : Timestamp.LocatedEntry)
+    (now : Nat) (timeout : Option Nat) :
+    Timestamp.lookup now timeout key.scope key.authUid (recordsFor key located) = true ↔
+      ∃ record, located.recordFor key.scope key.authUid key.sid = some record ∧
+        Timestamp.valid now timeout key.scope key.authUid record = true := by
+  simp only [Timestamp.lookup_iff, recordsFor_model]
+
+theorem authorized_sound (key : TimestampKey) (located : Timestamp.LocatedEntry)
+    (now : Nat) (timeout : Option Nat)
+    (h : Timestamp.lookup now timeout key.scope key.authUid (recordsFor key located) = true) :
+    ∃ record, located.recordFor key.scope key.authUid key.sid = some record ∧
+      located.entry.authUid = key.authUid ∧ located.matches key.scope key.authUid = true ∧
+      located.startValid = true ∧ located.timeValid = true ∧
+      (located.entry.kind = 1 ∨ located.entry.sid = key.sid) ∧
+      record.scope = key.scope ∧ record.authUid = key.authUid ∧
+      record.disabled = false ∧ record.time ≤ now ∧
+      ∀ t, timeout = some t → t ≠ 0 ∧ now - record.time < t * 10 ^ 9 := by
+  obtain ⟨record, hr, hv⟩ := (lookup_model key located now timeout).mp h
+  exact ⟨record, hr, Timestamp.LocatedEntry.authorized_sound hr hv⟩
+
+theorem recordsFor_invalid_start (key : TimestampKey) (located : Timestamp.LocatedEntry)
+    (h : located.startValid = false) : recordsFor key located = [] := by
+  simp [recordsFor, located.recordFor_invalid_start key.scope key.authUid key.sid h]
+
+theorem recordsFor_invalid_time (key : TimestampKey) (located : Timestamp.LocatedEntry)
+    (h : located.timeValid = false) : recordsFor key located = [] := by
+  simp [recordsFor, located.recordFor_invalid_time key.scope key.authUid key.sid h]
+
+theorem recordsFor_wrong_session (key : TimestampKey) (located : Timestamp.LocatedEntry)
+    (hg : located.entry.kind ≠ 1) (hs : located.entry.sid ≠ key.sid) :
+    recordsFor key located = [] := by
+  simp [recordsFor, located.recordFor_wrong_sid key.scope key.authUid key.sid hg hs]
+
+
+theorem updateFor_sound (key : TimestampKey) (record : Timestamp.Record)
+    (entry : Timestamp.DiskEntry) (h : updateFor key record = some entry) :
+    record.scope = key.scope ∧ record.authUid = key.authUid ∧
+      entry.toRecord = some record ∧ entry.matches key.scope key.authUid = true :=
+  Timestamp.updateEntry_sound h
+
+theorem updateFor_wrong_uid (key : TimestampKey) (record : Timestamp.Record)
+    (h : record.authUid ≠ key.authUid) : updateFor key record = none :=
+  Timestamp.updateEntry_wrong_uid key.scope key.lockScope key.sid key.authUid record h
+
+theorem updateFor_wrong_scope (key : TimestampKey) (record : Timestamp.Record)
+    (h : record.scope ≠ key.scope) : updateFor key record = none :=
+  Timestamp.updateEntry_wrong_scope key.scope key.lockScope key.sid key.authUid record h
+
+theorem initialEntry_model (key : TimestampKey) (scope : Timestamp.Scope) :
+    (initialEntry key scope).toRecord =
+      some { scope, authUid := key.authUid, time := 0, disabled := true } :=
+  Timestamp.entryFor_projection key.lockScope key.sid _
+
+theorem initialEntry_denied (key : TimestampKey) (scope : Timestamp.Scope)
+    (now : Nat) (timeout : Option Nat) (record : Timestamp.Record)
+    (h : (initialEntry key scope).toRecord = some record) :
+    Timestamp.valid now timeout key.scope key.authUid record = false := by
+  rw [initialEntry_model] at h
+  cases Option.some.inj h
+  simp [Timestamp.valid]
+
+theorem invalidated_records_denied (key : TimestampKey) (located : Timestamp.LocatedEntry)
+    (now : Nat) (timeout : Option Nat) :
+    Timestamp.lookup now timeout key.scope key.authUid
+      (recordsFor key { located with entry := Timestamp.disabledEntry located.entry }) =
+      false := by
+  apply Bool.eq_false_iff.mpr
+  intro accepted
+  obtain ⟨record, hr, hv⟩ := (lookup_model key
+    { located with entry := Timestamp.disabledEntry located.entry } now timeout).mp accepted
+  have denied := located.disabled_not_valid key.scope key.authUid key.sid now timeout hr
+  simp [denied] at hv
+
+end TimestampStorage
+
+private def writeKey (file : TsFile) (offset : Nat) (entry : Timestamp.DiskEntry) : IO Unit := do
+  if !decide entry.Representable then throw (IO.userError "timestamp record is out of range")
+  file.writeAt offset (Timestamp.encodeEntry entry)
+
+private def lockPlan (file : TsFile) (key : TimestampKey) : IO (Nat × Nat) := do
+  let first ← file.readAt 0 Timestamp.recordSize
+  let size := headerWord first 2
+  let mut pos := first.size
+  let mut overwrite : Bool := first.size < 40
+  if !overwrite && headerWord first 4 != 4 then
+    if size == 40 then
+      file.writeAt 0 (ByteArray.mk #[first[0]!, first[1]!, 40, 0, 4, 0] ++
+        ByteArray.mk (Array.replicate 34 0))
+    else overwrite := true
+  if overwrite then
+    file.truncate
+    file.writeAt pos (Timestamp.encodeEntry Timestamp.lockEntry)
+    pos := pos + Timestamp.recordSize
+  else if size != Timestamp.recordSize then pos := size
+  let (found, next) ← findRecord file pos fun l => l.matches key.lockScope key.authUid
+  let lockPos ← match found with
+    | some _ => pure (next - Timestamp.recordSize)
+    | none => do
+      writeKey file next (initialEntry key key.lockScope)
+      pure next
+  if key.scope != .global then return (lockPos, lockPos)
+  let (found, next) ← findRecord file 0 fun l => l.matches .global key.authUid
+  if found.isSome then return (lockPos, next - Timestamp.recordSize)
+  writeKey file next (initialEntry key .global)
+  return (lockPos, next)
+
+private def seekable (fd : UInt32) : IO Bool := do
+  match ← retry (Prim.Timestamp.pread fd 0 0) with
+  | .ok _ => return true
+  | .error _ => return false
+
+private def tryLock (fd : UInt32) (offset : Nat) : IO Bool := do
   try
-    lockRecord fd 0 true
-    let (offset, lockOffset) ← try
-      let mut extent ← initializeHeader fd (← tsSize fd).toNat
-      let lockOffset ← match ← findEntry fd extent key.lockScope key.authUid with
-        | some located => pure located.offset
-        | none => do
-          let offset := extent
-          writeEntry fd offset (initialEntry key key.lockScope)
-          extent := extent + Timestamp.recordSize
-          pure offset
-      let offset ← if key.scope == .global then
-          match ← findEntry fd extent key.scope key.authUid with
-          | some located => pure located.offset
-          | none => do
-            writeEntry fd extent (initialEntry key key.scope)
-            pure extent
-        else pure lockOffset
-      pure (offset, lockOffset)
-    finally
-      lockRecord fd 0 false
-    lockRecord fd lockOffset true
-    return { fd, offset, key, global := key.scope == .global }
+    lockRecord fd offset true
+    return true
   catch e =>
+    match e with
+    | .interrupted .. => throw e
+    | _ => return false
+
+private def unlockQuiet (fd : UInt32) (offset : Nat) : IO Unit := do
+  try lockRecord fd offset false catch _ => pure ()
+
+private def openTicket (sink : Notices) (config : TimestampConfig) (key : TimestampKey) :
+    IO (Option Ticket) := do
+  if key.lockScope == .global then
+    throw (IO.userError "timestamp lock scope must be terminal or process")
+  let some fd ← openTimestamp sink config true | return none
+  let fname := s!"{config.directory}/{config.uid}"
+  let attempt : IO (Option Nat) := do
+    if !(← seekable fd) then return none
+    if !(← tryLock fd 0) then return none
+    let (lockPos, offset) ← tryFinally (lockPlan (realFile sink fd fname) key)
+      (unlockQuiet fd 0)
+    if !(← tryLock fd lockPos) then return none
+    return some offset
+  let locked ← tryCatch attempt fun e => do
     tsClose fd
     throw e
+  match locked with
+  | none =>
+    tsClose fd
+    return none
+  | some offset =>
+    return some { sink, fd, fname, offset, key, global := key.scope == .global }
 
-private def readTicket (ticket : Ticket) : IO (List Timestamp.Record) := do
-  if ticket.global then lockRecord ticket.fd ticket.offset true
-  try
-    let bytes ← tsReadAt ticket.fd ticket.offset.toUInt64 Timestamp.recordSize.toUInt32
-    let some located := Timestamp.decodeSlot bytes ticket.offset | return []
-    return (located.recordFor ticket.key.scope ticket.key.authUid ticket.key.sid).toList
-  finally
-    if ticket.global then lockRecord ticket.fd ticket.offset false
+private def futureRecord (ticket : Ticket) (timeout : Option Nat)
+    (located : Timestamp.LocatedEntry) : IO Bool := do
+  let some limit := timeout | return false
+  if limit == 0 then return false
+  let some record := located.recordFor ticket.key.scope ticket.key.authUid ticket.key.sid |
+    return false
+  return !record.disabled && record.time > (← bootTimeNanos)
+
+private def readTicket (ticket : Ticket) (timeout : Option Nat) :
+    IO (Option (List Timestamp.Record)) := do
+  if ticket.global then
+    if !(← tryLock ticket.fd ticket.offset) then return none
+  tryFinally (do
+    let bytes ← readOrEmpty ticket.fd ticket.offset Timestamp.recordSize
+    if bytes.size != Timestamp.recordSize then return none
+    let some located := Timestamp.decodeSlot bytes ticket.offset | return some []
+    if ← futureRecord ticket timeout located then
+      let notice : TimestampNotice :=
+        { message := "ignoring time stamp from the future", alert := true }
+      ticket.sink.modify (·.push notice)
+      let disabled := { located with entry := Timestamp.disabledEntry located.entry }
+      try
+        writeBytes ticket.sink ticket.fd ticket.fname (ticket.offset + 6)
+          (ByteArray.mk (Timestamp.encNat 2 disabled.entry.flags).toArray)
+      catch _ => pure ()
+      return some (TimestampStorage.recordsFor ticket.key disabled)
+    return some (TimestampStorage.recordsFor ticket.key located))
+    (if ticket.global then unlockQuiet ticket.fd ticket.offset else pure ())
 
 private def updateTicket (ticket : Ticket) (record : Timestamp.Record) : IO Unit := do
-  let some entry := Timestamp.updateEntry ticket.key.scope ticket.key.lockScope
-      ticket.key.sid ticket.key.authUid record |
+  let some entry := TimestampStorage.updateFor ticket.key record |
     throw (IO.userError "timestamp update does not match locked record")
-  if ticket.global then lockRecord ticket.fd ticket.offset true
-  try writeEntry ticket.fd ticket.offset entry
-  finally
-    if ticket.global then lockRecord ticket.fd ticket.offset false
+  let locked ← if ticket.global then tryLock ticket.fd ticket.offset else pure false
+  tryFinally (writeEntry ticket.sink ticket.fd ticket.fname ticket.offset entry)
+    (if locked then unlockQuiet ticket.fd ticket.offset else pure ())
 
 def readTimestamp (config : TimestampConfig) (key : TimestampKey) : IO (List Timestamp.Record) := do
-  let some fd ← openTimestamp config false | return []
-  try
-    let extent := (← tsSize fd).toNat
-    let header ← tsReadAt fd 0 8
-    if headerWord header 4 != 4 then return []
-    let some located ← findEntry fd extent key.scope key.authUid | return []
-    return (located.recordFor key.scope key.authUid key.sid).toList
-  finally tsClose fd
+  if key.lockScope == .global then return []
+  let some fd ← openTimestamp (← IO.mkRef #[]) config false | return []
+  tryFinally (do
+    if !(← seekable fd) then return []
+    let file ← overlayFile fd
+    let (_, offset) ← lockPlan file key
+    let bytes ← file.readAt offset Timestamp.recordSize
+    if bytes.size != Timestamp.recordSize then return []
+    let some located := Timestamp.decodeSlot bytes offset | return []
+    return TimestampStorage.recordsFor key located) (tsClose fd)
 
-private def reportCacheError (report : String → IO Unit) (error : IO.Error) : IO Unit :=
-  match error with
-  | .interrupted _ _ _ => pure ()
-  | _ => report error.toString
+private def reportNotices (sink : Notices) (report : TimestampNotice → IO Unit)
+    (error : Option IO.Error) : IO Unit := do
+  let notices ← sink.get
+  sink.set #[]
+  for notice in notices do report notice
+  if let some error := error then
+    match error with
+    | .interrupted _ _ _ => pure ()
+    | _ => if notices.isEmpty then report { message := error.toString }
 
-def withTimestampFile (config : TimestampConfig) (key : TimestampKey)
-    (f : List Timestamp.Record → IO (Option Timestamp.Record × α))
-    (report : String → IO Unit := fun _ => pure ()) : IO α := do
-  let opened : Except IO.Error Ticket ←
-    try pure (.ok (← openTicket config key)) catch e => pure (.error e)
-  match opened with
-  | .error e =>
-    reportCacheError report e
-    return (← f []).2
-  | .ok ticket =>
+structure TimestampHooks where
+  suspend : IO Unit
+  resume : IO Bool
+
+private def closeSlot (slot : IO.Ref (Option Ticket)) : IO Unit := do
+  let some ticket ← slot.get | return
+  slot.set none
+  tsClose ticket.fd
+
+private def ticketHooks (sink : Notices) (report : TimestampNotice → IO Unit)
+    (config : TimestampConfig) (key : TimestampKey) (slot : IO.Ref (Option Ticket)) :
+    TimestampHooks where
+  suspend := try closeSlot slot catch _ => pure ()
+  resume := do
     try
-      let records ← try readTicket ticket catch e => reportCacheError report e; pure []
-      let (record, result) ← f records
-      if let some record := record then
-        try updateTicket ticket record catch e => reportCacheError report e
+      let ticket ← openTicket sink config key
+      slot.set ticket
+      reportNotices sink report none
+      return ticket.isSome
+    catch e =>
+      reportNotices sink report (some e)
+      return false
+
+def withTimestampHooks (config : TimestampConfig) (key : TimestampKey)
+    (report : TimestampNotice → IO Unit) (f : TimestampHooks → IO α) : IO α := do
+  let slot : IO.Ref (Option Ticket) ← IO.mkRef none
+  try f (ticketHooks (← IO.mkRef #[]) report config key slot) finally closeSlot slot
+
+def withTimestampFile (config : TimestampConfig) (key : TimestampKey) (timeout : Option Nat)
+    (f : TimestampHooks → List Timestamp.Record → IO (Option Timestamp.Record × α))
+    (report : TimestampNotice → IO Unit := fun _ => pure ()) : IO α := do
+  let sink ← IO.mkRef #[]
+  let slot : IO.Ref (Option Ticket) ← IO.mkRef none
+  let hooks := ticketHooks sink report config key slot
+  let opened : Except IO.Error (Option Ticket) ←
+    try pure (.ok (← openTicket sink config key)) catch e => pure (.error e)
+  try
+    match opened with
+    | .error e =>
+      reportNotices sink report (some e)
+      return (← f hooks []).2
+    | .ok none =>
+      reportNotices sink report none
+      return (← f hooks []).2
+    | .ok (some ticket) =>
+      slot.set (some ticket)
+      let status ← try readTicket ticket timeout catch e =>
+        reportNotices sink report (some e)
+        pure none
+      reportNotices sink report none
+      let (record, result) ← f hooks (status.getD [])
+      if status.isSome then
+        if let some record := record then
+          if let some current ← slot.get then
+            try updateTicket current record catch e => reportNotices sink report (some e)
       return result
-    finally tsClose ticket.fd
+  finally closeSlot slot
 
 def invalidateTimestamp (config : TimestampConfig) (scope : Timestamp.Scope) : IO Unit := do
-  let some fd ← openTimestamp config false | return
+  let sink ← IO.mkRef #[]
+  let some fd ← openTimestamp sink config false | return
   try
     lockRecord fd 0 true
-    let extent := (← tsSize fd).toNat
-    scanFile fd extent () fun _ located => do
-      if located.matches scope 0 true then
+    let file := realFile sink fd s!"{config.directory}/{config.uid}"
+    let mut pos := 0
+    for _ in [:(← file.size) / Timestamp.recordSize + 2] do
+      let (found, next) ← findRecord file pos fun l => l.matches scope 0 true
+      let some located := found | break
+      if located.entry.flags % 2 == 0 then
         let entry := Timestamp.disabledEntry located.entry
-        tsWriteAt fd (located.offset + 6).toUInt64
-          (ByteArray.mk (Timestamp.encNat 2 entry.flags).toArray)
-      pure (.yield ())
+        file.writeAt (located.offset + 6) (ByteArray.mk (Timestamp.encNat 2 entry.flags).toArray)
+      pos := next
   finally tsClose fd
 
 def removeTimestampFile (config : TimestampConfig) : IO Unit := do

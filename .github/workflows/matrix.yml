@@ -1,0 +1,54 @@
+name: Native architecture matrix
+on:
+  push:
+    branches:
+      - master
+      - ci/**
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  matrix:
+    name: Native ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/lean-sudo-build-cache
+          key: linux-${{ matrix.arch }}-build-${{ github.sha }}
+          restore-keys: |
+            linux-${{ matrix.arch }}-build-
+      - name: Build and run four native suites
+        env:
+          SUDO_BUILD_CACHE: ${{ runner.temp }}/lean-sudo-build-cache
+          SUDO_MATRIX_JOBS: 2
+        run: |
+          set -o pipefail
+          mkdir -p integration/out
+          integration/matrix.sh --arch '${{ matrix.arch }}' | tee integration/out/matrix-summary.txt
+      - name: Rotate exported build cache
+        if: always()
+        env:
+          CACHE: ${{ runner.temp }}/lean-sudo-build-cache
+        run: |
+          if [ -d "$CACHE-new" ]; then
+            rm -rf "$CACHE"
+            mv "$CACHE-new" "$CACHE"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-${{ matrix.arch }}
+          path: integration/out/
+          if-no-files-found: error

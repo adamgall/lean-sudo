@@ -7,14 +7,59 @@ namespace LeanSudo.Sys.Prim.Exec
 @[extern "ls_exec_sig_default"] opaque defaultHandler : Unit → USize
 @[extern "ls_exec_sig_ignore"] opaque ignoreHandler : Unit → USize
 
-def supportedSignal (signal : Nat) : Bool :=
-  signal < (kernelRealtimeMin ()).toNat || signal ≥ (realtimeMin ()).toNat
+def signalSupported (kernelMin userMin signal : Nat) : Bool :=
+  signal < kernelMin || signal ≥ userMin
 
-def supportedMask (mask : UInt64) : UInt64 := Id.run do
-  let mut result := mask
-  for signal in [(kernelRealtimeMin ()).toNat:(realtimeMin ()).toNat] do
-    result := result &&& ~~~((1 : UInt64) <<< (signal - 1).toUInt64)
-  return result
+def supportedSignal (signal : Nat) : Bool :=
+  signalSupported (kernelRealtimeMin ()).toNat (realtimeMin ()).toNat signal
+
+def signalBit (signal : Nat) : UInt64 := (1 : UInt64) <<< (signal - 1).toUInt64
+
+def clearSignalRange (first : Nat) : Nat → UInt64 → UInt64
+  | 0, mask => mask
+  | count + 1, mask =>
+    clearSignalRange (first + 1) count (mask &&& ~~~signalBit first)
+
+def supportedMask (mask : UInt64) : UInt64 :=
+  clearSignalRange (kernelRealtimeMin ()).toNat
+    ((realtimeMin ()).toNat - (kernelRealtimeMin ()).toNat) mask
+
+theorem signalSupported_excludes_internal (kernelMin userMin signal : Nat)
+    (lower : kernelMin ≤ signal) (upper : signal < userMin) :
+    signalSupported kernelMin userMin signal = false := by
+  simp [signalSupported, Nat.not_lt.mpr lower, Nat.not_le.mpr upper]
+
+theorem clearSignalRange_preserves_clear (first count : Nat) (mask bit : UInt64)
+    (clear : mask &&& bit = 0) :
+    clearSignalRange first count mask &&& bit = 0 := by
+  induction count generalizing first mask with
+  | zero => exact clear
+  | succ count ih =>
+    apply ih
+    rw [UInt64.and_assoc, UInt64.and_comm (~~~signalBit first) bit,
+      ← UInt64.and_assoc, clear]
+    simp
+
+theorem clearSignalRange_excludes (first count signal : Nat) (mask : UInt64)
+    (lower : first ≤ signal) (upper : signal < first + count) :
+    clearSignalRange first count mask &&& signalBit signal = 0 := by
+  induction count generalizing first mask with
+  | zero => omega
+  | succ count ih =>
+    simp only [clearSignalRange]
+    by_cases same : signal = first
+    · subst signal
+      apply clearSignalRange_preserves_clear
+      simp [UInt64.and_assoc]
+    · apply ih <;> omega
+
+theorem supportedMask_excludes_internal (mask : UInt64) (signal : Nat)
+    (lower : (kernelRealtimeMin ()).toNat ≤ signal)
+    (upper : signal < (realtimeMin ()).toNat) :
+    supportedMask mask &&& signalBit signal = 0 := by
+  apply clearSignalRange_excludes
+  · exact lower
+  · omega
 
 @[extern "leansudo_prim_exec_signal_fd"]
 private opaque signalFdRaw (mask : UInt64) : IO UInt32
@@ -28,8 +73,14 @@ private opaque signalMaskRaw (mask : UInt64) : IO Unit
 def signalMask (mask : UInt64) : IO Unit :=
   signalMaskRaw (supportedMask mask)
 
+def restoreSignalMask (original : UInt64) : IO Unit :=
+  signalMask original
+
 @[extern "leansudo_prim_exec_startup_mask"]
 opaque startupMask : IO UInt64
+
+@[extern "leansudo_prim_exec_inherited_fds"]
+opaque inheritedDescriptors : IO UInt64
 
 @[extern "leansudo_prim_exec_binary_fd"]
 opaque binaryFd : IO UInt32
@@ -99,7 +150,8 @@ opaque socketpair : IO (UInt32 × UInt32)
 opaque peerCredentials (fd : UInt32) : IO (UInt32 × UInt32 × UInt32)
 
 @[extern "leansudo_prim_exec_fork_helper"]
-opaque forkHelper (executable plan : UInt32) (keep : @& Array UInt32) : IO UInt32
+opaque forkHelper (executable : UInt32) (keep : @& Array UInt32) (source target : UInt32)
+  (marker : @& String) : IO UInt32
 
 @[extern "leansudo_prim_exec_getpid"] opaque getpid : IO UInt32
 @[extern "leansudo_prim_exec_getppid"] opaque getppid : IO UInt32

@@ -26,7 +26,7 @@ RUN apt-get update \
       sudo sudo-rs python3 procps util-linux passwd login libpam-modules libpam-runtime \
       locales language-pack-de-base language-pack-fr-base strace openssl \
       slapd ldap-utils sssd sssd-ldap libsss-sudo libnss-sss rsyslog exim4-daemon-light \
-      ssh-askpass xvfb xdotool openssh-server openssh-client libpam-oath oathtool \
+      ssh-askpass xvfb xdotool openssh-server openssh-client libpam-oath oathtool cracklib-runtime \
  && rm -rf /var/lib/apt/lists/*
 RUN localedef -i de_DE -f UTF-8 de_DE.UTF-8 \
  && localedef -i fr_FR -f UTF-8 fr_FR.UTF-8

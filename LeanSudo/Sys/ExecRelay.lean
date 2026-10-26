@@ -1,5 +1,7 @@
 import LeanSudo.Sys.ExecMonitor
 import LeanSudo.Sys.Relay
+import LeanSudo.Sys.Core
+import LeanSudo.Sys.Prim.IoLog
 
 namespace LeanSudo.Sys.Exec
 
@@ -55,17 +57,22 @@ private def dimension (name : String) (fallback : UInt32) : IO UInt32 := do
   let some n := (String.ofList chars).toNat? | return fallback
   return if 0 < n && n ≤ 0x7FFFFFFF then n.toUInt32 else fallback
 
-def preparePty : IO Pty := do
-  let tty ← checkResult "unable to allocate pty"
-    (← Prim.Exec.openFile "/dev/tty" ((K.O_RDWR ()) ||| (K.O_NOCTTY ()) ||| (K.O_CLOEXEC ())) 0)
+def preparePty (owner : UInt32) : IO (Option Pty) := do
+  let opened ← Prim.Exec.openFile "/dev/tty"
+    ((K.O_RDWR ()) ||| (K.O_NOCTTY ()) ||| (K.O_CLOEXEC ())) 0
+  if opened < 0 then return none
+  let tty := opened.toInt.toNat.toUInt32
   let allocated ← IO.mkRef (none : Option (UInt32 × UInt32))
   try
+    let ttyGroup := ((← Sys.getgrnam "tty").map (·.gid.toUInt32)).getD 0xFFFFFFFF
     let original ← Prim.Exec.tcgetattr tty
     let (r, c) ← try Prim.Exec.winsize tty catch _ => pure (0, 0)
     let rows ← if r != 0 && c != 0 then pure r else dimension "LINES" 24
     let cols ← if r != 0 && c != 0 then pure c else dimension "COLUMNS" 80
     let pair ← Prim.Exec.openpty original r c
     allocated.set (some pair)
+    try Prim.IoLog.chown pair.2 owner ttyGroup catch error =>
+      throw (IO.userError s!"unable to allocate pty: {error}")
     let master := pair.1
     let slave := pair.2
     discard <| checkResult "unable to allocate pty"
@@ -76,11 +83,13 @@ def preparePty : IO Pty := do
     discard <| checkResult "unable to allocate pty"
       (← Prim.Exec.fcntl master (K.F_SETFL ()) (flags ||| (K.O_NONBLOCK ())))
     let mut mask := 0
+    let group ← Prim.Exec.getpgid 0
     for fd in [:3] do
-      if ← Prim.Exec.isatty fd.toUInt32 then mask := mask ||| (1 <<< fd)
-    let foreground := (← Prim.Exec.tcgetpgrp tty) == (← Prim.Exec.getpgid 0)
+      if (← Prim.Exec.isatty fd.toUInt32) && (← Prim.Exec.tcgetpgrp fd.toUInt32) == group then
+        mask := mask ||| (1 <<< fd)
+    let foreground := (← Prim.Exec.tcgetpgrp tty) == group
     let raw ← IO.mkRef false
-    return { tty, master, slave, mask, original, rows, cols, foreground, raw }
+    return some { tty, master, slave, mask, original, rows, cols, foreground, raw }
   catch error =>
     if let some (master, slave) ← allocated.get then
       closeQuiet master
@@ -226,6 +235,14 @@ private def shouldForward (record : Prim.Exec.SignalInfo) (child : UInt32) (pty 
     if pty && pg >= 0 && pg == (← Prim.Exec.getpgid 0) then return false
   return true
 
+private def terminate (state : RelayState) : IO RelayState := do
+  if state.command == 0 then return state
+  let send := fun signal => if state.pty.isSome then signalGroup state.command signal
+    else do discard <| Prim.Exec.kill state.command signal
+  send (K.SIGHUP ())
+  send (K.SIGTERM ())
+  return { state with terminating := true, deadline := (← IO.monoMsNow) + 2000 }
+
 private partial def signals (hooks : RelayHooks) (state : RelayState) : IO RelayState := do
   let some record ← Prim.Exec.readSignal state.signals | return state
   hooks.onSignal record.signo
@@ -252,19 +269,17 @@ private partial def signals (hooks : RelayHooks) (state : RelayState) : IO Relay
       state := { state with pty := some pty }
   else if record.signo != (K.SIGCHLD ()) &&
       (← shouldForward record state.command state.pty.isSome) then
-    if state.pty.isSome then sendControl state 1 record.signo
+    if record.signo == (K.SIGALRM ()) then state ← terminate state
+    else if state.pty.isSome then sendControl state 1 record.signo
     else discard <| Prim.Exec.kill state.command record.signo
   signals hooks state
 
 private def timer (state : RelayState) : IO RelayState := do
   if state.deadline == 0 || (← IO.monoMsNow) < state.deadline then return state
-  let send := fun signal => if state.pty.isSome then signalGroup state.command signal
-    else do discard <| Prim.Exec.kill state.command signal
-  if !state.terminating then
-    send (K.SIGHUP ())
-    send (K.SIGTERM ())
-    return { state with terminating := true, deadline := (← IO.monoMsNow) + 2000 }
-  send (K.SIGKILL ())
+  if !state.terminating then return ← terminate state
+  if state.command != 0 then
+    if state.pty.isSome then signalGroup state.command (K.SIGKILL ())
+    else discard <| Prim.Exec.kill state.command (K.SIGKILL ())
   return { state with deadline := 0 }
 
 private def pumpMaster (hooks : RelayHooks) (state : RelayState) : IO RelayState := do

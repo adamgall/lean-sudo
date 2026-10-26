@@ -17,6 +17,73 @@ private structure Plan where
   ppid : Nat
   deriving ToJson, FromJson
 
+def validSession (maximum directory status pid ppid : Nat) (argv0 : String)
+    (args : List String) (environment : List (String × String)) : Bool :=
+  directory ≤ maximum && status ≤ maximum &&
+    0 < pid && pid ≤ maximum && ppid ≤ maximum &&
+    !argv0.contains '\x00' && args.all (fun arg => !arg.contains '\x00') &&
+    environment.all (fun (name, value) =>
+      !name.isEmpty && !name.contains '=' && !name.contains '\x00' && !value.contains '\x00')
+
+theorem validSession_safe (maximum directory status pid ppid : Nat) (argv0 : String)
+    (args : List String) (environment : List (String × String))
+    (valid : validSession maximum directory status pid ppid argv0 args environment = true) :
+    directory ≤ maximum ∧ status ≤ maximum ∧ 0 < pid ∧ pid ≤ maximum ∧ ppid ≤ maximum ∧
+    argv0.contains '\x00' = false ∧
+    (∀ arg ∈ args, arg.contains '\x00' = false) ∧
+    (∀ name value, (name, value) ∈ environment →
+      name.isEmpty = false ∧ name.contains '=' = false ∧
+      name.contains '\x00' = false ∧ value.contains '\x00' = false) := by
+  simpa only [validSession, Bool.and_eq_true, decide_eq_true_eq, Bool.not_eq,
+    Bool.not_eq_true, List.all_eq_true, Prod.forall, and_assoc] using valid
+
+theorem validSession_rejects_descriptor (maximum directory status pid ppid : Nat)
+    (argv0 : String) (args : List String) (environment : List (String × String))
+    (invalid : maximum < directory ∨ maximum < status) :
+    validSession maximum directory status pid ppid argv0 args environment = false := by
+  apply Bool.eq_false_iff.mpr
+  intro valid
+  have safe := validSession_safe maximum directory status pid ppid argv0 args environment valid
+  omega
+
+theorem validSession_rejects_process (maximum directory status pid ppid : Nat)
+    (argv0 : String) (args : List String) (environment : List (String × String))
+    (invalid : pid = 0 ∨ maximum < pid ∨ maximum < ppid) :
+    validSession maximum directory status pid ppid argv0 args environment = false := by
+  apply Bool.eq_false_iff.mpr
+  intro valid
+  have safe := validSession_safe maximum directory status pid ppid argv0 args environment valid
+  omega
+
+theorem validSession_rejects_nul (maximum directory status pid ppid : Nat)
+    (argv0 : String) (args : List String) (environment : List (String × String))
+    (invalid : argv0.contains '\x00' = true ∨
+      (∃ arg ∈ args, arg.contains '\x00' = true) ∨
+      (∃ name value, (name, value) ∈ environment ∧
+        (name.contains '\x00' = true ∨ value.contains '\x00' = true))) :
+    validSession maximum directory status pid ppid argv0 args environment = false := by
+  apply Bool.eq_false_iff.mpr
+  intro valid
+  have safe := validSession_safe maximum directory status pid ppid argv0 args environment valid
+  rcases safe with ⟨_, _, _, _, _, argvSafe, argsSafe, envSafe⟩
+  rcases invalid with bad | ⟨arg, member, bad⟩ | ⟨name, value, member, bad⟩
+  · simp [argvSafe] at bad
+  · simp [argsSafe arg member] at bad
+  · rcases envSafe name value member with ⟨_, _, nameSafe, valueSafe⟩
+    simp [nameSafe, valueSafe] at bad
+
+theorem validSession_rejects_environment_name (maximum directory status pid ppid : Nat)
+    (argv0 : String) (args : List String) (environment : List (String × String))
+    (name value : String) (member : (name, value) ∈ environment)
+    (invalid : name.isEmpty = true ∨ name.contains '=' = true) :
+    validSession maximum directory status pid ppid argv0 args environment = false := by
+  apply Bool.eq_false_iff.mpr
+  intro valid
+  have safe := validSession_safe maximum directory status pid ppid argv0 args environment valid
+  rcases safe with ⟨_, _, _, _, _, _, _, envSafe⟩
+  rcases envSafe name value member with ⟨nonempty, noEquals, _, _⟩
+  simp [nonempty, noEquals] at invalid
+
 private initialize session : IO.Ref (Option Plan) ← IO.mkRef none
 private initialize notifier : IO.Ref (Option UInt32) ← IO.mkRef none
 
@@ -48,10 +115,8 @@ def started : IO Unit := do
 
 private def helper (run : List String → IO UInt32) (json : Json) : IO UInt32 := do
   let plan ← IO.ofExcept (fromJson? json : Except String Plan)
-  unless plan.directory ≤ (K.INT_MAX ()).toNat && plan.status ≤ (K.INT_MAX ()).toNat &&
-      !plan.argv0.contains '\x00' && plan.args.all (fun arg => !arg.contains '\x00') &&
-      plan.environment.all (fun (name, value) =>
-        !name.isEmpty && !name.contains '=' && !name.contains '\x00' && !value.contains '\x00') do
+  unless validSession (K.INT_MAX ()).toNat plan.directory plan.status plan.pid plan.ppid
+      plan.argv0 plan.args plan.environment do
     throw (IO.userError "invalid background session plan")
   let fd := plan.status.toUInt32
   discard <| descriptor (← fcntl fd (K.F_SETFD ()) (K.FD_CLOEXEC ()))

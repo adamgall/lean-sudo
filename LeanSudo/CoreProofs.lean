@@ -157,8 +157,11 @@ theorem edit_origin (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .e
   obtain ⟨a, ha, _, hf, hh, hd⟩ := decide_allowed_action ctx (.inr p) h
   cases hm : ctx.opts.mode <;> simp only [allowedAction, hf, hm, Sum.elim] at hh
   case edit =>
-    have hp : editPlan ctx a = p := by simpa using hh
-    exact ⟨a, ha, rfl, hp.symm, allowedFailure_env ctx a hf (Or.inr hm), hd⟩
+    cases hx : invalidEditFile ctx with
+    | some bad => simp [hx] at hh
+    | none =>
+      have hp : editPlan ctx a = p := by simpa [hx] using hh
+      exact ⟨a, ha, rfl, hp.symm, allowedFailure_env ctx a hf (Or.inr hm), hd⟩
   all_goals repeat first | split at hh | cases hh
 
 theorem exec_allowed (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = .exec p) :
@@ -200,24 +203,25 @@ theorem edit_allowed (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .
 theorem edit_files_normalized (ctx : Context) (p : EditPlan)
     (h : (decide ctx).action = .edit p) :
     ∀ file ∈ p.files, file.startsWith "/" = true ∧ file.contains '\x00' = false := by
-  obtain ⟨_, _, he, _⟩ := decide_allowed_action ctx (.inr p) h
+  obtain ⟨a', _, _, hf, hh, _⟩ := decide_allowed_action ctx (.inr p) h
   obtain ⟨a, _, hm, rfl, _, _⟩ := edit_origin ctx p h
   have hb : invalidEditFile ctx = none := by
     cases hx : invalidEditFile ctx with
     | none => rfl
-    | some bad =>
-      simp [earlyAction, earlyFailure, hm, hx] at he
-      repeat first | contradiction | split at he
+    | some bad => simp [allowedAction, hf, hm, hx] at hh
   simp only [invalidEditFile, List.find?_eq_none] at hb
   simpa [editPlan, normalizedEditFile] using hb
 
 theorem edit_files_match_policy (ctx : Context) (p : EditPlan)
     (h : (decide ctx).action = .edit p) :
     (request ctx).command = .sudoedit p.policyFiles ∧
-    p.files = p.policyFiles.map (fun f => if f.startsWith "/" then f
-      else ctx.cwd ++ (if ctx.cwd.endsWith "/" then "" else "/") ++ f) := by
+    p.files = p.policyFiles.map (fun f => if f.startsWith "/" then f else match ctx.cwd with
+      | some cwd => cwd ++ (if cwd.endsWith "/" then "" else "/") ++ f
+      | none => f) := by
   obtain ⟨a, _, hm, rfl, _, _⟩ := edit_origin ctx p h
   simp [editPlan, request, hm, files]
+  intro f _
+  cases ctx.cwd <;> rfl
 
 theorem commandTimeout_policy_bound (ctx : Context) (a : Allowed)
     (h : a.timeout.getD ctx.settings.commandTimeout ≠ 0) :
@@ -234,8 +238,7 @@ theorem exec_identity (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = 
     p.uid = ctx.target.uid ∧ p.gid =
       (if ctx.settings.staySetuid then ctx.invokingRealGid.getD ctx.invoking.gid
        else (ctx.targetGroup.map (·.gid)).getD ctx.target.gid) ∧
-    p.groups = (if ctx.opts.preserveGroups || ctx.settings.preserveGroups then
-      ctx.invoking.groups else ctx.target.groups).map (·.2) := by
+    p.groups = targetGroups ctx := by
   obtain ⟨a, rc, _, _, _, rfl, _, _⟩ := exec_origin ctx p h
   exact ⟨rfl, rfl, rfl⟩
 
@@ -272,7 +275,7 @@ theorem exempt_user_no_auth (ctx : Context) (j : Judgement)
   simp [authentication, policyNeedsAuth, h]
 
 theorem denied_authentication_disabled (ctx : Context)
-    (h : ctx.settings.authenticate = false) :
+    (h : ((deniedMatch ctx).map (·.needsAuth)).getD ctx.settings.authenticate = false) :
     authentication ctx .deny = .none := by
   simp [authentication, policyNeedsAuth, deniedNeedsAuth, h]
 

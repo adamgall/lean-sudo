@@ -25,8 +25,27 @@ import LeanSudo.Sys.Plugins
 
 namespace LeanSudo.Shell
 
+initialize diagnosticProgname : IO.Ref String ← IO.mkRef "sudo"
+
+initialize pendingParseMail : IO.Ref (Option (IO Unit)) ← IO.mkRef none
+
+private def flushParseMail : IO Unit := do
+  if let some send ← pendingParseMail.get then
+    pendingParseMail.set none
+    send
+
 private def warn (msg : String) : IO Unit := do
-  Sys.writeStderr ("sudo: " ++ (← I18n.translate msg) ++ "\n")
+  Sys.writeStderr ((← diagnosticProgname.get) ++ ": " ++ (← I18n.translate msg) ++ "\n")
+
+private partial def rawEnviron : IO (List String) := do
+  let stride := (Sys.Prim.Posix.SIZEOF_POINTER ()).toUSize
+  let mut cursor ← Sys.Prim.CoreFacts.environment
+  let mut out := #[]
+  repeat
+    let some bytes ← Sys.Prim.CoreFacts.environmentEntry cursor | break
+    if let some entry := String.fromUTF8? bytes then out := out.push entry
+    cursor := cursor + stride
+  return out.toList
 
 private def groupNames (gids : List Nat) : IO (List (String × Nat)) :=
   gids.eraseDups.mapM fun gid => do
@@ -109,13 +128,13 @@ private def lookupAs (paths : Array (String × Bool)) (uid gid : Nat)
         return if dot && ignoreDot then (none, true) else (some path, false)
   return (none, false)
 
-private def resolvePath (search name : String) (ignoreDot : Bool)
+private def resolvePath (search : Option String) (name : String) (ignoreDot : Bool)
     (invoking target : Principal) (realGid targetGid : Nat) (targetGroups : List Nat)
     (root : Option String := none) : IO (Option String × Bool) := do
   let paths := if name.contains '/' then #[(name, false)] else Id.run do
     let mut paths := #[]
     let mut dot := false
-    for dir in search.splitOn ":" do
+    for dir in (search.map (·.splitOn ":")).getD [] do
       if dir == "" || dir == "." then dot := true
       else paths := paths.push (dir ++ "/" ++ name, false)
     if dot then paths := paths.push ("./" ++ name, true)
@@ -125,12 +144,11 @@ private def resolvePath (search name : String) (ignoreDot : Bool)
   lookupAs paths invoking.uid realGid (invoking.groups.map (·.2)) ignoreDot root
 
 private def resolveCommand (opts : Cli.Options) (invoking target : Principal)
-    (env : EnvList) (cwd : String) (st : Settings) (realGid : Nat)
+    (env : EnvList) (cwd : Option String) (st : Settings) (realGid : Nat)
     (targetGroup : Option GroupInfo) (root : Option String := none) :
     IO (Option Core.ResolvedCmd × Bool) := do
   if opts.mode != .run && opts.mode != .list then return (none, false)
-  let search := (if userIsExempt st invoking then none else st.securePath).getD
-    ((env.lookup "PATH").getD "/usr/bin:/bin")
+  let search := (if userIsExempt st invoking then none else st.securePath).or (env.lookup "PATH")
   let (name, argv) := if opts.shell || opts.login then
       let shell := Cli.userShell (if opts.login then none else env.lookup "SHELL")
         (if opts.login then target.shell else invoking.shell)
@@ -144,7 +162,8 @@ private def resolveCommand (opts : Cli.Options) (invoking target : Principal)
   let (found, inDot) ← resolvePath search name st.ignoreDot invoking target realGid targetGid targetGroups root
   let some path := found | return (none, inDot)
   let directory := Policy.dirOf path
-  let inspected := if root.isSome then rootedPath root directory else absolute cwd directory
+  let inspected := if root.isSome then rootedPath root directory
+    else (cwd.map (absolute · directory)).getD directory
   let some parent ← Sys.realpath inspected |
     throw (IO.userError ("unable to resolve command directory: " ++ directory))
   let parent := rootRelative (← canonicalRoot root) parent directory
@@ -301,7 +320,7 @@ private def commandSetid (pinned : Option (Nat × Sys.FileStat)) (path : Option 
   return inode.any (fun s => s.mode &&& 0o6000 != 0)
 
 private def rootCommandFacts (policy : Sudoers.Sudoers) (opts : Cli.Options)
-    (invoking target : Principal) (env : EnvList) (cwd : String) (st : Settings)
+    (invoking target : Principal) (env : EnvList) (cwd : Option String) (st : Settings)
     (realGid : Nat) (targetGroup : Option GroupInfo) (homes : List (String × String))
     (fallback : Option Core.ResolvedCmd) (r : Request) (root : String)
     (algos : List Sudoers.DigestAlgo) (baselineRoot : Option String) : IO RootCommandFacts := do
@@ -335,10 +354,8 @@ private def rootCommandFacts (policy : Sudoers.Sudoers) (opts : Cli.Options)
     setid,
     globPaths := facts.globPaths, regexMatches := facts.regexMatches, digests, refusal }
 
-private def gatherFacts (policy : Sudoers.Sudoers) (r : Request)
-    (otherUsers : List String := []) (policyLocale : String := "C")
-    (otherHosts : List String := []) (root : Option String := none) : IO Request := do
-  let r ← gatherCommandFacts policy r policyLocale root
+private def gatherNetgroups (policy : Sudoers.Sudoers) (r : Request)
+    (otherUsers : List String := []) (otherHosts : List String := []) : IO Request := do
   let users := ([none, some r.user.name, some r.runasUser.name, some "root"] ++
     otherUsers.map some).eraseDups
   let hosts := ([none, some r.lhost, some r.host] ++ otherHosts.map some).eraseDups
@@ -348,20 +365,31 @@ private def gatherFacts (policy : Sudoers.Sudoers) (r : Request)
   let netgroups ← queries.mapM fun (n, u, h) => return (n, u, h, ← Sys.inNetgroup n h u domain)
   return { r with netgroups }
 
+private def gatherFacts (policy : Sudoers.Sudoers) (r : Request)
+    (otherUsers : List String := []) (policyLocale : String := "C")
+    (otherHosts : List String := []) (root : Option String := none) : IO Request := do
+  gatherNetgroups policy (← gatherCommandFacts policy r policyLocale root) otherUsers otherHosts
+
 private def defaults (policy : Sudoers.Sudoers) (invoking : Principal) (host : String)
     (runas : Option Principal) (cmd : Option Command) (facts : Request)
-    (promptOverride : Bool) (emitWarnings : Bool := false) : IO Settings := do
-  let (settings, warnings) ← IO.ofExcept
-    (Policy.resolveDefaults policy invoking host runas cmd facts.canon (some facts)
-      { passpromptOverride := promptOverride })
-  if emitWarnings then for warning in warnings do warn warning
-  return settings
+    (promptOverride : Bool) (emitWarnings : Bool := false)
+    (initialRunas : Option Principal := runas) : IO Settings := do
+  match Policy.resolveDefaults policy invoking host runas cmd facts.canon (some facts)
+      { passpromptOverride := promptOverride } (initialRunas := initialRunas) with
+  | .ok (settings, warnings) =>
+    if emitWarnings then
+      for warning in warnings do Sys.writeStderr ((← I18n.translate warning) ++ "\n")
+    return settings
+  | .error diagnostics =>
+    Sys.writeStderr ((← I18n.translate diagnostics) ++ "\n")
+    throw (IO.userError "")
 
 private def identityInitializationFailure (opts : Cli.Options) (invoking : Principal)
-    (tty : Option String) (cwd : String) (resolvedGroup : Option String) (message : String) : IO α := do
+    (tty : Option String) (cwd : Option String) (resolvedGroup : Option String) (message : String) :
+    IO α := do
   let body := Core.logEscape message ++ " ; " ++
     (tty.map (fun t => "TTY=" ++ Core.logEscape (if t.startsWith "/dev/" then (t.drop 5).toString else t) ++ " ; ")).getD "" ++
-    "PWD=" ++ Core.logEscape cwd ++ " ; " ++
+    (cwd.map (fun c => "PWD=" ++ Core.logEscape c ++ " ; ")).getD "" ++
     (opts.user.map (fun name => "USER=" ++ Core.logEscape name ++ " ; ")).getD "" ++
     ((resolvedGroup.or opts.group).map (fun name => "GROUP=" ++ Core.logEscape name ++ " ; ")).getD ""
   for bytes in EventLog.splitSyslogBytes invoking.name body 960 do
@@ -378,11 +406,105 @@ private def hostnameWarning (invoking : Principal) (host message : String)
       Sys.syslogBytes "authpriv" "alert" bytes false
   warn reason
 
+private def parseErrorMail (settings : Settings) (invoking : Principal)
+    (canonicalHost lookupHost : String) (lines : List String) : IO Unit := do
+  let some path := settings.mailerpath | return
+  let some recipient := settings.mailto | return
+  unless ← executable path do return
+  let longHost := if settings.fqdn then canonicalHost else lookupHost
+  let name := invoking.name
+  let sender := settings.mailfrom.getD name
+  let subject := (settings.mailsub.replace "%h" longHost).replace "%u" name
+  if [recipient, sender, subject].any (fun f => f.contains '\n' || f.contains '\r') then return
+  let body := "\n".intercalate ("problem parsing sudoers" :: lines)
+  let time ← Sys.logTime settings.logYear settings.sudoersLocale
+  let text := s!"To: {recipient}\nFrom: {sender}\nAuto-Submitted: auto-generated\n" ++
+    s!"Subject: {subject}\n\n{longHost} : {time} : {name} : {body}\n\n"
+  let flags := (settings.mailerflags.getD "").splitOn " " |>.flatMap (·.splitOn "\t")
+    |>.filter (!·.isEmpty)
+  try Sys.sendMail path flags.toArray text catch _ => pure ()
+
+private def logDefaultsTrace (invoking : Principal) (lookupHost : String)
+    (trace : List (Settings × String)) : IO Unit := do
+  for (st, message) in trace do
+    let body := Core.logEscape message
+    if let (some facility, some priority) := (st.syslog, st.syslogBadpri) then
+      for bytes in EventLog.splitSyslogBytes invoking.name body st.syslogMaxlen do
+        Sys.syslogBytes facility priority bytes st.syslogPid
+    if let some path := st.logfile then
+      let time ← Sys.logTime st.logYear st.sudoersLocale
+      try Sys.appendLog path (EventLog.formatFile time lookupHost invoking.name body st.logHost
+        st.loglinelen) catch _ => pure ()
+
+private def defaultsReport (policy : Sudoers.Sudoers) (invoking : Principal)
+    (host canonicalHost lookupHost : String) (runas : Principal) (facts : Request)
+    (promptOverride : Bool) : IO Unit := do
+  let (final, trace, _) := Policy.resolveDefaultsTrace policy invoking host (some runas) none
+    facts.canon (some facts) { passpromptOverride := promptOverride }
+  if trace.isEmpty then return
+  logDefaultsTrace invoking lookupHost trace
+  parseErrorMail final invoking canonicalHost lookupHost (trace.map (Core.logEscape ·.2))
+
+private def cmndDefaultsReport (policy : Sudoers.Sudoers) (invoking : Principal)
+    (host canonicalHost lookupHost : String) (runas runas0 : Principal) (cmd : Option Command)
+    (facts : Request) (promptOverride : Bool) : IO Unit := do
+  if cmd.isNone then return
+  let initial : Settings := { passpromptOverride := promptOverride }
+  let (_, sudoersPass, _) := Policy.resolveDefaultsTrace policy invoking host (some runas) none
+    facts.canon (some facts) initial (initialRunas := some runas0)
+  let (final, trace, failed) := Policy.resolveDefaultsTrace policy invoking host (some runas) cmd
+    facts.canon (some facts) initial (initialRunas := some runas0)
+  let trace := trace.drop sudoersPass.length
+  if trace.isEmpty then return
+  logDefaultsTrace invoking lookupHost trace
+  let lines := trace.map (Core.logEscape ·.2)
+  let send := parseErrorMail final invoking canonicalHost lookupHost lines
+  if failed then send else pendingParseMail.set (some send)
+
+private def parseFailureReport (opts : Cli.Options) (invoking : Principal)
+    (tty cwd : Option String) (host canonicalHost lookupHost : String)
+    (journal : List Sudoers.Journal) (recovered : List Sudoers.Located) : IO Unit := do
+  let target := opts.user.getD (if opts.group.isSome then invoking.name else "root")
+  let ttyName := tty.map fun t => if t.startsWith "/dev/" then (t.drop 5).toString else t
+  let context :=
+    (ttyName.map fun t => "TTY=" ++ Core.logEscape t ++ " ; ").getD "" ++
+    (cwd.map fun c => "PWD=" ++ Core.logEscape c ++ " ; ").getD "" ++
+    "USER=" ++ Core.logEscape target ++ " ; " ++
+    (opts.group.map fun name => "GROUP=" ++ Core.logEscape name ++ " ; ").getD ""
+  for entry in journal do
+    let body := if entry.raw then Core.logEscape entry.reason else
+      Core.logEscape entry.reason ++ ((entry.errstr.map (" : " ++ ·)).getD "") ++ " ; " ++ context
+    for bytes in EventLog.splitSyslogBytes invoking.name body 960 do
+      Sys.syslogBytes "authpriv" "alert" bytes false
+  if journal.isEmpty then return
+  let policy := recovered.map (·.entry)
+  let base : Request := {
+    user := invoking, host, lhost := canonicalHost, interfaces := []
+    runasUser := invoking, runasGroup := none, runasUserExplicit := opts.user.isSome
+    command := .list, now := ← Sys.unixTime, localTimeBounds := [] }
+  let facts ← try gatherFacts policy base catch _ => pure base
+  let settings := match Policy.resolveDefaults policy invoking host none none facts.canon
+      (some facts) {} with
+    | .ok (settings, _) => settings
+    | .error _ => {}
+  parseErrorMail settings invoking canonicalHost lookupHost
+    (journal.map (Core.logEscape ·.text))
+
 private def loadSources (sources : List Nsswitch.Source) (host : String)
-    (invoking : Principal) (other : Option Principal) :
+    (invoking : Principal) (other : Option Principal)
+    (parseFailure : List Sudoers.Journal → List Sudoers.Located → IO Unit) :
     IO (List (Nsswitch.Source × List Sudoers.Located)) :=
   sources.mapM fun source => do
-    if source.name == "files" then return (source, ← Sudoers.load host)
+    if source.name == "files" then
+      match ← Sudoers.load host (progname := ← diagnosticProgname.get) with
+      | .ok entries => return (source, entries)
+      | .unusable message journal =>
+        parseFailure journal []
+        warn message
+        throw (IO.userError "error initializing audit plugin sudoers_audit")
+      | .failed journal recovered =>
+        parseFailure journal recovered
+        throw (IO.userError "")
     let (defs, rules) ← Sys.Sss.query invoking.uid.toUInt32 invoking.name
     let rules ← match other with
       | some p => do
@@ -433,9 +555,14 @@ private def timestampKey (ctx : Core.Context) : Sys.TimestampKey := {
 
 private def withCredentialCache (ctx : Core.Context)
     (f : List Timestamp.Record → IO (Option Timestamp.Record × α))
-    (report : String → IO Unit) : IO α := do
-  if ctx.opts.resetTimestamp || ctx.settings.timestampTimeout == some 0 then return (← f []).2
-  Sys.withTimestampFile (timestampConfig ctx) (timestampKey ctx) f report
+    (report : Sys.TimestampNotice → IO Unit) : IO α := do
+  if ctx.settings.timestampTimeout == some 0 then
+    return ← Sys.withAuthSuspend (pure ()) (pure false) (Prod.snd <$> f [])
+  if ctx.opts.resetTimestamp then
+    return ← Sys.withTimestampHooks (timestampConfig ctx) (timestampKey ctx) report fun hooks =>
+      Sys.withAuthSuspend hooks.suspend hooks.resume (Prod.snd <$> f [])
+  Sys.withTimestampFile (timestampConfig ctx) (timestampKey ctx) ctx.settings.timestampTimeout
+    (fun hooks records => Sys.withAuthSuspend hooks.suspend hooks.resume (f records)) report
 
 private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Config) : IO Core.Context := do
   if let some message := Cli.timeoutError opts then
@@ -455,21 +582,32 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
   let canonicalHost := match hostResult with | .ok host => host | .error _ => lookupHost
   let longHost := canonicalHost
   let host := (longHost.splitOn ".").headD "localhost"
-  let cwd ← Sys.getcwd
+  let cwd ← Sys.currentDirectory
+  let cwdWritable ← if cwd.isSome then pure false else do
+    let owned := ((← Sys.stat ".").map (·.uid == invoking.uid)).getD false
+    pure (owned || (← Sys.access "." 2))
   let mask ← Sys.umask 0
   let _ ← Sys.umask mask
   let ttyDevice ← Sys.ttyDevice
   let ttyName ← ttyFor ttyDevice conf.devsearch
   let userEnv ← Sys.environ
+  let rawEnv := (← rawEnviron) ++
+    (userEnv.filter (·.1 == "TZ")).map fun (k, v) => k ++ "=" ++ v
   let targetGroupInfo ← try opts.group.mapM group catch e =>
     identityInitializationFailure opts invoking ttyName cwd none e.toString
   let requestedTarget ← try opts.user.mapM (fun name => targetUser name invokingRealGid) catch e =>
     identityInitializationFailure opts invoking ttyName cwd (targetGroupInfo.map (·.1.name)) e.toString
+  let runas0 ← match requestedTarget with
+    | some (target, _) => pure target
+    | none =>
+      if opts.group.isSome then pure invoking
+      else Prod.fst <$> targetUser "root" invokingRealGid
   let nss ← try IO.FS.readFile "/etc/nsswitch.conf" catch e =>
     match e with | .noFileOrDirectory _ _ _ => pure "" | _ => throw e
   let sources ← IO.ofExcept (Nsswitch.configure nss)
   let listUser ← opts.otherUser.mapM user
   let loadedSources ← loadSources sources host invoking listUser
+    (parseFailureReport opts invoking ttyName cwd host canonicalHost lookupHost)
   let ipaHost ← if sources.any (·.name == "sss") && lookupHost.toLower == rawHost.toLower then
       try pure (Sss.ipaHostname (← IO.FS.readFile "/etc/sssd/sssd.conf"))
       catch _ => pure none
@@ -489,11 +627,12 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
     runasUser := invoking, runasGroup := none, runasUserExplicit := opts.user.isSome
     command := .list, now := wallTime, localTimeBounds }
   let preliminary ← gatherFacts policy base
-  let initial ← defaults policy invoking host none none preliminary opts.prompt.isSome
+  defaultsReport policy invoking host canonicalHost lookupHost runas0 preliminary opts.prompt.isSome
+  let initial ← defaults policy invoking host (some runas0) none preliminary opts.prompt.isSome
   let plugin ← loadGroupPlugin initial.groupPlugin
   let pluginConfig := initial.groupPlugin
   let preliminary ← gatherPluginFacts policy preliminary plugin
-  let initial ← defaults policy invoking host none none preliminary opts.prompt.isSome
+  let initial ← defaults policy invoking host (some runas0) none preliminary opts.prompt.isSome
   let submitHostResult ← if lookupHost == rawHost then pure hostResult
     else if initial.fqdn then Sys.canonicalHostname rawHost else pure (.ok rawHost)
   if initial.fqdn then
@@ -515,6 +654,7 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
   let targetUnknownGid := targetGroupInfo.any (·.2)
   let lookupSettings ← defaults policy invoking host (some target) none
     { preliminary with runasUser := target, runasGroup := targetGroup } opts.prompt.isSome
+    (initialRunas := some runas0)
   let roots := (opts.chroot.toList ++ lookupSettings.runchroot.toList ++ policy.flatMap
     (fun e => match e with
       | .userSpec us => us.entries.flatMap fun h => h.cmnds.filterMap (·.options.chroot)
@@ -550,19 +690,34 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
     } (listUser.toList.map (·.name)) initial.sudoersLocale ipaHosts expandedLookupRoot
   let facts ← gatherPluginFacts policy facts plugin (listUser.toList.map (·.name))
   let algos := ((policy.flatMap Sudoers.Parser.cmndAtoms).flatMap digestAlgos).eraseDups
+  cmndDefaultsReport policy invoking host canonicalHost lookupHost target runas0 policyCommand facts
+    opts.prompt.isSome
   let beforeDigest ← defaults policy invoking host (some target) policyCommand facts opts.prompt.isSome
-  let facts ← if beforeDigest.groupPlugin == pluginConfig then pure facts else do
-    for handle in plugin do Sys.GroupPlugin.close handle
-    let replacement ← loadGroupPlugin beforeDigest.groupPlugin
-    try gatherPluginFacts policy facts replacement (listUser.toList.map (·.name))
-    finally for handle in replacement do Sys.GroupPlugin.close handle
-  for handle in plugin do Sys.GroupPlugin.close handle
+    (initialRunas := some runas0)
+  let pluginChanged := beforeDigest.groupPlugin != pluginConfig
+  if pluginChanged then for handle in plugin do Sys.GroupPlugin.close handle
+  let activePlugin ← if pluginChanged then loadGroupPlugin beforeDigest.groupPlugin else pure plugin
+  let facts ← if pluginChanged then
+      gatherPluginFacts policy facts activePlugin (listUser.toList.map (·.name))
+    else pure facts
   let loadedSources := loadedSources.map fun (source, entries) =>
     (source, if source.name == "sss" then
       ipaHost.map (Sss.withIpaHost entries initial facts (invoking :: listUser.toList)) |>.getD entries
     else entries)
   let policy := (loadedSources.flatMap (·.2)).map (·.entry)
   let beforeDigest ← defaults policy invoking host (some target) policyCommand facts opts.prompt.isSome
+    (initialRunas := some runas0)
+  let initTarget := target
+  let switched := opts.user.isNone && opts.group.isNone &&
+    beforeDigest.runasDefault != initial.runasDefault
+  let (target, targetUnknownUid) ← if switched then
+      targetUser beforeDigest.runasDefault invokingRealGid
+    else pure (target, targetUnknownUid)
+  let facts ← if !switched then pure facts else do
+    let facts ← gatherNetgroups policy { facts with runasUser := target }
+      (listUser.toList.map (·.name)) ipaHosts
+    gatherPluginFacts policy facts activePlugin (listUser.toList.map (·.name))
+  for handle in activePlugin do Sys.GroupPlugin.close handle
   let activeRoots := match facts.command with
     | .run .. => opts.chroot.map (fun root => [root]) |>.getD roots
     | _ => []
@@ -574,7 +729,7 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
     | _ => false
   let rootPinSettings := if needsPinnedRoot then { beforeDigest with fdexec := "always" } else beforeDigest
   let rootFacts ← activeRoots.mapM fun root => do
-    let gathered ← rootCommandFacts policy opts invoking target userEnv cwd rootPinSettings
+    let gathered ← rootCommandFacts policy opts invoking initTarget userEnv cwd rootPinSettings
       invokingRealGid targetGroup homes command facts root algos lookupRoot
     return (root, gathered)
   let facts := { facts with rootFacts, defaultChroot := beforeDigest.runchroot }
@@ -592,7 +747,8 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
     | _, _ => baselineFacts.map (·.fileIds) |>.getD facts.fileIds
   let commandSetid ← commandSetid pinned (command.map (·.canonical))
   let facts := { facts with digests, fileIds }
-  let settings ← defaults policy invoking host (some target) policyCommand facts opts.prompt.isSome true
+  let settings ← defaults policy invoking host (some initTarget) policyCommand facts
+    opts.prompt.isSome true (initialRunas := some runas0)
   let locatedSudoers := selectSources loadedSources settings { facts with fastGlob := settings.fastGlob }
   let policy := locatedSudoers.map (·.entry)
   let policySettings := settings
@@ -607,8 +763,6 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
   let ppid ← Sys.getppid
   let sidStart ← Sys.processStartTime sid
   let ppidStart ← Sys.processStartTime ppid
-  if sidStart.isNone || ppidStart.isNone then
-    throw (IO.userError "unable to determine timestamp process identity")
   let tsScope := Timestamp.scopeFor settings.timestampType ttyDevice
     sid (sidStart.getD 0) ppid (ppidStart.getD 0)
   let tsLockScope := Timestamp.scopeFor
@@ -635,7 +789,7 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
     commandSetid
     policySettings := some policySettings
     policyTarget := some policyTarget
-    targetGroup, listUser, command, userEnv, cwd, userUmask := mask.toNat
+    targetGroup, listUser, command, userEnv, rawEnv, cwd, cwdWritable, userUmask := mask.toNat
     ttyName, toFacts := facts.toFacts, now := ← Sys.bootTimeNanos, tsScope, tsRecords := []
     tsSessionId := sid, tsLockScope, timestampOwnerUid, timestampOwnerGid
     wallTime, execFd, homes
@@ -666,12 +820,14 @@ private def jsonDetails (ctx : Core.Context) (accepted : Bool)
   let allowed := chosen.filter (·.2.allow) |>.map (Policy.allowedOf (Core.authorizationSettings ctx) ·.2)
   let cwd := (ctx.opts.chdir.or (allowed.bind (·.cwd.join))).or ctx.settings.runcwd
     |>.filter (· != "*")
-  let cwd := if commandEnv.isSome then ctx.cwd else
-    (cwd.bind (Core.expandHome ctx)).getD (if ctx.opts.login then ctx.target.home else ctx.cwd)
+  let cwd := if commandEnv.isSome then ctx.cwd else (cwd.bind (Core.expandHome ctx)).or
+    (if ctx.opts.login then some ctx.target.home else ctx.cwd)
   let command := match r.command with
     | .run p _ _ => p | .sudoedit _ => "sudoedit" | _ => Core.commandText ctx
   let argv := match r.command with
-    | .run _ _ _ => ctx.command.map (fun c => c.argv0 :: c.args) |>.getD ctx.opts.command
+    | .run p _ _ => match if accepted then none else Core.shellLogArgs ctx false p with
+      | some args => p :: args
+      | none => ctx.command.map (fun c => c.argv0 :: c.args) |>.getD ctx.opts.command
     | .sudoedit fs => "sudoedit" :: fs | _ => []
   let runenv := if accepted then commandEnv.or (allowed.bind fun a =>
       (buildEnv (Core.environment ctx a)).toOption.map (fun env => env.map fun (k, v) => k ++ "=" ++ v))
@@ -681,22 +837,24 @@ private def jsonDetails (ctx : Core.Context) (accepted : Bool)
     submituser := (Core.displayUser ctx).name, command := some command,
     runuser := some ctx.target.name, rungroup := ctx.targetGroup.map (·.name),
     runchroot := ctx.opts.chroot.or ((allowed.bind (·.chroot)).or ctx.settings.runchroot),
-    runcwd := some cwd, source := chosen.bind fun ((file, pos), _) =>
+    runcwd := cwd, source := chosen.bind fun ((file, pos), _) =>
       pos.map fun (line, col) => s!"{file}:{line}:{col}",
-    ttyname := ctx.ttyName, submithost := some (ctx.submitHost.getD ctx.longHost), submitcwd := some ctx.cwd,
+    ttyname := ctx.ttyName, submithost := some (ctx.submitHost.getD ctx.longHost), submitcwd := ctx.cwd,
     rungid := some ctx.target.gid, runuid := some ctx.target.uid, columns, lines,
     runargv := some argv, runenv,
-    submitenv := some (ctx.userEnv.map fun (k, v) => k ++ "=" ++ v) }
+    submitenv := some ctx.rawEnv }
 
 private def appendLogfile (ctx : Core.Context) (append : String → IO Unit) : IO Unit := do
   if let some path := ctx.settings.logfile then
     try append path catch e =>
       if ctx.settings.ignoreLogfileErrors then warn e.toString else throw e
 
-private def logJson (ctx : Core.Context) (priority : String) (event : EventLog.Event) : IO Unit := do
-  if priority != "none" then
+private def logJson (ctx : Core.Context) (priority : String) (event : EventLog.Event)
+    (mailOnly : Bool := false) : IO Unit := do
+  if priority != "none" && !mailOnly then
     if let some facility := ctx.settings.syslog then
       Sys.syslogBytes facility priority (EventLog.formatJsonSyslog event).toUTF8 ctx.settings.syslogPid
+  if mailOnly && ctx.settings.syslog.isNone then return
   appendLogfile ctx fun path =>
     if ctx.settings.logFormat == "json_compact" then
       Sys.appendLog path (EventLog.formatJsonLine event)
@@ -731,7 +889,8 @@ private def lineDetails (ctx : Core.Context) (line : Core.LogLine)
 private def logLine (ctx : Core.Context) (line : Core.LogLine)
     (iologPath : Option String := none) (remote : Bool := true)
     (commandEnv : Option (List String) := none)
-    (detailsOverride : Option EventLog.Details := none) : IO (Option EventLog.Event) := do
+    (detailsOverride : Option EventLog.Details := none) (mailOnly : Bool := false) :
+    IO (Option EventLog.Event) := do
   let ctx := if line.lookupComplete then ctx else
     { ctx with settings := Core.authorizationSettings ctx }
   let sendRemote := remote && !ctx.settings.logServers.isEmpty && line.reason.isSome
@@ -752,14 +911,15 @@ private def logLine (ctx : Core.Context) (line : Core.LogLine)
       uuid := ← Sys.eventUuid, reason := line.reason,
       serverTime := ← Sys.eventTime ctx.settings.logYear ctx.settings.sudoersLocale, eventTime := some eventTime,
       details, iologPath }
-    logJson ctx line.priority event
+    logJson ctx line.priority event mailOnly
     return some event
   let name := (ctx.previousUser.getD ctx.invoking).name
   let body := EventLog.messageBody name line.msg
-  if line.priority != "none" then
+  if line.priority != "none" && !mailOnly then
     if let some facility := ctx.settings.syslog then
       for bytes in EventLog.splitSyslogBytes name body ctx.settings.syslogMaxlen do
         Sys.syslogBytes facility line.priority bytes ctx.settings.syslogPid
+  if mailOnly && ctx.settings.syslog.isNone then return none
   appendLogfile ctx fun path => do
     Sys.appendLog path (EventLog.formatFile (← Sys.logTime ctx.settings.logYear ctx.settings.sudoersLocale)
       (ctx.submitHost.getD ctx.longHost) name body ctx.settings.logHost ctx.settings.loglinelen)
@@ -767,6 +927,7 @@ private def logLine (ctx : Core.Context) (line : Core.LogLine)
 
 private def mail (ctx : Core.Context) (line : Core.LogLine) : IO Unit := do
   if !ctx.mailerAvailable then return
+  if ctx.settings.syslog.isNone && ctx.settings.logfile.isNone then return
   let some path := ctx.settings.mailerpath | return
   let some recipient := ctx.settings.mailto | return
   let line ← localizedLog ctx line
@@ -781,6 +942,14 @@ private def mail (ctx : Core.Context) (line : Core.LogLine) : IO Unit := do
     s!"{ctx.longHost} : {← Sys.logTime ctx.settings.logYear ctx.settings.sudoersLocale} : {name} : {body}\n\n"
   let flags := (ctx.settings.mailerflags.getD "").splitOn " " |>.flatMap (·.splitOn "\t") |>.filter (!·.isEmpty)
   Sys.sendMail path flags.toArray text
+
+private def timestampNotice (ctx : Core.Context) (notice : Sys.TimestampNotice) : IO Unit := do
+  if notice.alert then
+    let line := { Core.logLine ctx (some notice.logReason) with event := .alert }
+    let line := { line with reason := some notice.text }
+    let _ ← logLine ctx line
+    mail ctx line
+  warn notice.text
 
 private def lecture (ctx : Core.Context) : IO String := do
   if ctx.settings.lecture == "never" || ctx.opts.nonInteractive then return ""
@@ -811,7 +980,7 @@ private def audit (ctx : Core.Context) (success : Bool) : IO Unit := do
 private def authFailure (ctx : Core.Context) (decision : Core.Decision)
     (failure : EventLog.AuthFailure) : IO Unit := do
   audit ctx false
-  let allowed := match Core.policyJudgement ctx with
+  let allowed := Core.pseudoValidated ctx || match Core.policyJudgement ctx with
     | .allow _ => true | .deny => false
   let listOrValidate := ctx.opts.mode == .list || ctx.opts.mode == .validate
   let line := Core.authFailureLog ctx failure.attempts (failure.attempts == 0)
@@ -819,17 +988,18 @@ private def authFailure (ctx : Core.Context) (decision : Core.Decision)
   let mailit := EventLog.mailAuthFailure allowed ctx.settings.mailBadpass ctx.settings.mailAlways
     (Core.denialMail ctx) listOrValidate failure
   if logit || mailit then
-    let _ ← logLine ctx { line with priority := if logit then line.priority else "none" }
+    let _ ← logLine ctx line (mailOnly := !logit)
     pure ()
   if mailit then mail ctx line
   if failure.attempts == 0 then warn "a password is required"
   else if ctx.settings.authfailMessage.isSome then
-    Sys.writeStderr ("sudo: " ++ Core.authFailureMessage ctx failure.attempts ++ "\n")
+    Sys.writeStderr ((← diagnosticProgname.get) ++ ": " ++
+      Core.authFailureMessage ctx failure.attempts ++ "\n")
   else warn (Core.authFailureMessage ctx failure.attempts)
   if !allowed && !failure.error then
     audit ctx false
     if let some line := decision.log then
-      let _ ← logLine ctx line
+      let _ ← logLine ctx line (mailOnly := decision.mailOnly)
       pure ()
     if decision.mail then mail ctx (Core.logLine ctx (some (Core.denialReason ctx)))
     if ctx.settings.passwdTries == 0 then
@@ -842,11 +1012,10 @@ private def authenticate (ctx : Core.Context) (h : Sys.PamHandle) : IO (Option E
     let rc ← Sys.pamAuthenticate h
     if rc == 0 then return none
     if let some err ← Sys.pamLastConvError h then
-      let signal ← Sys.pamInterrupted h
-      if signal == 0 && err != "a password is required" then warn err
+      if !err.isEmpty && err != "a password is required" then warn err
       return some {
         attempts := if ctx.opts.nonInteractive then 0 else attempt
-        noInput := ctx.opts.nonInteractive, error := ctx.opts.nonInteractive, signal := signal.toNat }
+        noInput := ctx.opts.nonInteractive, error := ctx.opts.nonInteractive }
     if ![6, 7, 9, 11].contains rc then
       let err := "PAM authentication error: " ++ (← Sys.pamStrerror h rc)
       warn err
@@ -857,7 +1026,7 @@ private def authenticate (ctx : Core.Context) (h : Sys.PamHandle) : IO (Option E
         I18n.gettext (Insults.select seed)
         else if ctx.settings.badpassMessageConfigured then pure ctx.settings.badpassMessage
         else I18n.gettext ctx.settings.badpassMessage
-      Sys.writeStderr (message ++ "\n")
+      Sys.pamTell h (message ++ "\n")
   return some { attempts := ctx.settings.passwdTries }
 
 private def checkPam (h : Sys.PamHandle) (operation : String) (result : IO Int) : IO Unit := do
@@ -905,11 +1074,15 @@ private def environment (input : EnvInput) (h : Sys.PamHandle) (unknownTarget : 
   return envToArray (← IO.ofExcept (buildEnv { input with pamEnv }))
 
 private def session (ctx : Core.Context) (h : Sys.PamHandle) (setcred openSession : Bool)
-    (run : IO Sys.ExitStatus) : IO Sys.ExitStatus := do
-  Sys.restoreCoreLimit
+    (identity : Option (List Nat × Nat)) (run : Option (List Nat × Nat) → IO Sys.ExitStatus) :
+    IO Sys.ExitStatus := do
+  Sys.restoreLimits ctx.progname
   if ctx.targetUnknownUid then
     cleanup (Sys.pamEnd h 0)
-    return ← run
+    return ← run none
+  if let some (groups, mask) := identity then
+    unless ctx.opts.preserveGroups || ctx.settings.preserveGroups do Sys.pamSetGroups groups
+    if ctx.settings.umask != 0o777 then discard <| Sys.umask mask.toUInt32
   let _ ← Sys.pamSetUser h ctx.target.name
   let credentials ← if setcred then do pure ((← Sys.pamSetcred h true) == 0) else pure false
   try
@@ -919,7 +1092,14 @@ private def session (ctx : Core.Context) (h : Sys.PamHandle) (setcred openSessio
           throw (IO.userError ("pam_open_session: " ++ (← Sys.pamStrerror h rc)))
         pure (rc == 0)
       else pure false
-    try run
+    let final ← match identity with
+      | none => pure none
+      | some (groups, mask) => do
+        let groups ← if setcred then Sys.getgroups else pure groups
+        let current ← Sys.umask 0
+        discard <| Sys.umask current
+        pure (some (groups, if ctx.settings.umaskExplicit then mask else current.toNat))
+    try run final
     finally
       if opened then cleanup (checkPam h "unable to close session" (Sys.pamCloseSession h))
   finally
@@ -927,17 +1107,20 @@ private def session (ctx : Core.Context) (h : Sys.PamHandle) (setcred openSessio
 
 private def logExit (ctx : Core.Context) (event : Option EventLog.Event)
     (line : Core.LogLine) (started : Nat) (status : Sys.ExitStatus) : IO Unit := do
-  if !ctx.settings.logExitStatus && ctx.settings.logServers.isEmpty then return
+  let mailAlways := ctx.settings.mailAlways
+  if !ctx.settings.logExitStatus && !mailAlways && ctx.settings.logServers.isEmpty then return
   let signal ← match status with
     | .signaled n => pure (some (← Sys.signalName n.toUInt32))
     | .exited _ => pure none
   let exitValue := match status with | .exited n => n | .signaled n => 128 + n
   cleanup (Sys.LogSrv.finish exitValue (signal.getD "") (← Sys.lastDumpedCore))
-  if !ctx.settings.logExitStatus then return
+  if !ctx.settings.logExitStatus && !mailAlways then return
+  let mailOnly := !ctx.settings.logExitStatus
+  let suffix := (signal.map (s!" ; SIGNAL={·}")).getD "" ++ s!" ; EXIT={exitValue}"
+  let line := { line with event := .exit, msg := line.msg ++ suffix }
+  if mailAlways then mail ctx line
   if ctx.settings.logFormat == "sudo" then
-    let suffix := (signal.map (s!" ; SIGNAL={·}")).getD "" ++ s!" ; EXIT={exitValue}"
-    discard <| logLine ctx { line with event := .exit, msg := line.msg ++ suffix }
-      (remote := false)
+    discard <| logLine ctx line (remote := false) (mailOnly := mailOnly)
     return
   let some accepted := event | return
   let elapsed := (← Sys.bootTimeNanos) - started
@@ -948,7 +1131,7 @@ private def logExit (ctx : Core.Context) (event : Option EventLog.Event)
     runTime := some { seconds := elapsed / 1000000000, nanoseconds := elapsed % 1000000000 },
     signal, dumpedCore := ← Sys.lastDumpedCore,
     exitValue := match status with | .exited n => n | .signaled n => 128 + n }
-  logJson ctx (ctx.settings.syslogGoodpri.getD "none") event
+  logJson ctx (ctx.settings.syslogGoodpri.getD "none") event mailOnly
 
 private def withInterceptedAuthentication (ctx : Core.Context)
     (authenticate : Core.Context → IO Bool) : IO Bool := do
@@ -960,7 +1143,7 @@ private def withInterceptedAuthentication (ctx : Core.Context)
           scope := ctx.tsScope, authUid := (Core.authUser ctx).uid
           time := ← Sys.bootTimeNanos, disabled := false : Timestamp.Record })
       else pure none
-    return (record, accepted)) warn
+    return (record, accepted)) (timestampNotice ctx)
 
 private def interceptedContext (original : Core.Context) (root : Option String) (enforce : Bool)
     (req : Sys.Intercept.Request) : IO Core.Context := do
@@ -974,7 +1157,7 @@ private def interceptedContext (original : Core.Context) (root : Option String) 
     path, canonical := parent ++ "/" ++ Policy.baseOf path,
     argv0 := path, args := req.argv.toList.drop 1 }
   let ctx : Core.Context := { original with
-    sudoers := policy, command := some command, cwd := req.cwd,
+    sudoers := policy, command := some command, cwd := some req.cwd,
     opts := { original.opts with
       mode := .run, command := path :: command.args,
       shell := false, login := false, resetTimestamp := false,
@@ -1089,14 +1272,15 @@ private def interceptedCheck (original : Core.Context) (root : Option String) (e
 
 private def executeAction (ctx : Core.Context) (decision : Core.Decision)
     (h : Option Sys.PamHandle) (plugins : Bool) : IO Sys.ExitStatus := do
-  let editor ← match decision.action with
+  let shown := (decision.refusedEdit.map Core.Action.edit).getD decision.action
+  let editor ← match shown with
     | .edit plan => Sudoedit.select ctx.progname plan
     | _ => pure none
-  if let .edit _ := decision.action then
+  if let .edit _ := shown then
     if editor.isNone then
       if plugins then Sys.Plugins.reject "policy plugin error" true #[]
       return .exited 1
-  let editorLine := match decision.action, editor with
+  let editorLine := match shown, editor with
     | .edit plan, some editor =>
       if decision.log.isNone && !decision.mail then none else
         let allowed := match Core.policyJudgement ctx with
@@ -1104,9 +1288,9 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
         some (Core.logLine ctx none allowed
           (some (editor.path, editor.words.drop 1 ++ ["--"] ++ plan.policyFiles)))
     | _, _ => none
-  let executes := match decision.action with | .exec _ | .edit _ => true | _ => false
+  let executes := match shown with | .exec _ | .edit _ => true | _ => false
   let editorDetails ← if !ctx.settings.logServers.isEmpty || ctx.settings.logFormat != "sudo" then
-      match decision.action, editor with
+      match shown, editor with
       | .edit plan, some editor => do
         let details ← jsonDetails ctx true
         pure (some { details with
@@ -1114,20 +1298,23 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
           runargv := some (editor.words ++ ["--"] ++ plan.policyFiles) })
       | _, _ => pure none
     else pure none
-  let started ← if ctx.settings.logExitStatus then Sys.bootTimeNanos else pure 0
+  let started ← if ctx.settings.logExitStatus || ctx.settings.mailAlways then Sys.bootTimeNanos
+    else pure 0
   if !ctx.settings.logServers.isEmpty then
-    match decision.action with
+    match shown with
     | .exec plan =>
       let details ← jsonDetails ctx true
       let details := if plan.iolog.isSome then { details with runcwd := plan.cwd } else details
-      Sys.LogSrv.accept ctx.settings details plan.iolog Sys.IoLog.remote
+      if plan.iolog.isNone || (← Sys.IoLog.builtin) then
+        Sys.LogSrv.accept ctx.settings details plan.iolog Sys.IoLog.remote
     | .edit plan =>
       let some details := editorDetails | throw (IO.userError "missing editor event metadata")
-      Sys.LogSrv.accept ctx.settings details plan.iolog Sys.IoLog.remote
+      if plan.iolog.isNone || (← Sys.IoLog.builtin) then
+        Sys.LogSrv.accept ctx.settings details plan.iolog Sys.IoLog.remote
     | _ => pure ()
-  let openIolog : IO (Option String) := do
+  let openIolog : IO (Option (String × String)) := do
     if !ctx.settings.logServers.isEmpty then return none
-    let info ← match decision.action with
+    let info ← match shown with
       | .exec plan => pure (plan.iolog.map (·, plan.gid, plan.path, plan.argv))
       | .edit plan => do
         let some iolog := plan.iolog | pure none
@@ -1141,10 +1328,11 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
       user := ctx.invoking.name, group, runasUser := ctx.target.name, runasGroup
       hostname := ctx.longHost, command, cwd := ctx.cwd
       tty := ctx.ttyName.getD "unknown", argv := argv.toArray } ctx.settings.sudoersLocale
-  let iologPath ← openIolog
+  let iolog ← openIolog
+  let iologPath := iolog.map (·.1)
   if plugins then
     let source := (← jsonDetails ctx true).source
-    let approved ← match decision.action with
+    let approved ← match shown with
       | .exec plan =>
         Sys.Plugins.check (Sys.Plugins.commandInfo ctx plan source iologPath)
           plan.argv.toArray (envToArray (← IO.ofExcept (buildEnv plan.envInput)))
@@ -1153,15 +1341,8 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
         Sys.Plugins.check (Sys.Plugins.editCommandInfo ctx plan editor.path source iologPath)
           (editor.words ++ ["--"] ++ plan.policyFiles).toArray
           (envToArray ctx.userEnv)
-      | .fail _ _ => do
-        Sys.Plugins.reject "command rejected by policy" false (Sys.Plugins.rejectionInfo ctx source)
-        pure true
-      | .print _ code =>
-        if code == 0 then
-          Sys.Plugins.accept #["command=list"] ctx.opts.command.toArray (envToArray ctx.userEnv)
-        else do
-          Sys.Plugins.reject "command rejected by policy" false #["command=list"]
-          pure true
+      | .fail _ _ => pure true
+      | .print _ _ => pure true
       | .validate =>
         Sys.Plugins.accept #["command=validate"] #[] (envToArray ctx.userEnv)
       | _ => pure true
@@ -1169,20 +1350,28 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
       if !Sys.Plugins.approvalPermits decision approved then return .exited 1
     else if !approved then return .exited 1
   if let some (.reject _) := decision.audit then audit ctx false
-  let event ← match decision.log with
-    | some line => logLine ctx (editorLine.getD line) iologPath (detailsOverride := editorDetails)
-    | none => do
-      if !executes || ctx.settings.logFormat == "sudo" || !ctx.settings.logExitStatus then pure none
-      else pure (some {
-        kind := .accept, uuid := ← Sys.eventUuid,
-        serverTime := ← Sys.eventTime ctx.settings.logYear ctx.settings.sudoersLocale, iologPath : EventLog.Event })
-  if decision.mail then mail ctx ((editorLine.or decision.log).getD (Core.logLine ctx none))
+  let line := match editorLine.or decision.log with
+    | some line => line
+    | none => Core.logLine ctx none (if !executes then none else
+        match Core.policyJudgement ctx with | .allow a => some a | .deny => none)
+  let line := (iolog.map (Core.withTsid line ·.2)).getD line
+  let event ← if decision.log.isSome || (executes && decision.mail) then
+      logLine ctx line iologPath (detailsOverride := editorDetails)
+        (mailOnly := decision.log.isNone || decision.mailOnly)
+    else if !executes || ctx.settings.logFormat == "sudo" ||
+        !(ctx.settings.logExitStatus || ctx.settings.mailAlways) then pure none
+    else pure (some {
+      kind := .accept, uuid := ← Sys.eventUuid,
+      serverTime := ← Sys.eventTime ctx.settings.logYear ctx.settings.sudoersLocale, iologPath : EventLog.Event })
+  if decision.mail then mail ctx line
+  flushParseMail
   if let some path := decision.adminFlag then
     cleanup (Sys.createAdminFlag path ctx.invoking.uid ctx.invoking.gid (ctx.invoking.groups.map (·.2)))
   match decision.action with
   | .exec plan =>
     let some h := h | throw (IO.userError "missing PAM transaction")
-    let status ← session ctx h plan.pamSetcred plan.pamSession do
+    let identity := some (plan.groups, plan.umask)
+    let status ← session ctx h plan.pamSetcred plan.pamSession identity fun final => do
       if let some .accept := decision.audit then audit ctx true
       let env ← environment plan.envInput h ctx.targetUnknownUid
       let run : IO Sys.ExitStatus := do
@@ -1190,7 +1379,9 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
         let prepared ← Sys.Intercept.prepare env
         let hooks := Sys.RelayHooks.compose Sys.Plugins.relayHooks
           (Sys.RelayHooks.compose Sys.IoLog.relayHooks Sys.Intercept.relayHooks)
-        Sys.runCommandPrepared { Sys.Exec.specOfPlan plan env with env := prepared.env }
+        let (groups, umask) := final.getD (plan.groups, plan.umask)
+        Sys.runCommandPrepared { Sys.Exec.specOfPlan plan env with
+            env := prepared.env, groups := groups.toArray, umask }
           hooks prepared.seccompFilter prepared.trace #[] prepared.keepFds
       if plan.intercept || plan.logSubcmds then
         if plan.intercept then
@@ -1203,7 +1394,7 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
           (plan.intercept && ctx.settings.interceptVerify) (!plan.intercept)
           (interceptedCheck ctx plan.chroot plan.intercept plugins) run
       else run
-    logExit ctx event ((editorLine.or decision.log).getD (Core.logLine ctx none)) started status
+    logExit ctx event line started status
     return status
   | .edit plan =>
     let some h := h | throw (IO.userError "missing PAM transaction")
@@ -1211,23 +1402,30 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
     if let some .accept := decision.audit then audit ctx true
     try Sys.setUid 0 catch e =>
       throw (IO.userError ("unable to change uid to root (0): " ++ e.toString))
-    let status ← session ctx h plan.pamSetcred plan.pamSession do
-      Sudoedit.run ctx.progname plan editor (← environment plan.envInput h ctx.targetUnknownUid)
-    logExit ctx event ((editorLine.or decision.log).getD (Core.logLine ctx none)) started status
+    let status ← Sudoedit.run ctx.progname plan editor fun body =>
+      session ctx h plan.pamSetcred plan.pamSession none fun _ => do
+        body (← environment plan.envInput h ctx.targetUnknownUid)
+    logExit ctx event line started status
     return status
   | .print text code =>
     (← IO.getStdout).putStr (← I18n.translate text)
+    if plugins then
+      if code == 0 then
+        discard <| Sys.Plugins.accept #["command=list"] ctx.opts.command.toArray
+          (envToArray ctx.userEnv)
+      else Sys.Plugins.reject "command rejected by policy" false #["command=list"]
     return .exited code.toNat
   | .fail text code =>
     Sys.writeStderr (← I18n.translate text)
+    if plugins && decision.refusedEdit.isNone then
+      Sys.Plugins.reject "command rejected by policy" false
+        (Sys.Plugins.rejectionInfo ctx (← jsonDetails ctx true).source)
     return .exited code.toNat
   | .validate => return .exited 0
   | .resetTimestamp =>
     let scope ← if ctx.settings.timestampType == .kernel then do
         let ppid ← Sys.getppid
-        let some start ← Sys.processStartTime ppid |
-          throw (IO.userError "unable to determine timestamp process identity")
-        pure (Timestamp.Scope.ppid ppid start)
+        pure (Timestamp.Scope.ppid ppid ((← Sys.processStartTime ppid).getD 0))
       else pure ctx.tsScope
     Sys.invalidateTimestamp (timestampConfig ctx) scope
     return .exited 0
@@ -1235,8 +1433,8 @@ private def executeAction (ctx : Core.Context) (decision : Core.Decision)
     Sys.removeTimestampFile (timestampConfig ctx)
     return .exited 0
 
-private def execute (ctx : Core.Context) (decision : Core.Decision)
-    (conf : SudoConf.Config) : IO Sys.ExitStatus := do
+private def executeChecked (ctx : Core.Context) (decision : Core.Decision)
+    (conf : SudoConf.Config) (restore : IO Unit) : IO Sys.ExitStatus := do
   let needsSession := match decision.action with | .exec _ | .edit _ => true | _ => false
   let authUser := match decision.auth with
     | .required u => u
@@ -1246,12 +1444,13 @@ private def execute (ctx : Core.Context) (decision : Core.Decision)
     | .none => (Core.earlyAction ctx).isNone &&
       Core.policyNeedsAuth ctx (Core.authJudgement ctx
         (Core.policyJudgement ctx))
-  if !needsSession && !needsAuth && !decision.updateTimestamp then
+  let quiet := !needsSession && !needsAuth && !decision.updateTimestamp
+  if quiet && (Core.earlyAction ctx).isSome then
     return ← executeAction ctx decision none (!conf.plugins.isEmpty)
   let askpass := ((ctx.userEnv.lookup "SUDO_ASKPASS").filter (!·.isEmpty)).or conf.askpass
   let useAskpass := ctx.opts.askpass || (!ctx.opts.stdin && ctx.ttyName.isNone &&
     !ctx.settings.visiblepw && (ctx.userEnv.lookup "DISPLAY").isSome && askpass.isSome)
-  if useAskpass && askpass.isNone then
+  if !quiet && useAskpass && askpass.isNone then
     throw (IO.userError "no askpass program specified, try setting SUDO_ASKPASS")
   let service := if useAskpass && ctx.settings.pamAskpassService.isSome then
       ctx.settings.pamAskpassService.getD ctx.settings.pamService
@@ -1263,21 +1462,20 @@ private def execute (ctx : Core.Context) (decision : Core.Decision)
   withPam ctx service authUser.name prompt (!(ctx.opts.shell || ctx.opts.login))
       (if useAskpass then askpass.getD "" else "") fun h => do
     Sys.pamLecture h (← lecture ctx)
-    let authorized : IO (Bool × Nat) := do
+    let authorized : IO Bool := do
       if !needsAuth && !decision.updateTimestamp then
-        if needsSession then
-          try account ctx h catch e =>
-            warn e.toString
-            authFailure ctx decision { error := true }
-            return (false, 0)
-        return (true, 0)
+        try account ctx h catch e =>
+          warn e.toString
+          authFailure ctx decision { error := true }
+          return false
+        return true
       withCredentialCache ctx (fun records => do
         let cached := !ctx.opts.resetTimestamp && Timestamp.lookup (← Sys.bootTimeNanos)
           ctx.settings.timestampTimeout ctx.tsScope authUser.uid records
         let failure ← if !needsAuth || cached then pure none else authenticate ctx h
         if let some failure := failure then
           authFailure ctx decision failure
-          return (none, (false, failure.signal))
+          return (none, false)
         if ← Sys.pamLectured h then
           cleanup do
             let _ ← Sys.stateMarker ctx.settings.lectureStatusDir ctx.invoking.uid true
@@ -1285,19 +1483,36 @@ private def execute (ctx : Core.Context) (decision : Core.Decision)
         try account ctx h catch e =>
           warn e.toString
           authFailure ctx decision { error := true }
-          return (none, (false, 0))
+          return (none, false)
         let out ← if decision.updateTimestamp then do
             pure (some {
               scope := ctx.tsScope, authUid := authUser.uid
               time := ← Sys.bootTimeNanos, disabled := false : Timestamp.Record })
           else pure none
-        return (out, (true, 0))) warn
-    let (approved, signal) ← authorized
-    if !approved then
+        return (out, true)) (timestampNotice ctx)
+    if !(← authorized) then
       if !conf.plugins.isEmpty then
         Sys.Plugins.reject "authentication failure" true #[]
-      return if signal == 0 then .exited 1 else .signaled signal
+      return .exited 1
+    if needsSession then restore
     executeAction ctx decision (some h) (!conf.plugins.isEmpty)
+
+private def execute (ctx : Core.Context) (decision : Core.Decision)
+    (conf : SudoConf.Config) : IO Sys.ExitStatus := do
+  match ctx.opts.mode with
+  | .help | .version | .resetTimestamp | .removeTimestamp =>
+    return ← executeChecked ctx decision conf (pure ())
+  | _ => pure ()
+  Sys.Limits.unlimitNproc ctx.progname
+  let restored ← IO.mkRef false
+  let restore : IO Unit := do
+    unless ← restored.get do
+      restored.set true
+      Sys.Limits.restoreNproc (some ctx.progname)
+  try executeChecked ctx decision conf restore
+  finally
+    restore
+    flushParseMail
 
 private def configuration : IO SudoConf.Config := do
   let path := "/etc/sudo.conf"
@@ -1315,8 +1530,14 @@ private def configuration : IO SudoConf.Config := do
   finally
     Sys.closeDescriptor fd.toUInt32
 
+private def putQuiet (text : String) : IO Unit := do
+  let stdout ← IO.getStdout
+  try
+    stdout.putStr text
+    stdout.flush
+  catch _ => pure ()
+
 def run (args : List String) : IO UInt32 := do
-  let diagnosticProgname ← IO.mkRef "sudo"
   try
     Sys.initializeProcess false
     I18n.initializeLocale
@@ -1362,8 +1583,7 @@ def run (args : List String) : IO UInt32 := do
             pure ("Configure options: " ++ Cli.configureOptions (← Sys.architecture) ++ "\n")
           else pure ""
         let header := "Sudo version 1.9.17p2\n" ++ configure
-        (← IO.getStdout).putStr header
-        (← IO.getStdout).flush
+        putQuiet header
         pure header
       else pure ""
     if !conf.plugins.isEmpty then
@@ -1390,9 +1610,8 @@ def run (args : List String) : IO UInt32 := do
       let text := if conf.plugins.isEmpty then text else
         (text.replace "Sudoers I/O plugin version 1.9.17p2\n" "").replace
           "Sudoers audit plugin version 1.9.17p2\n" ""
-      (← IO.getStdout).putStr (← I18n.translate text)
+      putQuiet (← I18n.translate text)
       if !conf.plugins.isEmpty then
-        (← IO.getStdout).flush
         let builtin := fun name => (conf.plugins.find? fun p =>
           p.symbol == name && Sys.Plugins.isBuiltin conf p).map (·.line.toUInt32)
         let ioLine := (builtin "sudoers_io").getD
@@ -1426,7 +1645,7 @@ def run (args : List String) : IO UInt32 := do
       Sys.writeStderr (Cli.usageFor (← diagnosticProgname.get))
     else
       cleanup (Sys.Plugins.close 3 1)
-      warn e.toString
+      unless e.toString.isEmpty do warn e.toString
     return 1
 
 end LeanSudo.Shell

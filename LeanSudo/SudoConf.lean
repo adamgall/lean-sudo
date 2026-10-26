@@ -10,19 +10,21 @@ def words (s : String) : List String :=
 @[specialize] def foldLogicalLinesM {m : Type → Type} [Monad m] {α : Type}
     (trimTrailing : Bool) (step : α → Nat → String → m α) (initial : α)
     (text : String) : m α := do
+  let cString (s : String) := String.ofList (s.toList.takeWhile (· != '\x00'))
   let (n, pending, result) ← (text.splitOn "\n").foldlM
     (fun (n, pending, result) s => do
       let s := String.ofList ((s.toList.reverse.dropWhile (· == '\r')).reverse)
-      let parts := s.splitOn "#"
-      let s := parts.headD ""
-      let continued := parts.length == 1 && s.endsWith "\\" && !s.endsWith "\\\\"
+      let visible := cString s
+      let comment := visible.contains '#'
+      let s := if comment then String.ofList (visible.toList.takeWhile (· != '#')) else s
+      let continued := !comment && s.endsWith "\\" && !s.endsWith "\\\\"
       let s := trimStart (if continued then (s.dropEnd 1).toString
         else if trimTrailing then trimEnd s else s)
       if continued then pure (n + 1, pending ++ s, result)
-      else return (n + 1, "", ← step result n (pending ++ s)))
+      else return (n + 1, "", ← step result n (cString (pending ++ s))))
     (1, "", initial)
   if pending.isEmpty then return result
-  step result (n - 1) pending
+  step result (n - 1) (cString pending)
 
 structure Plugin where
   symbol : String

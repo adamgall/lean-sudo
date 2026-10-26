@@ -30,7 +30,7 @@ structure Metadata where
   runasGroup : String
   hostname : String
   command : String
-  cwd : String
+  cwd : Option String
   tty : String
   argv : Array String
   rows : Nat := 24
@@ -120,7 +120,7 @@ private def cleanLegacy (s : String) : String :=
 
 def legacyLog (m : Metadata) (seconds : Nat) : String :=
   s!"{seconds}:{cleanLegacy m.user}:{cleanLegacy m.runasUser}:{cleanLegacy m.runasGroup}:{cleanLegacy m.tty}:{m.rows}:{m.cols}\n" ++
-  m.cwd.replace "\n" " " ++ "\n" ++
+  (m.cwd.getD "unknown").replace "\n" " " ++ "\n" ++
   (String.intercalate " " m.argv.toList).replace "\n" " " ++ "\n"
 
 def jsonLog (m : Metadata) (seconds nanoseconds : Nat) : String :=
@@ -130,7 +130,8 @@ def jsonLog (m : Metadata) (seconds nanoseconds : Nat) : String :=
     s!"    \"seconds\": {seconds},\n    \"nanoseconds\": {nanoseconds}\n" ++ "  },\n" ++
     field "submituser" (toJson m.user) ++ field "submitgroup" (toJson m.group) ++
     field "runuser" (toJson m.runasUser) ++ field "rungroup" (toJson m.runasGroup) ++
-    field "submithost" (toJson m.hostname) ++ field "submitcwd" (toJson m.cwd) ++
+    field "submithost" (toJson m.hostname) ++
+    ((m.cwd.map fun cwd => field "submitcwd" (toJson cwd)).getD "") ++
     field "ttyname" (toJson m.tty) ++ field "command" (toJson m.command) ++
     "  \"runargv\": [\n" ++
     String.intercalate ",\n" (m.argv.toList.map fun arg => "    " ++ (toJson arg).compress) ++

@@ -2,6 +2,7 @@ import LeanSudo.Sys.Exec
 import LeanSudo.Helper
 import LeanSudo.Sys.Prim.Edit
 import LeanSudo.Sys.Prim.Posix
+import LeanSudo.Sys.Prim.CoreLogs
 
 namespace LeanSudo.Sys.Edit
 
@@ -9,7 +10,7 @@ open Prim.Posix
 
 namespace P
 export Prim.Edit (Packet Platform platform socketPair sendMsg recvMsg openAt accessAt
-  unlinkAt makeTemp stat pread pwrite truncate sync setTimes clock)
+  unlinkAt stat pread pwrite truncate sync setTimes clock)
 end P
 
 namespace E
@@ -61,6 +62,36 @@ theorem authorizeFile_regular (typeMask regular mode : Nat) (invalid : UInt32) :
 private def atDir (platform : P.Platform) (dir : UInt32) : UInt32 :=
   if dir == noneFd then platform.atFdcwd.toUInt32 else dir
 
+private def tempChars : ByteArray :=
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".toUTF8
+
+private partial def randomBytes (count : Nat) (acc : ByteArray := .empty) : IO ByteArray := do
+  if acc.size ≥ count then return acc
+  let (error, bytes) ← Prim.CoreLogs.random (count - acc.size).toUInt32
+  if error != 0 && error != EINTR () then fail error
+  randomBytes count (acc ++ bytes)
+
+private partial def openTemp (dir : UInt32) (front back : ByteArray) (xs : Nat) : IO Result := do
+  let random ← randomBytes (2 * xs)
+  let chosen := (List.range xs).foldl (fun acc i =>
+    let value := random[2 * i]!.toNat + 256 * random[2 * i + 1]!.toNat
+    acc.push tempChars[value % tempChars.size]!) ByteArray.empty
+  let some name := String.fromUTF8? (front ++ chosen ++ back) | fail (EINVAL ())
+  let flags := O_CREAT () ||| O_EXCL () ||| O_RDWR () ||| O_CLOEXEC ()
+  match ← P.openAt dir name flags (S_IRUSR () ||| S_IWUSR ()) with
+  | .ok fd => return ⟨name, fd⟩
+  | .error error => if error == EEXIST () then openTemp dir front back xs else fail error
+
+private def createTemp (platform : P.Platform) (path : String) (suffixLen : Nat) :
+    IO Result := do
+  let bytes := path.toUTF8
+  if suffixLen > bytes.size then fail (EINVAL ())
+  let stemEnd := bytes.size - suffixLen
+  let xs := ((bytes.extract 0 stemEnd).toList.reverse.takeWhile (· == 'X'.toNat.toUInt8)).length
+  if xs < 6 then fail (EINVAL ())
+  openTemp (atDir platform noneFd) (bytes.extract 0 (stemEnd - xs))
+    (bytes.extract stemEnd bytes.size) xs
+
 private def executeOperation (platform : P.Platform) (op dir : UInt32)
     (path : String) (suffixLen : Nat) : IO Result := do
   let dir := atDir platform dir
@@ -97,8 +128,7 @@ private def executeOperation (platform : P.Platform) (op dir : UInt32)
   else if op == 4 then
     if path.utf8ByteSize >= platform.pathMax then fail platform.eNameTooLong.toUInt32
     if suffixLen > (INT_MAX ()).toNat then fail (EINVAL ())
-    let (name, fd) ← checked (← P.makeTemp path suffixLen.toUInt32)
-    return ⟨name, fd⟩
+    createTemp platform path suffixLen
   else if op == 5 then
     match ← P.unlinkAt dir path with
     | .ok () => return ⟨"", noneFd⟩

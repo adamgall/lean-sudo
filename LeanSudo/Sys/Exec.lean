@@ -1,6 +1,7 @@
 import LeanSudo.Sys.ExecUtmp
 import LeanSudo.Sys.Prim.CoreFacts
 import LeanSudo.Background
+import LeanSudo.Sys.FrontSignals
 
 namespace LeanSudo.Sys
 
@@ -112,6 +113,22 @@ private structure Resources where
   utmp : Option ByteArray := none
   finalStatus : UInt32 := 256
 
+private def execRemap (spec : ExecSpec) (keep : Array UInt32) : IO (Option (UInt32 × UInt32)) := do
+  let some fd := spec.execFd | return none
+  let some slot := sudoExecSlot (← Prim.Exec.inheritedDescriptors) | return none
+  if slot == fd || slot ≥ 63 || keep.contains slot.toUInt32 then return none
+  return some (fd.toUInt32, slot.toUInt32)
+
+private def remapPlan (plan : ChildPlan) (remap : Option (UInt32 × UInt32)) : ChildPlan :=
+  match remap with
+  | some (_, slot) => { plan with spec := { plan.spec with execFd := some slot.toNat } }
+  | none => plan
+
+private def remapKeep (keep : Array UInt32) (remap : Option (UInt32 × UInt32)) : Array UInt32 :=
+  match remap with
+  | some (fd, _) => keep.filter (· != fd)
+  | none => keep
+
 private def run (spec : ExecSpec) (hooks : RelayHooks) (filter : ByteArray)
     (trace : Bool) (keepFds : Array UInt32) : IO ExitStatus := do
   let _ ← match check spec with
@@ -126,9 +143,8 @@ private def run (spec : ExecSpec) (hooks : RelayHooks) (filter : ByteArray)
     let mut pty : Option Pty := none
     let mut owner : UInt32 := 0
     let mut plan ← prepare spec errorWriter filter keepFds
-    let anyTty := (← Prim.Exec.isatty 0) || (← Prim.Exec.isatty 1) || (← Prim.Exec.isatty 2)
-    if ((spec.usePty && !spec.background) || (← hooks.forcePty)) && anyTty then
-      try pty := some (← preparePty) catch error =>
+    if (spec.usePty && !spec.background) || (← hooks.forcePty) then
+      try pty ← preparePty spec.uid.toUInt32 catch error =>
         stderr s!"sudo: {error}\n"
     resources.modify fun state => { state with pty }
     if let some terminal := pty then
@@ -153,6 +169,12 @@ private def run (spec : ExecSpec) (hooks : RelayHooks) (filter : ByteArray)
       resources.modify fun state => { state with owned := state.owned.push reader |>.push writer }
       plan := { plan with gate := some reader.toNat }
       gate := some writer
+    if let some signal ← FrontSignals.terminated then
+      let status := signal ||| (K.waitCore ())
+      resources.modify fun state => { state with finalStatus := status }
+      hooks.onFinish status
+      dumpedCore.set true
+      return .signaled signal.toNat
     let signals ← Prim.Exec.signalFd
     resources.modify fun state => { state with owned := state.owned.push signals }
     discard <| checkResult "command error pipe"
@@ -168,11 +190,12 @@ private def run (spec : ExecSpec) (hooks : RelayHooks) (filter : ByteArray)
       let (eventReader, eventWriter) ← Prim.Exec.pipe ((K.O_CLOEXEC ()) ||| (K.O_NONBLOCK ()))
       resources.modify fun state => {
         state with owned := state.owned.push eventReader |>.push eventWriter }
+      let keep := fds ++ #[terminal.slave, commandReader, eventWriter]
+      let remap ← execRemap spec keep
       let monitor : MonitorPlan := {
-        child := plan, slave := terminal.slave.toNat,
+        child := remapPlan plan remap, slave := terminal.slave.toNat,
         commands := commandReader.toNat, events := eventWriter.toNat }
-      owner ← Helper.spawn "exec-monitor" (toJson monitor)
-        (fds ++ #[terminal.slave, commandReader, eventWriter])
+      owner ← Helper.spawn "exec-monitor" (toJson monitor) (remapKeep keep remap) remap
       resources.modify fun state => { state with owner }
       closeQuiet commandReader
       closeQuiet eventWriter
@@ -181,7 +204,9 @@ private def run (spec : ExecSpec) (hooks : RelayHooks) (filter : ByteArray)
       commands := some commandWriter
       events := some eventReader
     else
-      owner ← Helper.spawn "exec-command" (toJson plan) fds
+      let remap ← execRemap spec fds
+      owner ← Helper.spawn "exec-command" (toJson (remapPlan plan remap)) (remapKeep fds remap)
+        remap
       resources.modify fun state => { state with owner }
       hooks.onSpawn owner
       if let some writer := gate then
@@ -247,21 +272,15 @@ private def run (spec : ExecSpec) (hooks : RelayHooks) (filter : ByteArray)
 end Exec
 
 def initializeProcess (disableCoredump : Bool := true) : IO Unit := do
-  for fd in [:3] do
-    let result ← Prim.Exec.fcntl fd.toUInt32 (K.F_GETFD ()) 0
-    if result != -(Int64.ofInt (K.EBADF ()).toNat) then continue
-    let replacement ← Exec.checkResult "unable to open /dev/null"
-      (← Prim.Exec.openFile "/dev/null" (K.O_RDWR ()) 0)
-    if replacement != fd.toUInt32 then
-      Prim.Exec.dup2 replacement fd.toUInt32
-      Exec.closeQuiet replacement
+  let initial ← Exec.processState.get
+  let limits ← if initial.initialized then pure initial.limits else
+    (List.range (K.RLIM_NLIMITS ())).toArray.mapM fun resource => do
+      try pure (some (← Prim.Exec.getrlimit resource.toUInt32)) catch _ => pure none
+  if !initial.initialized then Limits.unlimit "sudo"
   Prim.CoreFacts.initializeLocale
   let mut state ← Exec.processState.get
   if !state.initialized then
-    state := { state with uid := (← Prim.Exec.getuid), gid := (← Prim.Exec.getgid) }
-    for resource in [:(K.RLIM_NLIMITS ())] do
-      let limit ← try pure (some (← Prim.Exec.getrlimit resource.toUInt32)) catch _ => pure none
-      state := { state with limits := state.limits.push limit }
+    state := { state with uid := (← Prim.Exec.getuid), gid := (← Prim.Exec.getgid), limits }
     for signal in [1:(K.NSIG ())] do
       if Prim.Exec.supportedSignal signal then
         let action ← Prim.Exec.signalAction signal.toUInt32 (Prim.Exec.defaultHandler ()) 0 0 true
@@ -269,20 +288,23 @@ def initializeProcess (disableCoredump : Bool := true) : IO Unit := do
           state := { state with ignored := state.ignored.push signal }
     state := { state with initialized := true }
   if disableCoredump && state.core.isNone then
-    let limit ← Prim.Exec.getrlimit (K.RLIMIT_CORE ())
-    Exec.checkErr "unable to disable core dumps"
-      (← Prim.Exec.setrlimit (K.RLIMIT_CORE ()) 0 limit.2)
-    let dumpable ← Prim.Exec.prctl (K.PR_GET_DUMPABLE ())
-    discard <| Exec.checkResult "unable to disable core dumps"
-      (← Prim.Exec.prctl (K.PR_SET_DUMPABLE ()) 0)
-    state := { state with core := some limit, dumpable := dumpable.toInt }
+    let limit ← try pure (some (← Prim.Exec.getrlimit (K.RLIMIT_CORE ()))) catch error => do
+      Exec.stderr s!"sudo: getrlimit(RLIMIT_CORE): {error}\n"
+      pure none
+    if let some limit := limit then
+      let error ← Prim.Exec.setrlimit (K.RLIMIT_CORE ()) 0 limit.2
+      if error != 0 then Limits.warn "sudo" "setrlimit(RLIMIT_CORE)" error
+      let dumpable ← Prim.Exec.prctl (K.PR_GET_DUMPABLE ())
+      discard <| Prim.Exec.prctl (K.PR_SET_DUMPABLE ()) 0
+      state := { state with
+        core := if error == 0 then some limit else none, dumpable := dumpable.toInt }
   Exec.processState.set state
 
-def restoreCoreLimit : IO Unit := do
+def restoreLimits (progname : String) : IO Unit := do
+  Limits.restore progname
   let state ← Exec.processState.get
   if let some (low, high) := state.core then
-    let error ← Prim.Exec.setrlimit (K.RLIMIT_CORE ()) low high
-    if error != 0 then Exec.warnLimit (K.RLIMIT_CORE ()) error
+    discard <| Prim.Exec.setrlimit (K.RLIMIT_CORE ()) low high
     Exec.processState.set { state with core := none }
 
 def lastDumpedCore : IO Bool := Exec.dumpedCore.get
