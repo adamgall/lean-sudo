@@ -46,12 +46,12 @@ def main():
             data_files += 1
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run(['gcov', '--json-format', str(note)], cwd=directory,
-                                    capture_output=True, text=True)
+                                    capture_output=True, text=True, errors='replace')
             diagnostics.append(result.stdout + result.stderr)
             if result.returncode:
                 raise RuntimeError('gcov failed for ' + str(note) + ': ' + result.stderr)
             for compressed in pathlib.Path(directory).glob('*.gcov.json.gz'):
-                with gzip.open(compressed, 'rt') as stream:
+                with gzip.open(compressed, 'rt', errors='replace') as stream:
                     document = json.load(stream)
                 for source in document['files']:
                     filename = source['file'].removeprefix('/src/')

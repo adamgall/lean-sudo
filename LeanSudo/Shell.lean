@@ -148,7 +148,8 @@ private def resolveCommand (opts : Cli.Options) (invoking target : Principal)
     (targetGroup : Option GroupInfo) (root : Option String := none) :
     IO (Option Core.ResolvedCmd × Bool) := do
   if opts.mode != .run && opts.mode != .list then return (none, false)
-  let search := (if userIsExempt st invoking then none else st.securePath).or (env.lookup "PATH")
+  let search := (if userIsExempt st invoking then none else st.securePath).or
+    (lookupLastSet env "PATH")
   let (name, argv) := if opts.shell || opts.login then
       let shell := Cli.userShell (if opts.login then none else env.lookup "SHELL")
         (if opts.login then target.shell else invoking.shell)
@@ -770,7 +771,7 @@ private def context (progname : String) (opts : Cli.Options) (conf : SudoConf.Co
     sid (sidStart.getD 0) ppid (ppidStart.getD 0)
   let (timestampOwnerUid, timestampOwnerGid) ← timestampOwnerIds settings.timestampowner
   let previousUser ← if uid == 0 then
-      match userEnv.lookup "SUDO_USER" with
+      match lookupLastSet userEnv "SUDO_USER" with
       | some name => do
         if name == "root" then pure none
         else try pure (some (← user name)) catch _ => pure none
@@ -834,7 +835,7 @@ private def jsonDetails (ctx : Core.Context) (accepted : Bool)
     else none
   let (columns, lines) ← Sys.terminalSize
   return {
-    submituser := (Core.displayUser ctx).name, command := some command,
+    submituser := ctx.invoking.name, command := some command,
     runuser := some ctx.target.name, rungroup := ctx.targetGroup.map (·.name),
     runchroot := ctx.opts.chroot.or ((allowed.bind (·.chroot)).or ctx.settings.runchroot),
     runcwd := cwd, source := chosen.bind fun ((file, pos), _) =>
@@ -864,7 +865,7 @@ private def localizedLog (ctx : Core.Context) (line : Core.LogLine) : IO Core.Lo
   let some reason := line.reason | return line
   let translated ← I18n.translateLog ctx.settings.sudoersLocale reason
   if translated == reason then return line
-  let initial := Core.logEscape (Core.displayUser ctx).name ++ " : "
+  let initial := Core.logEscape ctx.invoking.name ++ " : "
   let separator := if line.raw then "" else " ; "
   let original := initial ++ Core.logEscape reason ++ separator
   let msg := if line.msg.startsWith original then
@@ -913,7 +914,7 @@ private def logLine (ctx : Core.Context) (line : Core.LogLine)
       details, iologPath }
     logJson ctx line.priority event mailOnly
     return some event
-  let name := (ctx.previousUser.getD ctx.invoking).name
+  let name := ctx.invoking.name
   let body := EventLog.messageBody name line.msg
   if line.priority != "none" && !mailOnly then
     if let some facility := ctx.settings.syslog then
@@ -931,7 +932,7 @@ private def mail (ctx : Core.Context) (line : Core.LogLine) : IO Unit := do
   let some path := ctx.settings.mailerpath | return
   let some recipient := ctx.settings.mailto | return
   let line ← localizedLog ctx line
-  let name := (ctx.previousUser.getD ctx.invoking).name
+  let name := ctx.invoking.name
   let sender := ctx.settings.mailfrom.getD name
   let subject := (ctx.settings.mailsub.replace "%h" ctx.longHost).replace "%u" name
   for field in [recipient, sender, subject] do
@@ -1464,7 +1465,7 @@ private def executeChecked (ctx : Core.Context) (decision : Core.Decision)
   let service := if useAskpass && ctx.settings.pamAskpassService.isSome then
       ctx.settings.pamAskpassService.getD ctx.settings.pamService
     else if ctx.opts.login then ctx.settings.pamLoginService else ctx.settings.pamService
-  let promptFormat ← match ctx.opts.prompt.or (ctx.userEnv.lookup "SUDO_PROMPT") with
+  let promptFormat ← match ctx.opts.prompt.or (lookupFirstSet ctx.userEnv "SUDO_PROMPT") with
     | some configured => pure configured
     | none => if ctx.settings.passpromptConfigured then pure ctx.settings.passprompt else I18n.gettext ctx.settings.passprompt
   let prompt := expandPrompt promptFormat ctx.invoking.name ctx.target.name ctx.longHost authUser.name

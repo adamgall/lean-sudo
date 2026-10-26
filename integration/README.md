@@ -12,8 +12,8 @@ services and removing cases without a real substitute):
 
 | Suite | sudo.ws | lean-sudo |
 |---|---:|---:|
-| sudo | 918/918 | 918/918 |
-| visudo | 154/154 | 154/154 |
+| sudo | 1113/1113 | 1113/1113 |
+| visudo | 193/193 | 193/193 |
 
 These are shared compatibility suites, not a claim that every behavior is
 identical: intentional safety differences are encoded in the expectations.
@@ -57,6 +57,11 @@ macOS, or a suitably configured Docker installation on Linux). Environment:
   does not get that fallback.
 * `SUDO_IT_IMAGE`: suite image tag prefix; defaults to `lean-sudo-it`;
   the runner appends `-amd64` or `-arm64`.
+* `SUDO_IT_EXCLUDE` (read by `tests.sh` inside the container): space-separated
+  exact sudo-suite test names to skip. Excluded tests are not counted in the
+  summary; each is listed as `# EXCLUDED: NAME` after the summary line. Only the
+  instrumented-variant runner sets it (see "Sanitizer and generated-C coverage
+  builds").
 
 `integration/build.sh` builds Linux `sudo` and `visudo` from the working tree
 using `integration/Dockerfile.build` and Docker's local artifact output, exporting
@@ -252,13 +257,13 @@ explicitly. The numbered prefixes control source order, not ownership.
 | `62-host-alert.sh` | `host-alert-*`: local-host DNS failures use raw startup syslog alerts, remote `-h` failures use stderr only, and early hostname callbacks precede configured logfile/JSON logging. |
 | `63-local-bound-time.sh` | `local-bound-*`: system-zone America/New_York validity bounds, exact short/long UTC listings across winter/summer and historic DST gaps/folds, explicit-zone and caller-TZ isolation, and live NOTBEFORE/NOTAFTER allow/deny; restores `/etc/localtime` after every case and on exit. |
 | `66-ext-auth.sh` | `ext-auth-*`: `-S` EOF newline after the prompt, bounded 1023-byte password reads (multi-attempt, split password, CR terminator), askpass exec-failure diagnostics, tty hangup/SIGHUP and SIGINT/QUIT/TERM during the prompt, a signal interrupting the read even when the password was buffered meanwhile (stopped reader), SIGTSTP at the `-S` and tty prompt (newline, stop or orphaned no-stop, time-stamp reopen for `-k`, fresh prompt, zero `timestamp_timeout` abandoning the password), `pam_group` groups from `pam_setcred` and the PAM session umask reaching the command. |
-| `66-ext-core.sh` | `ext-core-*`: `-l`/`-ll`/`-U`/`-v` with no rules, typed command in list denials, PAM account checks for list and NOPASSWD paths, unset `PATH`, missing/non-executable `-s`/`-i` shell, `-V` with unwritable stdout, denied run-as-self and negated NOPASSWD rules without a prompt, sudoedit refusals without a PAM session, environment order, `-s`/`-i` argument unescaping, mail-only denials and relative sudoedit files from a deleted cwd. |
+| `66-ext-core.sh` | `ext-core-*`: `-l`/`-ll`/`-U`/`-v` with no rules, typed command in list denials, PAM account checks for list and NOPASSWD paths, unset `PATH`, missing/non-executable `-s`/`-i` shell, `-V` with unwritable stdout, denied run-as-self and negated NOPASSWD rules without a prompt, sudoedit refusals without a PAM session, environment order, duplicate environment names (first kept entry wins under `-E`, `env_keep`/`env_check`, `-i` and `!env_reset`; last `SUDO_PS1`; last command-line `VAR=value`; last non-empty `PATH` for command lookup; first non-empty `SUDO_PROMPT`), root's `SUDO_USER` affecting only the admin flag file (not logfile/JSON user, denials or sudoedit identity), `-s`/`-i` argument unescaping, mail-only denials and relative sudoedit files from a deleted cwd. |
 | `66-ext-edit.sh` | `ext-sudoedit-*`: missing files below writable ancestors, temporary files deleted/replaced/re-moded by the editor, fully random temporary names, environment-editor fallback and deleted-cwd relative-file diagnostics. |
 | `66-ext-exec.sh` | `ext-exec-*`: SIGALRM/SIGCHLD to sudo with and without a tty or pty, monitor command line and process topology, command pty owner, foreign terminals inherited, forged helper markers, `-g` group among the supplementary groups and the digest command descriptor number. |
 | `66-ext-logging.sh` | `ext-logging-*`: root-group logfile creation, JSON `runenv` order, `-s`/`-i` `COMMAND=` escaping, `TSID=` with I/O logging, `mail_always` exit mail and mail-only events, `-V` log file path. |
 | `66-ext-parse.sh` | `ext-parse-*`: sudo.ws's first syntax diagnostic (token column, ordering), escaped command paths, quoted Defaults value column and colon-separated include search paths. |
 | `66-ext-plugins.sh` | `ext-plugins-*`: built-in I/O logger loaded only as sudo.ws loads `sudoers_io` (policy-only `sudo.conf`, `sudoers_io` with options beside a log server). |
-| `66-ext-robust.sh` | `ext-robust-*`: closed standard descriptors, `RLIMIT_AS` 1 GiB, small `RLIMIT_NOFILE`, deleted working directory (text and JSON logs) and signals pending before the prompt acting at exec. |
+| `66-ext-robust.sh` | `ext-robust-*`: closed standard descriptors (including policy warnings written to a closed, read-only or full stderr), `RLIMIT_AS` 1 GiB, small `RLIMIT_NOFILE`, deleted working directory (text and JSON logs) and signals pending before the prompt acting at exec. |
 | `66-ext-sudoers.sh` | `ext-sudoers-*`: NUL bytes in names and lines, CWD value diagnostics, located Defaults warnings/errors and their order, missing main/included files, scoped Defaults order, `sudo.conf` NUL handling and timestamp alerts logged to syslog/mail. |
 | `70-iolog.sh` | `iolog-*`: unmodified `sudoreplay.ws` interoperability, input/output streams, compression, permissions, error policy, path expansion, sequence wrap and password masking. |
 | `80-i18n.sh` | `i18n-*`: byte-for-byte German/French/C diagnostics, help/listing/prompts, LANGUAGE precedence, missing-locale fallback and literal configured messages. |
@@ -511,8 +516,14 @@ terminated by SIGSEGV/SIGBUS/SIGABRT/SIGILL/SIGFPE/SIGSYS/SIGTRAP, it does not
 time out where sudo.ws finished, and it leaves no stray process.
 
 Normalization is limited to timestamp encodings, process IDs, generated mail/
-JSON identities, pipe/socket inode numbers, terminal allocation numbers and
-sudoedit temporary suffixes. No diagnostic wording, whitespace or status is
+JSON identities, pipe/socket inode numbers, terminal allocation numbers,
+sudoedit temporary suffixes and the order of whole messages in root's mailbox.
+Messages are compared as a sorted list because each mail (for example the
+`mail_always` acceptance and `EXIT=` mails) is a separate background
+sendmail/Exim delivery whose mailbox append order races; under campaign load
+sudo.ws itself delivered the later `EXIT=0` mail first (seed 847588893 class
+`e3a3afec4713`, not reproducible in 46 isolated replays). Message content,
+count and headers are still compared. No diagnostic wording, whitespace or status is
 rewritten. Terminal execution uses `ptyrun.py`; stdout and stderr on that
 terminal necessarily form one transcript, while non-terminal channels remain
 separate. JSON logs remain text so duplicate keys and malformed reference output
@@ -634,6 +645,32 @@ Harness issues found and fixed during the campaign: binaries copied by
 `docker cp` kept the host uid (now chowned to root), unreaped zombies (now
 `--init`), late reference mail leaking into the next run (now drained per
 side), and unnormalised Exim 4.99 message ids and `unix_chkpwd[pid]`.
+
+### Campaign result (seed 847588893)
+
+The final run of this seed found four classes; after the fixes below it is clean:
+
+```
+SUMMARY seed=847588893 sudo=3000 visudo=3000 equal=5490 deviations=510 differences=0 classes=0 shrunk=0 unshrunk=0 budget_exhausted=false
+```
+
+* `64788de73af6` duplicate environment names (`CF_DUP=one`, `CF_DUP=two`) with
+  `-E`: sudo.ws's `rebuild_env` adds caller entries with `sudo_putenv(entry,
+  dupcheck=true, overwrite=false)` in every mode, so the first kept occurrence
+  wins; lean-sudo kept the last. Also aligned: last `SUDO_PS1`, last non-empty
+  `PATH` for command lookup and `SUDO_USER`, first non-empty `SUDO_PROMPT`
+  (sudoers.c scans the caller environment that way).
+* `ab930022a662`, `8de19657fe2f` a stderr write failure aborted lean-sudo: glibc
+  reopens closed descriptors of a setuid program on `/dev/null` read-only, so the
+  `CHROOT` deprecation warning failed with `EBADF` and lean-sudo exited 1 before
+  logging or running anything. sudo.ws ignores warning write failures; so does
+  lean-sudo now. Any warning (unresolvable host name, `CHROOT`) triggered it.
+* `e3a3afec4713` harness race in mailbox order (see normalization above).
+
+While fixing the first class, root running sudo with `SUDO_USER` set was found
+to diverge: sudo.ws swaps only `ctx->user.pw` (admin flag file location), never
+the logged/JSON submitting user, denial text or sudoedit identity; lean-sudo
+used the previous user for all of them. `ext-core-env-previous-user` covers it.
 
 ## Comment-free source policy
 
@@ -976,6 +1013,19 @@ names. Any suite failure or matched crash diagnostic makes the runner fail.
 Signal diagnostics are leads requiring classification: a deliberately signalled
 test command is not automatically a sanitizer defect. Silence is not proof that
 no process died: the suite's assertions remain the primary behavioral oracle.
+Transcripts are read as bytes and decoded with replacement characters (visudo
+echoes binary file content), so `results.json` and the coverage report are
+always produced.
+
+Exactly one test is excluded, and only for the ASan and coverage variants:
+`ext-robust-rlimit-as-one-gib` (`EXCLUSIONS` in `integration/coverage/run.py`,
+passed as `SUDO_IT_EXCLUDE` to the sudo suite). It runs sudo under a 1 GiB
+`RLIMIT_AS`; AddressSanitizer reserves an 8 GiB shadow mapping at startup, and
+gcov cannot flush counters under that address-space limit, so neither
+instrumented binary can pass it regardless of product behaviour. The trap
+sanitizer variant, the ordinary suites and the visudo suite exclude nothing.
+`results.json` records each suite's `excluded` list and the console summaries
+include the `# EXCLUDED:` lines.
 
 Coverage uses GCC gcov on the trusted C layer and all locally generated Lean C,
 with atomic counter increments and unoptimized generated code. The coverage-only

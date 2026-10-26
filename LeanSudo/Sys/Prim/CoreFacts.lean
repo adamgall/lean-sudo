@@ -254,8 +254,7 @@ partial def writeStderr (bytes : ByteArray) (offset : Nat := 0) : IO Unit := do
   if offset >= bytes.size then return
   let rc ← write (Posix.STDERR_FILENO ()) bytes offset.toUSize
   if rc == -(errnoValue (Posix.EINTR ())) then return ← writeStderr bytes offset
-  if rc == 0 then failErrno (errnoValue (Posix.EIO ()))
-  check rc
+  if rc <= 0 then return
   writeStderr bytes (offset + rc.toNat)
 
 end LeanSudo.Sys.Prim.CoreFacts

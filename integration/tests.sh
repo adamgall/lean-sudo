@@ -133,6 +133,7 @@ PY
 
 
 NUM=0 PASSED=0 FAILED=0
+EXCLUDED=()
 FAILED_NAMES=()
 CUR= CMD= RC= OUT= ERR=
 FAILS=()
@@ -144,6 +145,10 @@ emit() { printf '%s\n' "$*" | tee -a "$TAP" "$LOG"; }
 begin() {
   CUR=$1
   if [[ -n $FILTER ]] && ! [[ $CUR =~ $FILTER ]]; then return 1; fi
+  if [[ " ${SUDO_IT_EXCLUDE:-} " == *" $CUR "* ]]; then
+    EXCLUDED+=("$CUR")
+    return 1
+  fi
   FAILS=() XENV=() CMD= RC= OUT= ERR=
   reset_state
   printf '\n=== %s\n' "$CUR" >>"$LOG"
@@ -1205,6 +1210,7 @@ emit "1..$NUM"
 emit "# implementation: $LABEL ($IMPL_BIN)"
 emit "# passed: $PASSED/$NUM, failed: $FAILED"
 for n in "${FAILED_NAMES[@]}"; do emit "# FAILED: $n"; done
+for n in "${EXCLUDED[@]}"; do emit "# EXCLUDED: $n"; done
 reset_state
 rm -rf "$WORK"
 [[ $NUM -gt 0 ]] || { echo "# no tests matched filter '$FILTER'"; exit 2; }

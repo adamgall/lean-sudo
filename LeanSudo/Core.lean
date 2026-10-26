@@ -7,7 +7,7 @@ namespace LeanSudo.Core
 
 open Policy
 
-def displayUser (ctx : Context) : Principal :=
+def adminFlagUser (ctx : Context) : Principal :=
   if ctx.invoking.uid == 0 && (ctx.opts.mode == .run || ctx.opts.mode == .edit) then
     ctx.previousUser.getD ctx.invoking else ctx.invoking
 
@@ -278,8 +278,8 @@ def editPlan (ctx : Context) (a : Allowed) : EditPlan :=
   let candidates := editorCandidates ctx
   { toRunPlan := { runPlan ctx a with iolog := IoLog.plan ctx.settings {} },
     files := files ctx, policyFiles := ctx.opts.command,
-    editors := candidates.map (·.2), editUid := (displayUser ctx).uid,
-    editGid := (displayUser ctx).gid, editGroups := (displayUser ctx).groups.map (·.2),
+    editors := candidates.map (·.2), editUid := ctx.invoking.uid,
+    editGid := ctx.invoking.gid, editGroups := ctx.invoking.groups.map (·.2),
     fileUid := ctx.target.uid, fileGid := targetGid ctx, fileGroups := targetGroups ctx,
     follow := a.follow.getD ctx.settings.sudoeditFollow, checkdir := ctx.settings.sudoeditCheckdir,
     editorSources := candidates.map (·.1),
@@ -496,13 +496,13 @@ def deniedAction (ctx : Context) : Action :=
   else if ctx.opts.mode = .validate then
     if pseudoValidated ctx then .validate
     else .fail s!"Sorry, user {ctx.invoking.name} may not run sudo on {displayShortHost ctx}.\n" 1
-  else if !userMatches ctx then .fail (s!"{(displayUser ctx).name} is not in the sudoers file.\n" ++ incident ctx) 1
+  else if !userMatches ctx then .fail (s!"{ctx.invoking.name} is not in the sudoers file.\n" ++ incident ctx) 1
   else if !hostMatches ctx then
-    .fail (s!"{(displayUser ctx).name} is not allowed to run sudo on {displayShortHost ctx}.\n" ++ incident ctx) 1
+    .fail (s!"{ctx.invoking.name} is not allowed to run sudo on {displayShortHost ctx}.\n" ++ incident ctx) 1
   else if ctx.command.isNone && ctx.opts.mode = .run && ctx.settings.pathInfo then notFound ctx
   else
     let target := ctx.target.name ++ (ctx.targetGroup.map (fun g => ":" ++ g.name)).getD ""
-    .fail (s!"Sorry, user {(displayUser ctx).name} is not allowed to execute '{commandText ctx}' as {target} on {displayHost ctx}.\n" ++
+    .fail (s!"Sorry, user {ctx.invoking.name} is not allowed to execute '{commandText ctx}' as {target} on {displayHost ctx}.\n" ++
       (ctx.settings.cmddenialMessage.map (· ++ "\n")).getD "" ++ incident ctx) 1
 
 def logEscape (text : String) (blanks : Bool := false) (quotes : Bool := false) : String :=
@@ -558,7 +558,7 @@ def logLine (ctx : Context) (reason : Option String) (allowed : Option Allowed :
     event := if reason.isSome then .reject else .accept,
     runcwd := cwd, runchroot := chroot,
     priority := (if reason.isSome then ctx.settings.syslogBadpri else ctx.settings.syslogGoodpri).getD "none",
-    msg := logEscape (displayUser ctx).name ++ " : " ++ (reason.map (fun s => logEscape s ++ " ; ")).getD "" ++
+    msg := logEscape ctx.invoking.name ++ " : " ++ (reason.map (fun s => logEscape s ++ " ; ")).getD "" ++
       (tty.map (fun t => s!"TTY={t} ; ")).getD "" ++
       (chroot.map (fun p => s!"CHROOT={logEscape p} ; ")).getD "" ++
       (cwd.map (fun c => s!"PWD={logEscape c} ; ")).getD "" ++
@@ -588,7 +588,6 @@ def failureLog (ctx : Context) (failure : FailureInfo)
       opts := { ctx.opts with
         chroot := if failure.rootApplied then ctx.opts.chroot else none
         chdir := if failure.cwdApplied then ctx.opts.chdir else none }
-      previousUser := none
       command := if failure.commandReady then ctx.command else none }
     let line := logLine eventCtx (some reason) allowed
       (if failure.commandReady then none else some (unresolvedLogCommand ctx))
@@ -618,9 +617,9 @@ def authFailureLog (ctx : Context) (attempts : Nat) (noninteractive : Bool) : Lo
     else authFailureMessage ctx attempts))
 
 def successAdminFlag (ctx : Context) : Option String :=
-  if (displayUser ctx).groups.any (fun g => g.1 == "sudo" || g.1 == "admin") then
+  if (adminFlagUser ctx).groups.any (fun g => g.1 == "sudo" || g.1 == "admin") then
     ctx.settings.adminFlag.map fun p =>
-      if p.startsWith "~/" then (displayUser ctx).home ++ String.ofList (p.toList.drop 1) else p
+      if p.startsWith "~/" then (adminFlagUser ctx).home ++ String.ofList (p.toList.drop 1) else p
   else none
 
 def copiesEnvironment (ctx : Context) : Bool :=

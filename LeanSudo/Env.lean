@@ -35,6 +35,11 @@ def hasKey (e : EnvList) (k : String) : Bool := e.any (fun kv => kv.1 == k)
 
 def lookup (e : EnvList) (k : String) : Option String := (e.find? (fun kv => kv.1 == k)).map (·.2)
 
+def lookupFirstSet (e : EnvList) (k : String) : Option String :=
+  lookup (e.filter fun kv => !kv.2.isEmpty) k
+
+def lookupLastSet (e : EnvList) (k : String) : Option String := lookupFirstSet e.reverse k
+
 def setVar (e : EnvList) (k v : String) : EnvList :=
   if hasKey e k then e.map (fun kv => if kv.1 == k then (k, v) else kv) else e ++ [(k, v)]
 
@@ -159,7 +164,7 @@ def resetHome (i : EnvInput) : Bool :=
   i.settings.alwaysSetHome || i.setHome || i.loginShell || (i.shellMode && i.settings.setHome)
 
 def baseEnv (i : EnvInput) (reset : Bool) : EnvList :=
-  setAll [] (i.userEnv.filter fun kv => userPass i reset kv.1 kv.2)
+  addDefaults [] (i.userEnv.filter fun kv => userPass i reset kv.1 kv.2)
 
 def lognameReset (i : EnvInput) (src e : EnvList) : EnvList :=
   match lookup src "LOGNAME", lookup src "USER" with
@@ -194,7 +199,7 @@ def commonDefaults (i : EnvInput) (e : EnvList) : EnvList :=
   let e1 := setDefault e "SHELL" i.target.shell
   let e2 := setDefault e1 "TERM" "unknown"
   let e3 := setDefault e2 "PATH" stdPath
-  match lookup (i.userEnv.filter fun kv => entryOk kv.1 kv.2) "SUDO_PS1" with
+  match lookup (i.userEnv.filter fun kv => entryOk kv.1 kv.2).reverse "SUDO_PS1" with
   | some ps1 => setVar e3 "PS1" ps1
   | none => e3
 

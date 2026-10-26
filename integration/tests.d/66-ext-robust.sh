@@ -67,6 +67,29 @@ begin ext-robust-two-closed-std-fds-denied && {
   end
 }
 
+begin ext-robust-closed-std-fds-policy-warning && {
+  install -m 0440 /dev/stdin /etc/sudoers.d/ext-robust <<'EOF'
+Defaults logfile=/var/log/ext-robust.log, loglinelen=0
+kate ALL=(ALL:ALL) CHROOT=* NOPASSWD: ALL
+EOF
+  rm -f /var/log/ext-robust.log /tmp/ext-robust-ran
+  run kate 'umask 022; sudo /usr/bin/touch /tmp/ext-robust-ran 1>&- 2>&-; echo rc=$?'
+  expect_rc 0
+  [[ $OUT == rc=0 ]] || fail 'stdout: expected the command to succeed'
+  [[ -e /tmp/ext-robust-ran ]] || fail 'command: expected it to run'
+  run root 'sed "s/^.* : kate : /kate : /" /var/log/ext-robust.log'
+  [[ $OUT == 'kate : PWD=/home/kate ; USER=root ; COMMAND=/usr/bin/touch /tmp/ext-robust-ran' ]] ||
+    fail 'logfile: expected the accepted command'
+  rm -f /tmp/ext-robust-ran
+  run kate 'sudo /usr/bin/touch /tmp/ext-robust-ran 2>&-; echo rc=$?'
+  [[ $OUT == rc=0 ]] || fail 'stdout: expected the command to succeed with stderr closed'
+  [[ -e /tmp/ext-robust-ran ]] || fail 'command: expected it to run with stderr closed'
+  run kate 'sudo /usr/bin/true 2>/dev/full; echo rc=$?'
+  [[ $OUT == rc=0 ]] || fail 'stdout: expected the warning write failure to be ignored'
+  rm -f /tmp/ext-robust-ran /var/log/ext-robust.log
+  end
+}
+
 begin ext-robust-rlimit-as-one-gib && {
   run root 'prlimit --as=1073741824 sudo -n grep "^Max address space" /proc/self/limits'
   ext_robust_limits

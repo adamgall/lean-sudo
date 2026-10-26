@@ -243,9 +243,9 @@ theorem exec_identity (ctx : Context) (p : ExecPlan) (h : (decide ctx).action = 
   exact ⟨rfl, rfl, rfl⟩
 
 theorem edit_identity (ctx : Context) (p : EditPlan) (h : (decide ctx).action = .edit p) :
-    p.fileUid = ctx.target.uid ∧ p.editUid = (displayUser ctx).uid ∧
+    p.fileUid = ctx.target.uid ∧ p.editUid = ctx.invoking.uid ∧
     p.fileGid = targetGid ctx ∧ p.fileGroups = targetGroups ctx ∧
-    p.editGid = (displayUser ctx).gid ∧ p.editGroups = (displayUser ctx).groups.map (·.2) := by
+    p.editGid = ctx.invoking.gid ∧ p.editGroups = ctx.invoking.groups.map (·.2) := by
   obtain ⟨a, _, _, rfl, _, _⟩ := edit_origin ctx p h
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 

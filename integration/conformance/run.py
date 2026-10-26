@@ -158,6 +158,13 @@ def normalise(value):
     return visit(value)
 
 
+def delivery_order(result):
+    if not result.get('mail'):
+        return result
+    messages = [part for part in re.split(r'(?m)^(?=From \S+ )', result['mail']) if part]
+    return dict(result, mail=''.join(sorted(messages, key=normalise)))
+
+
 def tracked_roots():
     homes = sorted({pwd.getpwnam(name).pw_dir for name in USERS})
     return ['/run/sudo', '/var/log', '/var/lib/sudo', '/tmp'] + homes
@@ -522,7 +529,7 @@ def difference_classes(scenario, normal, broken):
 
 def compare(scenario, logger, timeout):
     raw = {side: execute(scenario, side, logger, timeout) for side in ('reference', 'lean')}
-    normal = {side: normalise(value) for side, value in raw.items()}
+    normal = {side: normalise(delivery_order(value)) for side, value in raw.items()}
     return raw, normal
 
 

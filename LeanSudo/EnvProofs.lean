@@ -292,7 +292,7 @@ private theorem origin_of_sudoValues {i : EnvInput} {reset : Bool} {extra : EnvL
 theorem inv_baseEnv (i : EnvInput) (reset : Bool) (extra : EnvList) :
     Inv (Origin i reset extra) (baseEnv i reset) := by
   unfold baseEnv
-  refine inv_setAll (inv_nil _) ?_
+  refine inv_addDefaults (inv_nil _) ?_
   intro kv hm
   rw [List.mem_filter] at hm
   exact Or.inl hm
@@ -300,7 +300,7 @@ theorem inv_baseEnv (i : EnvInput) (reset : Bool) (extra : EnvList) :
 theorem baseEnv_user {i : EnvInput} {reset : Bool} {kv : String × String}
     (h : kv ∈ baseEnv i reset) : kv ∈ i.userEnv ∧ userPass i reset kv.1 kv.2 = true := by
   unfold baseEnv at h
-  rcases mem_setAll h with h | h
+  rcases mem_addDefaults h with h | h
   · simp at h
   · exact List.mem_filter.1 h
 
@@ -366,7 +366,7 @@ theorem inv_commonDefaults (i : EnvInput) (reset : Bool) (extra : EnvList) {e : 
   split
   · rename_i ps1 hps
     refine inv_setVar h3 ?_
-    have hm := List.mem_filter.1 (lookup_mem hps)
+    have hm := List.mem_filter.1 (List.mem_reverse.1 (lookup_mem hps))
     exact Or.inr (Or.inr (Or.inl ⟨rfl, hm.1, hm.2⟩))
   · exact h3
 
@@ -398,7 +398,7 @@ theorem mem_assemble_origin {i : EnvInput} {reset : Bool} {extra : EnvList} {kv 
 
 theorem nodup_assemble (i : EnvInput) (reset : Bool) (extra : EnvList) :
     NodupKeys (assemble i reset extra) := by
-  have h0 : NodupKeys (baseEnv i reset) := nodup_setAll _ (by simp [NodupKeys])
+  have h0 : NodupKeys (baseEnv i reset) := nodup_addDefaults _ (by simp [NodupKeys])
   have h1 : NodupKeys
       (if reset then defaultsReset i (baseEnv i reset) else defaultsCopy i (baseEnv i reset)) := by
     split

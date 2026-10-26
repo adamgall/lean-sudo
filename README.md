@@ -25,7 +25,7 @@ $ sudo id -u
 It reads your existing `/etc/sudoers`, `/etc/sudoers.d` and `/etc/sudo.conf`, uses the
 system's PAM stack (`/etc/pam.d/sudo`, `sudo-i`), prints the same prompts and messages
 (translated, like the original), writes the same syslog lines and I/O logs, and passes
-the same 918-test end-to-end suite as the original sudo, byte for byte where it matters.
+the same 1113-test end-to-end suite as the original sudo, byte for byte where it matters.
 
 > **"sudo.ws"** in this document means the original sudo: the C implementation
 > written around 1980 and maintained by Todd C. Miller since the 1990s, whose home is
@@ -159,7 +159,7 @@ Credentialed file helpers require regular files (`Sys.Edit.authorizeFile_regular
 and lookup's executable and unavailable-error classifications are characterized by
 `Sys.Lookup.executable_iff` and `Sys.Lookup.unavailable_iff`.
 
-In total there are 406 hand-written theorems. `scripts/AxiomAudit.lean` checks mechanically that
+In total there are 498 hand-written theorems. `scripts/AxiomAudit.lean` checks mechanically that
 every declaration defined in a `LeanSudo` module (definitions, theorems and instances,
 including private and generated ones) rests only on Lean's three standard axioms
 (`propext`, `Quot.sound`, `Classical.choice`). A `sorry`, `admit` or `native_decide` in
@@ -168,7 +168,7 @@ the library would make it fail; it is backed by a source grep for those words an
 
 ```console
 $ lake env lean scripts/AxiomAudit.lean
-12444 declarations (2886 theorems) checked; axioms used ⊆ propext, Quot.sound, Classical.choice
+13789 declarations (3243 theorems) checked; axioms used ⊆ propext, Quot.sound, Classical.choice
 ```
 
 A proof is only as good as its statement, so the statements are written to be read:
@@ -186,8 +186,28 @@ byte for byte where it matters:
 
 | Suite | sudo.ws 1.9.17p2 | lean-sudo |
 |---|---|---|
-| `sudo` end-to-end: authentication and PAM, run-as users/groups, `!` rules and aliases, globs/regex/digests/netgroups/networks/FQDN hosts, group plugins, SSSD rules (real slapd + sssd), `Defaults` scoping, environment, `-l`/`-ll`/`-U` output, timestamps (interoperating with sudo.ws), `-i`/`-s`/`-b`, exit status, signals and job control, `NOEXEC`, `TIMEOUT`, `CHROOT`, rlimits, `stay_setuid`, utmp, command interception and `log_subcmds`, sudoedit, `sudo.conf` with audit/approval/I/O plugins, `nsswitch.conf`, askpass, mail, audit records, accept/reject/alert events compared in syslog, logfile and JSON, remote log servers (`sudo_logsrvd`, TLS), I/O logs replayed with the system's `sudoreplay`, translations (German, French), command-line errors, security regressions | 1104/1104 | 1104/1104 |
+| `sudo` end-to-end: authentication and PAM, run-as users/groups, `!` rules and aliases, globs/regex/digests/netgroups/networks/FQDN hosts, group plugins, SSSD rules (real slapd + sssd), `Defaults` scoping, environment, `-l`/`-ll`/`-U` output, timestamps (interoperating with sudo.ws), `-i`/`-s`/`-b`, exit status, signals and job control, `NOEXEC`, `TIMEOUT`, `CHROOT`, rlimits, `stay_setuid`, utmp, command interception and `log_subcmds`, sudoedit, `sudo.conf` with audit/approval/I/O plugins, `nsswitch.conf`, askpass, mail, audit records, accept/reject/alert events compared in syslog, logfile and JSON, remote log servers (`sudo_logsrvd`, TLS), I/O logs replayed with the system's `sudoreplay`, translations (German, French), command-line errors, security regressions | 1113/1113 | 1113/1113 |
 | `visudo` (check mode, edit mode with includes, locking, permissions, export) | 193/193 | 193/193 |
+
+Beyond that suite, every change is checked by evidence that does not depend on
+tests we wrote (commands and results in [integration/README.md](integration/README.md)):
+
+* **Native CI on both architectures.** GitHub Actions builds and runs both suites
+  against both implementations on real amd64 and arm64 runners
+  (`.github/workflows/matrix.yml`); all eight runs must pass with equal counts.
+* **Randomized conformance comparison** (`integration/conformance.sh`): seeded
+  generation of sudoers files, invocations and hostile process state (closed stdio,
+  odd descriptors, resource limits, huge or malformed environments, signals while
+  prompting or running), run against both implementations and compared on output,
+  logs, mail, files touched and the command's credentials, descriptors, environment,
+  limits and signal mask. Three seeds of 3000 sudo and 3000 visudo cases each end
+  with zero differences outside the documented deviations below.
+* **An independent suite.** The sudo-rs project's compliance tests (pinned revision,
+  unmodified original-sudo assertions): sudo.ws passes 851 of 861, lean-sudo 827; all
+  26 tests that pass on sudo.ws and fail on lean-sudo are documented deviations below.
+* **Hardened builds.** The C layer built with undefined-behaviour/bounds trapping and
+  with AddressSanitizer passes both suites with no diagnostics; a gcov build measures
+  which C and Lean code the suites execute.
 
 ## Features
 

@@ -8,6 +8,8 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+EXCLUSIONS = {'asan': ['ext-robust-rlimit-as-one-gib'],
+              'coverage': ['ext-robust-rlimit-as-one-gib']}
 
 
 def command(args, **kwargs):
@@ -46,11 +48,13 @@ def main():
     for suite in ['sudo', 'visudo']:
         label = variant + '-' + suite
         entry = '/opt/sudo-it/tests.sh' if suite == 'sudo' else '/opt/impl/visudo-tests.sh'
+        excluded = EXCLUSIONS.get(variant, []) if suite == 'sudo' else []
         args = ['docker', 'create', '--hostname', 'sudo-it', '--network', 'none',
                 '--cap-add', 'SYS_PTRACE', '--cap-add', 'SYS_ADMIN',
                 '-v', str(output) + ':/out', '-e', 'IMPL_LABEL=' + label,
                 '-e', 'HOST_UID=' + str(os.getuid()), '-e', 'HOST_GID=' + str(os.getgid()),
-                '-e', 'VISUDO_SUDO_BINARY=/opt/impl/sudo', '--entrypoint', entry,
+                '-e', 'VISUDO_SUDO_BINARY=/opt/impl/sudo',
+                '-e', 'SUDO_IT_EXCLUDE=' + ' '.join(excluded), '--entrypoint', entry,
                 image, '/opt/impl/' + suite]
         cid = command(args, capture_output=True, text=True).stdout.strip()
         try:
@@ -64,12 +68,14 @@ def main():
                 result = subprocess.run(['docker', 'start', '-a', cid], stdout=log, stderr=log)
             if variant == 'coverage':
                 command(['docker', 'cp', '-q', cid + ':/coverage/.', str(data)])
-            text = (output / (suite + '-console.log')).read_text()
+            text = (output / (suite + '-console.log')).read_bytes().decode(errors='replace')
             summaries = [line for line in text.splitlines()
-                         if re.search(r'^# (passed:|implementation:|FAILED:)|^1\.\.', line)]
+                         if re.search(r'^# (passed:|implementation:|FAILED:|EXCLUDED:)|^1\.\.',
+                                      line)]
             print('\n'.join(summaries), flush=True)
-            results.append({'suite': suite, 'status': result.returncode, 'summaries': summaries})
-            transcript = (output / (label + '.log')).read_text()
+            results.append({'suite': suite, 'status': result.returncode,
+                            'excluded': excluded, 'summaries': summaries})
+            transcript = (output / (label + '.log')).read_bytes().decode(errors='replace')
             test = 'suite setup'
             for line in transcript.splitlines():
                 if line.startswith('=== '):
