@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/signalfd.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 enum {
@@ -133,14 +134,17 @@ LEAN_EXPORT lean_obj_res lean_pam_caught(uint32_t signal) {
 
 LEAN_EXPORT lean_obj_res lean_pam_poll(uint32_t fd, uint32_t timeout, b_lean_obj_arg unblock) {
     if (lean_sarray_size(unblock) != sizeof(sigset_t)) return ls_ok(lean_int_to_int(-EINVAL));
-    sigset_t saved;
-    int error = pthread_sigmask(SIG_UNBLOCK, (const sigset_t *)lean_sarray_cptr(unblock), &saved);
+    const sigset_t *allowed = (const sigset_t *)lean_sarray_cptr(unblock);
+    sigset_t waiting;
+    int error = pthread_sigmask(SIG_SETMASK, NULL, &waiting);
     if (error != 0) return ls_ok(lean_int_to_int(-error));
+    for (int signo = 1; signo < NSIG; signo++)
+        if (sigismember(allowed, signo) == 1) sigdelset(&waiting, signo);
     struct pollfd input = {.fd = (int)fd, .events = POLLIN};
-    int rc = poll(&input, 1, (int32_t)timeout);
-    error = errno;
-    pthread_sigmask(SIG_SETMASK, &saved, NULL);
-    return ls_ok(lean_int_to_int(rc < 0 ? -error : rc));
+    struct timespec limit = {.tv_sec = (time_t)(timeout / 1000),
+        .tv_nsec = (long)(timeout % 1000) * 1000000L};
+    int rc = ppoll(&input, 1, (int32_t)timeout < 0 ? NULL : &limit, &waiting);
+    return ls_ok(lean_int_to_int(rc < 0 ? -errno : rc));
 }
 
 LEAN_EXPORT lean_obj_res lean_pam_tcgetattr(uint32_t fd) {
